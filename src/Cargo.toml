@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "./name-lib",
+    "./name-client",
+    "./buckyos-kit",
+    "./debug-lib",
+    "./kRPC",
+    "./rbac",
+]
+
