@@ -43,16 +43,20 @@ p, ood,kv://users/*/apps/*,read|write,allow
 p, ood,kv://nodes/{device}/*,read|write,allow
 p, ood,kv://services/*,read|write,allow
 p, ood,kv://system/rbac/policy,read|write,allow
+
 p, client, kv://boot/*, read,allow
 p, client,kv://devices/{device}/*,read,allow
 p, client,kv://devices/{device}/info,read|write,allow
+
 p, service, kv://boot/*, read,allow
 p, service,kv://services/{service}/*,read|write,allow
+p, service,kv://services/*/info,read,allow
 p, service,kv://users*,read,allow
 p, service,kv://users/*/*,read,allow
 p, service,kv://system/*,read,allow
 p, service,dfs://system/data/{service}/*,read|write,allow
 p, service,dfs://system/cache/{service}/*,read|write,allow
+
 p, app, kv://boot/*, read,allow
 p, app, kv://users/*/apps/{app}/settings,read|write,allow
 p, app, kv://users/*/apps/{app}/config,read,allow
@@ -278,6 +282,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
         assert_eq!(enforce("su_bob", Some("control-panel"), "kv://users/bob/settings", "write").await, true);
         assert_eq!(enforce("bob", Some("control-panel"), "dfs://library/photos/1.jpg", "read").await, true);
         assert_eq!(enforce("bob", Some("control-panel"), "dfs://library/photos/1.jpg", "write").await, false);
+        assert_eq!(enforce("ood1", Some("repo-service"), "kv://services/verify-hub/info", "read").await, true);
         //app1 can read and write config and info
         assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/config", "read").await, true);
         assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/config", "write").await, false);
