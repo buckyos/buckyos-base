@@ -255,6 +255,7 @@ pub struct ZoneConfig {
     pub device_list: Option<HashMap<String, DID>>, //gateway device did list
     //ood server endpoints,can be ["ood1","ood2@192.168.32.1","ood3#vlan1]
     pub oods: Vec<String>,
+    pub zone_gateway: Vec<String>,
     //因为所有的Node上的Gateway都是同质的，所以这里可以不用配置？DNS记录解析到哪个Node，哪个Node的Gateway就是ZoneGateway
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sn: Option<String>, //
@@ -291,6 +292,7 @@ impl ZoneConfig {
             name: None,
             device_list: None,
             oods: vec![],
+            zone_gateway: vec![],
             sn: None,
             docker_repo_base_url: None,
             verify_hub_info: None,
@@ -316,8 +318,16 @@ impl ZoneConfig {
         Ok(config)
     }
 
+    pub fn get_default_zone_gateway(&self) -> Option<String> {
+        if self.zone_gateway.is_empty() {
+            return None;
+        }
+        return Some(self.zone_gateway[0].clone());
+    }
+
     pub fn init_by_boot_config(&mut self, boot_config: &ZoneBootConfig) {
         self.oods = boot_config.oods.clone();
+        self.zone_gateway = boot_config.oods.clone();
         self.sn = boot_config.sn.clone();
         self.exp = boot_config.exp;
         self.iat = boot_config.iat as u64;
