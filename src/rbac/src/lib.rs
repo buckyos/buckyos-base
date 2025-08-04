@@ -81,8 +81,8 @@ g, system-config, kernel
 g, verify-hub, kernel
 g, control-panel, kernel
 g, buckycli, kernel
+g, cyfs-gateway, kernel
 "#;
-
 
 lazy_static!{
     static ref SYS_ENFORCE: Arc<Mutex<Option<Enforcer> > > = {
@@ -283,6 +283,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
         assert_eq!(enforce("bob", Some("control-panel"), "dfs://library/photos/1.jpg", "read").await, true);
         assert_eq!(enforce("bob", Some("control-panel"), "dfs://library/photos/1.jpg", "write").await, false);
         assert_eq!(enforce("ood1", Some("repo-service"), "kv://services/verify-hub/info", "read").await, true);
+        assert_eq!(enforce("ood1", Some("cyfs-gateway"), "kv://boot/config", "read").await, true);
         //app1 can read and write config and info
         assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/config", "read").await, true);
         assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/config", "write").await, false);
