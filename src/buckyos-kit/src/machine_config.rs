@@ -16,7 +16,7 @@ pub struct BuckyOSMachineConfig {
 impl Default for BuckyOSMachineConfig {
     fn default() -> Self {
         let mut web3_bridge = HashMap::new();
-        web3_bridge.insert("bns".to_string(), "web3.buckyos.org".to_string());
+        web3_bridge.insert("bns".to_string(), "web3.buckyos.ai".to_string());
 
         Self {
             web3_bridge,
