@@ -1,4 +1,7 @@
-use std::{env, path::{Path, PathBuf, Component}};
+use std::{
+    env,
+    path::{Component, Path, PathBuf},
+};
 
 pub fn normalize_path(path_str: &str) -> String {
     let path_str = path_str.replace("\\", "/");
@@ -37,9 +40,8 @@ pub fn get_buckyos_root_dir() -> PathBuf {
     }
 
     if cfg!(target_os = "windows") {
-        let user_data_dir = env::var("APPDATA").unwrap_or_else(|_| {
-            env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string())
-        });
+        let user_data_dir = env::var("APPDATA")
+            .unwrap_or_else(|_| env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
         Path::new(&user_data_dir).join("buckyos")
     } else {
         Path::new("/opt/buckyos").to_path_buf()
@@ -50,7 +52,7 @@ pub fn get_buckyos_dev_user_home() -> PathBuf {
     if env::var("BUCKYOS_DEV_HOME").is_ok() {
         return Path::new(&env::var("BUCKYOS_DEV_HOME").unwrap()).to_path_buf();
     }
-    let home_dir = env::var("HOME").unwrap();
+    let home_dir = env::home_dir().unwrap();
     Path::new(&home_dir).join(".buckycli")
 }
 
@@ -62,18 +64,19 @@ pub fn get_buckyos_system_etc_dir() -> PathBuf {
     get_buckyos_root_dir().join("etc")
 }
 
-
-pub fn get_buckyos_log_dir(service: &str,is_service:bool) -> PathBuf {
+pub fn get_buckyos_log_dir(service: &str, is_service: bool) -> PathBuf {
     if is_service {
         get_buckyos_root_dir().join("logs").join(service)
     } else {
         // 获取用户临时目录
         if cfg!(target_os = "windows") {
-            let temp_dir = env::var("TEMP").or_else(|_| env::var("TMP")).unwrap_or_else(|_| {
-                // 如果环境变量不存在，使用用户目录下的临时文件夹
-                let user_profile = env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
-                format!("{}\\AppData\\Local\\Temp", user_profile)
-            });
+            let temp_dir = env::var("TEMP")
+                .or_else(|_| env::var("TMP"))
+                .unwrap_or_else(|_| {
+                    // 如果环境变量不存在，使用用户目录下的临时文件夹
+                    let user_profile = env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
+                    format!("{}\\AppData\\Local\\Temp", user_profile)
+                });
             Path::new(&temp_dir).join("buckyos").join("logs")
         } else {
             Path::new("/tmp").join("buckyos").join("logs")
@@ -85,16 +88,19 @@ pub fn get_buckyos_service_data_dir(service_name: &str) -> PathBuf {
     get_buckyos_root_dir().join("data").join(service_name)
 }
 
-pub fn get_buckyos_service_local_data_dir(service_name: &str,disk_id: Option<&str>) -> PathBuf {
+pub fn get_buckyos_service_local_data_dir(service_name: &str, disk_id: Option<&str>) -> PathBuf {
     if disk_id.is_some() {
-        get_buckyos_root_dir().join("local").join(disk_id.unwrap()).join(service_name)
+        get_buckyos_root_dir()
+            .join("local")
+            .join(disk_id.unwrap())
+            .join(service_name)
     } else {
         get_buckyos_root_dir().join("local").join(service_name)
     }
 }
 
 pub fn adjust_path(old_path: &str) -> std::io::Result<PathBuf> {
-    let new_path= old_path.replace("{BUCKYOS_ROOT}", &get_buckyos_root_dir().to_string_lossy());
+    let new_path = old_path.replace("{BUCKYOS_ROOT}", &get_buckyos_root_dir().to_string_lossy());
     let normalized_path = normalize_path(&new_path);
     Ok(std::path::Path::new(&normalized_path).to_path_buf())
 }
@@ -110,7 +116,7 @@ pub fn get_buckyos_named_data_dir(mgr_id: &str) -> PathBuf {
 pub fn get_relative_path(base_path: &str, full_path: &str) -> String {
     if full_path.starts_with(base_path) {
         if base_path.ends_with('/') {
-            full_path[base_path.len()-1..].to_string()
+            full_path[base_path.len() - 1..].to_string()
         } else {
             full_path[base_path.len()..].to_string()
         }
@@ -139,24 +145,38 @@ mod tests {
         let relative_path = get_relative_path(base_path, full_path);
         assert_eq!(relative_path, "/1234567890/asdf?a=1&b=2");
 
+        let home_dir = get_buckyos_dev_user_home();
+        println!("home dir: {}", home_dir.display());
     }
     #[test]
     fn test_normalize_path() {
         let path = "C:\\Users\\buckyos\\AppData\\Local\\Temp\\buckyos\\logs\\buckyos.log";
         let normalized = normalize_path(path);
-        assert_eq!(normalized.as_str(), "C:/Users/buckyos/AppData/Local/Temp/buckyos/logs/buckyos.log");
+        assert_eq!(
+            normalized.as_str(),
+            "C:/Users/buckyos/AppData/Local/Temp/buckyos/logs/buckyos.log"
+        );
 
         let path = "C:\\Users\\buckyos\\AppData\\Local\\Temp\\buckyos\\.\\logs\\buckyos.log";
         let normalized = normalize_path(path);
-        assert_eq!(normalized.as_str(), "C:/Users/buckyos/AppData/Local/Temp/buckyos/logs/buckyos.log");
+        assert_eq!(
+            normalized.as_str(),
+            "C:/Users/buckyos/AppData/Local/Temp/buckyos/logs/buckyos.log"
+        );
 
         let path = "C:\\Users\\buckyos\\AppData\\Local\\Temp\\buckyos\\..\\logs\\buckyos.log";
         let normalized = normalize_path(path);
-        assert_eq!(normalized.as_str(), "C:/Users/buckyos/AppData/Local/Temp/logs/buckyos.log");
+        assert_eq!(
+            normalized.as_str(),
+            "C:/Users/buckyos/AppData/Local/Temp/logs/buckyos.log"
+        );
 
         let path = "C:\\Users\\buckyos\\AppData\\Local\\Temp\\buckyos\\..\\logs\\buckyos.log";
         let normalized = normalize_path(path);
-        assert_eq!(normalized.as_str(), "C:/Users/buckyos/AppData/Local/Temp/logs/buckyos.log");
+        assert_eq!(
+            normalized.as_str(),
+            "C:/Users/buckyos/AppData/Local/Temp/logs/buckyos.log"
+        );
 
         let path = "/opt/buckyos/data/chunk/../1234567890";
         let normalized = normalize_path(path);
