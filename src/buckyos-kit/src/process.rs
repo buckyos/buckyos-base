@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Stdio};
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 #[derive(Error, Debug)]
@@ -80,7 +81,7 @@ pub async fn parse_script_file(path: &PathBuf) -> Result<(String, bool)> {
         let python_cmd = "python3";
         #[cfg(target_os = "linux")]
         let python_cmd = "python3";
-        
+
         script_engine = String::from(python_cmd);
     }
 
@@ -113,7 +114,7 @@ pub async fn execute(
             command.env(key, value);
         }
     }
-    //println!("{:?}", command);
+
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
@@ -126,20 +127,38 @@ pub async fn execute(
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
 
-    let output_future = async {
-        let mut output = Vec::new();
-        tokio::select! {
-            result = read_stream(stdout) => {
-                output.extend(result?);
-            }
-            result = read_stream(stderr) => {
-                output.extend(result?);
-            }
-        }
-        child.wait().await.map(|status| (status, output))
-    };
+    let (tx, mut rx) = mpsc::channel(100);
 
-    let result = timeout(Duration::from_secs(timeout_secs), output_future).await;
+    let stdout_reader = BufReader::new(stdout);
+    let stderr_reader = BufReader::new(stderr);
+
+    let tx_clone = tx.clone();
+    let stdout_handle = tokio::spawn(async move {
+        let mut lines = stdout_reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tx_clone.send((line, "stdout")).await.unwrap();
+        }
+    });
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut lines = stderr_reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tx.send((line, "stderr")).await.unwrap();
+        }
+    });
+
+    let result = timeout(Duration::from_secs(timeout_secs), async {
+        let mut output = Vec::new();
+        while let Some((line, source)) = rx.recv().await {
+            output.extend_from_slice(format!("[{}] {}\n", source, line).as_bytes());
+        }
+
+        stdout_handle.await.unwrap();
+        stderr_handle.await.unwrap();
+
+        child.wait().await.map(|status| (status, output))
+    })
+    .await;
 
     match result {
         Ok(Ok((status, output))) => {
@@ -148,17 +167,10 @@ pub async fn execute(
         }
         Ok(Err(e)) => Err(ServiceControlError::ReasonError(e.to_string())),
         Err(_) => {
-            // Timeout occurred, try to kill the process
             let _ = child.kill().await;
             Err(ServiceControlError::Timeout(
                 "Script execution timed out".to_string(),
             ))
         }
     }
-}
-
-async fn read_stream<R: AsyncRead + Unpin>(mut reader: R) -> std::io::Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await?;
-    Ok(buffer)
 }
