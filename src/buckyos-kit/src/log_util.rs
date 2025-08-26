@@ -6,15 +6,16 @@ pub fn init_logging(app_name: &str, is_service: bool) {
     // get log level in env RUST_LOG, default is info
     let log_level = std::env::var("BUCKY_LOG").unwrap_or_else(|_| "info".to_string());
     let log_level = log_level.parse().unwrap_or(log::LevelFilter::Info);
-    // log_file in target dir, with pid
+
     let pid = std::process::id();
-    let log_file;
-    if is_service {
-        log_file = get_buckyos_log_dir(app_name, is_service).join(format!("{}_{}.log", app_name, pid));
+    let log_dir = get_buckyos_log_dir(app_name, is_service);
+    std::fs::create_dir_all(&log_dir).unwrap();
+
+    let log_file = if is_service {
+        &log_dir.join(format!("{}_{}.log", app_name, pid)) // log_file in target dir, with pid
     } else {
-        log_file = get_buckyos_log_dir(app_name, is_service).join(format!("{}.log", app_name));
-    }
-    std::fs::create_dir_all(log_file.parent().unwrap()).unwrap();
+        &log_dir.join(format!("{}.log", app_name))
+    };
 
     let config = ConfigBuilder::new()
         .set_time_format_custom(format_description!(
