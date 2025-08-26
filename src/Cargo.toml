@@ -5,6 +5,7 @@ members = [
     "./name-lib",
     "./name-client",
     "./buckyos-kit",
+    "./buckyos-tracing",
     "./debug-lib",
     "./kRPC",
     "./rbac",

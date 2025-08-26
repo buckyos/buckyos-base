@@ -1,0 +1,12 @@
+[package]
+name = "buckyos-tracing"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+tracing = "*"
+tracing-subscriber = { version = "*", features = ["env-filter"] }
+tracing-log = "*"
+tracing-appender = "0.2"
+console-subscriber = { version = "*" }
+buckyos-kit = { path = "../buckyos-kit" }
