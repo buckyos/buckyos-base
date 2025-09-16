@@ -326,6 +326,7 @@ impl ZoneConfig {
     }
 
     pub fn init_by_boot_config(&mut self, boot_config: &ZoneBootConfig) {
+        self.id = boot_config.id.clone().unwrap();
         self.oods = boot_config.oods.clone();
         self.zone_gateway = boot_config.oods.clone();
         self.sn = boot_config.sn.clone();
