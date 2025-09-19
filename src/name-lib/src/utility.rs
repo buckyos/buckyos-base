@@ -1,23 +1,28 @@
-use std::net::{IpAddr, Ipv6Addr};
-use std::str::FromStr;
-use jsonwebtoken::jwk::Jwk;
-use tokio::net::UdpSocket;
-use std::net::ToSocketAddrs;
-use std::path::{Path, PathBuf};
-use serde::{Serialize, Deserialize};
-use serde_json::json;
-use thiserror::Error;
-use jsonwebtoken::{encode,decode,Header, Algorithm, Validation, EncodingKey, DecodingKey};
-use rand::rngs::OsRng;
-use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey};
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use curve25519_dalek::montgomery::MontgomeryPoint;
+use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey};
+use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv6Addr};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use thiserror::Error;
+use tokio::net::UdpSocket;
+use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, engine::general_purpose::STANDARD,Engine as _};
-use base64::prelude::BASE64_STANDARD_NO_PAD;
 use crate::config::DeviceConfig;
-use sysinfo::{Components, Disks, Networks, System};
+use base64::prelude::BASE64_STANDARD_NO_PAD;
+use base64::{
+    engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _,
+};
+use bip39::{Language, Mnemonic};
+use hmac::{Hmac, Mac};
 use log::*;
+use sha2::Sha512;
+use sysinfo::{Components, Disks, Networks, System};
 
 #[derive(Error, Debug)]
 pub enum NSError {
@@ -58,16 +63,20 @@ pub fn is_did(identifier: &str) -> bool {
 }
 
 pub fn get_x_from_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> NSResult<String> {
-    let jwk_json = serde_json::to_value(jwk).map_err(|_| NSError::Failed("Invalid jwk".to_string()))?;
-    let x = jwk_json.get("x")
+    let jwk_json =
+        serde_json::to_value(jwk).map_err(|_| NSError::Failed("Invalid jwk".to_string()))?;
+    let x = jwk_json
+        .get("x")
         .ok_or(NSError::Failed("Invalid jwk".to_string()))?;
     let x_str = x.as_str().unwrap().to_string();
     Ok(x_str)
 }
 
 pub fn get_x_from_jwk_string(jwk_string: &str) -> NSResult<String> {
-    let jwk_json = serde_json::from_str::<serde_json::Value>(jwk_string).map_err(|_| NSError::Failed("Invalid jwk".to_string()))?;
-    let x = jwk_json.get("x")
+    let jwk_json = serde_json::from_str::<serde_json::Value>(jwk_string)
+        .map_err(|_| NSError::Failed("Invalid jwk".to_string()))?;
+    let x = jwk_json
+        .get("x")
         .ok_or(NSError::Failed("Invalid jwk".to_string()))?;
     let x_str = x.as_str().unwrap().to_string();
     Ok(x_str)
@@ -79,27 +88,33 @@ pub fn decode_jwt_claim_without_verify(jwt: &str) -> NSResult<serde_json::Value>
         return Err(NSError::Failed("parts.len != 3".to_string())); // JWT 应该由三个部分组成
     }
     let claims_part = parts[1];
-    let claims_bytes = URL_SAFE_NO_PAD.decode(claims_part).map_err(|_| NSError::Failed("base64 decode error".to_string()))?;
-    let claims_str = String::from_utf8(claims_bytes).map_err(|_| NSError::Failed("String::from_utf8 error".to_string()))?;
-    let claims: serde_json::Value = serde_json::from_str(claims_str.as_str()).map_err(|_| NSError::Failed("serde_json::from_str error".to_string()))?;
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(claims_part)
+        .map_err(|_| NSError::Failed("base64 decode error".to_string()))?;
+    let claims_str = String::from_utf8(claims_bytes)
+        .map_err(|_| NSError::Failed("String::from_utf8 error".to_string()))?;
+    let claims: serde_json::Value = serde_json::from_str(claims_str.as_str())
+        .map_err(|_| NSError::Failed("serde_json::from_str error".to_string()))?;
 
     Ok(claims)
 }
 
-pub fn decode_json_from_jwt_with_default_pk(jwt: &str,jwk:&jsonwebtoken::jwk::Jwk) -> NSResult<serde_json::Value> {
-
-    let header: jsonwebtoken::Header = jsonwebtoken::decode_header(jwt).map_err(|error| {
-        NSError::DecodeJWTError("JWT decode header error".to_string())
-    })?;
+pub fn decode_json_from_jwt_with_default_pk(
+    jwt: &str,
+    jwk: &jsonwebtoken::jwk::Jwk,
+) -> NSResult<serde_json::Value> {
+    let header: jsonwebtoken::Header = jsonwebtoken::decode_header(jwt)
+        .map_err(|error| NSError::DecodeJWTError("JWT decode header error".to_string()))?;
 
     let public_key = DecodingKey::from_jwk(jwk).unwrap();
     let validation = Validation::new(header.alg);
 
-    let decoded_token = decode::<serde_json::Value>(jwt, &public_key, &validation).map_err(
-        |error| NSError::DecodeJWTError(format!("JWT decode error:{}",error))
-    )?;
+    let decoded_token = decode::<serde_json::Value>(jwt, &public_key, &validation)
+        .map_err(|error| NSError::DecodeJWTError(format!("JWT decode error:{}", error)))?;
 
-    let decoded_json = decoded_token.claims.as_object()
+    let decoded_json = decoded_token
+        .claims
+        .as_object()
         .ok_or(NSError::DecodeJWTError("Invalid token".to_string()))?;
 
     let result_value = serde_json::Value::Object(decoded_json.clone());
@@ -107,19 +122,21 @@ pub fn decode_json_from_jwt_with_default_pk(jwt: &str,jwk:&jsonwebtoken::jwk::Jw
     Ok(result_value)
 }
 
-pub fn decode_json_from_jwt_with_pk(jwt: &str,pk:&jsonwebtoken::DecodingKey) -> NSResult<serde_json::Value> {
-
-    let header: jsonwebtoken::Header = jsonwebtoken::decode_header(jwt).map_err(|error| {
-        NSError::DecodeJWTError("JWT decode header error".to_string())
-    })?;
+pub fn decode_json_from_jwt_with_pk(
+    jwt: &str,
+    pk: &jsonwebtoken::DecodingKey,
+) -> NSResult<serde_json::Value> {
+    let header: jsonwebtoken::Header = jsonwebtoken::decode_header(jwt)
+        .map_err(|error| NSError::DecodeJWTError("JWT decode header error".to_string()))?;
 
     let validation = Validation::new(header.alg);
 
-    let decoded_token = decode::<serde_json::Value>(jwt,pk, &validation).map_err(
-        |error| NSError::DecodeJWTError(format!("JWT decode error:{}",error))
-    )?;
+    let decoded_token = decode::<serde_json::Value>(jwt, pk, &validation)
+        .map_err(|error| NSError::DecodeJWTError(format!("JWT decode error:{}", error)))?;
 
-    let decoded_json = decoded_token.claims.as_object()
+    let decoded_json = decoded_token
+        .claims
+        .as_object()
         .ok_or(NSError::DecodeJWTError("Invalid token".to_string()))?;
 
     let result_value = serde_json::Value::Object(decoded_json.clone());
@@ -129,13 +146,14 @@ pub fn decode_json_from_jwt_with_pk(jwt: &str,pk:&jsonwebtoken::DecodingKey) -> 
 
 fn build_pkcs8(private_key: &[u8]) -> Vec<u8> {
     let mut pkcs8 = vec![
-        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
     ];
     pkcs8.extend_from_slice(private_key);
     pkcs8
 }
 
-pub fn from_pkcs8(pkcs8: &[u8]) -> NSResult<[u8;32]> {
+pub fn from_pkcs8(pkcs8: &[u8]) -> NSResult<[u8; 32]> {
     // Check if input has the minimum required length (16 bytes header + 32 bytes key)
     if pkcs8.len() < 48 {
         return Err(NSError::Failed("Invalid PKCS#8 data length".to_string()));
@@ -143,9 +161,10 @@ pub fn from_pkcs8(pkcs8: &[u8]) -> NSResult<[u8;32]> {
 
     // Verify PKCS#8 header for Ed25519
     let expected_header = [
-        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
     ];
-    
+
     if &pkcs8[..16] != expected_header {
         return Err(NSError::Failed("Invalid PKCS#8 header".to_string()));
     }
@@ -153,29 +172,27 @@ pub fn from_pkcs8(pkcs8: &[u8]) -> NSResult<[u8;32]> {
     // Extract the 32-byte private key
     let mut private_key = [0u8; 32];
     private_key.copy_from_slice(&pkcs8[16..48]);
-    
+
     Ok(private_key)
 }
 
-pub fn load_private_key(file_path:&Path) -> NSResult<EncodingKey> {
+pub fn load_private_key(file_path: &Path) -> NSResult<EncodingKey> {
     let contents = std::fs::read_to_string(file_path).map_err(|err| {
         error!("read private key failed! {}", err);
         return NSError::ReadLocalFileError(file_path.to_string_lossy().to_string());
     })?;
 
-    let private_key: EncodingKey = EncodingKey::from_ed_pem(contents.as_bytes()).map_err(|err| {
-        error!("parse private key failed! {}", err);
-        return NSError::ReadLocalFileError(format!(
-            "Failed to parse private key {}",
-            err
-        ));
-    })?;
+    let private_key: EncodingKey =
+        EncodingKey::from_ed_pem(contents.as_bytes()).map_err(|err| {
+            error!("parse private key failed! {}", err);
+            return NSError::ReadLocalFileError(format!("Failed to parse private key {}", err));
+        })?;
 
     Ok(private_key)
 }
 
 //TODO: would use a PEM parser library
-pub fn load_raw_private_key(file_path:&Path) -> NSResult<[u8;48]> {
+pub fn load_raw_private_key(file_path: &Path) -> NSResult<[u8; 48]> {
     // load from /etc/buckyos/node_private_key.toml
     let contents = std::fs::read_to_string(file_path).map_err(|err| {
         error!("read private key failed! {}", err);
@@ -191,16 +208,99 @@ pub fn load_raw_private_key(file_path:&Path) -> NSResult<[u8;48]> {
     let end_pos = end_pos.unwrap();
     let mut b64content = contents[start_pos..end_pos].to_string();
     let b64content = b64content.trim();
-    let private_key_bytes = STANDARD.decode(b64content)
-        .map_err(|err| NSError::Failed(format!("base64 decode error:{}",err)))?;
+    let private_key_bytes = STANDARD
+        .decode(b64content)
+        .map_err(|err| NSError::Failed(format!("base64 decode error:{}", err)))?;
 
     //from_pkcs8(&private_key_bytes)
     Ok(private_key_bytes.try_into().unwrap())
 }
 
+// ---------- Deterministic Ed25519 from mnemonic (BIP39 + SLIP-0010) ----------
+
+const HARDENED_OFFSET: u32 = 0x8000_0000;
+// Custom, non-coin purpose to avoid conflicts with SLIP-44 coin paths.
+// Path: m/9777'/0'/{index}'
+const BUC_KEY_PURPOSE: u32 = 9777;
+const BUC_KEY_COIN: u32 = 0;
+
+type HmacSha512 = Hmac<Sha512>;
+
+fn slip10_master_key(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let mut mac =
+        HmacSha512::new_from_slice(b"ed25519 seed").expect("HMAC can take key of any size");
+    mac.update(seed);
+    let result = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    let mut chain_code = [0u8; 32];
+    key.copy_from_slice(&result[..32]);
+    chain_code.copy_from_slice(&result[32..]);
+    (key, chain_code)
+}
+
+fn slip10_derive_hardened(
+    parent_key: [u8; 32],
+    parent_cc: [u8; 32],
+    index: u32,
+) -> ([u8; 32], [u8; 32]) {
+    let i = index | HARDENED_OFFSET;
+    let mut mac = HmacSha512::new_from_slice(&parent_cc).expect("HMAC can take key of any size");
+    // data = 0x00 || key || ser32(i)
+    mac.update(&[0u8]);
+    mac.update(&parent_key);
+    mac.update(&i.to_be_bytes());
+    let result = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    let mut chain_code = [0u8; 32];
+    key.copy_from_slice(&result[..32]);
+    chain_code.copy_from_slice(&result[32..]);
+    (key, chain_code)
+}
+
+fn slip10_derive_ed25519(seed: &[u8], path: &[u32]) -> ([u8; 32], [u8; 32]) {
+    let (mut key, mut cc) = slip10_master_key(seed);
+    for &segment in path {
+        let (k, c) = slip10_derive_hardened(key, cc, segment);
+        key = k;
+        cc = c;
+    }
+    (key, cc)
+}
+
+pub fn generate_ed25519_key_pair_from_mnemonic(
+    mnemonic: &str,
+    passphrase: Option<&str>,
+    index: u32,
+) -> NSResult<(String, serde_json::Value)> {
+    // Parse mnemonic -> seed (BIP39)
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, mnemonic)
+        .map_err(|e| NSError::InvalidParam(format!("Invalid mnemonic: {}", e)))?;
+    let seed = mnemonic.to_seed(passphrase.unwrap_or(""));
+
+    // Derive using SLIP-0010 Ed25519 on a custom purpose path to avoid coin conflicts.
+    // Path: m/9777'/0'/{index}'
+    let path = [BUC_KEY_PURPOSE, BUC_KEY_COIN, index];
+    let (sk32, _cc) = slip10_derive_ed25519(&seed, &path);
+
+    // Build ed25519 signing key from 32-byte secret
+    let signing_key = SigningKey::from_bytes(&sk32);
+
+    // Prepare PEM (PKCS#8 constructed as existing helper does)
+    let pkcs8_bytes = build_pkcs8(&sk32);
+    let private_key_pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        STANDARD.encode(&pkcs8_bytes)
+    );
+
+    // Prepare public key JWK consistent with existing utilities
+    let public_key_jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+
+    Ok((private_key_pem, public_key_jwk))
+}
+
 // Generate a random private key and return the PKCS#8 encoded bytes
-pub fn generate_ed25519_key() -> (SigningKey, [u8;48]) {
-    let mut csprng = rand::rngs::OsRng{};
+pub fn generate_ed25519_key() -> (SigningKey, [u8; 48]) {
+    let mut csprng = rand::rngs::OsRng {};
     let signing_key: SigningKey = SigningKey::generate(&mut csprng);
     let private_key_bytes = signing_key.to_bytes();
     let pkcs8_bytes = build_pkcs8(&private_key_bytes);
@@ -219,15 +319,19 @@ pub fn encode_ed25519_sk_to_pk_jwk(sk: &SigningKey) -> serde_json::Value {
     public_key_jwk
 }
 
-pub fn ed25519_to_decoding_key(sk: &[u8;32]) -> NSResult<DecodingKey> {
+pub fn ed25519_to_decoding_key(sk: &[u8; 32]) -> NSResult<DecodingKey> {
     let public_key = DecodingKey::from_ed_der(sk);
     Ok(public_key)
 }
 
-pub fn jwk_to_ed25519_pk(jwk: &Jwk) -> NSResult<[u8;32]> {
+pub fn jwk_to_ed25519_pk(jwk: &Jwk) -> NSResult<[u8; 32]> {
     let x = get_x_from_jwk(jwk)?;
-    let x_bytes = URL_SAFE_NO_PAD.decode(x).map_err(|_| NSError::Failed("jwk_to_ed25519_pk: Invalid x".to_string()))?;
-    let x_bytes = x_bytes.try_into().map_err(|_| NSError::Failed("jwk_to_ed25519_pk: Invalid x".to_string()))?;
+    let x_bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|_| NSError::Failed("jwk_to_ed25519_pk: Invalid x".to_string()))?;
+    let x_bytes = x_bytes
+        .try_into()
+        .map_err(|_| NSError::Failed("jwk_to_ed25519_pk: Invalid x".to_string()))?;
     Ok(x_bytes)
 }
 
@@ -243,7 +347,6 @@ pub fn encode_ed25519_pkcs8_sk_to_pk(pkcs8_bytes: &[u8]) -> String {
 }
 
 pub fn generate_ed25519_key_pair() -> (String, serde_json::Value) {
-    
     let (signing_key, pkcs8_bytes) = generate_ed25519_key();
 
     let private_key_pem = format!(
@@ -256,35 +359,33 @@ pub fn generate_ed25519_key_pair() -> (String, serde_json::Value) {
     (private_key_pem, public_key_jwk)
 }
 
-
 pub fn generate_x25519_key_pair() -> (PublicKey, StaticSecret) {
     let mut csprng = OsRng;
     let signing_key: SigningKey = SigningKey::generate(&mut csprng);
-    
+
     let private_key_bytes = signing_key.to_bytes();
     let public_key_bytes = signing_key.verifying_key().to_bytes();
-    println!("public_key_bytes: {:?}",public_key_bytes);
-    println!("private_key_bytes: {:?}",private_key_bytes);
+    println!("public_key_bytes: {:?}", public_key_bytes);
+    println!("private_key_bytes: {:?}", private_key_bytes);
 
     let public_key_jwk = json!({
         "kty": "OKP",
         "crv": "Ed25519",
         "x": URL_SAFE_NO_PAD.encode(public_key_bytes),
     });
-    println!("{}",public_key_jwk);
+    println!("{}", public_key_jwk);
 
     let pkcs8_bytes = build_pkcs8(&private_key_bytes);
     let private_key_pem = format!(
         "\n-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
         STANDARD.encode(&pkcs8_bytes)
     );
-    println!("{}",private_key_pem);
-
+    println!("{}", private_key_pem);
 
     let x25519_public_key = ed25519_to_curve25519::ed25519_pk_to_curve25519(public_key_bytes);
-    println!("x25519_public_key: {:?}",x25519_public_key);
+    println!("x25519_public_key: {:?}", x25519_public_key);
     let x25519_private_key = ed25519_to_curve25519::ed25519_sk_to_curve25519(private_key_bytes);
-    println!("x25519_private_key: {:?}",x25519_private_key);
+    println!("x25519_private_key: {:?}", x25519_private_key);
 
     let x25519_public_key = x25519_dalek::PublicKey::from(x25519_public_key);
     let x25519_private_key = x25519_dalek::StaticSecret::from(x25519_private_key);
@@ -296,21 +397,22 @@ pub fn generate_x25519_key_pair() -> (PublicKey, StaticSecret) {
 pub fn get_device_did_from_ed25519_jwk_str(jwk_public_key: &str) -> NSResult<String> {
     let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_str(jwk_public_key)
         .map_err(|_| NSError::Failed("Invalid public key".to_string()))?;
-    let jwk_value = serde_json::to_value(jwk)
-        .map_err(|_| NSError::Failed("Invalid public key".to_string()))?;
-    let x = jwk_value.get("x")
+    let jwk_value =
+        serde_json::to_value(jwk).map_err(|_| NSError::Failed("Invalid public key".to_string()))?;
+    let x = jwk_value
+        .get("x")
         .ok_or(NSError::Failed("Invalid public key".to_string()))?;
-    let did = format!("did:dev:{}",x.as_str().unwrap());
+    let did = format!("did:dev:{}", x.as_str().unwrap());
     Ok(did)
 }
 
 pub fn get_device_did_from_ed25519_jwk(public_key: &serde_json::Value) -> NSResult<String> {
-    let x = public_key.get("x")
+    let x = public_key
+        .get("x")
         .ok_or(NSError::Failed("Invalid public key".to_string()))?;
-    let did = format!("did:dev:{}",x.as_str().unwrap());
+    let did = format!("did:dev:{}", x.as_str().unwrap());
     Ok(did)
 }
-
 
 mod test {
     use crate::DID;
@@ -327,16 +429,18 @@ mod test {
 
         let share_secret1 = my_secret.diffie_hellman(&public_key2);
         let share_secret2 = private_key2.diffie_hellman(&my_public);
-       
-        assert_eq!(share_secret1.to_bytes(), share_secret2.to_bytes());  
+
+        assert_eq!(share_secret1.to_bytes(), share_secret2.to_bytes());
     }
 
     #[test]
     fn test_generate_ed25519_key_pair() {
         let (private_key, public_key) = generate_ed25519_key_pair();
-        println!("private_key: {}",private_key);
-        println!("public_key: {}",serde_json::to_string(&public_key).unwrap());
-
+        println!("private_key: {}", private_key);
+        println!(
+            "public_key: {}",
+            serde_json::to_string(&public_key).unwrap()
+        );
     }
 
     #[test]
@@ -347,7 +451,7 @@ mod test {
         if !key_dir.is_dir() {
             std::fs::create_dir_all(&key_dir).unwrap();
         }
-        println!("key_dir: {:?}",key_dir);
+        println!("key_dir: {:?}", key_dir);
 
         let (private_key, public_key) = generate_ed25519_key_pair();
 
@@ -362,15 +466,15 @@ mod test {
     fn test_load_pem_private_key() {
         let key_path = Path::new("d:\\temp\\device_key.pem");
         let private_key = load_raw_private_key(&key_path).unwrap();
-        println!("private_key: {:?}",private_key);
+        println!("private_key: {:?}", private_key);
         let private_key_der = from_pkcs8(&private_key).unwrap();
-        println!("private_key_der: {:?}",private_key_der);
+        println!("private_key_der: {:?}", private_key_der);
 
         let private_key_x25519 = ed25519_to_curve25519::ed25519_sk_to_curve25519(private_key_der);
-        println!("private_key_x25519: {:?}",private_key_x25519);
+        println!("private_key_x25519: {:?}", private_key_x25519);
 
         let file_content = std::fs::read_to_string("d:\\temp\\device_key.pem").unwrap();
-        println!("file_content: {}",file_content);
+        println!("file_content: {}", file_content);
 
         //let encoding_key = EncodingKey::from_ed_pem(file_content.as_bytes()).unwrap();
         let encoding_key = EncodingKey::from_ed_der(&private_key);
@@ -384,17 +488,17 @@ mod test {
 
         let token = encode(&header, &test_payload, &encoding_key).unwrap();
         let token2 = encode(&header, &test_payload, &encoding_key2).unwrap();
-        println!("token: {}",token);
-        println!("token2: {}",token2);
+        println!("token: {}", token);
+        println!("token2: {}", token2);
         assert_eq!(token, token2);
 
-        //let sn_public_key 
-        let did_str ="8vlobDX73HQj-w5TUjC_ynr_ljsWcDAgVOzsqXCw7no.dev.did";
+        //let sn_public_key
+        let did_str = "8vlobDX73HQj-w5TUjC_ynr_ljsWcDAgVOzsqXCw7no.dev.did";
         let sn_did = DID::from_str(did_str).unwrap();
         let sn_public_key = sn_did.get_ed25519_auth_key().unwrap();
-        println!("sn_public_key: {:?}",sn_public_key);
+        println!("sn_public_key: {:?}", sn_public_key);
         let sn_x25519_public_key = ed25519_to_curve25519::ed25519_pk_to_curve25519(sn_public_key);
-        println!("sn_x_public_key: {:?}",sn_x25519_public_key);
+        println!("sn_x_public_key: {:?}", sn_x25519_public_key);
         let sn_x_public_key = x25519_dalek::PublicKey::from(sn_x25519_public_key);
 
         let my_secret = EphemeralSecret::random();
@@ -404,5 +508,28 @@ mod test {
         let sn_x25519_sk = x25519_dalek::StaticSecret::from(private_key_x25519);
         let share_secret2 = sn_x25519_sk.diffie_hellman(&my_public);
         assert_eq!(share_secret1.to_bytes(), share_secret2.to_bytes());
+    }
+
+    #[test]
+    fn test_generate_ed25519_key_pair_from_mnemonic_print() {
+        // Known BIP39 test mnemonic (English)
+        let mnemonic = "crawl library carry despair master knee expose foot random bag icon asthma";
+        let passphrase = Some("TREZOR");
+        let index = 0u32;
+
+        let (pem, jwk) = generate_ed25519_key_pair_from_mnemonic(mnemonic, passphrase, index)
+            .expect("derive should succeed");
+
+        println!("mnemonic derived pem: {}", pem);
+        println!(
+            "mnemonic derived jwk: {}",
+            serde_json::to_string(&jwk).unwrap()
+        );
+
+        // Basic sanity
+        assert!(pem.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(jwk.get("kty").unwrap() == "OKP");
+        assert!(jwk.get("crv").unwrap() == "Ed25519");
+        assert!(jwk.get("x").is_some());
     }
 }

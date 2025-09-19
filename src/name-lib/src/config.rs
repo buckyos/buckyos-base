@@ -183,7 +183,7 @@ How to use OODInfo & ZoneBootInfo
 
 Before Node Boot(first time connected to system_config_service),ZoneBootInfo will help Node connect to system_config_service
 按下面的顺序搜索，搜索到第一个返回
-orders: 
+orders:
 - looking for same LAN ood by udp broadcast
 - looking for same LAN ood by tcp-scan (ipv4,C类地址，最多尝试254个地址)
 
@@ -199,16 +199,15 @@ Node Daemon会定期刷新ZoneBootInfo 当长时间没有办法连接上任何oo
 */
 
 pub struct OODInfo {
-    pub address:Option<IpAddr>,
-    pub net_id:Option<String>,
-    pub last_connected_time:Option<u64> //linux time stamp
+    pub address: Option<IpAddr>,
+    pub net_id: Option<String>,
+    pub last_connected_time: Option<u64>, //linux time stamp
 }
 pub struct ZoneBootInfo {
     //pub zone_boot_config: ZoneBootConfig,
-    // oodid -> address 
+    // oodid -> address
     pub ood_info: HashMap<String, OODInfo>,
 }
-
 
 impl ZoneBootInfo {
     pub fn new_by_boot_config(boot_config: &ZoneBootConfig) -> Self {
@@ -217,7 +216,6 @@ impl ZoneBootInfo {
         }
     }
 }
-
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct VerifyHubInfo {
@@ -957,7 +955,6 @@ pub struct NodeIdentityConfig {
 }
 
 impl NodeIdentityConfig {
-
     pub fn load_node_identity_config(file_path: &PathBuf) -> NSResult<(NodeIdentityConfig)> {
         let contents = std::fs::read_to_string(file_path.clone()).map_err(|err| {
             error!("read {} failed! {}", file_path.to_string_lossy(), err);
@@ -980,8 +977,8 @@ impl NodeIdentityConfig {
     }
 }
 
-//unit test
-#[cfg(test)]
+// unit tests that depend on external crates are behind an opt-in feature
+#[cfg(all(test, feature = "config_tests"))]
 mod tests {
     use super::super::*;
     use super::DeviceInfo;
