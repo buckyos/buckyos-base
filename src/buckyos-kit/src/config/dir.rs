@@ -55,6 +55,15 @@ fn toml_to_json(toml_value: toml::Value) -> Result<JsonValue, Box<dyn std::error
     Ok(json_value)
 }
 
+fn yaml_to_json(yaml_value: serde_yaml_ng::Value) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let json_value = serde_json::Value::deserialize(yaml_value).map_err(|e| {
+        let msg = format!("Failed to convert YAML to JSON: {:?}", e);
+        error!("{}", msg);
+        msg
+    })?;
+    Ok(json_value)
+}
+
 // Load a config file, support JSON and TOML
 async fn load_file(file: &Path) -> Result<JsonValue, Box<dyn std::error::Error>> {
     debug!("Loading config file: {:?}", file);
@@ -86,6 +95,16 @@ async fn load_file(file: &Path) -> Result<JsonValue, Box<dyn std::error::Error>>
                 })?;
 
                 return toml_to_json(toml_value);
+            }
+            "yaml" | "yml" => {
+                // Parse YAML file directly
+                let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
+                    let msg = format!("Failed to parse YAML: {:?}", e);
+                    error!("{}", msg);
+                    msg
+                })?;
+
+                return yaml_to_json(yaml_value);
             }
             _ => {
                 // Unknown extension, use content to guess
@@ -131,7 +150,7 @@ async fn load_file(file: &Path) -> Result<JsonValue, Box<dyn std::error::Error>>
 ///   ]
 /// }
 ///
-/// 
+///
 
 
 pub async fn load_dir_with_root(
@@ -226,7 +245,7 @@ async fn scan_files(dir: &Path) -> Result<Vec<IndexedFile>, Box<dyn std::error::
 fn extract_index_from_filename(path: &Path) -> Option<u32> {
     let file_stem = path.file_name()?.to_str()?;
     //println!("file_stem: {}", file_stem);
-    let index_part = file_stem.rsplit('.').next()?; 
+    let index_part = file_stem.rsplit('.').next()?;
     //println!("index_part: {}", index_part);
     let index = index_part.parse::<u32>().ok();
     if index.is_none() {
@@ -273,6 +292,7 @@ pub async fn load_dir(dir: &Path) -> Result<Vec<ConfigItem>, Box<dyn std::error:
 
 #[cfg(test)]
 mod test {
+    use crate::config::dir::load_file;
 
     #[test]
     fn test_file_index() {
@@ -292,5 +312,26 @@ mod test {
         let path = std::path::Path::new("dir.1");
         let index = super::extract_index_from_filename(path);
         assert_eq!(index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_yaml_read() {
+        let yaml = r#"
+test:
+  - a: 1
+    b: 2
+  - a: 3
+    b: 4
+        "#;
+        let tmp_file = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
+        std::fs::write(tmp_file.path(), yaml).unwrap();
+
+        let ret = load_file(tmp_file.path()).await;
+        assert!(ret.is_ok());
+        let value = ret.unwrap();
+        assert_eq!(value["test"][0]["a"], 1);
+        assert_eq!(value["test"][0]["b"], 2);
+        assert_eq!(value["test"][1]["a"], 3);
+        assert_eq!(value["test"][1]["b"], 4);
     }
 }
