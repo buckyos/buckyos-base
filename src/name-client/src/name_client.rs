@@ -12,10 +12,10 @@ use name_lib::*;
 use log::*;
 
 pub struct NameClientConfig {
-    enable_cache: bool,
-    local_cache_dir: Option<String>,
-    max_ttl: u32,
-    cache_size: u64,
+    pub enable_cache: bool,
+    pub local_cache_dir: Option<String>,
+    pub max_ttl: u32,
+    pub cache_size: u64,
 }
 
 impl Default for NameClientConfig {
