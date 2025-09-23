@@ -16,15 +16,19 @@ serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 json_value_merge = "*"
 toml = "*"
+serde_yaml_ng = "*"
 time = { version = "^0.3", features = ["formatting"] }
 tokio = { version = "*", features = ["full"] }
 log = "*"
 simplelog = "*"
 env_logger = "*"
-ed25519-dalek = { version = "*", features = ["rand_core"] } 
+ed25519-dalek = { version = "*", features = ["rand_core"] }
 pkcs8 = "*"
 #rand = ""
 base64 = "*"
 async-recursion = "*"
 lazy_static = "*"
 async-trait = "*"
+
+[dev-dependencies]
+tempfile = "3.23.0"
