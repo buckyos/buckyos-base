@@ -81,6 +81,15 @@ pub async fn parse_script_file(path: &PathBuf) -> Result<(String, bool)> {
         let python_cmd = "python3";
         #[cfg(target_os = "linux")]
         let python_cmd = "python3";
+        //如果是安卓和ios，提示错误
+        #[cfg(target_os = "android")]
+        return Err(ServiceControlError::ReasonError(
+            "Android does not support python scripts".to_string(),
+        ));
+        #[cfg(target_os = "ios")]
+        return Err(ServiceControlError::ReasonError(
+            "iOS does not support python scripts".to_string(),
+        ));
 
         script_engine = String::from(python_cmd);
     }
