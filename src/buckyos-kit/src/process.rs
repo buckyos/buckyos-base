@@ -75,21 +75,22 @@ pub async fn parse_script_file(path: &PathBuf) -> Result<(String, bool)> {
 
     if script_engine.contains("python") {
         // 根据操作系统选择合适的python命令
-        #[cfg(target_os = "windows")]
-        let python_cmd = "python";
-        #[cfg(target_os = "macos")]
-        let python_cmd = "python3";
-        #[cfg(target_os = "linux")]
-        let python_cmd = "python3";
-        //如果是安卓和ios，提示错误
-        #[cfg(target_os = "android")]
-        return Err(ServiceControlError::ReasonError(
-            "Android does not support python scripts".to_string(),
-        ));
-        #[cfg(target_os = "ios")]
-        return Err(ServiceControlError::ReasonError(
-            "iOS does not support python scripts".to_string(),
-        ));
+        // #[cfg(target_os = "windows")]
+        // let python_cmd = "python";
+        // #[cfg(target_os = "macos")]
+        // let python_cmd = "python3";
+        // #[cfg(target_os = "linux")]
+        // let python_cmd = "python3";
+
+        let python_cmd = if cfg!(target_os = "windows") {
+            "python"
+        } else if cfg!(target_os = "macos") {
+            "python3"
+        } else if cfg!(target_os = "linux") {
+            "python3"
+        } else {
+            "python3" // 默认使用python3
+        };
 
         script_engine = String::from(python_cmd);
     }
