@@ -122,14 +122,14 @@ impl kRPC {
                 let sys = sys_vec.unwrap().as_array()
                     .ok_or(RPCErrors::ParserResponseError("sys is not array".to_string()))?;
                 
-                if sys.len() > 1 {
+                if sys.len() >= 1 {
                     let seq = sys[0].as_u64()
                         .ok_or(RPCErrors::ParserResponseError("sys[0] is not u64".to_string()))?;
                     if seq != current_seq {
                         return Err(RPCErrors::ParserResponseError(format!("seq not match: {}!={}",seq,current_seq)));
                     }
                 }
-                if sys.len() > 2 {
+                if sys.len() >= 2 {
                     let token = sys[1].as_str()
                         .ok_or(RPCErrors::ParserResponseError("sys[1] is not string".to_string()))?;
                     self.session_token.write().await.replace(token.to_string());    
