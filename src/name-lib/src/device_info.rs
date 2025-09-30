@@ -1,87 +1,79 @@
-use std::ops::Deref;
-use std::net::{IpAddr, Ipv6Addr};
-use std::str::FromStr;
-use tokio::net::UdpSocket;
-use std::net::ToSocketAddrs;
-use serde::{Serialize,Deserialize};
-use serde_json::json;
-use thiserror::Error;
 use buckyos_kit::*;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv6Addr};
+use std::ops::Deref;
+use std::str::FromStr;
+use thiserror::Error;
+use tokio::net::UdpSocket;
 
 use crate::config::DeviceConfig;
 use crate::{NSError, NSResult, DID};
-use sysinfo::{Components, Disks, Networks, System};
-use nvml_wrapper::*;
 use nvml_wrapper::enum_wrappers::device::Clock;
-
-
+use nvml_wrapper::*;
+use sysinfo::{Components, Disks, Networks, System};
 
 // describe a device runtime info
-#[derive(Clone, Serialize, Deserialize,Debug,PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeviceInfo {
-    #[serde(flatten)]    
-    pub device_doc:DeviceConfig,
+    #[serde(flatten)]
+    pub device_doc: DeviceConfig,
     pub arch: String,
-    pub os:String, //linux,windows,apple
-    pub update_time:u64,
+    pub os: String, //linux,windows,apple
+    pub update_time: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state:Option<String>,
+    pub state: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sys_hostname : Option<String>,
+    pub sys_hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_os_info:Option<String>,
-    
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_info:Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_num:Option<u32>,//cpu核心数
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_mhz:Option<u32>,//cpu的最大性能,单位是MHZ
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_ratio:Option<f32>,//cpu的性能比率
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_usage:Option<f32>,//类似top里的load,0 -- core 
-    
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_mem:Option<u64>,//单位是bytes
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem_usage:Option<u64>,//单位是bytes
+    pub base_os_info: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_space:Option<u64>,//单位是bytes
+    pub cpu_info: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_usage:Option<u64>,//单位是bytes
+    pub cpu_num: Option<u32>, //cpu核心数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mhz: Option<u32>, //cpu的最大性能,单位是MHZ
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_ratio: Option<f32>, //cpu的性能比率
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_usage: Option<f32>, //类似top里的load,0 -- core
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gpu_info:Option<String>,//gpu信息
-    #[serde(skip_serializing_if = "Option::is_none")]     
-    pub gpu_tflops:Option<f32>,//gpu的算力,单位是TFLOPS
+    pub total_mem: Option<u64>, //单位是bytes
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gpu_total_mem:Option<u64>,//gpu总内存,单位是bytes
+    pub mem_usage: Option<u64>, //单位是bytes
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gpu_used_mem:Option<u64>,//gpu已用内存,单位是bytes
+    pub total_space: Option<u64>, //单位是bytes
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gpu_load:Option<f32>,//gpu负载
-    
+    pub disk_usage: Option<u64>, //单位是bytes
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_info: Option<String>, //gpu信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_tflops: Option<f32>, //gpu的算力,单位是TFLOPS
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_total_mem: Option<u64>, //gpu总内存,单位是bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_used_mem: Option<u64>, //gpu已用内存,单位是bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_load: Option<f32>, //gpu负载
 }
 
 impl Deref for DeviceInfo {
     type Target = DeviceConfig;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.device_doc
     }
 }
 
 impl DeviceInfo {
-    pub fn from_device_doc(device_doc:&DeviceConfig) -> Self {
-        #[cfg(all(target_os = "macos"))]
-        let os_type = "apple";
-        #[cfg(all(target_os = "linux"))]
-        let os_type = "linux";
-        #[cfg(all(target_os = "windows"))]
-        let os_type = "windows";
+    pub fn from_device_doc(device_doc: &DeviceConfig) -> Self {
+        let os_type = Self::get_os_type();
 
         #[cfg(all(target_arch = "x86_64"))]
         let arch = "amd64";
@@ -89,37 +81,39 @@ impl DeviceInfo {
         let arch = "aarch64";
 
         let result_info = DeviceInfo {
-            device_doc:device_doc.clone(),
-            arch:arch.to_string(),
-            os:os_type.to_string(),
-            update_time:buckyos_get_unix_timestamp(),
-            state:None,
-            sys_hostname:None,
-            base_os_info:None,
-            cpu_info:None,
-            cpu_num:None,
-            cpu_mhz:None,
-            cpu_ratio:None,
-            cpu_usage:None,
-            total_mem:None,
-            mem_usage:None,
-            total_space:None,
-            disk_usage:None,
-            gpu_info:None,
-            gpu_tflops:None,
-            gpu_total_mem:None,
-            gpu_used_mem:None,
-            gpu_load:None,
+            device_doc: device_doc.clone(),
+            arch: arch.to_string(),
+            os: os_type.to_string(),
+            update_time: buckyos_get_unix_timestamp(),
+            state: None,
+            sys_hostname: None,
+            base_os_info: None,
+            cpu_info: None,
+            cpu_num: None,
+            cpu_mhz: None,
+            cpu_ratio: None,
+            cpu_usage: None,
+            total_mem: None,
+            mem_usage: None,
+            total_space: None,
+            disk_usage: None,
+            gpu_info: None,
+            gpu_tflops: None,
+            gpu_total_mem: None,
+            gpu_used_mem: None,
+            gpu_load: None,
         };
 
         return result_info;
     }
 
     //return (short_name,net_id,ip_addr)
-    pub fn get_net_info_from_ood_desc_string(ood_desc_string:&str) -> (String,Option<String>,Option<IpAddr>){
-        let ip :Option<IpAddr>;
-        let net_id :Option<String>;
-       
+    pub fn get_net_info_from_ood_desc_string(
+        ood_desc_string: &str,
+    ) -> (String, Option<String>, Option<IpAddr>) {
+        let ip: Option<IpAddr>;
+        let net_id: Option<String>;
+
         let parts: Vec<&str> = ood_desc_string.split('@').collect();
         let hostname = parts[0];
         if parts.len() > 1 {
@@ -135,57 +129,52 @@ impl DeviceInfo {
         }
 
         let parts: Vec<&str> = ood_desc_string.split('#').collect();
-        if parts.len() == 2{
+        if parts.len() == 2 {
             net_id = Some(parts[1].to_string());
         } else {
             net_id = None;
-        }   
-        return (hostname.to_string(),net_id,ip);
+        }
+        return (hostname.to_string(), net_id, ip);
     }
 
-    pub fn new(ood_string:&str,did:DID) -> Self {
+    pub fn new(ood_string: &str, did: DID) -> Self {
         //device_string format: hostname@[ip]#[netid]
-        let (hostname,net_id,ip) = Self::get_net_info_from_ood_desc_string(ood_string);
-        
-        #[cfg(all(target_os = "macos"))]
-        let os_type = "apple";
-        #[cfg(all(target_os = "linux"))]
-        let os_type = "linux";
-        #[cfg(all(target_os = "windows"))]
-        let os_type = "windows";
+        let (hostname, net_id, ip) = Self::get_net_info_from_ood_desc_string(ood_string);
+
+        let os_type = Self::get_os_type();
 
         #[cfg(all(target_arch = "x86_64"))]
         let arch = "amd64";
         #[cfg(all(target_arch = "aarch64"))]
         let arch = "aarch64";
 
-        let mut config = DeviceConfig::new(hostname.as_str(),did.id.to_string());
+        let mut config = DeviceConfig::new(hostname.as_str(), did.id.to_string());
         config.ip = ip;
         config.net_id = net_id;
         config.device_type = "ood".to_string();
 
         DeviceInfo {
-            device_doc:config,
-            state:Some("Ready".to_string()),
-            arch:arch.to_string(),
-            os:os_type.to_string(),
-            update_time:buckyos_get_unix_timestamp(),
-            base_os_info:None,
-            cpu_info:None,
-            cpu_num:None,
-            cpu_mhz:None,
-            cpu_ratio:None,
-            cpu_usage:None,
-            total_mem:None,
-            mem_usage:None,
-            total_space:None,
-            disk_usage:None,
-            sys_hostname:None,
-            gpu_info:None,
-            gpu_tflops:None,
-            gpu_total_mem:None,
-            gpu_used_mem:None,
-            gpu_load:None,
+            device_doc: config,
+            state: Some("Ready".to_string()),
+            arch: arch.to_string(),
+            os: os_type.to_string(),
+            update_time: buckyos_get_unix_timestamp(),
+            base_os_info: None,
+            cpu_info: None,
+            cpu_num: None,
+            cpu_mhz: None,
+            cpu_ratio: None,
+            cpu_usage: None,
+            total_mem: None,
+            mem_usage: None,
+            total_space: None,
+            disk_usage: None,
+            sys_hostname: None,
+            gpu_info: None,
+            gpu_tflops: None,
+            gpu_total_mem: None,
+            gpu_used_mem: None,
+            gpu_load: None,
         }
     }
 
@@ -194,7 +183,7 @@ impl DeviceInfo {
         sys.refresh_all();
 
         let test_socket = UdpSocket::bind("0.0.0.0:0").await;
-        if test_socket.is_ok(){
+        if test_socket.is_ok() {
             let test_socket = test_socket.unwrap();
             test_socket.connect("8.8.8.8:80").await;
             let local_addr = test_socket.local_addr().unwrap();
@@ -202,12 +191,17 @@ impl DeviceInfo {
         }
 
         // Get OS information
-        self.base_os_info = Some(format!("{} {} {}",System::name().unwrap_or_default(), System::os_version().unwrap_or_default(), System::kernel_version().unwrap_or_default()));
+        self.base_os_info = Some(format!(
+            "{} {} {}",
+            System::name().unwrap_or_default(),
+            System::os_version().unwrap_or_default(),
+            System::kernel_version().unwrap_or_default()
+        ));
         // Get CPU information
         let mut cpu_usage = 0.0;
-        let mut cpu_mhz:u32 = 0;
-        let mut cpu_mhz_last:u32 = 0;
-        let mut cpu_brand:String = "Unknown".to_string();
+        let mut cpu_mhz: u32 = 0;
+        let mut cpu_mhz_last: u32 = 0;
+        let mut cpu_brand: String = "Unknown".to_string();
         self.cpu_ratio = Some(1.0);
         for cpu in sys.cpus() {
             cpu_brand = cpu.brand().to_string();
@@ -216,10 +210,15 @@ impl DeviceInfo {
             cpu_mhz_last = cpu.frequency() as u32;
         }
         if cpu_mhz < 1000 {
-            cpu_mhz = 2000*sys.cpus().len() as u32;
+            cpu_mhz = 2000 * sys.cpus().len() as u32;
             cpu_mhz_last = 2000;
         }
-        self.cpu_info = Some(format!("{} @ {} MHz,({} cores)", cpu_brand, cpu_mhz_last, sys.cpus().len()));
+        self.cpu_info = Some(format!(
+            "{} @ {} MHz,({} cores)",
+            cpu_brand,
+            cpu_mhz_last,
+            sys.cpus().len()
+        ));
         self.cpu_num = Some(sys.cpus().len() as u32);
         self.cpu_mhz = Some(cpu_mhz);
         self.cpu_usage = Some(cpu_usage);
@@ -277,18 +276,25 @@ impl DeviceInfo {
                             if let Some(name) = path.file_name() {
                                 if name.to_string_lossy().starts_with("card") {
                                     // Try to read vendor name
-                                    if let Ok(vendor) = fs::read_to_string(path.join("device/vendor")) {
+                                    if let Ok(vendor) =
+                                        fs::read_to_string(path.join("device/vendor"))
+                                    {
                                         let vendor = vendor.trim();
                                         let gpu_type = match vendor {
                                             "0x1002" => "AMD",
                                             "0x8086" => "Intel",
                                             _ => "Unknown",
                                         };
-                                        
+
                                         // Try to read device name
-                                        if let Ok(device) = fs::read_to_string(path.join("device/device")) {
-                                            self.gpu_info = Some(format!("{} GPU (Device ID: {})", 
-                                                gpu_type, device.trim()));
+                                        if let Ok(device) =
+                                            fs::read_to_string(path.join("device/device"))
+                                        {
+                                            self.gpu_info = Some(format!(
+                                                "{} GPU (Device ID: {})",
+                                                gpu_type,
+                                                device.trim()
+                                            ));
                                         } else {
                                             self.gpu_info = Some(format!("{} GPU", gpu_type));
                                         }
@@ -316,10 +322,23 @@ impl DeviceInfo {
             if net_id.starts_with("wan") {
                 return true;
             }
-        } 
+        }
         return false;
     }
 
+    fn get_os_type() -> String {
+        #[cfg(all(target_os = "macos"))]
+        let os_type = "apple";
+        #[cfg(all(target_os = "linux"))]
+        let os_type = "linux";
+        #[cfg(all(target_os = "windows"))]
+        let os_type = "windows";
+        #[cfg(all(target_os = "android"))]
+        let os_type = "android";
+        #[cfg(all(target_os = "ios"))]
+        let os_type = "ios";
+        os_type.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -328,12 +347,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_device_info() {
-        let mut device_info = DeviceInfo::new("ood1@192.168.1.1#wan1", DID::new("bns","ood1"));
+        let mut device_info = DeviceInfo::new("ood1@192.168.1.1#wan1", DID::new("bns", "ood1"));
         device_info.auto_fill_by_system_info().await.unwrap();
         let device_info_json = serde_json::to_string_pretty(&device_info).unwrap();
         println!("{}", device_info_json);
     }
 }
-
-
-
