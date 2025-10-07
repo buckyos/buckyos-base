@@ -18,7 +18,7 @@ async-trait = "*"
 hickory-resolver = { version = "*", features = ["dns-over-rustls"] }
 tokio = { version = "*", features = ["full"] }
 mini-moka = "*" 
-jsonwebtoken = "*"
+jsonwebtoken = { version = "*", features = ["aws_lc_rs"] }
 ed25519-dalek = { version = "*", features = ["pkcs8"] } 
 x25519-dalek = { version = "*", features = ["static_secrets","getrandom"] }
 curve25519-dalek = "*"

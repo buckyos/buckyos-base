@@ -14,7 +14,7 @@ serde_json = "*"
 thiserror = "*"
 openssl = { version = "*", features = ["vendored"] }
 reqwest = {version = "*", features = ["json", "rustls-tls"]}
-jsonwebtoken = "*"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 buckyos-kit = { path = "../buckyos-kit" }
 name-lib = { path = "../name-lib" }
