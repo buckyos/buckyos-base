@@ -79,6 +79,11 @@ impl kRPC {
         *session_token = None;
     }
 
+    pub async fn get_session_token(&self) -> Option<String> {
+        let session_token = self.session_token.read().await;
+        session_token.clone()
+    }
+
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         //retry 2 times here.
         self._call(method, params).await
@@ -93,7 +98,7 @@ impl kRPC {
             current_seq = *seq;
 
             let session_token = self.session_token.read().await;
-            
+
             if session_token.is_some() {
                 request_body = json!({
                     "method": method,
@@ -121,7 +126,7 @@ impl kRPC {
             if sys_vec.is_some() {
                 let sys = sys_vec.unwrap().as_array()
                     .ok_or(RPCErrors::ParserResponseError("sys is not array".to_string()))?;
-                
+
                 if sys.len() >= 1 {
                     let seq = sys[0].as_u64()
                         .ok_or(RPCErrors::ParserResponseError("sys[0] is not u64".to_string()))?;
@@ -132,7 +137,7 @@ impl kRPC {
                 if sys.len() >= 2 {
                     let token = sys[1].as_str()
                         .ok_or(RPCErrors::ParserResponseError("sys[1] is not string".to_string()))?;
-                    self.session_token.write().await.replace(token.to_string());    
+                    self.session_token.write().await.replace(token.to_string());
                 }
             }
 
