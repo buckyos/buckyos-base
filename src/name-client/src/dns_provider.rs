@@ -27,7 +27,7 @@ impl DnsProvider {
             let dns_server = dns_server.unwrap().as_str();
             return Ok( Self {
                 dns_server : dns_server.map(|s| s.to_string())
-            }) 
+            })
         }
         Ok(Self {
             dns_server: None,
@@ -58,7 +58,7 @@ impl DnsProvider {
     //     let txt = DnsTxtCodec::decode(txt_list)?;
     //     return Ok(serde_json::from_str(txt.as_str()).map_err(into_ns_err!(NSErrorCode::InvalidData, "Failed to parse txt {}", txt))?);
     // }
-   
+
 }
 
 #[async_trait::async_trait]
@@ -72,15 +72,20 @@ impl NsProvider for DnsProvider {
         let resolver;
         if self.dns_server.is_some() {
             let dns_server = self.dns_server.clone().unwrap();
-            let dns_ip_addr = IpAddr::from_str(&dns_server)
-                .map_err(|e| NSError::ReadLocalFileError(format!("Invalid dns server: {}", e)))?;
+            let dns_ip_addr = if let Ok(ip) = IpAddr::from_str(&dns_server) {
+                SocketAddr::new(ip, 53)
+            } else {
+                let dns_ip_addr = SocketAddr::from_str(&dns_server)
+                    .map_err(|e| NSError::ReadLocalFileError(format!("Invalid dns server: {}", e)))?;
+                dns_ip_addr
+            };
             let name_server_configs = vec![NameServerConfig::new(
-                SocketAddr::new(dns_ip_addr, 53),
+                dns_ip_addr,
                 Protocol::Udp,
             )];
             server_config = ResolverConfig::from_parts(
-                None, 
-                vec![], 
+                None,
+                vec![],
                 name_server_configs,
             );
             resolver = TokioAsyncResolver::tokio(server_config, ResolverOpts::default());
@@ -170,7 +175,7 @@ impl NsProvider for DnsProvider {
                     proof_type: NameProof::None,
                     create_time: 0,
                     ttl: None,
-                }; 
+                };
                 for record in response.iter() {
                     let txt = record.txt_data().iter().map(|s| -> String {
                         let byte_slice: &[u8] = &s;
@@ -184,7 +189,7 @@ impl NsProvider for DnsProvider {
                         let did_doc = EncodedDocument::Jwt(did_payload.to_string());
                         name_info.did_document = Some(did_doc);
                     }
-                   
+
                     if txt.starts_with("PKX=") {
                         let pkx = txt.trim_start_matches("PKX=").trim_end_matches(";");
                         pkx_list.push(pkx.to_string());
@@ -196,8 +201,8 @@ impl NsProvider for DnsProvider {
                 }
                 if pkx_list.len() > 0 {
                     debug!("pkx_list: {:?}",pkx_list);
-                    name_info.pk_x_list = Some(pkx_list);  
-                
+                    name_info.pk_x_list = Some(pkx_list);
+
                     //verify did_document by pkx_list
                     let jwt_str = name_info.did_document.as_ref().unwrap();
                     let owner_public_key = name_info.get_owner_pk();
@@ -216,7 +221,7 @@ impl NsProvider for DnsProvider {
                     if zone_boot_config.is_err() {
                         return Err(NSError::Failed("parse zone boot config failed!".to_string()));
                     }
-                    
+
                     let mut zone_boot_config = zone_boot_config.unwrap();
                     zone_boot_config.owner_key = Some(public_key_jwk);
                     zone_boot_config.id = Some(DID::from_str(name).unwrap());
@@ -224,7 +229,7 @@ impl NsProvider for DnsProvider {
                     if gateway_devs.is_some() {
                         zone_boot_config.gateway_devs =  gateway_devs.unwrap();
                     }
-         
+
                     info!("resolve & verify zone_boot_config from {} TXT record OK.",name);
                     let zone_boot_config_value = serde_json::to_value(&zone_boot_config).unwrap();
                     //info!("zone_boot_config_value: {:?}",zone_boot_config_value);
@@ -236,7 +241,7 @@ impl NsProvider for DnsProvider {
                 return Err(NSError::Failed(format!("Invalid record type: {:?}", record_type)));
             }
         }
-        
+
     }
 
     async fn query_did(&self, did: &DID, fragment: Option<&str>, from_ip: Option<IpAddr>) -> NSResult<EncodedDocument> {
