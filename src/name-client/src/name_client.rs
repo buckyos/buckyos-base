@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use core::error;
-
+use std::time::Duration;
 use crate::provider::RecordType;
 use crate::dns_provider::{DnsProvider};
 use crate::name_query::NameQuery;
@@ -47,18 +47,19 @@ impl NameClient {
         //name_query.add_provider(Box::new(DnsProvider::new(None)));
         //name_query.add_provider(Box::new(ZoneProvider::new()));
         let cache_size = config.cache_size;
+        let ttl = config.max_ttl;
 
         Self {
             name_query,
             config: config,
-            cache: mini_moka::sync::Cache::new(cache_size), //TODO: enable local cache?
-            doc_cache: mini_moka::sync::Cache::new(cache_size),
+            cache: mini_moka::sync::Cache::builder().max_capacity(cache_size).time_to_live(Duration::from_secs(ttl as u64)).build(), //TODO: enable local cache?
+            doc_cache: mini_moka::sync::Cache::builder().max_capacity(cache_size).time_to_live(Duration::from_secs(ttl as u64)).build(),
         }
     }
 
     pub async fn add_provider(&self, provider: Box<dyn NsProvider>) {
         self.name_query.add_provider(provider).await;
-    } 
+    }
 
     pub fn add_did_cache(&self, did: DID, doc: EncodedDocument) -> NSResult<()> {
         self.doc_cache.insert(did, doc);
@@ -114,42 +115,43 @@ impl NameClient {
             }
         }
 
-        let did_doc = self.name_query.query_did(did).await;
-        if did_doc.is_err() {
-            // Try load from local cache
-            if self.config.local_cache_dir.is_some() {
-                let cache_dir = self.config.local_cache_dir.as_ref().unwrap();
-                // let file_path = format!("{}/{}.doc.json", cache_dir, did);
-                let mut file_path = std::path::PathBuf::new();
-                file_path.push(cache_dir);
-                file_path.push(format!("{}.doc.json", did.to_host_name()));
-                let file_path = file_path.to_str().unwrap().to_string();
+        // Try load from local cache
+        if self.config.local_cache_dir.is_some() {
+            let cache_dir = self.config.local_cache_dir.as_ref().unwrap();
+            // let file_path = format!("{}/{}.doc.json", cache_dir, did);
+            let mut file_path = std::path::PathBuf::new();
+            file_path.push(cache_dir);
+            file_path.push(format!("{}.doc.json", did.to_host_name()));
+            let file_path = file_path.to_str().unwrap().to_string();
 
-                debug!("try load did doc from local cache: {}", file_path);
-                let ret = std::fs::read_to_string(file_path.as_str());
-                match ret {
-                    Ok(did_doc) => {
-                        let ret = serde_json::from_str::<DeviceConfig>(&did_doc);
-                        match ret {
-                            Ok(did_doc) => {
-                                info!("load did doc from local cache: {}", file_path);
-                                let did_doc_value = serde_json::to_value(&did_doc).unwrap();
-                                let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-                                return Ok(encoded_doc);
-                            }
-                            Err(e) => {
-                                error!(
+            debug!("try load did doc from local cache: {}", file_path);
+            let ret = std::fs::read_to_string(file_path.as_str());
+            match ret {
+                Ok(did_doc) => {
+                    let ret = serde_json::from_str::<DeviceConfig>(&did_doc);
+                    match ret {
+                        Ok(did_doc) => {
+                            info!("load did doc from local cache: {}", file_path);
+                            let did_doc_value = serde_json::to_value(&did_doc).unwrap();
+                            let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
+                            return Ok(encoded_doc);
+                        }
+                        Err(e) => {
+                            error!(
                                     "Parse did doc from local cache failed: {}, {}",
                                     file_path, e
                                 );
-                            }
                         }
                     }
-                    Err(e) => {
-                        error!("load did doc from local cache failed: {}, {}", file_path, e);
-                    }
+                }
+                Err(e) => {
+                    error!("load did doc from local cache failed: {}, {}", file_path, e);
                 }
             }
+        }
+
+        let did_doc = self.name_query.query_did(did).await;
+        if did_doc.is_err() {
             return did_doc;
         }
 
