@@ -46,17 +46,21 @@ pub fn get_default_web3_bridge_config() -> HashMap<String, String> {
 
 //name lib 是系统最基础的库，应尽量在进程启动时完成初始化
 pub async fn init_name_lib(web3_bridge_config:&HashMap<String, String>) -> NSResult<()> {
+    init_name_lib_ex(web3_bridge_config, NameClientConfig::default()).await
+}
+
+pub async fn init_name_lib_ex(web3_bridge_config:&HashMap<String, String>, config: NameClientConfig) -> NSResult<()> {
     //init web3 bridge config
     if IS_NAME_LIB_INITED.get().is_some() {
         return Ok(());
     }
-    
+
     let set_result = KNOWN_WEB3_BRIDGE_CONFIG.set(web3_bridge_config.clone());
     if set_result.is_err() {
         return Err(NSError::Failed("Failed to set KNOWN_WEB3_BRIDGE_CONFIG".to_string()));
     }
 
-    let client = NameClient::new(NameClientConfig::default());
+    let client = NameClient::new(config);
     client.add_provider(Box::new(DnsProvider::new(None))).await;
     let set_result = GLOBAL_NAME_CLIENT.set(client);
     if set_result.is_err() {
@@ -68,7 +72,6 @@ pub async fn init_name_lib(web3_bridge_config:&HashMap<String, String>) -> NSRes
     }
     Ok(())
 }
-
 
 pub async fn resolve_ip(name: &str) -> NSResult<IpAddr> {
     let name_info = resolve(name,None).await?;

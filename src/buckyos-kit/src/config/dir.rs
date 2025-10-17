@@ -17,7 +17,7 @@ struct Include {
 #[derive(Debug, Deserialize)]
 struct RootConfig {
     /// List of `includes` (parsed from both TOML and JSON files)
-    includes: Vec<Include>,
+    includes: Option<Vec<Include>>,
 }
 
 fn get_root_file(dir: &Path) -> Option<PathBuf> {
@@ -169,27 +169,30 @@ pub async fn load_dir_with_root(
 
     // Load sub files or dirs
     let mut config = Vec::new();
-    for include in root_config.includes {
-        let include_path = dir.join(include.path);
+    if let Some(includes) = root_config.includes {
+        for include in includes {
+            let include_path = dir.join(include.path);
 
-        // FIXME: what should we do if include_path not exists? return error or just ignore?
-        if !include_path.exists() {
-            let msg = format!("Include path not exists: {:?}", include_path);
-            error!("{}", msg);
-            return Err(msg.into());
-        }
+            // FIXME: what should we do if include_path not exists? return error or just ignore?
+            if !include_path.exists() {
+                let msg = format!("Include path not exists: {:?}", include_path);
+                error!("{}", msg);
+                return Err(msg.into());
+            }
 
-        if include_path.is_dir() {
-            let items = load_dir(&include_path).await?;
-            config.extend(items);
-        } else {
-            let value = load_file(&include_path).await?;
-            config.push(ConfigItem {
-                path: include_path,
-                value,
-            });
+            if include_path.is_dir() {
+                let items = load_dir(&include_path).await?;
+                config.extend(items);
+            } else {
+                let value = load_file(&include_path).await?;
+                config.push(ConfigItem {
+                    path: include_path,
+                    value,
+                });
+            }
         }
     }
+
     config.push(ConfigItem {
         path: root_file.to_path_buf(),
         value: root_value,
