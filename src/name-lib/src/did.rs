@@ -191,7 +191,7 @@ impl EncodedDocument {
     }
 
     pub fn from_str(doc_str: String) -> NSResult<Self> {
-        if doc_str.starts_with("{") {
+        if doc_str.starts_with("{") || doc_str.starts_with("[") {
             let real_value = serde_json::from_str(&doc_str)
                 .map_err(|e| NSError::DecodeJWTError(e.to_string()))?;
             return Ok(EncodedDocument::JsonLd(real_value));
