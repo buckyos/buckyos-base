@@ -1,7 +1,12 @@
 use std::{
     env,
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
+
+lazy_static::lazy_static! {
+    static ref BUCKYOS_ROOT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+}
 
 pub fn normalize_path(path_str: &str) -> String {
     let path_str = path_str.replace("\\", "/");
@@ -35,17 +40,53 @@ pub fn normalize_path(path_str: &str) -> String {
 }
 
 pub fn get_buckyos_root_dir() -> PathBuf {
-    if env::var("BUCKYOS_ROOT").is_ok() {
-        return Path::new(&env::var("BUCKYOS_ROOT").unwrap()).to_path_buf();
+    // 检查缓存
+    {
+        let cache = BUCKYOS_ROOT_DIR.lock().unwrap();
+        if let Some(cached_path) = cache.as_ref() {
+            let result = cached_path.clone();
+            drop(cache); // 显式释放锁
+            return result;
+        }
     }
 
-    if cfg!(target_os = "windows") {
-        let user_data_dir = env::var("APPDATA")
-            .unwrap_or_else(|_| env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
-        Path::new(&user_data_dir).join("buckyos")
+    // 第一次调用，计算路径
+    let root_dir = if env::var("BUCKYOS_ROOT").is_ok() {
+        Path::new(&env::var("BUCKYOS_ROOT").unwrap()).to_path_buf()
     } else {
-        Path::new("/opt/buckyos").to_path_buf()
+        //获得当前可执行文件所在的目录，并向上级目录寻找，直到找到包含applist.json的bin目录
+        let mut current_dir = env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        while !current_dir.join("applist.json").exists() {
+            if let Some(parent) = current_dir.parent() {
+                current_dir = parent.to_path_buf();
+            } else {
+                // 如果到达根目录还没找到，使用默认路径
+                break;
+            }
+        }
+        
+        if current_dir.join("applist.json").exists() {
+            current_dir.parent().unwrap().to_path_buf()
+        } else if cfg!(target_os = "windows") {
+            let user_data_dir = env::var("APPDATA")
+                .unwrap_or_else(|_| env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
+            Path::new(&user_data_dir).join("buckyos")
+        } else {
+            Path::new("/opt/buckyos").to_path_buf()
+        }
+    };
+
+    // 缓存结果
+    {
+        let mut cache = BUCKYOS_ROOT_DIR.lock().unwrap();
+        *cache = Some(root_dir.clone());
     }
+
+    root_dir
 }
 
 pub fn get_buckyos_dev_user_home() -> PathBuf {
