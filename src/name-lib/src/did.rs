@@ -1,17 +1,17 @@
-
-
 use std::collections::HashMap;
 
-use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
-use serde::{Deserialize, Serialize,Serializer, Deserializer};
-use serde_json::{Value, json};
-use async_trait::async_trait;
-use once_cell::sync::OnceCell;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, engine::general_purpose::STANDARD,Engine as _};
+use crate::config::{DeviceConfig, OwnerConfig, ZoneBootConfig, ZoneConfig};
 use crate::{decode_jwt_claim_without_verify, NSError, NSResult};
-use crate::config::{OwnerConfig, DeviceConfig,ZoneConfig,ZoneBootConfig};
+use async_trait::async_trait;
+use base64::{
+    engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _,
+};
+use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{json, Value};
 
-#[derive(Clone,Debug,PartialEq,Hash,Eq,PartialOrd,Ord)]
+#[derive(Clone, Debug, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct DID {
     pub method: String,
     pub id: String,
@@ -46,19 +46,19 @@ impl DID {
         None
     }
 
-    pub fn get_auth_key(&self) -> Option<(DecodingKey,Jwk)> {
+    pub fn get_auth_key(&self) -> Option<(DecodingKey, Jwk)> {
         if self.method == "dev" {
-           let jwk = json!({
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "x": self.id,
-           });
-           let jwk = serde_json::from_value(jwk);
-           if jwk.is_err() {
-            return None;
-           }
-           let jwk:Jwk = jwk.unwrap();
-           return Some((DecodingKey::from_jwk(&jwk).unwrap(),jwk));
+            let jwk = json!({
+             "kty": "OKP",
+             "crv": "Ed25519",
+             "x": self.id,
+            });
+            let jwk = serde_json::from_value(jwk);
+            if jwk.is_err() {
+                return None;
+            }
+            let jwk: Jwk = jwk.unwrap();
+            return Some((DecodingKey::from_jwk(&jwk).unwrap(), jwk));
         }
         None
     }
@@ -66,7 +66,7 @@ impl DID {
     pub fn is_self_auth(&self) -> bool {
         self.method == "dev"
     }
-    
+
     pub fn from_str(did: &str) -> NSResult<Self> {
         let parts: Vec<&str> = did.split(':').collect();
         if parts[0] != "did" {
@@ -75,7 +75,7 @@ impl DID {
             if result.is_some() {
                 return Ok(result.unwrap());
             }
-            return Err(NSError::InvalidDID(format!("invalid did {}",did)));
+            return Err(NSError::InvalidDID(format!("invalid did {}", did)));
         }
         let id = parts[2..].join(":");
         Ok(DID {
@@ -98,11 +98,11 @@ impl DID {
             let web3_bridge_config = web3_bridge_config.unwrap();
             let bridge_base_hostname = web3_bridge_config.get(self.method.as_str());
             if bridge_base_hostname.is_some() {
-                return format!("{}.{}",self.id,bridge_base_hostname.unwrap());
+                return format!("{}.{}", self.id, bridge_base_hostname.unwrap());
             }
         }
         //todo: find web3 bridge config
-        format!("{}.{}.did",self.id,self.method)
+        format!("{}.{}.did", self.id, self.method)
     }
 
     fn from_host_name(host_name: &str) -> Option<Self> {
@@ -116,12 +116,13 @@ impl DID {
         let web3_bridge_config = KNOWN_WEB3_BRIDGE_CONFIG.get();
         if web3_bridge_config.is_some() {
             let web3_bridge_config = web3_bridge_config.unwrap();
-            for (method,bridge_base_hostname) in web3_bridge_config.iter() {
+            for (method, bridge_base_hostname) in web3_bridge_config.iter() {
                 if host_name.ends_with(bridge_base_hostname) {
                     if host_name == bridge_base_hostname {
                         break;
                     }
-                    let id = host_name[..host_name.len()-bridge_base_hostname.len()-1].to_string();
+                    let id =
+                        host_name[..host_name.len() - bridge_base_hostname.len() - 1].to_string();
                     return Some(DID::new(method, &id));
                 }
             }
@@ -158,7 +159,7 @@ impl<'de> Deserialize<'de> for DID {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize,Debug,PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub enum EncodedDocument {
     JsonLd(Value),
     Jwt(String),
@@ -199,13 +200,13 @@ impl EncodedDocument {
         return Ok(EncodedDocument::Jwt(doc_str));
     }
 
-    pub fn to_json_value(self)->NSResult<Value> {
+    pub fn to_json_value(self) -> NSResult<Value> {
         match self {
             EncodedDocument::Jwt(jwt_str) => {
                 let claims = decode_jwt_claim_without_verify(jwt_str.as_str())
                     .map_err(|e| NSError::DecodeJWTError(e.to_string()))?;
                 Ok(claims)
-            },
+            }
             EncodedDocument::JsonLd(value) => Ok(value),
         }
     }
@@ -215,16 +216,19 @@ impl EncodedDocument {
 pub trait DIDDocumentTrait {
     fn get_id(&self) -> DID;
     //key id is none means the default key
-    fn get_auth_key(&self,kid:Option<&str>) -> Option<(DecodingKey,Jwk)>;
-    fn get_exchange_key(&self,kid:Option<&str>) -> Option<(DecodingKey,Jwk)>;
+    fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
+    //实现了该方法的did document 可以进行密钥交换（建立rtcp连接)
+    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
 
     fn get_iss(&self) -> Option<String>;
     fn get_exp(&self) -> Option<u64>;
     fn get_iat(&self) -> Option<u64>;
 
-    fn encode(&self,key:Option<&EncodingKey>) -> NSResult<EncodedDocument>;
-    fn decode(doc: &EncodedDocument,key:Option<&DecodingKey>) -> NSResult<Self> where Self: Sized;
-    // async fn decode_with_load_key<'a, F, Fut>(doc: &'a EncodedDocument,loader:F) -> NSResult<Self> 
+    fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument>;
+    fn decode(doc: &EncodedDocument, key: Option<&DecodingKey>) -> NSResult<Self>
+    where
+        Self: Sized;
+    // async fn decode_with_load_key<'a, F, Fut>(doc: &'a EncodedDocument,loader:F) -> NSResult<Self>
     //     where Self: Sized,
     //           F: Fn(&'a str) -> Fut,
     //           Fut: std::future::Future<Output = NSResult<DecodingKey>>;
@@ -234,27 +238,30 @@ pub trait DIDDocumentTrait {
     //fn from_json_value(value: &Value) -> Self;
 }
 
-
-pub static KNOWN_WEB3_BRIDGE_CONFIG:OnceCell<HashMap<String,String>> = OnceCell::new();
+pub static KNOWN_WEB3_BRIDGE_CONFIG: OnceCell<HashMap<String, String>> = OnceCell::new();
 
 pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>> {
     let doc_value = doc.to_json_value()?;
     if doc_value.get("verificationMethod").is_none() {
-        let zone_boot_config = serde_json::from_value::<ZoneBootConfig>(doc_value).map_err(|e| NSError::Failed(format!("parse zone boot config failed: {}",e)))?;
+        let zone_boot_config = serde_json::from_value::<ZoneBootConfig>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse zone boot config failed: {}", e)))?;
         return Ok(Box::new(zone_boot_config));
     }
 
     if doc_value.get("full_name").is_some() {
-        let owner_config = serde_json::from_value::<OwnerConfig>(doc_value).map_err(|e| NSError::Failed(format!("parse owner config failed: {}",e)))?;
+        let owner_config = serde_json::from_value::<OwnerConfig>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse owner config failed: {}", e)))?;
         return Ok(Box::new(owner_config));
     }
     if doc_value.get("device_type").is_some() {
-        let device_config = serde_json::from_value::<DeviceConfig>(doc_value).map_err(|e| NSError::Failed(format!("parse device config failed: {}",e)))?;
+        let device_config = serde_json::from_value::<DeviceConfig>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse device config failed: {}", e)))?;
         return Ok(Box::new(device_config));
     }
 
     if doc_value.get("oods").is_some() {
-        let zone_config = serde_json::from_value::<ZoneConfig>(doc_value).map_err(|e| NSError::Failed(format!("parse zone config failed: {}",e)))?;
+        let zone_config = serde_json::from_value::<ZoneConfig>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse zone config failed: {}", e)))?;
         return Ok(Box::new(zone_config));
     }
 
@@ -264,7 +271,7 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_did_from_str() {
         let did = DID::from_str("did:bns:waterflier").unwrap();
@@ -307,13 +314,10 @@ mod tests {
         let did_str = did.to_string();
         assert_eq!(did_str, "did:web:buckyos.ai");
 
-
         let did = DID::from_str("abcdef.dev.did").unwrap();
         assert_eq!(did.method, "dev");
         assert_eq!(did.id, "abcdef");
         let did_str = did.to_string();
         assert_eq!(did_str, "did:dev:abcdef");
     }
-    
 }
-
