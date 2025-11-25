@@ -90,7 +90,7 @@ pub struct OODDescriptionString {
     pub node_type: NodeType,
     pub net_id: Option<String>,
     pub ip: Option<IpAddr>,
-    pub net_id_explicit: bool, // Marks whether net_id is explicitly specified by user (not serialized)
+
 }
 
 impl OODDescriptionString {
@@ -100,7 +100,6 @@ impl OODDescriptionString {
         net_id: Option<String>,
         ip: Option<IpAddr>,
     ) -> Self {
-        let net_id_explicit = net_id.is_some(); // If net_id is provided, it's considered explicitly specified
         let mut final_net_id = net_id;
         // If IP is present but net_id is not, automatically set to wan
         if ip.is_some() && final_net_id.is_none() {
@@ -111,7 +110,6 @@ impl OODDescriptionString {
             node_type,
             net_id: final_net_id,
             ip,
-            net_id_explicit,
         }
     }
 
@@ -137,19 +135,10 @@ impl OODDescriptionString {
         if self.ip.is_some() {
             result += &format!(":{}", self.ip.as_ref().unwrap());
             if self.net_id.is_some() {
-                let net_id_str = self.net_id.as_ref().unwrap();
-                // If "wan" is auto-added (not explicitly specified), don't output @wan (maintain compatibility with input)
-                if net_id_str == "wan" && !self.net_id_explicit {
-                    return Ok(result);
-                } else if net_id_str == "lan" || net_id_str == "lan1" {
-                    // Only "lan" or "lan1" are simplified to "lan"
-                    result += "@lan";
-                    return Ok(result);
-                } else {
-                    result += &format!("@{}", net_id_str);
-                    return Ok(result);
+                if self.net_id.as_ref().unwrap() != "wan" {
+                    result += &format!("@{}", self.net_id.as_ref().unwrap());
                 }
-            }
+            } 
             // If IP is present but net_id is not, return directly (allow this case for backward compatibility)
             return Ok(result);
         }
@@ -236,7 +225,6 @@ impl FromStr for OODDescriptionString {
             node_type,
             net_id,
             ip,
-            net_id_explicit,
         })
     }
 }
@@ -1935,7 +1923,7 @@ mod tests {
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
-                "ood1:192.168.1.8@wan",
+                "ood1:192.168.1.8",
                 NodeType::OOD,
                 Some("wan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
@@ -1965,7 +1953,7 @@ mod tests {
                 Some("2001:db8::1".parse().unwrap()),
             ),
             (
-                "ood1:2001:db8::1@wan",
+                "ood1:2001:db8::1",
                 NodeType::OOD,
                 Some("wan".to_string()),
                 Some("2001:db8::1".parse().unwrap()),
@@ -1991,6 +1979,8 @@ mod tests {
                 input
             );
             assert_eq!(result.ip, expected_ip, "Failed for input: {}", input);
+            let result_string = result.to_string().unwrap();
+            assert_eq!(result_string, input, "Failed for input: {}", input);
         }
     }
 
@@ -2024,7 +2014,7 @@ mod tests {
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
-                "#gate1:192.168.1.8@wan",
+                "#gate1:192.168.1.8",
                 NodeType::Gateway,
                 Some("wan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
@@ -2199,7 +2189,7 @@ mod tests {
                     Some("wan".to_string()),
                     Some("192.168.1.8".parse().unwrap()),
                 ),
-                "ood1:192.168.1.8@wan",
+                "ood1:192.168.1.8",
             ),
             (
                 OODDescriptionString::new(
@@ -2208,7 +2198,7 @@ mod tests {
                     Some("lan1".to_string()),
                     Some("192.168.1.8".parse().unwrap()),
                 ),
-                "ood1:192.168.1.8@lan", // lan1 will be simplified to lan
+                "ood1:192.168.1.8@lan1", // lan1 will be simplified to lan
             ),
             (
                 OODDescriptionString::new("gate1".to_string(), NodeType::Gateway, None, None),
@@ -2230,7 +2220,7 @@ mod tests {
                     Some("wan".to_string()),
                     Some("210.35.22.1".parse().unwrap()),
                 ),
-                "#gate1:210.35.22.1@wan",
+                "#gate1:210.35.22.1",
             ),
             (
                 OODDescriptionString::new("ood1".to_string(), NodeType::OODOnly, None, None),
@@ -2484,7 +2474,7 @@ mod tests {
         );
         let serialized = ood.to_string().unwrap();
         assert_eq!(
-            serialized, "ood1:192.168.1.8@lan",
+            serialized, "ood1:192.168.1.8@lan1",
             "lan net_id should be simplified to 'lan' when IP is present"
         );
 
@@ -2563,6 +2553,10 @@ mod tests {
             gateway_devs: vec![],
             extra_info: extera_info,
         };
+
+
+        let json_str = serde_json::to_string(&zone_boot_config).unwrap();
+        println!("zone_boot_config: {:?}", json_str);
 
         let zone_boot_config_jwt = zone_boot_config.encode(Some(&private_key)).unwrap();
         println!("zone_boot_config_jwt: {:?}", zone_boot_config_jwt);
