@@ -51,32 +51,37 @@ fn default_context() -> String {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub enum NodeType {
+pub enum DeviceNodeType {
     OOD,     //ood and gateway
     Gateway, //gateway only
     OODOnly, //not gateway
-    Node,    //normal node
-    Device,  //client device only
-    Sensor,  //sensor only
-    Browser, //browser only
+    Server,
+    Device,//normal client device
+    Sensor,//sensor,
+    IoTController,//iot controller
+    UnknownClient(String),
 }
 
-impl Default for NodeType {
+
+impl Default for DeviceNodeType {
     fn default() -> Self {
-        NodeType::Device
+        DeviceNodeType::Device
     }
 }
 
-impl NodeType {
+impl DeviceNodeType {
     pub fn is_allow_in_oods(&self) -> bool {
         match self {
-            NodeType::OOD => true,
-            NodeType::Gateway => true,
-            NodeType::OODOnly => true,
+            DeviceNodeType::OOD => true,
+            DeviceNodeType::Gateway => true,
+            DeviceNodeType::OODOnly => true,
             _ => false,
         }
     }
 }
+
+
+
 //OODDescriptionString is a string that describes the OOD
 // ood1@lan1
 // ood1@wan
@@ -87,7 +92,7 @@ impl NodeType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OODDescriptionString {
     pub name: String,
-    pub node_type: NodeType,
+    pub node_type: DeviceNodeType,
     pub net_id: Option<String>,
     pub ip: Option<IpAddr>,
 
@@ -96,7 +101,7 @@ pub struct OODDescriptionString {
 impl OODDescriptionString {
     pub fn new(
         name: String,
-        node_type: NodeType,
+        node_type: DeviceNodeType,
         net_id: Option<String>,
         ip: Option<IpAddr>,
     ) -> Self {
@@ -116,13 +121,13 @@ impl OODDescriptionString {
     pub fn to_string(&self) -> NSResult<String> {
         let mut result = String::new();
         match self.node_type {
-            NodeType::OOD => {
+            DeviceNodeType::OOD => {
                 result = self.name.clone();
             }
-            NodeType::Gateway => {
+            DeviceNodeType::Gateway => {
                 result = format!("#{}", self.name);
             }
-            NodeType::OODOnly => {
+            DeviceNodeType::OODOnly => {
                 result = format!("${}", self.name);
             }
             _ => {
@@ -156,15 +161,15 @@ impl FromStr for OODDescriptionString {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // s examples: "ood1"  "#ood1"  "$ood1"   "ood1:192.168.1.8@lan"  "#ood1:192.168.1.8@lan" "$ood1:1.2.3.4@lan"  "ood1@wan"  "ood1:192.168.1.8@wan"
         // Rules can refer to to_string
-        let mut node_type = NodeType::OOD;
+        let mut node_type = DeviceNodeType::OOD;
         let mut rest = s;
 
         // Process prefix to determine NodeType
         if let Some(stripped) = s.strip_prefix('#') {
-            node_type = NodeType::Gateway;
+            node_type = DeviceNodeType::Gateway;
             rest = stripped;
         } else if let Some(stripped) = s.strip_prefix('$') {
-            node_type = NodeType::OODOnly;
+            node_type = DeviceNodeType::OODOnly;
             rest = stripped;
         }
 
@@ -1906,55 +1911,55 @@ mod tests {
     fn test_ood_description_string_from_str_ood() {
         // Test various formats of OOD type
         let cases = vec![
-            ("ood1", NodeType::OOD, None, None),
-            ("ood1@wan", NodeType::OOD, Some("wan".to_string()), None),
-            ("ood1@lan1", NodeType::OOD, Some("lan1".to_string()), None),
-            ("ood1@lan", NodeType::OOD, Some("lan".to_string()), None),
+            ("ood1", DeviceNodeType::OOD, None, None),
+            ("ood1@wan", DeviceNodeType::OOD, Some("wan".to_string()), None),
+            ("ood1@lan1", DeviceNodeType::OOD, Some("lan1".to_string()), None),
+            ("ood1@lan", DeviceNodeType::OOD, Some("lan".to_string()), None),
             (
                 "ood1:192.168.1.8",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("wan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
                 "ood1:192.168.1.8@lan",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("lan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
                 "ood1:192.168.1.8",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("wan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
                 "ood1:192.168.1.8@lan1",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("lan1".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
                 "ood1:210.35.234.21",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("wan".to_string()),
                 Some("210.35.234.21".parse().unwrap()),
             ),
             (
                 "ood1:192.168.1.100@lan1",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("lan1".to_string()),
                 Some("192.168.1.100".parse().unwrap()),
             ),
             (
                 "ood1:2001:db8::1",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("wan".to_string()),
                 Some("2001:db8::1".parse().unwrap()),
             ),
             (
                 "ood1:2001:db8::1",
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("wan".to_string()),
                 Some("2001:db8::1".parse().unwrap()),
             ),
@@ -1988,40 +1993,40 @@ mod tests {
     fn test_ood_description_string_from_str_gateway() {
         // Test various formats of Gateway type
         let cases = vec![
-            ("#gate1", NodeType::Gateway, None, None),
+            ("#gate1", DeviceNodeType::Gateway, None, None),
             (
                 "#gate1@wan",
-                NodeType::Gateway,
+                DeviceNodeType::Gateway,
                 Some("wan".to_string()),
                 None,
             ),
             (
                 "#gate1@lan1",
-                NodeType::Gateway,
+                DeviceNodeType::Gateway,
                 Some("lan1".to_string()),
                 None,
             ),
             (
                 "#gate1:210.35.22.1",
-                NodeType::Gateway,
+                DeviceNodeType::Gateway,
                 Some("wan".to_string()),
                 Some("210.35.22.1".parse().unwrap()),
             ),
             (
                 "#gate1:192.168.1.8@lan",
-                NodeType::Gateway,
+                DeviceNodeType::Gateway,
                 Some("lan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
                 "#gate1:192.168.1.8",
-                NodeType::Gateway,
+                DeviceNodeType::Gateway,
                 Some("wan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
             (
                 "#gateway1:10.0.0.1@lan2",
-                NodeType::Gateway,
+                DeviceNodeType::Gateway,
                 Some("lan2".to_string()),
                 Some("10.0.0.1".parse().unwrap()),
             ),
@@ -2056,34 +2061,34 @@ mod tests {
     fn test_ood_description_string_from_str_ood_only() {
         // Test various formats of OODOnly type
         let cases = vec![
-            ("$ood1", NodeType::OODOnly, None, None),
+            ("$ood1", DeviceNodeType::OODOnly, None, None),
             (
                 "$ood1@wan",
-                NodeType::OODOnly,
+                DeviceNodeType::OODOnly,
                 Some("wan".to_string()),
                 None,
             ),
             (
                 "$ood1@lan1",
-                NodeType::OODOnly,
+                DeviceNodeType::OODOnly,
                 Some("lan1".to_string()),
                 None,
             ),
             (
                 "$ood1:210.35.234.21",
-                NodeType::OODOnly,
+                DeviceNodeType::OODOnly,
                 Some("wan".to_string()),
                 Some("210.35.234.21".parse().unwrap()),
             ),
             (
                 "$ood1:1.2.3.4@lan",
-                NodeType::OODOnly,
+                DeviceNodeType::OODOnly,
                 Some("lan".to_string()),
                 Some("1.2.3.4".parse().unwrap()),
             ),
             (
                 "$ood1:192.168.1.8@wan",
-                NodeType::OODOnly,
+                DeviceNodeType::OODOnly,
                 Some("wan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
@@ -2143,13 +2148,13 @@ mod tests {
         // Test to_string() method
         let test_cases = vec![
             (
-                OODDescriptionString::new("ood1".to_string(), NodeType::OOD, None, None),
+                OODDescriptionString::new("ood1".to_string(), DeviceNodeType::OOD, None, None),
                 "ood1",
             ),
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OOD,
+                    DeviceNodeType::OOD,
                     Some("wan".to_string()),
                     None,
                 ),
@@ -2158,7 +2163,7 @@ mod tests {
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OOD,
+                    DeviceNodeType::OOD,
                     Some("lan1".to_string()),
                     None,
                 ),
@@ -2167,7 +2172,7 @@ mod tests {
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OOD,
+                    DeviceNodeType::OOD,
                     None,
                     Some("192.168.1.8".parse().unwrap()),
                 ),
@@ -2176,7 +2181,7 @@ mod tests {
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OOD,
+                    DeviceNodeType::OOD,
                     Some("lan".to_string()),
                     Some("192.168.1.8".parse().unwrap()),
                 ),
@@ -2185,7 +2190,7 @@ mod tests {
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OOD,
+                    DeviceNodeType::OOD,
                     Some("wan".to_string()),
                     Some("192.168.1.8".parse().unwrap()),
                 ),
@@ -2194,20 +2199,20 @@ mod tests {
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OOD,
+                    DeviceNodeType::OOD,
                     Some("lan1".to_string()),
                     Some("192.168.1.8".parse().unwrap()),
                 ),
                 "ood1:192.168.1.8@lan1", // lan1 will be simplified to lan
             ),
             (
-                OODDescriptionString::new("gate1".to_string(), NodeType::Gateway, None, None),
+                OODDescriptionString::new("gate1".to_string(), DeviceNodeType::Gateway, None, None),
                 "#gate1",
             ),
             (
                 OODDescriptionString::new(
                     "gate1".to_string(),
-                    NodeType::Gateway,
+                    DeviceNodeType::Gateway,
                     Some("wan".to_string()),
                     None,
                 ),
@@ -2216,20 +2221,20 @@ mod tests {
             (
                 OODDescriptionString::new(
                     "gate1".to_string(),
-                    NodeType::Gateway,
+                    DeviceNodeType::Gateway,
                     Some("wan".to_string()),
                     Some("210.35.22.1".parse().unwrap()),
                 ),
                 "#gate1:210.35.22.1",
             ),
             (
-                OODDescriptionString::new("ood1".to_string(), NodeType::OODOnly, None, None),
+                OODDescriptionString::new("ood1".to_string(), DeviceNodeType::OODOnly, None, None),
                 "$ood1",
             ),
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OODOnly,
+                    DeviceNodeType::OODOnly,
                     Some("wan".to_string()),
                     None,
                 ),
@@ -2238,7 +2243,7 @@ mod tests {
             (
                 OODDescriptionString::new(
                     "ood1".to_string(),
-                    NodeType::OODOnly,
+                    DeviceNodeType::OODOnly,
                     Some("lan".to_string()),
                     Some("1.2.3.4".parse().unwrap()),
                 ),
@@ -2256,10 +2261,10 @@ mod tests {
     fn test_ood_description_string_to_string_error_cases() {
         // Test error cases of to_string() (unsupported NodeType)
         let error_cases = vec![
-            NodeType::Node,
-            NodeType::Device,
-            NodeType::Sensor,
-            NodeType::Browser,
+            DeviceNodeType::Node,
+            DeviceNodeType::Device,
+            DeviceNodeType::Sensor,
+            DeviceNodeType::Browser,
         ];
 
         for node_type in error_cases {
@@ -2330,7 +2335,7 @@ mod tests {
         // Test serialization (should serialize to string)
         let ood = OODDescriptionString::new(
             "ood1".to_string(),
-            NodeType::OOD,
+            DeviceNodeType::OOD,
             Some("wan".to_string()),
             None,
         );
@@ -2342,7 +2347,7 @@ mod tests {
 
         let ood2 = OODDescriptionString::new(
             "gate1".to_string(),
-            NodeType::Gateway,
+            DeviceNodeType::Gateway,
             None,
             Some("192.168.1.8".parse().unwrap()),
         );
@@ -2354,7 +2359,7 @@ mod tests {
 
         let ood3 = OODDescriptionString::new(
             "ood1".to_string(),
-            NodeType::OODOnly,
+            DeviceNodeType::OODOnly,
             Some("lan".to_string()),
             Some("1.2.3.4".parse().unwrap()),
         );
@@ -2371,21 +2376,21 @@ mod tests {
         let json = "\"ood1@wan\"";
         let ood: OODDescriptionString = serde_json::from_str(json).unwrap();
         assert_eq!(ood.name, "ood1");
-        assert_eq!(ood.node_type, NodeType::OOD);
+        assert_eq!(ood.node_type, DeviceNodeType::OOD);
         assert_eq!(ood.net_id, Some("wan".to_string()));
         assert_eq!(ood.ip, None);
 
         let json2 = "\"#gate1:192.168.1.8\"";
         let ood2: OODDescriptionString = serde_json::from_str(json2).unwrap();
         assert_eq!(ood2.name, "gate1");
-        assert_eq!(ood2.node_type, NodeType::Gateway);
+        assert_eq!(ood2.node_type, DeviceNodeType::Gateway);
         assert_eq!(ood2.net_id, Some("wan".to_string())); // Automatically set to wan
         assert_eq!(ood2.ip, Some("192.168.1.8".parse().unwrap()));
 
         let json3 = "\"$ood1:1.2.3.4@lan\"";
         let ood3: OODDescriptionString = serde_json::from_str(json3).unwrap();
         assert_eq!(ood3.name, "ood1");
-        assert_eq!(ood3.node_type, NodeType::OODOnly);
+        assert_eq!(ood3.node_type, DeviceNodeType::OODOnly);
         assert_eq!(ood3.net_id, Some("lan".to_string()));
         assert_eq!(ood3.ip, Some("1.2.3.4".parse().unwrap()));
     }
@@ -2394,42 +2399,42 @@ mod tests {
     fn test_ood_description_string_serialize_deserialize_round_trip() {
         // Test serialize/deserialize round-trip
         let test_cases = vec![
-            OODDescriptionString::new("ood1".to_string(), NodeType::OOD, None, None),
+            OODDescriptionString::new("ood1".to_string(), DeviceNodeType::OOD, None, None),
             OODDescriptionString::new(
                 "ood1".to_string(),
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("wan".to_string()),
                 None,
             ),
             OODDescriptionString::new(
                 "ood1".to_string(),
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("lan1".to_string()),
                 None,
             ),
             OODDescriptionString::new(
                 "ood1".to_string(),
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 None,
                 Some("192.168.1.8".parse().unwrap()),
             ),
             OODDescriptionString::new(
                 "ood1".to_string(),
-                NodeType::OOD,
+                DeviceNodeType::OOD,
                 Some("lan".to_string()),
                 Some("192.168.1.8".parse().unwrap()),
             ),
-            OODDescriptionString::new("gate1".to_string(), NodeType::Gateway, None, None),
+            OODDescriptionString::new("gate1".to_string(), DeviceNodeType::Gateway, None, None),
             OODDescriptionString::new(
                 "gate1".to_string(),
-                NodeType::Gateway,
+                DeviceNodeType::Gateway,
                 Some("wan".to_string()),
                 None,
             ),
-            OODDescriptionString::new("ood1".to_string(), NodeType::OODOnly, None, None),
+            OODDescriptionString::new("ood1".to_string(), DeviceNodeType::OODOnly, None, None),
             OODDescriptionString::new(
                 "ood1".to_string(),
-                NodeType::OODOnly,
+                DeviceNodeType::OODOnly,
                 Some("lan".to_string()),
                 Some("1.2.3.4".parse().unwrap()),
             ),
@@ -2468,7 +2473,7 @@ mod tests {
         // Test special handling of lan (if net_id starts with "lan" and has IP, serialize as "@lan")
         let ood = OODDescriptionString::new(
             "ood1".to_string(),
-            NodeType::OOD,
+            DeviceNodeType::OOD,
             Some("lan1".to_string()),
             Some("192.168.1.8".parse().unwrap()),
         );
@@ -2481,7 +2486,7 @@ mod tests {
         // Test lan2 case (only "lan" or "lan1" are simplified to "lan", "lan2" remains unchanged)
         let ood2 = OODDescriptionString::new(
             "ood1".to_string(),
-            NodeType::OOD,
+            DeviceNodeType::OOD,
             Some("lan2".to_string()),
             Some("192.168.1.8".parse().unwrap()),
         );
