@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 
 use crate::config::{default_context, ServiceNode, VerificationMethodNode};
 use crate::{
-    DEFUALT_EXPIRE_TIME, DID, DIDDocumentTrait, EncodedDocument, NSError, NSResult, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk
+    DEFAULT_EXPIRE_TIME, DID, DIDDocumentTrait, EncodedDocument, NSError, NSResult, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk
 };
 use nvml_wrapper::enum_wrappers::device::Clock;
 use nvml_wrapper::*;
@@ -137,7 +137,7 @@ impl DeviceConfig {
             zone_did: Some(zone_did.clone()),
             iss: owner_did.to_string(),
             exp: mini_config.exp,
-            iat: mini_config.exp - DEFUALT_EXPIRE_TIME,
+            iat: mini_config.exp - DEFAULT_EXPIRE_TIME,
             extra_info: mini_config.extra_info,
         }
     }
@@ -175,7 +175,7 @@ impl DeviceConfig {
             support_container: true,
             zone_did: None,
             iss: "".to_string(),
-            exp: buckyos_get_unix_timestamp() + DEFUALT_EXPIRE_TIME,
+            exp: buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME,
             iat: buckyos_get_unix_timestamp() as u64,
             extra_info: HashMap::new(),
         }

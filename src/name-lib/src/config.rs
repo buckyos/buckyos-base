@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::DEFUALT_EXPIRE_TIME;
+use crate::DEFAULT_EXPIRE_TIME;
 use crate::get_x_from_jwk;
 
 use crate::DID;
@@ -400,7 +400,7 @@ impl DIDDocumentTrait for ZoneBootConfig {
     }
 
     fn get_iat(&self) -> Option<u64> {
-        return Some(self.exp - DEFUALT_EXPIRE_TIME);
+        return Some(self.exp - DEFAULT_EXPIRE_TIME);
     }
 
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument> {
@@ -604,7 +604,7 @@ impl ZoneConfig {
             .collect();
         self.sn = boot_config.sn.clone();
         self.exp = boot_config.exp;
-        self.iat = self.exp - DEFUALT_EXPIRE_TIME;
+        self.iat = self.exp - DEFAULT_EXPIRE_TIME;
 
         if boot_config.owner.is_some() {
             self.owner = Some(boot_config.owner.clone().unwrap());
@@ -2365,7 +2365,7 @@ mod tests {
                 "ood3".parse().unwrap(),
             ],
             sn: Some("sn.buckyos.io".to_string()),
-            exp: buckyos_get_unix_timestamp() + DEFUALT_EXPIRE_TIME,
+            exp: buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME,
             owner: None,
             owner_key: None,
             devices: HashMap::new(),

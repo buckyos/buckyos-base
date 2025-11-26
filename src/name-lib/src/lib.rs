@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 pub static CURRENT_DEVICE_CONFIG: OnceCell<DeviceConfig> = OnceCell::new();
-pub const DEFUALT_EXPIRE_TIME: u64 = 3600 * 24 * 365 * 5;
+pub const DEFAULT_EXPIRE_TIME: u64 = 3600 * 24 * 365 * 5;
 
 pub fn try_load_current_device_config_from_env() -> NSResult<()> {
     let device_doc = env::var("BUCKYOS_THIS_DEVICE");
