@@ -165,6 +165,7 @@ impl NsProvider for DnsProvider {
                 //let mut did_tx:String;
                 //let mut did_doc = DIDSimpleDocument::new();
                 let mut pkx_list = Vec::new();
+                let mut devices = Vec::new();
                 let mut name_info = NameInfo {
                     name: name.to_string(),
                     address:Vec::new(),
@@ -193,6 +194,12 @@ impl NsProvider for DnsProvider {
                     if txt.starts_with("PKX=") {
                         let pkx = txt.trim_start_matches("PKX=").trim_end_matches(";");
                         pkx_list.push(pkx.to_string());
+                    }
+
+                    if txt.starts_with("DEV=") {
+                        let dev_payload = txt.trim_start_matches("DEV=").trim_end_matches(";");
+                        debug!("zone_boot_config device payload: {}",dev_payload);
+                        devices.push(dev_payload.to_string());
                     }
                 }
 
@@ -223,8 +230,30 @@ impl NsProvider for DnsProvider {
                     }
 
                     let mut zone_boot_config = zone_boot_config.unwrap();
-                    zone_boot_config.owner_key = Some(public_key_jwk);
+
+                    //NOTICE: 因为zone_boot_config为了减少字节数，owner通常为空，因此不在这里验证pkx0,外部使用时应首先对owner_key进行验证
+                    let public_key = DecodingKey::from_jwk(&public_key_jwk);
+                    if public_key.is_err() {
+                        return Err(NSError::Failed("parse public key failed!".to_string()));
+                    }
+                    let public_key = public_key.unwrap();
+                    zone_boot_config.owner_key = Some(public_key_jwk.clone());
                     zone_boot_config.id = Some(DID::from_str(name).unwrap());
+
+                    if devices.len() > 0 {
+                        for device_jwt in devices {
+                            //用zone_boot_config.owner_key验证device_jwt
+                            let device_mini_config = DeviceMiniConfig::from_jwt(&device_jwt, &public_key);
+                            if device_mini_config.is_err() {
+                                error!("decode device mini config from jwt {:?} failed! {}",device_jwt,device_mini_config.err().unwrap());
+                            } else {
+                                let device_mini_config = device_mini_config.unwrap();
+                                let device_config = DeviceConfig::new_by_mini_config(device_mini_config, DID::from_str(name).unwrap(), DID::from_str(name).unwrap());
+                                zone_boot_config.devices.insert(device_config.name.clone(), device_config);
+                            }
+                        }
+                    }
+
                     let gateway_devs = name_info.get_gateway_device_list();
                     if gateway_devs.is_some() {
                         zone_boot_config.gateway_devs =  gateway_devs.unwrap();

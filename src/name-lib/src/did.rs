@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::config::{DeviceConfig, OwnerConfig, ZoneBootConfig, ZoneConfig};
+use crate::config::{OwnerConfig, ZoneBootConfig, ZoneConfig};
+use crate::DeviceConfig;
 use crate::{decode_jwt_claim_without_verify, NSError, NSResult};
 use async_trait::async_trait;
 use base64::{

@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-use crate::config::DeviceConfig;
+use crate::{DeviceConfig, DID};
 use base64::prelude::BASE64_STANDARD_NO_PAD;
 use base64::{
     engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _,
