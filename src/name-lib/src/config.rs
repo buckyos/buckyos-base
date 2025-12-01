@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::DEFAULT_EXPIRE_TIME;
 use crate::get_x_from_jwk;
+use crate::DEFAULT_EXPIRE_TIME;
 
 use crate::DID;
 use crate::{DeviceConfig, DeviceInfo};
@@ -58,12 +58,11 @@ pub enum DeviceNodeType {
     Gateway, //gateway only
     OODOnly, //not gateway
     Server,
-    Device,//normal client device
-    Sensor,//sensor,
-    IoTController,//iot controller
+    Device,        //normal client device
+    Sensor,        //sensor,
+    IoTController, //iot controller
     UnknownClient(String),
 }
-
 
 impl Default for DeviceNodeType {
     fn default() -> Self {
@@ -90,8 +89,6 @@ impl DeviceNodeType {
     }
 }
 
-
-
 //OODDescriptionString is a string that describes the OOD
 // ood1@lan1
 // ood1@wan
@@ -105,7 +102,6 @@ pub struct OODDescriptionString {
     pub node_type: DeviceNodeType,
     pub net_id: Option<String>,
     pub ip: Option<IpAddr>,
-
 }
 
 impl OODDescriptionString {
@@ -153,7 +149,7 @@ impl OODDescriptionString {
                 if self.net_id.as_ref().unwrap() != "wan" {
                     result += &format!("@{}", self.net_id.as_ref().unwrap());
                 }
-            } 
+            }
             // If IP is present but net_id is not, return directly (allow this case for backward compatibility)
             return Ok(result);
         }
@@ -282,7 +278,6 @@ pub struct ZoneBootConfig {
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
     //------- The following fields are not serialized, but stored separately in TXT Records ------------
-
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_key: Option<Jwk>, //PKX=0:xxxxxxx;
 
@@ -293,7 +288,7 @@ pub struct ZoneBootConfig {
     #[serde(skip_serializing)]
     #[serde(default)]
     //device name -> device config jwt,
-    pub devices:HashMap<String, DeviceConfig>,
+    pub devices: HashMap<String, DeviceConfig>,
 }
 
 impl ZoneBootConfig {
@@ -307,7 +302,7 @@ impl ZoneBootConfig {
         return result;
     }
 
-    pub fn device_is_ood(&self,device_name: &str) -> bool {
+    pub fn device_is_ood(&self, device_name: &str) -> bool {
         for ood in self.oods.iter() {
             if ood.name == device_name {
                 if ood.node_type.is_ood() {
@@ -318,7 +313,7 @@ impl ZoneBootConfig {
         return false;
     }
 
-    pub fn device_is_gateway(&self,device_name: &str) -> bool {
+    pub fn device_is_gateway(&self, device_name: &str) -> bool {
         for ood in self.oods.iter() {
             if ood.name == device_name {
                 if ood.node_type.is_gateway() {
@@ -328,7 +323,7 @@ impl ZoneBootConfig {
         }
         return false;
     }
-    
+
     pub fn get_gateway_name(&self) -> String {
         for ood in self.oods.iter() {
             if ood.node_type.is_gateway() {
@@ -338,10 +333,9 @@ impl ZoneBootConfig {
         return "".to_string();
     }
 
-    pub fn get_device_config(&self,device_name: &str) -> Option<&DeviceConfig> {
+    pub fn get_device_config(&self, device_name: &str) -> Option<&DeviceConfig> {
         return self.devices.get(device_name);
     }
-    
 }
 
 impl DIDDocumentTrait for ZoneBootConfig {
@@ -378,7 +372,7 @@ impl DIDDocumentTrait for ZoneBootConfig {
             let device_config = device_config.unwrap();
             return device_config.get_exchange_key(None);
         }
-        
+
         if self.gateway_devs.is_empty() {
             return None;
         }
@@ -807,7 +801,6 @@ impl DIDDocumentTrait for ZoneConfig {
     // }
 }
 
-
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct OwnerConfig {
     #[serde(rename = "@context", default = "default_context")]
@@ -1005,8 +998,6 @@ impl DIDDocumentTrait for OwnerConfig {
     //     unimplemented!()
     // }
 }
-
-
 
 // unit tests that depend on external crates are behind an opt-in feature
 
@@ -1727,9 +1718,24 @@ mod tests {
         // Test various formats of OOD type
         let cases = vec![
             ("ood1", DeviceNodeType::OOD, None, None),
-            ("ood1@wan", DeviceNodeType::OOD, Some("wan".to_string()), None),
-            ("ood1@lan1", DeviceNodeType::OOD, Some("lan1".to_string()), None),
-            ("ood1@lan", DeviceNodeType::OOD, Some("lan".to_string()), None),
+            (
+                "ood1@wan",
+                DeviceNodeType::OOD,
+                Some("wan".to_string()),
+                None,
+            ),
+            (
+                "ood1@lan1",
+                DeviceNodeType::OOD,
+                Some("lan1".to_string()),
+                None,
+            ),
+            (
+                "ood1@lan",
+                DeviceNodeType::OOD,
+                Some("lan".to_string()),
+                None,
+            ),
             (
                 "ood1:192.168.1.8",
                 DeviceNodeType::OOD,
@@ -2373,7 +2379,6 @@ mod tests {
             extra_info: extera_info,
         };
 
-
         let json_str = serde_json::to_string(&zone_boot_config).unwrap();
         println!("zone_boot_config: {:?}", json_str);
 
@@ -2428,7 +2433,6 @@ mod tests {
         assert_eq!(encoded, token2);
     }
 
-   
     #[test]
     fn test_owner_config() {
         let private_key_pem = r#"

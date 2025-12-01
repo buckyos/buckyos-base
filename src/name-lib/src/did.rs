@@ -89,6 +89,13 @@ impl DID {
         format!("did:{}:{}", self.method, self.id)
     }
 
+    pub fn to_raw_host_name(&self) -> String {
+        if self.method == "web" {
+            return self.id.clone();
+        }
+        format!("{}.{}.did", self.id, self.method)
+    }
+
     pub fn to_host_name(&self) -> String {
         if self.method == "web" {
             return self.id.clone();
@@ -320,5 +327,14 @@ mod tests {
         assert_eq!(did.id, "abcdef");
         let did_str = did.to_string();
         assert_eq!(did_str, "did:dev:abcdef");
+
+        let did = DID::from_str("did:bns:app1.waterflier").unwrap();
+        assert_eq!(did.method, "bns");
+        assert_eq!(did.id, "app1.waterflier");
+        let did_str = did.to_string();
+        assert_eq!(did_str, "did:bns:app1.waterflier");
+        let host_name = did.to_host_name();
+        assert_eq!(host_name, "app1.waterflier.web3.buckyos.io");
+
     }
 }

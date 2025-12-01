@@ -14,7 +14,8 @@ use tokio::net::UdpSocket;
 
 use crate::config::{default_context, ServiceNode, VerificationMethodNode};
 use crate::{
-    DEFAULT_EXPIRE_TIME, DID, DIDDocumentTrait, EncodedDocument, NSError, NSResult, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk,
+    DIDDocumentTrait, EncodedDocument, NSError, NSResult, DEFAULT_EXPIRE_TIME, DID,
 };
 use nvml_wrapper::enum_wrappers::device::Clock;
 use nvml_wrapper::*;
@@ -46,12 +47,13 @@ impl DeviceMiniConfig {
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
 
-        let token = encode(&header, self, owner_private_key)
-            .map_err(|error| NSError::Failed(format!("Failed to encode device mini config:{}", error)))?;
+        let token = encode(&header, self, owner_private_key).map_err(|error| {
+            NSError::Failed(format!("Failed to encode device mini config:{}", error))
+        })?;
         return Ok(token);
     }
 
-    pub fn from_jwt(jwt: &str,key:&DecodingKey) -> NSResult<Self> {
+    pub fn from_jwt(jwt: &str, key: &DecodingKey) -> NSResult<Self> {
         let json_result = decode_json_from_jwt_with_pk(jwt, key)?;
         let result: DeviceMiniConfig = serde_json::from_value(json_result).map_err(|error| {
             NSError::Failed(format!("Failed to decode device mini config:{}", error))
@@ -104,7 +106,11 @@ impl DeviceConfig {
         return DeviceConfig::new(name, x);
     }
 
-    pub fn new_by_mini_config(mini_config: DeviceMiniConfig,zone_did: DID,owner_did: DID) -> Self {
+    pub fn new_by_mini_config(
+        mini_config: DeviceMiniConfig,
+        zone_did: DID,
+        owner_did: DID,
+    ) -> Self {
         let did = format!("did:dev:{}", mini_config.x);
         let jwk = json!(
             {
@@ -161,7 +167,7 @@ impl DeviceConfig {
             ip: None,
             net_id: None,
             ddns_sn_url: None,
-            rtcp_port:None,
+            rtcp_port: None,
             verification_method: vec![VerificationMethodNode {
                 key_type: "Ed25519VerificationKey2020".to_string(),
                 key_id: "#main_key".to_string(),
@@ -645,7 +651,6 @@ mod tests {
         println!("{}", device_info_json);
     }
 
-
     #[test]
     fn test_device_mini_config() {
         let owner_private_key_pem = r#"
@@ -659,7 +664,8 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 "crv": "Ed25519",
                 "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
             }
-        )).unwrap();
+        ))
+        .unwrap();
         let owner_private_key: EncodingKey =
             EncodingKey::from_ed_pem(owner_private_key_pem.as_bytes()).unwrap();
         let owner_public_key = DecodingKey::from_jwk(&owner_jwk).unwrap();
@@ -682,12 +688,17 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let txt_record = format!("DEV={};", mini_jwt);
         println!("mini_jwt:{} {}", &txt_record, txt_record.len());
 
-
-        let mini_config_from_jwt = DeviceMiniConfig::from_jwt(&mini_jwt, &owner_public_key).unwrap();
-        let mini_config_from_jwt_json = serde_json::to_string_pretty(&mini_config_from_jwt).unwrap();
+        let mini_config_from_jwt =
+            DeviceMiniConfig::from_jwt(&mini_jwt, &owner_public_key).unwrap();
+        let mini_config_from_jwt_json =
+            serde_json::to_string_pretty(&mini_config_from_jwt).unwrap();
         println!("jwt decoded json: {}", mini_config_from_jwt_json);
 
-        let device_config = DeviceConfig::new_by_mini_config(mini_config, DID::new("bns", "ood1"), DID::new("bns", "lzc"));
+        let device_config = DeviceConfig::new_by_mini_config(
+            mini_config,
+            DID::new("bns", "ood1"),
+            DID::new("bns", "lzc"),
+        );
         let device_config_json = serde_json::to_string_pretty(&device_config).unwrap();
         println!("{}", device_config_json);
     }
@@ -822,5 +833,4 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(device_config, decoded);
         assert_eq!(encoded, token2);
     }
-
 }

@@ -25,8 +25,14 @@ impl ConfigMerger {
         Ok(merged.value)
     }
 
-    pub async fn load_dir_with_root(dir: &Path, root_file: &Path) -> Result<Value, Box<dyn std::error::Error>> {
-        info!("Loading config files from directory: {:?} with root file: {:?}", dir, root_file);
+    pub async fn load_dir_with_root(
+        dir: &Path,
+        root_file: &Path,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        info!(
+            "Loading config files from directory: {:?} with root file: {:?}",
+            dir, root_file
+        );
 
         let configs = load_dir_with_root(dir, root_file).await?;
 

@@ -112,7 +112,10 @@ impl DebugConfig {
         }
     }
 
-    fn load_root(&self, config_path: &Path) -> Result<toml::value::Table, Box<dyn std::error::Error>> {
+    fn load_root(
+        &self,
+        config_path: &Path,
+    ) -> Result<toml::value::Table, Box<dyn std::error::Error>> {
         let contents = std::fs::read_to_string(config_path).map_err(|e| {
             let msg = format!(
                 "load log config failed! file={}, err={}",

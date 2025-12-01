@@ -1,8 +1,8 @@
-pub fn is_true(v:&bool) -> bool {
+pub fn is_true(v: &bool) -> bool {
     return *v;
 }
 
-pub fn is_false(v:&bool) -> bool {
+pub fn is_false(v: &bool) -> bool {
     return !*v;
 }
 

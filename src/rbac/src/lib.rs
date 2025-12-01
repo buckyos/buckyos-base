@@ -1,16 +1,17 @@
-
 #![allow(dead_code)]
 #![allow(unused)]
 
-use std::collections::HashMap;
-use std::sync::{Arc};
 use casbin::RbacApi;
-use log::*;
-use tokio::sync::Mutex;
-use casbin::{rhai::ImmutableString, CoreApi, DefaultModel, Enforcer, Filter, MemoryAdapter, MgmtApi};
+use casbin::{
+    rhai::ImmutableString, CoreApi, DefaultModel, Enforcer, Filter, MemoryAdapter, MgmtApi,
+};
 use lazy_static::lazy_static;
+use log::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-pub const DEFAULT_MODEL: &str =  r#"
+pub const DEFAULT_MODEL: &str = r#"
 [request_definition]
 r = sub,obj,act
 
@@ -84,12 +85,13 @@ g, buckycli, kernel
 g, cyfs-gateway, kernel
 "#;
 
-lazy_static!{
-    static ref SYS_ENFORCE: Arc<Mutex<Option<Enforcer> > > = {
-        Arc::new(Mutex::new(None))
-    };
+lazy_static! {
+    static ref SYS_ENFORCE: Arc<Mutex<Option<Enforcer>>> = { Arc::new(Mutex::new(None)) };
 }
-pub async fn create_enforcer(model_str:Option<&str>,policy_str:Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn create_enforcer(
+    model_str: Option<&str>,
+    policy_str: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let model_str = model_str.unwrap_or(DEFAULT_MODEL);
     let policy_str = policy_str.unwrap_or(DEFAULT_POLICY);
 
@@ -112,15 +114,14 @@ pub async fn create_enforcer(model_str:Option<&str>,policy_str:Option<&str>) -> 
     Ok(())
 }
 
-pub async fn update_enforcer(policy_str:Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn update_enforcer(policy_str: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let policy_str = policy_str.unwrap_or(DEFAULT_POLICY);
     let model_str = DEFAULT_MODEL;
-    return create_enforcer(Some(model_str),Some(policy_str)).await
+    return create_enforcer(Some(model_str), Some(policy_str)).await;
 }
 //use default RBAC config to enforce the access control
 //default acl config is stored in the memory,so it is not async function
-pub async fn enforce(userid:&str, appid:Option<&str>,res_path:&str,op_name:&str) -> bool {
-
+pub async fn enforce(userid: &str, appid: Option<&str>, res_path: &str, op_name: &str) -> bool {
     let enforcer = SYS_ENFORCE.lock().await;
     if enforcer.is_none() {
         error!("enforcer is not initialized");
@@ -141,7 +142,10 @@ pub async fn enforce(userid:&str, appid:Option<&str>,res_path:&str,op_name:&str)
     let res2 = res2.unwrap();
 
     //println!("enforce {},{},{}, result:{}",appid, res_path, op_name,res2);
-    debug!("enforce {},{},{}, result:{}",appid, res_path, op_name,res2);    
+    debug!(
+        "enforce {},{},{}, result:{}",
+        appid, res_path, op_name, res2
+    );
     if appid == "kernel" {
         return res2;
     }
@@ -153,7 +157,7 @@ pub async fn enforce(userid:&str, appid:Option<&str>,res_path:&str,op_name:&str)
     }
     let res = res.unwrap();
     //println!("enforce {},{},{} result:{}",userid, res_path, op_name,res);
-    debug!("enforce {},{},{} result:{}",userid, res_path, op_name,res);
+    debug!("enforce {},{},{} result:{}", userid, res_path, op_name, res);
     return res2 && res;
 }
 
@@ -161,10 +165,12 @@ pub async fn enforce(userid:&str, appid:Option<&str>,res_path:&str,op_name:&str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::test;
+    use casbin::{
+        rhai::ImmutableString, CoreApi, DefaultModel, Enforcer, Filter, MemoryAdapter, MgmtApi,
+    };
     use std::collections::HashMap;
-    use casbin::{rhai::ImmutableString, CoreApi, DefaultModel, Enforcer, Filter, MemoryAdapter, MgmtApi};
-    
+    use tokio::test;
+
     #[test]
     async fn test_simple_enforce() -> Result<(), Box<dyn std::error::Error>> {
         // 定义模型配置
@@ -184,7 +190,7 @@ e = priority(p.eft) || deny
 [matchers]
 m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && regexMatch(r.act, p.act)
         "#;
-    
+
         // 定义策略配置
         let policy_str = r#"
         p, owner, kv://*, read|write,allow
@@ -217,7 +223,7 @@ m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && regexMatch(r.act, p.act)
         g, charlie, user
         g, app1, app_service 
         "#;
-    
+
         // 使用字符串创建 Casbin 模型和策略适配器
         let m = DefaultModel::from_str(model_str).await?;
         // 创建一个空的内存适配器
@@ -231,7 +237,6 @@ m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && regexMatch(r.act, p.act)
                 if rule[0] == "p" {
                     println!("add policy {:?}", &rule);
                     e.add_policy(rule[1..].to_vec()).await?;
-                    
                 } else if rule[0] == "g" {
                     println!("add group policy {:?}", &rule);
                     e.add_grouping_policy(rule[1..].to_vec()).await?;
@@ -239,21 +244,21 @@ m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && regexMatch(r.act, p.act)
             }
         }
 
-    
         // 测试权限
-        let alice_read_kv = e.enforce(("alice","write","kv://config")).unwrap();
+        let alice_read_kv = e.enforce(("alice", "write", "kv://config")).unwrap();
         println!("Alice can write kv://config: {}", alice_read_kv); // true
         assert_eq!(alice_read_kv, true);
-    
+
         Ok(())
     }
 
     #[test]
     async fn test_enforce() {
-        std::env::set_var("BUCKY_LOG","debug");
-        buckyos_kit::init_logging("test_rbac",false);
+        std::env::set_var("BUCKY_LOG", "debug");
+        buckyos_kit::init_logging("test_rbac", false);
         let mut policy_str = DEFAULT_POLICY.to_string();
-        policy_str = policy_str + r#"
+        policy_str = policy_str
+            + r#"
 g, sys-test, app
 g, buckyos-filebrowser, app
 g, ood1, ood
@@ -265,52 +270,323 @@ g, repo-service,service
 g, bob,user
 p, su_bob,kv://users/bob/*,read|write,allow
         "#;
-        create_enforcer(None,Some(&policy_str)).await.unwrap();
+        create_enforcer(None, Some(&policy_str)).await.unwrap();
         let res = enforce("ood", Some("node-daemon"), "kv://boot/config", "read").await;
         assert_eq!(res, true);
-        assert_eq!(enforce("ood1", Some("node-daemon"), "kv://boot/config", "write").await, false);
-        assert_eq!(enforce("ood1", Some("verify-hub"), "kv://system/verify-hub/key", "read").await, true);
-        assert_eq!(enforce("root", Some("node-daemon"), "kv://boot/config", "write").await, true);
-        assert_eq!(enforce("ood1", Some("repo-service"), "kv://services/repo-service/instance/ood1", "write").await, true);
-        assert_eq!(enforce("ood1", Some("smb-service"), "kv://services/smb-service/latest_smb_items", "read").await, true);
-        assert_eq!(enforce("ood1", Some("smb-service"), "kv://boot/config", "read").await, true);
-        assert_eq!(enforce("ood1", Some("scheduler"), "kv://users/alice/apps/app2/config", "write").await, true);
-        assert_eq!(enforce("bob", Some("node-daemon"), "kv://users/alice/apps/app2", "read").await, false);
-        assert_eq!(enforce("bob", Some("app1"), "kv://users/bob/apps/app1/settings", "read").await, true);
-        assert_eq!(enforce("bob", Some("control-panel"), "kv://users/bob/settings", "read").await, true);
-        assert_eq!(enforce("bob", Some("control-panel"), "kv://users/bob/settings", "write").await, false);
-        assert_eq!(enforce("su_bob", Some("control-panel"), "kv://users/bob/settings", "write").await, true);
-        assert_eq!(enforce("bob", Some("control-panel"), "dfs://library/photos/1.jpg", "read").await, true);
-        assert_eq!(enforce("bob", Some("control-panel"), "dfs://library/photos/1.jpg", "write").await, false);
-        assert_eq!(enforce("ood1", Some("repo-service"), "kv://services/verify-hub/info", "read").await, true);
-        assert_eq!(enforce("ood1", Some("cyfs-gateway"), "kv://boot/config", "read").await, true);
+        assert_eq!(
+            enforce("ood1", Some("node-daemon"), "kv://boot/config", "write").await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "ood1",
+                Some("verify-hub"),
+                "kv://system/verify-hub/key",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce("root", Some("node-daemon"), "kv://boot/config", "write").await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "ood1",
+                Some("repo-service"),
+                "kv://services/repo-service/instance/ood1",
+                "write"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "ood1",
+                Some("smb-service"),
+                "kv://services/smb-service/latest_smb_items",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce("ood1", Some("smb-service"), "kv://boot/config", "read").await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "ood1",
+                Some("scheduler"),
+                "kv://users/alice/apps/app2/config",
+                "write"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "bob",
+                Some("node-daemon"),
+                "kv://users/alice/apps/app2",
+                "read"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "bob",
+                Some("app1"),
+                "kv://users/bob/apps/app1/settings",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "bob",
+                Some("control-panel"),
+                "kv://users/bob/settings",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "bob",
+                Some("control-panel"),
+                "kv://users/bob/settings",
+                "write"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "su_bob",
+                Some("control-panel"),
+                "kv://users/bob/settings",
+                "write"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "bob",
+                Some("control-panel"),
+                "dfs://library/photos/1.jpg",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "bob",
+                Some("control-panel"),
+                "dfs://library/photos/1.jpg",
+                "write"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "ood1",
+                Some("repo-service"),
+                "kv://services/verify-hub/info",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce("ood1", Some("cyfs-gateway"), "kv://boot/config", "read").await,
+            true
+        );
         //app1 can read and write config and info
-        assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/config", "read").await, true);
-        assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/config", "write").await, false);
-        assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/info", "read").await, true);
-        assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app1/info", "write").await, false);
-        assert_eq!(enforce("alice", Some("control-panel"), "dfs://library/photos/1.jpg", "read").await, true);
-        assert_eq!(enforce("alice", Some("control-panel"), "dfs://library/photos/1.jpg", "write").await, true);
-        assert_eq!(enforce("root", Some("app1"), "kv://users/alice/apps/app1/settings", "write").await, true);
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "kv://users/alice/apps/app1/config",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "kv://users/alice/apps/app1/config",
+                "write"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "kv://users/alice/apps/app1/info",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "kv://users/alice/apps/app1/info",
+                "write"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("control-panel"),
+                "dfs://library/photos/1.jpg",
+                "read"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("control-panel"),
+                "dfs://library/photos/1.jpg",
+                "write"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "root",
+                Some("app1"),
+                "kv://users/alice/apps/app1/settings",
+                "write"
+            )
+            .await,
+            true
+        );
         //can read and write appdata
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/appdata/app1/readme.txt", "write").await, true);
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/appdata/app1/readme.txt", "read").await, true);
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/appdata/app1/readme.txt",
+                "write"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/appdata/app1/readme.txt",
+                "read"
+            )
+            .await,
+            true
+        );
         //can read and write cache
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/cache/app1/readme_cache.txt", "write").await, true);
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/cache/app1/readme_cache.txt", "read").await, true);
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/cache/app1/readme_cache.txt",
+                "write"
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/cache/app1/readme_cache.txt",
+                "read"
+            )
+            .await,
+            true
+        );
 
         //can not read and write app2
-        assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app2/settings", "write").await, false);
-        assert_eq!(enforce("alice", Some("app1"), "kv://users/alice/apps/app2/info", "read").await, false);
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/appdata/app2/readme.txt", "write").await, false);
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/appdata/app2/readme.txt", "read").await, false);
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/cache/app2/readme_cache.txt", "write").await, false);
-        assert_eq!(enforce("alice", Some("app1"), "dfs://users/alice/cache/app2/readme_cache.txt", "read").await, false);
-        assert_eq!(true,true);
-        assert_eq!(false,false);
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "kv://users/alice/apps/app2/settings",
+                "write"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "kv://users/alice/apps/app2/info",
+                "read"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/appdata/app2/readme.txt",
+                "write"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/appdata/app2/readme.txt",
+                "read"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/cache/app2/readme_cache.txt",
+                "write"
+            )
+            .await,
+            false
+        );
+        assert_eq!(
+            enforce(
+                "alice",
+                Some("app1"),
+                "dfs://users/alice/cache/app2/readme_cache.txt",
+                "read"
+            )
+            .await,
+            false
+        );
+        assert_eq!(true, true);
+        assert_eq!(false, false);
         //su_alice has more permission than alice
         //assert_eq!(enforce("su_alice", Some("control_panel"), "kv://users/alice/apps/app2/config", "write").await, true);
-
     }
-
 }

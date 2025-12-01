@@ -1,16 +1,16 @@
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
-mod session_token;
 mod protocol;
-pub use session_token::*;
+mod session_token;
 pub use protocol::*;
+pub use session_token::*;
 
 use reqwest::{Client, ClientBuilder};
-use std::time::{Duration,SystemTime, UNIX_EPOCH};
-use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use serde_json::{json, Value};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::RwLock;
 
 //TODO:整体设计基本与jsonrpc2.0一致，要考虑是否完全兼容
 
@@ -43,16 +43,17 @@ pub type Result<T> = std::result::Result<T, RPCErrors>;
 pub struct kRPC {
     client: Client,
     server_url: String,
-    protcol_type:RPCProtoclType,
-    seq:RwLock<u64>,
-    session_token:RwLock<Option<String>>,
-    init_token:Option<String>,
+    protcol_type: RPCProtoclType,
+    seq: RwLock<u64>,
+    session_token: RwLock<Option<String>>,
+    init_token: Option<String>,
 }
 
 impl kRPC {
-    pub fn new(url: &str,token:Option<String>) -> Self {
+    pub fn new(url: &str, token: Option<String>) -> Self {
         let start = SystemTime::now();
-        let since_the_epoch = start.duration_since(UNIX_EPOCH)
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
         let timestamp_millis = since_the_epoch.as_secs() as u64 * 1_000_000;
 
@@ -67,10 +68,10 @@ impl kRPC {
         kRPC {
             client,
             server_url: url.to_string(),
-            protcol_type:RPCProtoclType::HttpPostJson,
-            seq:RwLock::new(timestamp_millis),
-            session_token:RwLock::new(token.clone()),
-            init_token:token.clone(),
+            protcol_type: RPCProtoclType::HttpPostJson,
+            seq: RwLock::new(timestamp_millis),
+            session_token: RwLock::new(token.clone()),
+            init_token: token.clone(),
         }
     }
 
@@ -90,8 +91,8 @@ impl kRPC {
     }
 
     pub async fn _call(&self, method: &str, params: Value) -> Result<Value> {
-        let request_body:Value;
-        let current_seq:u64;
+        let request_body: Value;
+        let current_seq: u64;
         {
             let mut seq = self.seq.write().await;
             *seq += 1;
@@ -114,40 +115,60 @@ impl kRPC {
             }
         }
 
-        let response = self.client
+        let response = self
+            .client
             .post(&self.server_url)
             .json(&request_body)
             .send()
-            .await.map_err(|err| RPCErrors::ReasonError(format!("{}",err)))?;
+            .await
+            .map_err(|err| RPCErrors::ReasonError(format!("{}", err)))?;
 
         if response.status().is_success() {
-            let rpc_response: Value = response.json().await.map_err(|err| RPCErrors::ReasonError(format!("{}",err)))?;
+            let rpc_response: Value = response
+                .json()
+                .await
+                .map_err(|err| RPCErrors::ReasonError(format!("{}", err)))?;
             let sys_vec = rpc_response.get("sys");
             if sys_vec.is_some() {
-                let sys = sys_vec.unwrap().as_array()
-                    .ok_or(RPCErrors::ParserResponseError("sys is not array".to_string()))?;
+                let sys = sys_vec
+                    .unwrap()
+                    .as_array()
+                    .ok_or(RPCErrors::ParserResponseError(
+                        "sys is not array".to_string(),
+                    ))?;
 
                 if sys.len() >= 1 {
-                    let seq = sys[0].as_u64()
-                        .ok_or(RPCErrors::ParserResponseError("sys[0] is not u64".to_string()))?;
+                    let seq = sys[0].as_u64().ok_or(RPCErrors::ParserResponseError(
+                        "sys[0] is not u64".to_string(),
+                    ))?;
                     if seq != current_seq {
-                        return Err(RPCErrors::ParserResponseError(format!("seq not match: {}!={}",seq,current_seq)));
+                        return Err(RPCErrors::ParserResponseError(format!(
+                            "seq not match: {}!={}",
+                            seq, current_seq
+                        )));
                     }
                 }
                 if sys.len() >= 2 {
-                    let token = sys[1].as_str()
-                        .ok_or(RPCErrors::ParserResponseError("sys[1] is not string".to_string()))?;
+                    let token = sys[1].as_str().ok_or(RPCErrors::ParserResponseError(
+                        "sys[1] is not string".to_string(),
+                    ))?;
                     self.session_token.write().await.replace(token.to_string());
                 }
             }
 
             if rpc_response.get("error").is_some() {
-                Err(RPCErrors::ReasonError(format!("rpc call error: {}", rpc_response.get("error").unwrap())))
+                Err(RPCErrors::ReasonError(format!(
+                    "rpc call error: {}",
+                    rpc_response.get("error").unwrap()
+                )))
             } else {
                 Ok(rpc_response.get("result").unwrap().clone())
             }
         } else {
-            Err(RPCErrors::ReasonError(format!("rpc call error: {}", response.status())))
+            Err(RPCErrors::ReasonError(format!(
+                "rpc call error: {}",
+                response.status()
+            )))
         }
     }
 }
@@ -165,31 +186,30 @@ mod test {
             trace_id: Some("$trace_id".to_string()),
         };
         let encoded = serde_json::to_string(&req).unwrap();
-        println!("req encoded:{}",encoded);
+        println!("req encoded:{}", encoded);
 
         let decoded: RPCRequest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(req, decoded);
 
         let resp = RPCResponse {
             result: RPCResult::Success(json!(100)),
-            seq:100,
+            seq: 100,
             token: Some("$3232323".to_string()),
             trace_id: Some("$trace_id".to_string()),
         };
         let encoded = serde_json::to_string(&resp).unwrap();
-        println!("resp encoded:{}",encoded);
+        println!("resp encoded:{}", encoded);
         let decoded: RPCResponse = serde_json::from_str(&encoded).unwrap();
         assert_eq!(resp, decoded);
 
-
         let resp = RPCResponse {
             result: RPCResult::Failed("game over".to_string()),
-            seq:100,
+            seq: 100,
             token: None,
             trace_id: None,
         };
         let encoded = serde_json::to_string(&resp).unwrap();
-        println!("resp encoded:{}",encoded);
+        println!("resp encoded:{}", encoded);
         let decoded: RPCResponse = serde_json::from_str(&encoded).unwrap();
         assert_eq!(resp, decoded);
     }

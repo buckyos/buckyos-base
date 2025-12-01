@@ -1,7 +1,7 @@
 use super::panic::*;
 use crate::bug_report::*;
-use buckyos_kit::{EventListenerAsyncRoutine, SyncEventManagerSync, get_buckyos_log_dir};
 use backtrace::Backtrace;
+use buckyos_kit::{get_buckyos_log_dir, EventListenerAsyncRoutine, SyncEventManagerSync};
 use chrono::offset::Local;
 use chrono::DateTime;
 use std::panic;
@@ -153,7 +153,7 @@ impl PanicBuilder {
         assert!(!product_name.is_empty());
         assert!(!service_name.is_empty());
 
-        let mut root = get_buckyos_log_dir("panic",false);
+        let mut root = get_buckyos_log_dir("panic", false);
         root.push(product_name);
 
         Self {
@@ -229,6 +229,5 @@ mod test {
 
         //     unreachable!("panic");
         // });
-        
     }
 }

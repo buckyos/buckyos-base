@@ -55,11 +55,7 @@ pub fn get_buckyos_root_dir() -> PathBuf {
         Path::new(&env::var("BUCKYOS_ROOT").unwrap()).to_path_buf()
     } else {
         //获得当前可执行文件所在的目录，并向上级目录寻找，直到找到包含applist.json的bin目录
-        let mut current_dir = env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let mut current_dir = env::current_exe().unwrap().parent().unwrap().to_path_buf();
         while !current_dir.join("applist.json").exists() {
             if let Some(parent) = current_dir.parent() {
                 current_dir = parent.to_path_buf();
@@ -68,7 +64,7 @@ pub fn get_buckyos_root_dir() -> PathBuf {
                 break;
             }
         }
-        
+
         if current_dir.join("applist.json").exists() {
             current_dir.parent().unwrap().to_path_buf()
         } else if cfg!(target_os = "windows") {
