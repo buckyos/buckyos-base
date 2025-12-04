@@ -16,6 +16,7 @@ impl DIDDocumentCache {
     /// Create a new DIDDocumentCache with the given cache directory.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         let cache_dir = cache_dir.unwrap_or_else(Self::get_default_cache_dir);
+        info!("did-document cache directory: {}", cache_dir.display());
         if let Err(err) = fs::create_dir_all(&cache_dir) {
             error!(
                 "Failed to prepare doc cache directory {}: {}",
@@ -27,7 +28,7 @@ impl DIDDocumentCache {
     }
 
     pub fn get_default_cache_dir() -> PathBuf {
-        get_buckyos_service_local_data_dir("name-client", None).join("did_docs")
+        get_buckyos_service_local_data_dir("did_docs", None)
     }
 
     pub fn with_default_dir() -> Self {
