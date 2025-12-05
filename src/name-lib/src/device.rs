@@ -36,6 +36,7 @@ pub struct DeviceMiniConfig {
     pub x: String,
     //rtcp port
     #[serde(rename = "p")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rtcp_port: Option<u32>,
     pub exp: u64,
     #[serde(flatten)]
@@ -676,7 +677,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let mini_config = DeviceMiniConfig {
             name: "ood1".to_string(),
             x: "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
-            rtcp_port: Some(2981),
+            rtcp_port: None,
             exp: exp,
             extra_info: HashMap::new(),
         };
