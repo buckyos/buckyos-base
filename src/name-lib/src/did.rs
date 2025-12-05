@@ -96,6 +96,35 @@ impl DID {
         format!("{}.{}.did", self.id, self.method)
     }
 
+    pub fn to_host_name_by_bridge(&self, bridge_base_hostname: &str) -> String {
+        if self.method == "web" {
+            return self.id.clone();
+        }
+        return format!("{}.{}", self.id, bridge_base_hostname);
+    }
+
+    pub fn from_host_name_by_bridge(host_name: &str, method: &str, bridge_base_hostname: &str) -> Option<Self> {
+        loop {
+            if host_name.ends_with(bridge_base_hostname) {
+                if host_name == bridge_base_hostname {
+                    break;
+                }
+                let id = host_name[..host_name.len() - bridge_base_hostname.len() - 1].to_string();
+                return Some(DID::new(method, &id));
+            }
+            break;
+        }
+
+        if host_name.ends_with(".did") {
+            let parts: Vec<&str> = host_name.split('.').collect();
+            if parts.len() == 3 {
+                return Some(DID::new(parts[1].to_string().as_str(), parts[0]));
+            }
+        }
+
+        return Some(DID::new("web", host_name.to_string().as_str()));
+    }
+
     pub fn to_host_name(&self) -> String {
         if self.method == "web" {
             return self.id.clone();
@@ -336,5 +365,19 @@ mod tests {
         let host_name = did.to_host_name();
         assert_eq!(host_name, "app1.waterflier.web3.buckyos.io");
 
+        let did = DID::from_host_name_by_bridge("app1.waterflier.web3.buckyos.io", "bns", "web3.buckyos.io").unwrap();
+        assert_eq!(did.method, "bns");
+        assert_eq!(did.id, "app1.waterflier");
+        let did_str = did.to_string();
+        assert_eq!(did_str, "did:bns:app1.waterflier");
+        let host_name = did.to_host_name_by_bridge("web3.buckyos.io");
+        assert_eq!(host_name, "app1.waterflier.web3.buckyos.io");
+        let did = DID::from_host_name_by_bridge("waterflier.buckyos.io", "bns", "web3.buckyos.io").unwrap();
+        assert_eq!(did.method, "web");
+        assert_eq!(did.id, "waterflier.buckyos.io");
+        let did_str = did.to_string();
+        assert_eq!(did_str, "did:web:waterflier.buckyos.io");
+        let host_name = did.to_host_name_by_bridge("web3.buckyos.io");
+        assert_eq!(host_name, "waterflier.buckyos.io");
     }
 }

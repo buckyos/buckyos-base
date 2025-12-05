@@ -16,7 +16,7 @@ impl DIDDocumentCache {
     /// Create a new DIDDocumentCache with the given cache directory.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         let cache_dir = cache_dir.unwrap_or_else(Self::get_default_cache_dir);
-        info!("did-document cache directory: {}", cache_dir.display());
+        info!("doc cache directory: {}", cache_dir.display());
         if let Err(err) = fs::create_dir_all(&cache_dir) {
             error!(
                 "Failed to prepare doc cache directory {}: {}",
