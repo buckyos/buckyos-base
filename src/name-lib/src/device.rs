@@ -315,6 +315,7 @@ impl DIDDocumentTrait for DeviceConfig {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeviceMiniInfo {
+    pub hostname: String, //hostname of the device
     pub device_type: String,
     pub arch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -350,11 +351,14 @@ pub struct DeviceMiniInfo {
     pub gpu_used_mem: Option<u64>, //gpu已用内存,单位是bytes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_load: Option<f32>, //gpu负载
+    #[serde(flatten)]
+    pub extra_info: HashMap<String, serde_json::Value>,
 }
 
 impl Default for DeviceMiniInfo {
     fn default() -> Self {
         Self {
+            hostname: System::host_name().unwrap_or_default(),
             device_type: "ood".to_string(),
             arch: "".to_string(),
             state: "inactive".to_string(),
@@ -372,6 +376,7 @@ impl Default for DeviceMiniInfo {
             gpu_used_mem: None,
             gpu_load: None,
             base_os_info: None,
+            extra_info: HashMap::new(),
         }
     }
 }
@@ -567,6 +572,9 @@ pub struct DeviceInfo {
     pub gpu_used_mem: Option<u64>, //gpu已用内存,单位是bytes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_load: Option<f32>, //gpu负载
+
+    #[serde(flatten)]
+    pub extra_info: HashMap<String, serde_json::Value>,
 }
 
 impl Deref for DeviceInfo {
@@ -608,6 +616,7 @@ impl DeviceInfo {
             gpu_total_mem: None,
             gpu_used_mem: None,
             gpu_load: None,
+            extra_info: HashMap::new(),
         };
 
         return result_info;
@@ -681,6 +690,7 @@ impl DeviceInfo {
             gpu_total_mem: None,
             gpu_used_mem: None,
             gpu_load: None,
+            extra_info: HashMap::new(),
         }
     }
 
