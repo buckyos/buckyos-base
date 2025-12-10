@@ -313,6 +313,213 @@ impl DIDDocumentTrait for DeviceConfig {
     // }
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct DeviceMiniInfo {
+    pub device_type: String,
+    pub arch: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_os_info: Option<String>,
+    pub state:String,//actived,inactive,error
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_url:Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_info: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_num: Option<u32>, //cpu核心数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mhz: Option<u32>, //cpu的最大性能,单位是MHZ
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_ratio: Option<f32>, //cpu的性能比率
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_mem: Option<u64>, //单位是bytes
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_space: Option<u64>, //单位是bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_usage: Option<u64>, //单位是bytes
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_info: Option<String>, //gpu信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_tflops: Option<f32>, //gpu的算力,单位是TFLOPS
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_total_mem: Option<u64>, //gpu总内存,单位是bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_used_mem: Option<u64>, //gpu已用内存,单位是bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_load: Option<f32>, //gpu负载
+}
+
+impl Default for DeviceMiniInfo {
+    fn default() -> Self {
+        Self {
+            device_type: "ood".to_string(),
+            arch: "".to_string(),
+            state: "inactive".to_string(),
+            active_url: None,
+            cpu_info: None,
+            cpu_num: None,
+            cpu_mhz: None,
+            cpu_ratio: None,
+            total_mem: None,
+            total_space: None,
+            disk_usage: None,
+            gpu_info: None,
+            gpu_tflops: None,
+            gpu_total_mem: None,
+            gpu_used_mem: None,
+            gpu_load: None,
+            base_os_info: None,
+        }
+    }
+}
+
+impl DeviceMiniInfo {
+    pub async fn auto_fill_by_system_info(&mut self) -> NSResult<()> {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
+        self.arch = System::cpu_arch();
+        // Get OS information
+        self.base_os_info = Some(format!(
+            "{} {} {}",
+            System::name().unwrap_or_default(),
+            System::os_version().unwrap_or_default(),
+            System::kernel_version().unwrap_or_default()
+        ));
+        // Get CPU information
+        let mut cpu_usage = 0.0;
+        let mut cpu_mhz: u32 = 0;
+        let mut cpu_mhz_last: u32 = 0;
+        let mut cpu_brand: String = "Unknown".to_string();
+        self.cpu_ratio = Some(1.0);
+        for cpu in sys.cpus() {
+            cpu_brand = cpu.brand().to_string();
+            cpu_usage += cpu.cpu_usage();
+            cpu_mhz += cpu.frequency() as u32;
+            cpu_mhz_last = cpu.frequency() as u32;
+        }
+        if cpu_mhz < 1000 {
+            cpu_mhz = 2000 * sys.cpus().len() as u32;
+            cpu_mhz_last = 2000;
+        }
+        self.cpu_info = Some(format!(
+            "{} @ {} MHz,({} cores)",
+            cpu_brand,
+            cpu_mhz_last,
+            sys.cpus().len()
+        ));
+        self.cpu_num = Some(sys.cpus().len() as u32);
+        self.cpu_mhz = Some(cpu_mhz);
+
+        // Get memory information
+        self.total_mem = Some(sys.total_memory());
+
+        // Get disk space information
+        let mut total_space = 0u64;
+        let mut used_space = 0u64;
+        let disks = Disks::new_with_refreshed_list();
+        for disk in disks.list() {
+            let total = disk.total_space();
+            let available = disk.available_space();
+            total_space += total;
+            used_space += total.saturating_sub(available);
+        }
+        self.total_space = Some(total_space);
+        self.disk_usage = Some(used_space);
+
+
+        // First try NVIDIA GPU
+        let nvidia_info = match nvml_wrapper::Nvml::init() {
+            Ok(nvml) => {
+                if let Ok(device) = nvml.device_by_index(0) {
+                    // Get GPU name
+                    let name = device.name().ok();
+                    let memory = device.memory_info().ok();
+                    let utilization = device.utilization_rates().ok();
+                    let clock = device.clock_info(Clock::Graphics).ok();
+                    let cuda_cores = device.num_cores().ok();
+
+                    Some((name, memory, utilization, clock, cuda_cores))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+
+        if let Some((name, memory, utilization, clock, cuda_cores)) = nvidia_info {
+            // NVIDIA GPU found
+            self.gpu_info = name.map(|n| format!("NVIDIA {}", n));
+            if let Some(mem) = memory {
+                self.gpu_total_mem = Some(mem.total);
+                self.gpu_used_mem = Some(mem.used);
+            }
+            if let Some(util) = utilization {
+                self.gpu_load = Some(util.gpu as f32);
+            }
+            if let (Some(clock), Some(cores)) = (clock, cuda_cores) {
+                let tflops = (clock as f32 * cores as f32 * 2.0) / 1_000_000.0;
+                self.gpu_tflops = Some(tflops);
+            }
+        } else {
+            // Try to get basic GPU info from system
+            #[cfg(target_os = "linux")]
+            {
+                use std::fs;
+                use std::path::Path;
+
+                let gpu_dir = Path::new("/sys/class/drm");
+                if gpu_dir.exists() {
+                    if let Ok(entries) = fs::read_dir(gpu_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if let Some(name) = path.file_name() {
+                                if name.to_string_lossy().starts_with("card") {
+                                    // Try to read vendor name
+                                    if let Ok(vendor) =
+                                        fs::read_to_string(path.join("device/vendor"))
+                                    {
+                                        let vendor = vendor.trim();
+                                        let gpu_type = match vendor {
+                                            "0x1002" => "AMD",
+                                            "0x8086" => "Intel",
+                                            _ => "Unknown",
+                                        };
+
+                                        // Try to read device name
+                                        if let Ok(device) =
+                                            fs::read_to_string(path.join("device/device"))
+                                        {
+                                            self.gpu_info = Some(format!(
+                                                "{} GPU (Device ID: {})",
+                                                gpu_type,
+                                                device.trim()
+                                            ));
+                                        } else {
+                                            self.gpu_info = Some(format!("{} GPU", gpu_type));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no GPU info was found
+        if self.gpu_info.is_none() {
+            self.gpu_info = Some("No GPU detected or unable to get GPU information".to_string());
+        }
+
+        Ok(())
+    }
+}
+
 // describe a device runtime info
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeviceInfo {
@@ -524,6 +731,18 @@ impl DeviceInfo {
         // Get memory information
         self.total_mem = Some(sys.total_memory());
         self.mem_usage = Some(sys.used_memory());
+        // Get disk space information
+        let mut total_space = 0u64;
+        let mut used_space = 0u64;
+        let disks = Disks::new_with_refreshed_list();
+        for disk in disks.list() {
+            let total = disk.total_space();
+            let available = disk.available_space();
+            total_space += total;
+            used_space += total.saturating_sub(available);
+        }
+        self.total_space = Some(total_space);
+        self.disk_usage = Some(used_space);
         // Get hostname if not already set
         self.sys_hostname = Some(System::host_name().unwrap_or_default());
 
@@ -643,6 +862,16 @@ impl DeviceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_device_mini_info() {
+        let mut device_mini_info = DeviceMiniInfo::default();
+        device_mini_info.auto_fill_by_system_info().await.unwrap();
+
+        device_mini_info.active_url = Some("./index.html".to_string());
+        let device_mini_info_json = serde_json::to_string_pretty(&device_mini_info).unwrap();
+        println!("{}", device_mini_info_json);
+    }
 
     #[tokio::test]
     async fn test_device_info() {
