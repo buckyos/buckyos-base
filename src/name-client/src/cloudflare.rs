@@ -156,7 +156,9 @@ impl NsUpdateProvider for CloudflareProvider {
                 RecordType::TXT => record
                     .txt
                     .clone()
-                    .ok_or_else(|| NSError::Failed("No TXT content provided".to_string()))?,
+                    .first()
+                    .ok_or_else(|| NSError::Failed("No TXT content provided".to_string()))?
+                    .clone(),
                 RecordType::CNAME => record
                     .cname
                     .clone()
@@ -274,17 +276,8 @@ impl NsProvider for CloudflareProvider {
             )));
         }
 
-        let mut name_info = NameInfo {
-            name: name.to_string(),
-            address: vec![],
-            cname: None,
-            txt: None,
-            did_document: None,
-            pk_x_list: None,
-            proof_type: crate::NameProof::None,
-            create_time: 0,
-            ttl: Some(records[0].ttl),
-        };
+        let mut name_info = NameInfo::default();
+
 
         match record_type {
             RecordType::A | RecordType::AAAA => {
@@ -295,7 +288,7 @@ impl NsProvider for CloudflareProvider {
                 }
             }
             RecordType::TXT => {
-                name_info.txt = Some(records[0].content.clone());
+                name_info.txt = vec![records[0].content.clone()];
             }
             RecordType::CNAME => {
                 name_info.cname = Some(records[0].content.clone());

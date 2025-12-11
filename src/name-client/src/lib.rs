@@ -183,7 +183,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_did_nameinfo() {
-        std::env::set_var("BUCKY_LOG", "debug");
+        unsafe { std::env::set_var("BUCKY_LOG", "debug") };
         let service_name = "name-client-test";
         let web3_bridge_config = get_default_web3_bridge_config();
         buckyos_kit::init_logging(service_name, false);

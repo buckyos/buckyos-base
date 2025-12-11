@@ -10,17 +10,16 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::{NSResult, NameInfo, NameProof, NsProvider, RecordType};
+use crate::DEFAULT_FRAGMENT;
+use crate::{NSResult, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 
 /* config file example (toml):
 
 [www.example.com]
-TTL=1800
-A=["192.168.1.102","192.168.1.103"]
-DID="did:example:1234567890"
-PKX="0:xxxxx"
-CNAME="www.abc.com"
+ttl=1800
+address=["192.168.1.102","192.168.1.103"]
+txt=["THIS_IS_TXT_RECORD"]
 
 ["*.example.com"]
 A=["192.168.1.104","192.168.1.105"]
@@ -34,30 +33,11 @@ MX=["mail.example.com"]
 
 */
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) struct DomainConfig {
-    #[serde(default)]
-    pub ttl: u32,
-    #[serde(default, rename = "A")]
-    pub a: Vec<String>,
-    #[serde(default, rename = "AAAA")]
-    pub aaaa: Vec<String>,
-    #[serde(default, rename = "MX")]
-    pub mx: Vec<String>,
-    #[serde(default, rename = "TXT")]
-    pub txt: Option<String>,
-    #[serde(default, rename = "DID")]
-    pub did: Option<String>,
-    #[serde(default, rename = "PKX")]
-    pub pkx: Vec<String>,
-    #[serde(default, rename = "CNAME")]
-    pub cname: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct DnsLocalConfig {
     #[serde(flatten)]
-    pub domains: HashMap<String, DomainConfig>,
+    pub domains: HashMap<String, NameInfo>,
 }
 
 pub struct LocalConfigDnsProvider {
@@ -157,80 +137,104 @@ impl LocalConfigDnsProvider {
             .all(|(p, n)| *p == "*" || *p == *n)
     }
 
-    fn convert_domain_config_to_records(
-        domain: &str,
-        config: &DomainConfig,
-        record_type: RecordType,
-    ) -> NSResult<NameInfo> {
-        let default_ttl = config.ttl;
-        let mut name_info = NameInfo {
-            name: domain.to_string(),
-            address: Vec::new(),
-            cname: None,
-            txt: None,
-            did_document: None,
-            pk_x_list: None,
-            proof_type: NameProof::None,
-            create_time: 0,
-            ttl: Some(default_ttl),
-        };
+    // fn convert_domain_config_to_records(
+    //     domain: &str,
+    //     config: &DomainConfig,
+    //     record_type: RecordType,
+    // ) -> NSResult<NameInfo> {
+    //     let default_ttl = config.ttl;
+    //     let mut name_info = NameInfo {
+    //         name: domain.to_string(),
+    //         address: Vec::new(),
+    //         cname: None,
+    //         txt: Vec::new(),
+    //         did_documents: HashMap::new(),
+    //         iat: 0,
+    //         ttl: Some(default_ttl),
+    //     };
 
-        match record_type {
-            RecordType::A => {
-                name_info.address = config
-                    .a
-                    .iter()
-                    .filter_map(|addr| IpAddr::from_str(addr).ok())
-                    .filter(|addr| addr.is_ipv4())
-                    .collect();
-                if name_info.address.len() < 1 {
-                    return Err(NSError::InvalidData);
-                }
-            }
-            RecordType::AAAA => {
-                name_info.address = config
-                    .aaaa
-                    .iter()
-                    .filter_map(|addr| IpAddr::from_str(addr).ok())
-                    .filter(|addr| addr.is_ipv6())
-                    .collect();
-                if name_info.address.len() < 1 {
-                    return Err(NSError::InvalidData);
-                }
-            }
-            RecordType::CNAME => {
-                if config.cname.is_some() {
-                    name_info.cname = config.cname.clone();
-                } else {
-                    return Err(NSError::InvalidData);
-                }
-            }
-            RecordType::TXT => {
-                name_info.txt = config.txt.clone();
-                if config.did.is_some() {
-                    let doc_doc_str = config.did.clone().unwrap();
-                    let did_doc = EncodedDocument::from_str(doc_doc_str)?;
-                    name_info.did_document = Some(did_doc);
-                }
-                if !config.pkx.is_empty() {
-                    name_info.pk_x_list = Some(config.pkx.clone());
-                }
-            }
-            _ => {
-                warn!(
-                    "record type {} not support in dns local file config provider",
-                    record_type.to_string()
-                );
-                return Err(NSError::InvalidData);
-            }
-        }
+    //     match record_type {
+    //         RecordType::A => {
+    //             name_info.address = config
+    //                 .a
+    //                 .iter()
+    //                 .filter_map(|addr| IpAddr::from_str(addr).ok())
+    //                 .filter(|addr| addr.is_ipv4())
+    //                 .collect();
+    //             if name_info.address.len() < 1 {
+    //                 return Err(NSError::InvalidData);
+    //             }
+    //         }
+    //         RecordType::AAAA => {
+    //             name_info.address = config
+    //                 .aaaa
+    //                 .iter()
+    //                 .filter_map(|addr| IpAddr::from_str(addr).ok())
+    //                 .filter(|addr| addr.is_ipv6())
+    //                 .collect();
+    //             if name_info.address.len() < 1 {
+    //                 return Err(NSError::InvalidData);
+    //             }
+    //         }
+    //         RecordType::CNAME => {
+    //             if config.cname.is_some() {
+    //                 name_info.cname = config.cname.clone();
+    //             } else {
+    //                 return Err(NSError::InvalidData);
+    //             }
+    //         }
+    //         RecordType::TXT => {
+    //             name_info.txt = config.txt.clone();
+    //             if config.did.is_some() {
+    //                 let doc_doc_str = config.did.clone().unwrap();
+    //                 let did_doc = EncodedDocument::from_str(doc_doc_str)?;
+    //                 name_info.did_document = Some(did_doc);
+    //             }
+    //             if !config.pkx.is_empty() {
+    //                 name_info._pk_x_list = Some(config.pkx.clone());
+    //             }
+    //         }
+    //         _ => {
+    //             warn!(
+    //                 "record type {} not support in dns local file config provider",
+    //                 record_type.to_string()
+    //             );
+    //             return Err(NSError::InvalidData);
+    //         }
+    //     }
 
-        Ok(name_info)
-    }
+    //     Ok(name_info)
+    // }
 
     pub fn get_all_domains(&self) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
         inner.config.domains.keys().cloned().collect()
+    }
+
+    pub fn get_name_info(&self, host_name: &str) -> NSResult<NameInfo> {
+        let mut inner = self.inner.lock().unwrap();
+
+        // TODO:每次请求都加载文件，可能有性能问题，应该由外部触发reload
+        if let Err(e) = Self::check_and_reload_config(&mut inner) {
+            warn!("Failed to reload config: {},still use old config", e);
+        }
+
+        // First check for exact match
+        let config = inner.config.domains.get(host_name);
+        if config.is_none() {
+            for (pattern, config) in &inner.config.domains {
+                if pattern.contains('*') {
+                    if Self::matches_wildcard(pattern, host_name) {
+                        debug!("{} found in matches_wildcard {}", host_name, pattern);
+                        return Ok(config.clone());
+                    }
+                }
+            }
+            return Err(NSError::NotFound(host_name.to_string()));
+        }
+        debug!("{} found in dns-local-config!", host_name);
+        let config = config.unwrap();
+        return Ok(config.clone());
     }
 }
 
@@ -243,89 +247,35 @@ impl NsProvider for LocalConfigDnsProvider {
     async fn query(
         &self,
         domain: &str,
-        record_type: Option<RecordType>,
+        _record_type: Option<RecordType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<NameInfo> {
-        let record_type = record_type.unwrap_or(RecordType::A);
         let mut domain = domain.to_string();
         if domain.ends_with(".") {
             domain = domain.trim_end_matches('.').to_string();
         }
+        let name_info = self.get_name_info(&domain)?;
+        let mut new_name_info = name_info.parse_did_document_to_txt_record()?;
+        new_name_info.name = domain.to_string();
 
-        // 获取内部配置的锁
-        let mut inner = self.inner.lock().unwrap();
-
-        // 检查并重新加载配置
-        if let Err(e) = Self::check_and_reload_config(&mut inner) {
-            warn!("Failed to reload config: {},still use old config", e);
-        }
-
-        // First check for exact match
-        let config = inner.config.domains.get(&domain);
-        if config.is_none() {
-            for (pattern, config) in &inner.config.domains {
-                if pattern.contains('*') {
-                    if Self::matches_wildcard(pattern, &domain) {
-                        debug!("{} found in matches_wildcard {}", domain, pattern);
-                        return Self::convert_domain_config_to_records(
-                            &domain,
-                            config,
-                            record_type,
-                        );
-                    }
-                }
-            }
-            return Err(NSError::NotFound(domain.to_string()));
-        }
-        debug!("{} found in dns-local-config!", &domain);
-        let config = config.unwrap();
-        return Self::convert_domain_config_to_records(&domain, config, record_type);
+        return Ok(new_name_info);
     }
 
     async fn query_did(
         &self,
         did: &DID,
-        _fragment: Option<&str>,
+        fragment: Option<&str>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        let domain = did.to_host_name();
-        // 获取内部配置的锁
-        let mut inner = self.inner.lock().unwrap();
-
-        // 检查并重新加载配置
-        if let Err(e) = Self::check_and_reload_config(&mut inner) {
-            warn!("Failed to reload config: {}", e);
+        let host_name = did.to_host_name();
+        let name_info = self.get_name_info(&host_name)?; 
+        let new_name_info = name_info.parse_txt_record_to_did_document()?;
+        let fragment = fragment.unwrap_or(DEFAULT_FRAGMENT);
+        let did_document = new_name_info.get_did_document(fragment);
+        if did_document.is_some() {
+            return Ok(did_document.unwrap().clone());
         }
-
-        // First check for exact match
-        let config = inner.config.domains.get(&domain);
-        if config.is_none() {
-            for (pattern, config) in &inner.config.domains {
-                if pattern.contains('*') {
-                    if Self::matches_wildcard(pattern, &domain) {
-                        if config.did.is_some() {
-                            debug!(
-                                "query_did: {} found in matches_wildcard {}",
-                                domain, pattern
-                            );
-                            let doc_doc_str = config.did.clone().unwrap();
-                            let did_doc = EncodedDocument::from_str(doc_doc_str)?;
-                            return Ok(did_doc);
-                        }
-                    }
-                }
-            }
-            return Err(NSError::NotFound(domain.to_string()));
-        }
-
-        debug!("query_did: {} found in dns-local-config!", domain);
-        let config = config.unwrap();
-        if config.did.is_some() {
-            let doc_doc_str = config.did.clone().unwrap();
-            let did_doc = EncodedDocument::from_str(doc_doc_str)?;
-            return Ok(did_doc);
-        }
-        return Err(NSError::NotFound(domain.to_string()));
+        return Err(NSError::NotFound(format!("DID Document not found: {}", fragment)));
     }
 }
 
@@ -341,21 +291,25 @@ mod tests {
         let config_content = r#"
 ["www.example.com"]
 ttl = 300
-A = ["192.168.1.1"]
-TXT="THISISATEST"
-DID="eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbIm9vZDEiXSwiZXhwIjoyMDU4ODM4OTM5LCJpYXQiOjE3NDM0Nzg5Mzl9.6p01rckQkSoZ4kMOQfqZ_JIfHisYI27xNMtmHdYiu_0J_FZC-9j6JzN8PO3PO2A9Eugwo2877LJ5cyHGYEIbCw"
+address = ["192.168.1.1"]
+txt = [
+"THISISATEST",
+"BOOT=eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg;",
+"PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;",
+"DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;"
+]
 
 ["*.example.com"]
 ttl = 300
-A = ["192.168.1.2"]
+address = ["192.168.1.2"]
 
 ["*.sub.example.com"]
 ttl = 300
-A = ["192.168.1.3"]
+address = ["192.168.1.3"]
 
 ["mail.example.com"]
 ttl = 300
-A = ["192.168.1.106"]
+address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -402,15 +356,21 @@ A = ["192.168.1.106"]
             .query_did(&DID::new("web", "www.example.com"), None, None)
             .await
             .unwrap();
-        assert_eq!(result.to_string(),"eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbIm9vZDEiXSwiZXhwIjoyMDU4ODM4OTM5LCJpYXQiOjE3NDM0Nzg5Mzl9.6p01rckQkSoZ4kMOQfqZ_JIfHisYI27xNMtmHdYiu_0J_FZC-9j6JzN8PO3PO2A9Eugwo2877LJ5cyHGYEIbCw");
 
+        let _boot_config = ZoneBootConfig::decode(&result, None).unwrap();
+        let result = provider
+            .query_did(&DID::new("web", "www.example.com"), Some("boot"), None)
+            .await
+            .unwrap();
+        let boot_jwt = result.to_string();
+        assert_eq!(boot_jwt.as_str(),"eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg");
+ 
         let result = provider
             .query("www.example.com", Some(RecordType::TXT), None)
             .await
             .unwrap();
         assert_eq!(result.name, "www.example.com");
         assert_eq!(result.ttl.unwrap(), 300);
-        assert_eq!(result.txt, Some("THISISATEST".to_string()));
 
         // Test wildcard domain match
         let result = provider
@@ -427,6 +387,13 @@ A = ["192.168.1.106"]
             .unwrap();
         assert_eq!(result.name, "foo.sub.example.com");
         assert_eq!(result.ttl.unwrap(), 300);
+
+        let result = provider.query("mail.example.com", Some(RecordType::AAAA), None)
+            .await
+            .unwrap();
+        assert_eq!(result.name, "mail.example.com");
+        assert_eq!(result.address.len(), 1);
+        assert_eq!(result.address[0].to_string(), "2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa");
 
         // Test non-existent domain
         let result = provider

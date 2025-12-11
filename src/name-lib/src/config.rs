@@ -281,10 +281,6 @@ pub struct ZoneBootConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_key: Option<Jwk>, //PKX=0:xxxxxxx;
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(default)]
-    //已经过时，但为了向下兼容，保留该字段
-    pub gateway_devs: Vec<DID>,
     #[serde(skip_serializing)]
     #[serde(default)]
     //device name -> device config jwt,
@@ -372,17 +368,7 @@ impl DIDDocumentTrait for ZoneBootConfig {
             let device_config = device_config.unwrap();
             return device_config.get_exchange_key(None);
         }
-
-        if self.gateway_devs.is_empty() {
-            return None;
-        }
-        warn!("get_exchange_key: use pkx1 to get exchange key,this is deprecated.please add device_config_jwt to your TXT record!");
-        let did = self.gateway_devs[0].clone();
-        let key = did.get_auth_key();
-        if key.is_none() {
-            return None;
-        }
-        return Some(key.unwrap());
+        return None;
     }
 
     fn get_iss(&self) -> Option<String> {
@@ -1268,7 +1254,6 @@ mod tests {
             owner: None,
             owner_key: None,
             devices: HashMap::new(),
-            gateway_devs: vec![],
             extra_info: HashMap::new(),
         };
         let zone_boot_config_json_str = serde_json::to_string_pretty(&zone_boot_config).unwrap();
@@ -2375,7 +2360,6 @@ mod tests {
             owner: None,
             owner_key: None,
             devices: HashMap::new(),
-            gateway_devs: vec![],
             extra_info: extera_info,
         };
 

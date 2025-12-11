@@ -231,7 +231,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             owner: None,
             owner_key: None,
             devices: HashMap::new(),
-            gateway_devs: vec![],
             extra_info,
         };
         EncodedDocument::JsonLd(serde_json::to_value(zone_boot_config).unwrap())

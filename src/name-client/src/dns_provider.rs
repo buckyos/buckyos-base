@@ -1,14 +1,17 @@
 #![allow(unused)]
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
+use buckyos_kit::buckyos_get_unix_timestamp;
 use hickory_resolver::proto::rr::record_type;
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::{config::*, Resolver};
 use jsonwebtoken::DecodingKey;
+use serde_json::json;
 
-use crate::{NameInfo, NameProof, NsProvider, RecordType};
+use crate::{DEFAULT_FRAGMENT, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -29,6 +32,8 @@ impl DnsProvider {
         }
         Ok(Self { dns_server: None })
     }
+
+    
 
     // fn parse_dns_response(resp: DnsResponse) -> NSResult<NameInfo> {
     //     let mut txt_list = Vec::new();
@@ -110,7 +115,7 @@ impl NsProvider for DnsProvider {
                     )));
                 }
                 let response = response.unwrap();
-                let mut whole_txt = String::new();
+                let mut txt_vec = Vec::new();
                 for record in response.iter() {
                     let txt = record
                         .txt_data()
@@ -121,19 +126,18 @@ impl NsProvider for DnsProvider {
                         })
                         .collect::<Vec<String>>()
                         .join("");
-                    whole_txt.push_str(&txt);
+                    txt_vec.push(txt);
                 }
 
+                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
                 let name_info = NameInfo {
                     name: name.to_string(),
                     address: Vec::new(),
                     cname: None,
-                    txt: Some(whole_txt),
-                    did_document: None,
-                    pk_x_list: None,
-                    proof_type: NameProof::None,
-                    create_time: 0,
-                    ttl: None,
+                    txt: txt_vec,
+                    did_documents: HashMap::new(),
+                    iat: buckyos_get_unix_timestamp(),
+                    ttl: Some(ttl),
                 };
                 return Ok(name_info);
             }
@@ -150,155 +154,154 @@ impl NsProvider for DnsProvider {
                 for ip in response.iter() {
                     addrs.push(ip);
                 }
+                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
                 let name_info = NameInfo {
                     name: name.to_string(),
                     address: addrs,
                     cname: None,
-                    txt: None,
-                    did_document: None,
-                    pk_x_list: None,
-                    proof_type: NameProof::None,
-                    create_time: 0,
-                    ttl: None,
+                    txt: Vec::new(),
+                    did_documents: HashMap::new(),
+                    iat: buckyos_get_unix_timestamp(),
+                    ttl: Some(ttl),
                 };
                 return Ok(name_info);
             }
-            RecordType::DID => {
-                let response = resolver.txt_lookup(name).await;
-                if response.is_err() {
-                    warn!(
-                        "lookup {} txt record failed! {}",
-                        name,
-                        response.err().unwrap()
-                    );
-                    return Err(NSError::Failed(format!("lookup txt failed! {}", name)));
-                }
-                let response = response.unwrap();
-                //let mut did_tx:String;
-                //let mut did_doc = DIDSimpleDocument::new();
-                let mut pkx_list = Vec::new();
-                let mut devices = Vec::new();
-                let mut name_info = NameInfo {
-                    name: name.to_string(),
-                    address: Vec::new(),
-                    cname: None,
-                    txt: None,
-                    did_document: None,
-                    pk_x_list: None,
-                    proof_type: NameProof::None,
-                    create_time: 0,
-                    ttl: None,
-                };
-                for record in response.iter() {
-                    let txt = record
-                        .txt_data()
-                        .iter()
-                        .map(|s| -> String {
-                            let byte_slice: &[u8] = &s;
-                            return String::from_utf8_lossy(byte_slice).to_string();
-                        })
-                        .collect::<Vec<String>>()
-                        .join("");
+            // RecordType::DID => {
+            //     let response = resolver.txt_lookup(name).await;
+            //     if response.is_err() {
+            //         warn!(
+            //             "lookup {} txt record failed! {}",
+            //             name,
+            //             response.err().unwrap()
+            //         );
+            //         return Err(NSError::Failed(format!("lookup txt failed! {}", name)));
+            //     }
+            //     let response = response.unwrap();
+            //     //let mut did_tx:String;
+            //     //let mut did_doc = DIDSimpleDocument::new();
+            //     let mut pkx_list = Vec::new();
+            //     let mut devices = Vec::new();
+            //     let mut name_info = NameInfo {
+            //         name: name.to_string(),
+            //         address: Vec::new(),
+            //         cname: None,
+            //         txt: None,
+            //         did_document: None,
+            //         _pk_x_list: None,
+            //         proof_type: NameProof::None,
+            //         iat: 0,
+            //         ttl: None,
+            //     };
+            //     for record in response.iter() {
+            //         let txt = record
+            //             .txt_data()
+            //             .iter()
+            //             .map(|s| -> String {
+            //                 let byte_slice: &[u8] = &s;
+            //                 return String::from_utf8_lossy(byte_slice).to_string();
+            //             })
+            //             .collect::<Vec<String>>()
+            //             .join("");
 
-                    if txt.starts_with("DID=") {
-                        let did_payload = txt.trim_start_matches("DID=").trim_end_matches(";");
-                        debug!("did_payload: {}", did_payload);
+            //         if txt.starts_with("DID=") {
+            //             let did_payload = txt.trim_start_matches("DID=").trim_end_matches(";");
+            //             debug!("did_payload: {}", did_payload);
 
-                        let did_doc = EncodedDocument::Jwt(did_payload.to_string());
-                        name_info.did_document = Some(did_doc);
-                    }
+            //             let did_doc = EncodedDocument::Jwt(did_payload.to_string());
+            //             name_info.did_document = Some(did_doc);
+            //         }
 
-                    if txt.starts_with("PKX=") {
-                        let pkx = txt.trim_start_matches("PKX=").trim_end_matches(";");
-                        pkx_list.push(pkx.to_string());
-                    }
+            //         if txt.starts_with("PKX=") {
+            //             let pkx = txt.trim_start_matches("PKX=").trim_end_matches(";");
+            //             pkx_list.push(pkx.to_string());
+            //         }
 
-                    if txt.starts_with("DEV=") {
-                        let dev_payload = txt.trim_start_matches("DEV=").trim_end_matches(";");
-                        debug!("zone_boot_config device payload: {}", dev_payload);
-                        devices.push(dev_payload.to_string());
-                    }
-                }
+            //         if txt.starts_with("DEV=") {
+            //             let dev_payload = txt.trim_start_matches("DEV=").trim_end_matches(";");
+            //             debug!("zone_boot_config device payload: {}", dev_payload);
+            //             devices.push(dev_payload.to_string());
+            //         }
+            //     }
 
-                if name_info.did_document.is_none() {
-                    return Err(NSError::Failed("DID Document not found".to_string()));
-                }
-                if pkx_list.len() > 0 {
-                    debug!("pkx_list: {:?}", pkx_list);
-                    name_info.pk_x_list = Some(pkx_list);
+            //     if name_info.did_document.is_none() {
+            //         return Err(NSError::Failed("DID Document not found".to_string()));
+            //     }
+            //     if pkx_list.len() > 0 {
+            //         debug!("pkx_list: {:?}", pkx_list);
+            //         name_info._pk_x_list = Some(pkx_list);
 
-                    //verify did_document by pkx_list
-                    let jwt_str = name_info.did_document.as_ref().unwrap();
-                    let owner_public_key = name_info.get_owner_pk();
-                    if owner_public_key.is_none() {
-                        return Err(NSError::Failed("Owner public key not found".to_string()));
-                    }
-                    let public_key_jwk = owner_public_key.unwrap();
-                    let public_key = DecodingKey::from_jwk(&public_key_jwk);
-                    if public_key.is_err() {
-                        error!("parse public key failed! {}", public_key.err().unwrap());
-                        return Err(NSError::Failed("parse public key failed! ".to_string()));
-                    }
-                    let public_key = public_key.unwrap();
+            //         //verify did_document by pkx_list
+            //         let jwt_str = name_info.did_document.as_ref().unwrap();
+            //         let owner_public_key = name_info.get_owner_pk();
+            //         if owner_public_key.is_none() {
+            //             return Err(NSError::Failed("Owner public key not found".to_string()));
+            //         }
+            //         let public_key_jwk = owner_public_key.unwrap();
+            //         let public_key = DecodingKey::from_jwk(&public_key_jwk);
+            //         if public_key.is_err() {
+            //             error!("parse public key failed! {}", public_key.err().unwrap());
+            //             return Err(NSError::Failed("parse public key failed! ".to_string()));
+            //         }
+            //         let public_key = public_key.unwrap();
 
-                    let mut zone_boot_config = ZoneBootConfig::decode(&jwt_str, Some(&public_key));
-                    if zone_boot_config.is_err() {
-                        return Err(NSError::Failed(
-                            "parse zone boot config failed!".to_string(),
-                        ));
-                    }
+            //         let mut zone_boot_config = ZoneBootConfig::decode(&jwt_str, Some(&public_key));
+            //         if zone_boot_config.is_err() {
+            //             return Err(NSError::Failed(
+            //                 "parse zone boot config failed!".to_string(),
+            //             ));
+            //         }
 
-                    let mut zone_boot_config = zone_boot_config.unwrap();
+            //         let mut zone_boot_config = zone_boot_config.unwrap();
 
-                    //NOTICE: 因为zone_boot_config为了减少字节数，owner通常为空，因此不在这里验证pkx0,外部使用时应首先对owner_key进行验证
-                    let public_key = DecodingKey::from_jwk(&public_key_jwk);
-                    if public_key.is_err() {
-                        return Err(NSError::Failed("parse public key failed!".to_string()));
-                    }
-                    let public_key = public_key.unwrap();
-                    zone_boot_config.owner_key = Some(public_key_jwk.clone());
-                    zone_boot_config.id = Some(DID::from_str(name).unwrap());
+            //         //NOTICE: 因为zone_boot_config为了减少字节数，owner通常为空，因此不在这里验证pkx0,外部使用时应首先对owner_key进行验证
+            //         let public_key = DecodingKey::from_jwk(&public_key_jwk);
+            //         if public_key.is_err() {
+            //             return Err(NSError::Failed("parse public key failed!".to_string()));
+            //         }
+            //         let public_key = public_key.unwrap();
+            //         zone_boot_config.owner_key = Some(public_key_jwk.clone());
+            //         zone_boot_config.id = Some(DID::from_str(name).unwrap());
 
-                    if devices.len() > 0 {
-                        for device_jwt in devices {
-                            //用zone_boot_config.owner_key验证device_jwt
-                            let device_mini_config =
-                                DeviceMiniConfig::from_jwt(&device_jwt, &public_key);
-                            if device_mini_config.is_err() {
-                                error!(
-                                    "decode device mini config from jwt {:?} failed! {}",
-                                    device_jwt,
-                                    device_mini_config.err().unwrap()
-                                );
-                            } else {
-                                let device_mini_config = device_mini_config.unwrap();
-                                let device_config = DeviceConfig::new_by_mini_config(
-                                    device_mini_config,
-                                    DID::from_str(name).unwrap(),
-                                    DID::from_str(name).unwrap(),
-                                );
-                                zone_boot_config
-                                    .devices
-                                    .insert(device_config.name.clone(), device_config);
-                            }
-                        }
-                    }
+            //         if devices.len() > 0 {
+            //             for device_jwt in devices {
+            //                 //用zone_boot_config.owner_key验证device_jwt
+            //                 let device_mini_config =
+            //                     DeviceMiniConfig::from_jwt(&device_jwt, &public_key);
+            //                 if device_mini_config.is_err() {
+            //                     error!(
+            //                         "decode device mini config from jwt {:?} failed! {}",
+            //                         device_jwt,
+            //                         device_mini_config.err().unwrap()
+            //                     );
+            //                 } else {
+            //                     let device_mini_config = device_mini_config.unwrap();
+            //                     let device_config = DeviceConfig::new_by_mini_config(
+            //                         device_mini_config,
+            //                         DID::from_str(name).unwrap(),
+            //                         DID::from_str(name).unwrap(),
+            //                     );
+            //                     zone_boot_config
+            //                         .devices
+            //                         .insert(device_config.name.clone(), device_config);
+            //                 }
+            //             }
+            //         }
 
-                    let gateway_devs = name_info.get_gateway_device_list();
-                    if gateway_devs.is_some() {
-                        zone_boot_config.gateway_devs = gateway_devs.unwrap();
-                    }
+            //         let gateway_devs = name_info.get_gateway_device_list();
+            //         if gateway_devs.is_some() {
+            //             zone_boot_config.gateway_devs = gateway_devs.unwrap();
+            //         }
 
-                    info!(
-                        "resolve & verify zone_boot_config from {} TXT record OK.",
-                        name
-                    );
-                    let zone_boot_config_value = serde_json::to_value(&zone_boot_config).unwrap();
-                    //info!("zone_boot_config_value: {:?}",zone_boot_config_value);
-                    name_info.did_document = Some(EncodedDocument::JsonLd(zone_boot_config_value));
-                }
-                return Ok(name_info);
-            }
+            //         info!(
+            //             "resolve & verify zone_boot_config from {} TXT record OK.",
+            //             name
+            //         );
+            //         let zone_boot_config_value = serde_json::to_value(&zone_boot_config).unwrap();
+            //         //info!("zone_boot_config_value: {:?}",zone_boot_config_value);
+            //         name_info.did_document = Some(EncodedDocument::JsonLd(zone_boot_config_value));
+            //     }
+            //     return Ok(name_info);
+            // }
             _ => {
                 return Err(NSError::Failed(format!(
                     "Invalid record type: {:?}",
@@ -314,13 +317,19 @@ impl NsProvider for DnsProvider {
         fragment: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        info!("query_did: {}", did.to_string());
+        
         let name_info = self
-            .query(&did.to_host_name(), Some(RecordType::DID), None)
+            .query(&did.to_host_name(), Some(RecordType::TXT), None)
             .await?;
-        if name_info.did_document.is_some() {
-            return Ok(name_info.did_document.unwrap());
+
+        //识别TXT记录中的特殊记录
+        let new_name_info = name_info.parse_txt_record_to_did_document()?;
+
+        let fragment = fragment.unwrap_or(DEFAULT_FRAGMENT);
+        let did_document = new_name_info.get_did_document(fragment);
+        if did_document.is_some() {
+            return Ok(did_document.unwrap().clone());
         }
-        return Err(NSError::Failed("DID Document not found".to_string()));
+        return Err(NSError::NotFound(format!("DID Document not found: {}", fragment)));
     }
 }
