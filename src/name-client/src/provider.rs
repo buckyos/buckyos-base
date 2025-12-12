@@ -109,15 +109,9 @@ impl Default for NameInfo {
 
 impl NameInfo {
     pub fn new(domain: &str) -> Self {
-        return NameInfo {
-            name: domain.to_string(),
-            address: Vec::new(),
-            cname: None,
-            txt: Vec::new(),
-            did_documents: HashMap::new(),
-            iat: 0,
-            ttl: None,
-        };
+        let mut result = Self::default();
+        result.name = domain.to_string();
+        return result;
     }
 
     pub fn from_address(name: &str, address: IpAddr) -> Self {

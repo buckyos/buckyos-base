@@ -13,6 +13,70 @@ pub enum KVAction {
                                                    //Create(String),
 }
 
+
+
+pub fn apply_params_to_json(input_json: &Value, ext_params: Option<&HashMap<String, String>>) -> Result<Value, String> {
+    let mut real_params = HashMap::new();
+    
+    // 先添加内部参数
+    let inneer_params = input_json.get("params");
+    if inneer_params.is_some() {
+        let result  = serde_json::from_value(inneer_params.unwrap().clone());
+        if result.is_err() {
+            return Err(format!("Failed to parse inner params: {}", result.err().unwrap()));
+        }
+        let inner_params : HashMap<String, String> = result.unwrap();
+        real_params.extend(inner_params.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    
+    // 再添加外部参数，外部参数会覆盖内部参数
+    if ext_params.is_some() {
+        real_params.extend(ext_params.unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    if real_params.is_empty() {
+        return Ok(input_json.clone());
+    }
+
+    //展开json成string
+    let json_str = serde_json::to_string(input_json)
+        .map_err(|e| format!("Failed to serialize JSON: {}", e))?;
+
+    //对string中的{{param}} 进行替换
+    let mut result_str = json_str;
+    for (key, value) in real_params.iter() {
+        let pattern = format!("{{{{{}}}}}", key);
+        result_str = result_str.replace(&pattern, value);
+    }
+
+    //判断是否有未替换的{{}}
+    if result_str.contains("{{") && result_str.contains("}}") {
+        // 找出所有未替换的参数
+        let mut unreplaced = Vec::new();
+        let mut start = 0;
+        while let Some(open_pos) = result_str[start..].find("{{") {
+            let abs_open_pos = start + open_pos;
+            if let Some(close_pos) = result_str[abs_open_pos..].find("}}") {
+                let param = &result_str[abs_open_pos + 2..abs_open_pos + close_pos];
+                unreplaced.push(param.to_string());
+                start = abs_open_pos + close_pos + 2;
+            } else {
+                break;
+            }
+        }
+        if !unreplaced.is_empty() {
+            return Err(format!("Found unreplaced template parameters: {:?}", unreplaced));
+        }
+    }
+
+    //再次转换成json
+    let result_json = serde_json::from_str(&result_str)
+        .map_err(|e| format!("Failed to parse JSON after parameter replacement: {}", e))?;
+
+    Ok(result_json)
+
+}
+
 pub fn split_json_path(path: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -277,5 +341,105 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn test_apply_params_to_json() {
+        // Test 1: 使用外部参数替换
+        let input = json!({
+            "name": "{{user_name}}",
+            "age": "{{user_age}}",
+            "city": "{{city}}"
+        });
+        let mut ext_params = HashMap::new();
+        ext_params.insert("user_name".to_string(), "Alice".to_string());
+        ext_params.insert("user_age".to_string(), "30".to_string());
+        ext_params.insert("city".to_string(), "New York".to_string());
+        
+        let result = apply_params_to_json(&input, Some(&ext_params)).unwrap();
+        assert_eq!(result.get("name").unwrap().as_str().unwrap(), "Alice");
+        assert_eq!(result.get("age").unwrap().as_str().unwrap(), "30");
+        assert_eq!(result.get("city").unwrap().as_str().unwrap(), "New York");
+
+        // Test 2: 使用内部参数替换
+        let input_with_inner = json!({
+            "params": {
+                "service_name": "api-server",
+                "port": "8080"
+            },
+            "config": {
+                "name": "{{service_name}}",
+                "endpoint": "http://localhost:{{port}}"
+            }
+        });
+        
+        let result = apply_params_to_json(&input_with_inner, None).unwrap();
+        assert_eq!(
+            result.get("config").unwrap().get("name").unwrap().as_str().unwrap(),
+            "api-server"
+        );
+        assert_eq!(
+            result.get("config").unwrap().get("endpoint").unwrap().as_str().unwrap(),
+            "http://localhost:8080"
+        );
+
+        // Test 3: 外部参数覆盖内部参数
+        let input = json!({
+            "params": {
+                "env": "dev"
+            },
+            "environment": "{{env}}"
+        });
+        let mut ext_params = HashMap::new();
+        ext_params.insert("env".to_string(), "production".to_string());
+        
+        let result = apply_params_to_json(&input, Some(&ext_params)).unwrap();
+        assert_eq!(
+            result.get("environment").unwrap().as_str().unwrap(),
+            "production"
+        );
+
+        // Test 4: 没有参数的情况，直接返回原JSON
+        let input = json!({
+            "name": "Bob",
+            "age": 25
+        });
+        
+        let result = apply_params_to_json(&input, None).unwrap();
+        assert_eq!(result, input);
+
+        // Test 5: 存在未替换的参数应该返回错误
+        let input = json!({
+            "name": "{{user_name}}",
+            "age": "{{user_age}}"
+        });
+        let mut ext_params = HashMap::new();
+        ext_params.insert("user_name".to_string(), "Charlie".to_string());
+        
+        let result = apply_params_to_json(&input, Some(&ext_params));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("user_age"));
+
+        // Test 6: 嵌套对象中的参数替换
+        let input = json!({
+            "params": {
+                "db_host": "localhost",
+                "db_port": "5432",
+                "db_name": "mydb"
+            },
+            "database": {
+                "connection": {
+                    "host": "{{db_host}}",
+                    "port": "{{db_port}}",
+                    "database": "{{db_name}}"
+                }
+            }
+        });
+        
+        let result = apply_params_to_json(&input, None).unwrap();
+        let connection = result.get("database").unwrap().get("connection").unwrap();
+        assert_eq!(connection.get("host").unwrap().as_str().unwrap(), "localhost");
+        assert_eq!(connection.get("port").unwrap().as_str().unwrap(), "5432");
+        assert_eq!(connection.get("database").unwrap().as_str().unwrap(), "mydb");
     }
 }
