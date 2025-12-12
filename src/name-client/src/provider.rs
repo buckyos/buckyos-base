@@ -218,7 +218,7 @@ impl NameInfo {
                     //用zone_boot_config.owner_key验证device_jwt
                     let device_mini_config = DeviceMiniConfig::from_jwt(&device_jwt, &owner_public_key)?;
                     let device_config = DeviceConfig::new_by_mini_config(
-                        device_mini_config,
+                        &device_mini_config,
                         DID::from_str(host_name.as_str()).unwrap(),
                         DID::from_str(host_name.as_str()).unwrap(),
                     );

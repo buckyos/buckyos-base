@@ -21,6 +21,8 @@ use nvml_wrapper::enum_wrappers::device::Clock;
 use nvml_wrapper::*;
 use sysinfo::{Components, Disks, Networks, System};
 
+
+
 pub enum DeviceType {
     OOD,    //run system config service
     Node,   //run other service
@@ -44,6 +46,19 @@ pub struct DeviceMiniConfig {
 }
 
 impl DeviceMiniConfig {
+
+    pub fn new_by_device_config(device_config: &DeviceConfig) -> Self {
+        let default_key = device_config.get_default_key().unwrap();
+        let x = get_x_from_jwk(&default_key).unwrap();
+        Self {
+            name: device_config.name.clone(),
+            x,
+            rtcp_port: device_config.rtcp_port.clone(),
+            exp: device_config.exp,
+            extra_info: HashMap::new(),
+        }
+    }
+
     pub fn to_jwt(&self, owner_private_key: &EncodingKey) -> NSResult<String> {
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
@@ -108,7 +123,7 @@ impl DeviceConfig {
     }
 
     pub fn new_by_mini_config(
-        mini_config: DeviceMiniConfig,
+        mini_config: &DeviceMiniConfig,
         zone_did: DID,
         owner_did: DID,
     ) -> Self {
@@ -145,7 +160,7 @@ impl DeviceConfig {
             iss: owner_did.to_string(),
             exp: mini_config.exp,
             iat: mini_config.exp - DEFAULT_EXPIRE_TIME,
-            extra_info: mini_config.extra_info,
+            extra_info: HashMap::new(),
         }
     }
 
@@ -935,12 +950,21 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         println!("jwt decoded json: {}", mini_config_from_jwt_json);
 
         let device_config = DeviceConfig::new_by_mini_config(
-            mini_config,
+            &mini_config,
             DID::new("bns", "ood1"),
             DID::new("bns", "lzc"),
         );
         let device_config_json = serde_json::to_string_pretty(&device_config).unwrap();
         println!("{}", device_config_json);
+
+        let device_mini_config = DeviceMiniConfig::new_by_device_config(&device_config);
+        assert_eq!(mini_config, device_mini_config);
+        let device_mini_config_json = serde_json::to_string_pretty(&device_mini_config).unwrap();
+        println!("{}", device_mini_config_json);
+
+        let device_mini_config_jwt = device_mini_config.to_jwt(&owner_private_key).unwrap();
+        println!("device mini config jwt: {}", device_mini_config_jwt);
+        assert_eq!(mini_jwt, device_mini_config_jwt);
     }
 
     #[tokio::test]

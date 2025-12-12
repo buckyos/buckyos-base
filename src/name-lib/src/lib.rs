@@ -53,7 +53,9 @@ pub struct NodeIdentityConfig {
     pub owner_public_key: jsonwebtoken::jwk::Jwk, //owner is zone_owner, must same as zone_config.default_auth_key
     pub owner_did: DID,                           //owner's did
     pub device_doc_jwt: String,                   //device document,jwt string,siged by owner
+    pub device_mini_doc_jwt: String,               //device mini document,jwt string,siged by owner
     pub zone_iat: u32,
+    
     //device_private_key: ,storage in partical file
 }
 
