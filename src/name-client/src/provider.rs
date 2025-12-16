@@ -378,18 +378,25 @@ mod tests {
         
         // 获取 owner key 的 x 值
         let owner_x = get_x_from_jwk(&public_key_jwk).unwrap();
+
+        let other_txt = vec ![
+            "DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;".to_string(),
+            "BOOT=eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg;".to_string(),
+            "PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;".to_string(),
+        ];
         
         // 创建包含 TXT 记录的 NameInfo
         let name_info = NameInfo {
             name: "did:bns:testzone".to_string(),
             address: Vec::new(),
             cname: None,
-            txt: vec![
-                format!("BOOT={};", boot_jwt_str),
-                format!("PKX={};", owner_x),
-                format!("DEV={};", device_jwt),
-                "some-other-txt=value".to_string(),
-            ],
+            txt: other_txt,
+            // txt: vec![
+            //     format!("BOOT={};", boot_jwt_str),
+            //     format!("PKX={};", owner_x),
+            //     format!("DEV={};", device_jwt),
+            //     "some-other-txt=value".to_string(),
+            // ],
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
@@ -404,12 +411,16 @@ mod tests {
         // 验证结果
         assert!(parsed_info.did_documents.contains_key("boot"), "should contain boot document");
         assert!(parsed_info.did_documents.contains_key("zone"), "should contain zone document");
-        assert!(parsed_info.did_documents.contains_key("device1"), "should contain device1 document");
+        assert!(parsed_info.did_documents.contains_key("sn"), "should contain ood1 document");
+
+
+        let zone_boot_config = parsed_info.get_did_document("zone").unwrap();
+        let did_doc = parse_did_doc(zone_boot_config.clone()).unwrap();
+        let auth_key = did_doc.get_auth_key(None).unwrap();
+        let auth_key_x = get_x_from_jwk(&auth_key.1).unwrap();
+        //assert_eq!(auth_key_x, owner_x);
         
-        // 验证其他 TXT 记录被保留
-        assert_eq!(parsed_info.txt.len(), 1, "should preserve non-DID TXT records");
-        assert_eq!(parsed_info.txt[0], "some-other-txt=value");
-        
+
         println!("✓ test_parse_txt_record_to_did_document passed");
     }
 

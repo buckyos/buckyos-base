@@ -330,6 +330,7 @@ impl NsProvider for DnsProvider {
         if did_document.is_some() {
             return Ok(did_document.unwrap().clone());
         }
+        warn!("NsProvider::query_did{}: DID Document not found: {}", did.to_host_name(), fragment);
         return Err(NSError::NotFound(format!("DID Document not found: {}", fragment)));
     }
 }
