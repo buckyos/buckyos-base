@@ -25,6 +25,11 @@ use crate::{
 use crate::{DIDDocumentTrait, EncodedDocument};
 use crate::{NSError, NSResult};
 
+// Helper function for serde skip_serializing_if
+fn is_hashmap_empty<K, V>(map: &HashMap<K, V>) -> bool {
+    map.is_empty()
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub(crate) struct VerificationMethodNode {
     #[serde(rename = "type")]
@@ -281,8 +286,8 @@ pub struct ZoneBootConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_key: Option<Jwk>, //PKX=0:xxxxxxx;
 
-    #[serde(skip_serializing)]
     #[serde(default)]
+    #[serde(skip_serializing_if = "is_hashmap_empty")]
     //device name -> device config jwt,
     pub devices: HashMap<String, DeviceConfig>,
 }
