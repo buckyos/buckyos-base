@@ -322,6 +322,8 @@ impl NsProvider for DnsProvider {
             .query(&did.to_host_name(), Some(RecordType::TXT), None)
             .await?;
 
+        info!("NsProvicer will parse_txt_record_to_did_document... for {}",did.to_host_name());
+
         //识别TXT记录中的特殊记录
         let new_name_info = name_info.parse_txt_record_to_did_document()?;
 
