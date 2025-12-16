@@ -179,6 +179,7 @@ impl NameInfo {
         let mut new_txt_vec = Vec::new();
 
         for txt in self.txt.iter() {
+            info!("- TXT:{}",txt);
             if txt.starts_with("BOOT=") {
                 boot_payload = txt.trim_start_matches("BOOT=").trim_end_matches(";").to_string();
                 boot_jwt = Some(EncodedDocument::Jwt(boot_payload.clone()));
@@ -216,7 +217,12 @@ impl NameInfo {
             if devices.len() > 0 {
                 for device_jwt in devices {
                     //用zone_boot_config.owner_key验证device_jwt
-                    let device_mini_config = DeviceMiniConfig::from_jwt(&device_jwt, &owner_public_key)?;
+                    let device_mini_config = DeviceMiniConfig::from_jwt(&device_jwt, &owner_public_key);
+                    if device_mini_config.is_err()  {
+                        warn!("{} in not device_minit_config jwt",device_jwt);
+                        continue;
+                    }
+                    let device_mini_config = device_mini_config.unwrap();
                     let device_config = DeviceConfig::new_by_mini_config(
                         &device_mini_config,
                         DID::from_str(host_name.as_str()).unwrap(),
