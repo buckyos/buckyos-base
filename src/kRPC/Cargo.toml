@@ -13,7 +13,7 @@ serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 thiserror = "*"
 openssl = { version = "*", features = ["vendored"] }
-reqwest = {version = "*", features = ["json", "rustls-tls"]}
+reqwest = {version = "*", features = ["json","rustls-tls-native-roots"]}
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 buckyos-kit = { path = "../buckyos-kit" }
