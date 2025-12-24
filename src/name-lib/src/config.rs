@@ -597,7 +597,7 @@ impl ZoneConfig {
         if boot_config.owner_key.is_some() {
             self.verification_method[0].public_key = boot_config.owner_key.clone().unwrap();
         }
-        self.extra_info.extend(boot_config.extra_info.clone());
+        //self.extra_info.extend(boot_config.extra_info.clone());
     }
 
     pub fn get_zone_short_name(&self) -> String {
