@@ -5,7 +5,7 @@ use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
+use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::net::{IpAddr, Ipv6Addr};
 use std::ops::Deref;
 use std::str::FromStr;
@@ -103,8 +103,10 @@ pub struct DeviceConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rtcp_port: Option<u32>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip: Option<IpAddr>, //main_ip
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ips: Vec<IpAddr>, //main_ip
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub net_id: Option<String>, // lan1 | wan, when None it represents lan0
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,7 +143,7 @@ impl DeviceConfig {
             id: DID::from_str(&did).unwrap(),
             name: mini_config.name.clone(),
             device_type: "ood".to_string(),
-            ip: None,
+            ips: vec![],
             net_id: None,
             ddns_sn_url: None,
             rtcp_port: mini_config.rtcp_port,
@@ -180,7 +182,7 @@ impl DeviceConfig {
             id: DID::from_str(&did).unwrap(),
             name: name.to_string(),
             device_type: "ood".to_string(),
-            ip: None,
+            ips: vec![],
             net_id: None,
             ddns_sn_url: None,
             rtcp_port: None,
@@ -401,7 +403,7 @@ impl DeviceMiniInfo {
         let mut sys = System::new_all();
         sys.refresh_all();
 
-        self.arch = System::cpu_arch();
+        self.arch = System::cpu_arch().unwrap_or_default();
         // Get OS information
         self.base_os_info = Some(format!(
             "{} {} {}",
@@ -548,6 +550,7 @@ pub struct DeviceInfo {
     pub arch: String,
     pub os: String, //linux,windows,apple
     pub update_time: u64,
+    
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
 
@@ -555,6 +558,10 @@ pub struct DeviceInfo {
     pub sys_hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_os_info: Option<String>,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub all_ip: Vec<IpAddr>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_info: Option<String>,
@@ -617,6 +624,7 @@ impl DeviceInfo {
             state: None,
             sys_hostname: None,
             base_os_info: None,
+            all_ip: vec![],
             cpu_info: None,
             cpu_num: None,
             cpu_mhz: None,
@@ -679,7 +687,9 @@ impl DeviceInfo {
         let arch = "aarch64";
 
         let mut config = DeviceConfig::new(hostname.as_str(), did.id.to_string());
-        config.ip = ip;
+        if ip.is_some() {
+            config.ips.push(ip.unwrap());
+        }
         config.net_id = net_id;
         config.device_type = "ood".to_string();
 
@@ -690,6 +700,7 @@ impl DeviceInfo {
             os: os_type.to_string(),
             update_time: buckyos_get_unix_timestamp(),
             base_os_info: None,
+            all_ip: vec![],
             cpu_info: None,
             cpu_num: None,
             cpu_mhz: None,
@@ -718,7 +729,7 @@ impl DeviceInfo {
             let test_socket = test_socket.unwrap();
             test_socket.connect("8.8.8.8:80").await;
             let local_addr = test_socket.local_addr().unwrap();
-            self.device_doc.ip = Some(local_addr.ip());
+            self.device_doc.ips.push(local_addr.ip());
         }
 
         // Get OS information
@@ -1078,7 +1089,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             "LBgzvFCD4VqQxTsO2LCZjs9FPVaQV2Dt0Q5W_lr4mr0".to_string(),
         );
         device_config.iss = "did:bns:waterflier".to_string();
-        device_config.ip = None;
+        device_config.ips = Vec::new();
         device_config.net_id = None;
 
         let json_str = serde_json::to_string(&device_config).unwrap();

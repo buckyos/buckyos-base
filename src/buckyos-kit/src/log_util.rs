@@ -1,6 +1,6 @@
 use crate::get_buckyos_log_dir;
 use simplelog::*;
-use std::fs::File;
+use std::{fs::File, panic};
 
 pub fn init_logging(app_name: &str, is_service: bool) {
     // get log level in env RUST_LOG, default is info
@@ -47,4 +47,23 @@ pub fn init_logging(app_name: &str, is_service: bool) {
     if init_result.is_err() {
         println!("Failed to init logging: {}", init_result.err().unwrap());
     }
+
+     // 设置全局 panic hook，捕获所有 unwrap 失败
+     panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info.location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            format!("panic message: {}", s)
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            format!("panic message: {}", s)
+        } else {
+            "panic occurred".to_string()
+        };
+        
+        error!("[PANIC] unwrap/panic failed at {} - {}", location, message);
+        eprintln!("[PANIC] unwrap/panic failed at {} - {}", location, message);
+    }));
+
 }

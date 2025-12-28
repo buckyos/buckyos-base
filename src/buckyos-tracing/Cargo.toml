@@ -4,9 +4,10 @@ version = "0.4.0"
 edition = "2021"
 
 [dependencies]
-tracing = "*"
-tracing-subscriber = { version = "*", features = ["env-filter"] }
-tracing-log = "*"
-tracing-appender = "0.2"
-console-subscriber = { version = "*" }
-buckyos-kit = { path = "../buckyos-kit" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+tracing-appender = { workspace = true }
+console-subscriber = { workspace = true }
+buckyos-kit = { workspace = true }
+chrono = { workspace = true }

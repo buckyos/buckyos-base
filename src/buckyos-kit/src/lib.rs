@@ -33,7 +33,6 @@ mod test {
     use std::path::PathBuf;
 
     use super::*;
-    use env_logger;
 
     #[test]
     fn test_get_unix_timestamp() {

@@ -4,17 +4,17 @@ version = "0.4.0"
 edition = "2021"
 
 [dependencies]
-log = "*"
-serde = "*"
-serde_json = "*"
-backtrace = "*"
-chrono = "*"
-tide = "*"
-http-types = "*"
-surf = "*"
-buckyos-kit = { path = "../buckyos-kit" }
-tokio = { version = "*", features = ["full","tracing"] }
-sha2 = "*"
-toml = "*"
-hex = "*"
-once_cell = "*"
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+backtrace = { workspace = true }
+chrono = { workspace = true }
+tide = { workspace = true }
+http-types = { workspace = true }
+surf = { workspace = true }
+buckyos-kit = { workspace = true }
+tokio = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+once_cell = { workspace = true }

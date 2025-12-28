@@ -4,35 +4,33 @@ version = "0.4.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-# [features]
-# default = ["cloudflare"]
-# cloudflare = ["dep:reqwest"]
+[features]
+default = []
+cloudflare = []
 
 [dependencies]
-toml = "*"
-sysinfo = "*"
-thiserror = "*"
-log = "*"   
-rand = "*"
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
-async-trait = "*"
-hickory-resolver = { version = "*", features = ["dns-over-rustls"] }
-tokio = { version = "*", features = ["full"] }
-mini-moka = "*" 
-jsonwebtoken = { version = "*", features = ["aws_lc_rs"] }
-base64="*"
-once_cell="*"
-lazy_static="*"
-cfg-if = "1.0"
-reqwest = { version = "*", features = ["json","rustls-tls-native-roots"] }
+toml = { workspace = true }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+hickory-resolver = { workspace = true }
+tokio = { workspace = true }
+mini-moka = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+once_cell = { workspace = true }
+lazy_static = { workspace = true }
+cfg-if = { workspace = true }
+reqwest = { workspace = true }
 
-name-lib = { path = "../name-lib" }
-buckyos-kit = { path = "../buckyos-kit" }
-kRPC = { path = "../kRPC" }
-
-
+name-lib = { workspace = true }
+buckyos-kit = { workspace = true }
+kRPC = { workspace = true }
 
 [dev-dependencies]
-tempfile = "*"
+tempfile = { workspace = true }
 

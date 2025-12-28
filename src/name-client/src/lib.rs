@@ -189,16 +189,16 @@ mod tests {
         buckyos_kit::init_logging(service_name, false);
         init_name_lib(&web3_bridge_config).await.unwrap();
         let name_info = resolve(
-            "web3.buckyos.ai",
+            "sn.buckyos.ai",
             crate::provider::RecordType::from_str("DID"),
         )
         .await
         .unwrap();
         println!("name_info: {:?}", name_info);
-        let did = DID::from_str("did:web:web3.buckyos.ai").unwrap();
+        let did = DID::from_str("did:web:sn.buckyos.ai").unwrap();
         let did_doc = resolve_did(&did, None).await.unwrap();
         println!("did_doc: {:?}", did_doc);
-        let remote_did = DID::from_str("did:web:web3.buckyos.ai").unwrap();
+        let remote_did = DID::from_str("did:web:sn.buckyos.ai").unwrap();
         let _exchange_key = resolve_ed25519_exchange_key(&remote_did).await.unwrap();
         //println!("exchange_key: {:?}",exchange_key);
     }

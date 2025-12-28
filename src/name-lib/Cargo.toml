@@ -6,38 +6,33 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-
-sysinfo = "*"
-thiserror = "*"
-log = "*"   
-rand = "0.8"
-rand_core = "0.6.4"
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
-async-trait = "*"
-hickory-resolver = { version = "*", features = ["dns-over-rustls"] }
-tokio = { version = "*", features = ["full"] }
-mini-moka = "*" 
-jsonwebtoken = { version = "*", features = ["aws_lc_rs"] }
-ed25519-dalek = { version = "*", features = ["pkcs8"] } 
-x25519-dalek = { version = "*", features = ["static_secrets","getrandom"] }
-curve25519-dalek = "*"
-ed25519_to_curve25519 = "*"
-base64="*"
-once_cell="*"
-lazy_static="*"
-nvml-wrapper = { version = "*" }
-toml = "*"
-buckyos-kit = { path = "../buckyos-kit" }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+hickory-resolver = { workspace = true }
+tokio = { workspace = true }
+mini-moka = { workspace = true }
+jsonwebtoken = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+curve25519-dalek = { workspace = true }
+ed25519_to_curve25519 = { workspace = true }
+base64 = { workspace = true }
+once_cell = { workspace = true }
+lazy_static = { workspace = true }
+nvml-wrapper = { workspace = true }
+toml = { workspace = true }
+buckyos-kit = { workspace = true }
 
 # for mnemonic -> seed and SLIP-0010 derivation
-bip39 = "*"
-hmac = "*"
-sha2 = "*"
+bip39 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 
 [features]
 config_tests = []
-
-
-
 
