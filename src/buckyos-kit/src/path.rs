@@ -125,6 +125,10 @@ pub fn get_buckyos_service_data_dir(service_name: &str) -> PathBuf {
     get_buckyos_root_dir().join("data").join(service_name)
 }
 
+pub fn get_buckyos_app_data_dir(app_name: &str,owner_id: &str) -> PathBuf {
+    get_buckyos_root_dir().join("data").join(owner_id).join(app_name)
+}
+
 pub fn get_buckyos_service_local_data_dir(service_name: &str, disk_id: Option<&str>) -> PathBuf {
     if disk_id.is_some() {
         get_buckyos_root_dir()
@@ -133,6 +137,49 @@ pub fn get_buckyos_service_local_data_dir(service_name: &str, disk_id: Option<&s
             .join(service_name)
     } else {
         get_buckyos_root_dir().join("local").join(service_name)
+    }
+}
+
+pub fn get_buckyos_user_home_dir(user_id: &str) -> PathBuf {
+    get_buckyos_root_dir().join("home").join(user_id)
+}
+
+pub enum LibraryCategory {
+    Public,
+    Shared,
+    Photo,//所有自己拍的照片，视频
+    Pciture,
+    Music,
+    Video,
+    ROMS,
+    ISO,
+    Book,
+    Softwares,//各种软件安装包
+}
+
+impl LibraryCategory {
+    pub fn to_string(&self) -> Option<&str> {
+        match self {
+            LibraryCategory::Public => Some("public"),
+            LibraryCategory::Shared => Some("shared"),
+            LibraryCategory::Photo => Some("photo"),
+            LibraryCategory::Pciture => Some("picture"),
+            LibraryCategory::Music => Some("music"),
+            LibraryCategory::Video => Some("video"),
+            LibraryCategory::ROMS => Some("roms"),
+            LibraryCategory::ISO => Some("iso"),
+            LibraryCategory::Book => Some("book"),
+            LibraryCategory::Softwares => Some("softwares"),
+        }
+    }
+}
+
+pub fn get_buckyos_library_dir(category: LibraryCategory) -> Option<PathBuf> {
+    let category_str = category.to_string();
+    if category_str.is_some() {
+        Some(get_buckyos_root_dir().join("library").join(category_str.unwrap()))
+    } else {
+        None
     }
 }
 
