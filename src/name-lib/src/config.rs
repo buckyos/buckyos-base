@@ -39,9 +39,7 @@ pub(crate) struct VerificationMethodNode {
     #[serde(rename = "controller")]
     pub key_controller: String,
     #[serde(rename = "publicKeyJwk")]
-    pub public_key: Jwk,
-    #[serde(flatten)]
-    pub extra_info: HashMap<String, serde_json::Value>,
+    pub public_key: Jwk
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -525,8 +523,7 @@ impl ZoneConfig {
                 key_type: "Ed25519VerificationKey2020".to_string(),
                 key_id: "#main_key".to_string(),
                 key_controller: owner_did.to_string(),
-                public_key: public_key,
-                extra_info: HashMap::new(),
+                public_key: public_key
             }],
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
@@ -824,8 +821,7 @@ impl OwnerConfig {
             key_type: "Ed25519VerificationKey2020".to_string(),
             key_id: "#main_key".to_string(),
             key_controller: id.to_string(),
-            public_key: public_key,
-            extra_info: HashMap::new(),
+            public_key: public_key
         }];
 
         OwnerConfig {

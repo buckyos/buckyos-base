@@ -152,7 +152,6 @@ impl DeviceConfig {
                 key_id: "#main_key".to_string(),
                 key_controller: did.clone(),
                 public_key: public_key_jwk,
-                extra_info: HashMap::new(),
             }],
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
@@ -191,7 +190,6 @@ impl DeviceConfig {
                 key_id: "#main_key".to_string(),
                 key_controller: did.clone(),
                 public_key: public_key_jwk,
-                extra_info: HashMap::new(),
             }],
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
@@ -595,8 +593,8 @@ pub struct DeviceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_load: Option<f32>, //gpu负载
 
-    #[serde(flatten)]
-    pub extra_info: HashMap<String, serde_json::Value>,
+    //#[serde(flatten)]
+    //pub extra_info: HashMap<String, serde_json::Value>,
 }
 
 impl Deref for DeviceInfo {
@@ -639,7 +637,7 @@ impl DeviceInfo {
             gpu_total_mem: None,
             gpu_used_mem: None,
             gpu_load: None,
-            extra_info: HashMap::new(),
+            //extra_info: HashMap::new(),
         };
 
         return result_info;
@@ -716,7 +714,7 @@ impl DeviceInfo {
             gpu_total_mem: None,
             gpu_used_mem: None,
             gpu_load: None,
-            extra_info: HashMap::new(),
+            //extra_info: HashMap::new(),
         }
     }
 
@@ -1030,6 +1028,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         device_info_ood.auto_fill_by_system_info().await;
         let device_info_str = serde_json::to_string(&device_info_ood).unwrap();
         println!("ood device_info: {}", device_info_str);
+
+        let device_info2 = serde_json::from_str::<DeviceInfo>(&device_info_str).unwrap();
+        let device_info2_str = serde_json::to_string(&device_info2).unwrap();
+        println!("ood device_info2: {}", device_info2_str);
+        let device_info3 = serde_json::from_str::<DeviceInfo>(&device_info2_str).unwrap();
+
+
 
         assert_eq!(device_config, decoded);
         assert_eq!(encoded, token2);
