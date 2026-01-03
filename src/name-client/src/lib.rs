@@ -3,6 +3,8 @@
 mod config_provider;
 mod dns_provider;
 mod doc_cache;
+mod bns_provider;
+mod https_provider;
 mod name_client;
 mod name_query;
 mod provider;
@@ -11,6 +13,8 @@ mod utility;
 pub use config_provider::*;
 pub use dns_provider::*;
 pub use doc_cache::*;
+pub use bns_provider::*;
+pub use https_provider::*;
 use jsonwebtoken::DecodingKey;
 pub use name_client::*;
 pub use name_query::*;
@@ -40,7 +44,7 @@ pub static IS_NAME_LIB_INITED: OnceCell<bool> = OnceCell::new();
 
 pub fn get_default_web3_bridge_config() -> HashMap<String, String> {
     let mut web3_bridge_config = HashMap::new();
-    web3_bridge_config.insert("bns".to_string(), "web3.buckyos.org".to_string());
+    web3_bridge_config.insert("bns".to_string(), "web3.buckyos.ai".to_string());
     web3_bridge_config
 }
 
@@ -66,7 +70,7 @@ pub async fn init_name_lib_ex(
     }
 
     let client = NameClient::new(config);
-    client.add_provider(Box::new(DnsProvider::new(None))).await;
+    client.add_provider(Box::new(DnsProvider::new(None)), None).await;
     let set_result = GLOBAL_NAME_CLIENT.set(client);
     if set_result.is_err() {
         return Err(NSError::Failed(
@@ -150,13 +154,13 @@ pub async fn resolve_ed25519_exchange_key(remote_did: &DID) -> NSResult<[u8; 32]
     return Err(NSError::NotFound("Invalid did document".to_string()));
 }
 
-pub async fn resolve_did(did: &DID, fragment: Option<&str>) -> NSResult<EncodedDocument> {
+pub async fn resolve_did(did: &DID, doc_type: Option<&str>) -> NSResult<EncodedDocument> {
     let client = get_name_client();
     if client.is_none() {
         return Err(NSError::NotFound("Name client not found".to_string()));
     }
     let client = client.unwrap();
-    client.resolve_did(did, fragment).await
+    client.resolve_did(did, doc_type).await
 }
 
 pub async fn update_did_cache(did: DID, doc: EncodedDocument) -> NSResult<()> {

@@ -85,7 +85,7 @@ pub struct NameInfo {
     pub txt: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
-    /// key is the fragment,used by query_did
+    /// key is the doc_type,used by query_did
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub did_documents: HashMap<String, EncodedDocument>,
@@ -287,8 +287,8 @@ impl NameInfo {
     //     }
     // }
 
-    pub fn get_did_document(&self, fragment: &str) -> Option<&EncodedDocument> {
-        self.did_documents.get(fragment)
+    pub fn get_did_document(&self, doc_type: &str) -> Option<&EncodedDocument> {
+        self.did_documents.get(doc_type)
     }
 }
 
@@ -304,7 +304,7 @@ pub trait NsProvider: 'static + Send + Sync {
     async fn query_did(
         &self,
         did: &DID,
-        fragment: Option<&str>,
+        doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument>;
 }

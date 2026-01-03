@@ -263,18 +263,18 @@ impl NsProvider for LocalConfigDnsProvider {
     async fn query_did(
         &self,
         did: &DID,
-        fragment: Option<&str>,
+        doc_type: Option<&str>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         let host_name = did.to_host_name();
         let name_info = self.get_name_info(&host_name)?; 
         let new_name_info = name_info.parse_txt_record_to_did_document()?;
-        let fragment = fragment.unwrap_or(DEFAULT_FRAGMENT);
-        let did_document = new_name_info.get_did_document(fragment);
+        let doc_type = doc_type.unwrap_or(DEFAULT_FRAGMENT);
+        let did_document = new_name_info.get_did_document(doc_type);
         if did_document.is_some() {
             return Ok(did_document.unwrap().clone());
         }
-        return Err(NSError::NotFound(format!("DID Document not found: {}", fragment)));
+        return Err(NSError::NotFound(format!("DID Document not found: {}", doc_type)));
     }
 }
 

@@ -302,7 +302,7 @@ impl NsProvider for CloudflareProvider {
     async fn query_did(
         &self,
         _did: &DID,
-        _fragment: Option<&str>,
+        _doc_type: Option<&str>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         Err(NSError::Failed(

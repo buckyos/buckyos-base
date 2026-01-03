@@ -34,6 +34,8 @@ pub enum NSError {
     InvalidDID(String),
     #[error("{0} not found")]
     NotFound(String),
+    #[error("Disabled: {0}")]
+    Disabled(String),
     #[error("decode txt record error")]
     DnsTxtEncodeError,
     #[error("forbidden")]
