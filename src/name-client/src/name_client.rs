@@ -30,7 +30,7 @@ impl Default for NameClientConfig {
         Self {
             enable_cache: true,
             local_cache_dir:None,
-            cache_backend: CacheBackend::Sqlite,
+            cache_backend: CacheBackend::Filesystem,
         }
     }
 }
