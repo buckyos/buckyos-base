@@ -143,6 +143,7 @@ impl NameClient {
             cached_result = self.doc_cache.get(did, doc_type);
             if let Some((_, exp, trust_level)) = cached_result.as_ref() {
                 if !self.is_expired(*exp) {
+                    info!("cached did:{}#{} is not expired, trust_level set to: {}", did.to_string(), doc_type.unwrap_or(""), trust_level);
                     cached_trust_level = *trust_level;
                 }
             }
@@ -191,8 +192,13 @@ impl NameClient {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::{init_name_lib_ex, resolve_did};
+
     use super::*;
     use async_trait::async_trait;
+    use buckyos_kit::init_logging;
     use tempfile::tempdir;
 
     fn make_doc(iat: u64, exp: u64, marker: &str) -> EncodedDocument {
@@ -261,6 +267,13 @@ mod tests {
             cache_backend,
         };
         NameClient::new(cfg)
+    }
+
+    fn get_default_web3_bridge_config() -> HashMap<String, String> {
+        let mut config = HashMap::new();
+        config.insert("bns".to_string(), "web3.buckyos.ai".to_string());
+
+        config
     }
 
     #[tokio::test]
@@ -366,5 +379,50 @@ mod tests {
         // 期望通过已有缓存成功返回
         let resolved_again = client_low_only.resolve_did(&did, None).await.unwrap();
         assert_eq!(resolved_again, high_doc);
+    }
+
+    #[tokio::test]
+    async fn resolve_from_default_cache_without_providers() {
+        // 使用默认的 NameClient 配置，但指定临时缓存目录，模拟默认 did-cache 行为
+        let tmp_dir = tempdir().unwrap().keep();
+        let did = DID::from_str("did:web:cache.only").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached_doc = make_doc(now, now + 1800, "cache-only");
+
+        let mut client = NameClient::new(NameClientConfig {
+            enable_cache: true,
+            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
+            cache_backend: CacheBackend::Filesystem,
+        });
+
+        client
+            .doc_cache
+            .insert(did.clone(), None, cached_doc.clone(), now + 1800, DEFAULT_PROVIDER_TRUST_LEVEL);
+
+        // 未配置任何 provider，仍应直接从缓存返回
+        let resolved = client.resolve_did(&did, None).await.unwrap();
+        assert_eq!(resolved, cached_doc);
+    }
+
+    #[tokio::test]
+    async fn resolve_via_init_name_lib_with_mock_provider() {
+        init_logging("test-name-client",  false);
+        let tmp_dir = tempdir().unwrap().keep();
+        let now = buckyos_get_unix_timestamp();
+        let doc = make_doc(now, now + 600, "init-mock");
+        let did = DID::from_str("did:bns:filebrowser.buckyos").unwrap();
+
+        let web3_bridge = get_default_web3_bridge_config();
+        let cfg = NameClientConfig {
+            enable_cache: true,
+            local_cache_dir: None,
+            cache_backend: CacheBackend::Filesystem,
+        };
+
+        // 初始化全局客户端，模拟真实使用路径
+        init_name_lib_ex(&web3_bridge, cfg).await.unwrap();
+        let resolved = resolve_did(&did, None).await.unwrap();
+        let result_str = resolved.to_string();
+        info!("resolve result: {}", result_str);
     }
 }

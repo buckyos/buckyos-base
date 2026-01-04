@@ -104,6 +104,7 @@
 ## 参考：系统里的did-doc类型:用户,zone,设备，服务
 
 因为历史原因，BuckyOS内置关键类型的DIDDocument，一般称作XXXConfig
+并不是所有的did都可以与host之间完美互转。只有“顶层对象”才可以实现，非顶层对象did可以转换成一个url(buckyos目前只在内部使用该url,不鼓励发布该URL)
 
 ### OwnerConfig 
 - 无ip (不能与一个Owner建立连接)

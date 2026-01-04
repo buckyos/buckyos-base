@@ -204,7 +204,7 @@ impl DIDDocumentFsCache {
         match fs::read_to_string(&file_path) {
             Ok(content) => match EncodedDocument::from_str(content) {
                 Ok(doc) => {
-                    debug!("load did doc from local cache: {}", file_path.display());
+                    
                     let default_exp = fs::metadata(&file_path)
                         .ok()
                         .and_then(|m| m.modified().ok())
@@ -214,6 +214,7 @@ impl DIDDocumentFsCache {
                         trust_level: ROOT_TRUST_LEVEL,
                         exp: default_exp,
                     };
+                    info!("load did-cache from {} success. meta: {:?}", file_path.display(), meta);
                     Some((doc, meta))
                 }
                 Err(err) => {
