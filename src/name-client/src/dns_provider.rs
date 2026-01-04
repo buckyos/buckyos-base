@@ -102,7 +102,7 @@ impl NsProvider for DnsProvider {
                     txt_vec.push(txt);
                 }
 
-                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(300);
                 let name_info = NameInfo {
                     name: name.to_string(),
                     address: Vec::new(),
@@ -154,6 +154,7 @@ impl NsProvider for DnsProvider {
         doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
+        info!("NsProvider query did: {}", did.to_host_name());
         
         let name_info = self
             .query(&did.to_host_name(), Some(RecordType::TXT), None)
@@ -167,6 +168,7 @@ impl NsProvider for DnsProvider {
         let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
         let did_document = new_name_info.get_did_document(doc_type);
         if did_document.is_some() {
+            info!("NsProvider::query_did{}: DID Document found: {}", did.to_host_name(), doc_type);
             return Ok(did_document.unwrap().clone());
         }
         warn!("NsProvider::query_did{}: DID Document not found: {}", did.to_host_name(), doc_type);

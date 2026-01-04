@@ -148,7 +148,6 @@ impl NameClient {
             }
         }
 
-        // 用比缓存 trust-level 更高(数值更低)的 provider 进行解析
         let reslove_result = self
             .name_query
             .query_did(did, doc_type, Some(cached_trust_level))

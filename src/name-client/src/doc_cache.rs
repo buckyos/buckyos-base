@@ -544,6 +544,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         base.path().join(format!("{}.doc.json", did.to_raw_host_name()))
     }
 
+    fn meta_path(base: &tempfile::TempDir, did: &DID) -> PathBuf {
+        base.path().join(format!("{}.meta.json", did.to_raw_host_name()))
+    }
+
     fn owner_encoding_key() -> EncodingKey {
         EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap()
     }
@@ -645,6 +649,23 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert!(!cache.update(did.clone(), None, doc_v3, exp_v3, DEFAULT_PROVIDER_TRUST_LEVEL));
 
         assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
+    }
+
+    #[test]
+    fn fs_get_handles_missing_meta_file() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let now = buckyos_get_unix_timestamp();
+        let exp = now + DEFAULT_EXPIRE_TIME;
+        let doc = build_zone_doc(&did, exp, "missing-meta");
+        cache.insert(did.clone(), None, doc.clone(), exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+
+        // Simulate meta file being deleted/corrupted
+        std::fs::remove_file(meta_path(&tmp_dir, &did)).unwrap();
+
+        let (loaded_doc, loaded_exp, trust) = cache.get(&did, None).expect("doc should still load");
+        assert_eq!(loaded_doc, doc);
+        assert_eq!(loaded_exp, exp);
+        assert_eq!(trust, DEFAULT_PROVIDER_TRUST_LEVEL);
     }
 
     #[test]
