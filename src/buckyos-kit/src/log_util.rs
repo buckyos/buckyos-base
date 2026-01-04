@@ -48,8 +48,12 @@ pub fn init_logging(app_name: &str, is_service: bool) {
         println!("Failed to init logging: {}", init_result.err().unwrap());
     }
 
-     // 设置全局 panic hook，捕获所有 unwrap 失败
-     panic::set_hook(Box::new(|panic_info| {
+}
+
+
+pub fn init_log_panic() {
+    // 设置全局 panic hook，捕获所有 unwrap 失败
+    panic::set_hook(Box::new(|panic_info| {
         let location = panic_info.location()
             .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
             .unwrap_or_else(|| "unknown location".to_string());
@@ -65,5 +69,4 @@ pub fn init_logging(app_name: &str, is_service: bool) {
         error!("[PANIC] unwrap/panic failed at {} - {}", location, message);
         eprintln!("[PANIC] unwrap/panic failed at {} - {}", location, message);
     }));
-
 }
