@@ -93,7 +93,6 @@ impl NsProvider for DnsProvider {
                         .iter()
                         .map(|s| -> String {
                             let byte_slice: &[u8] = &s;
-                            info!("bytes:{:?}", byte_slice);
                             return String::from_utf8_lossy(byte_slice).to_string();
                         })
                         .collect::<Vec<String>>()
@@ -115,7 +114,7 @@ impl NsProvider for DnsProvider {
                 return Ok(name_info);
             }
             RecordType::A | RecordType::AAAA => {
-                info!("dns query txt: {}", name);
+                info!("dns query ip: {}", name);
                 let response = resolver.lookup_ip(name).await;
                 if response.is_err() {
                     return Err(NSError::Failed(format!(
@@ -155,13 +154,13 @@ impl NsProvider for DnsProvider {
         doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        info!("NsProvider query did: {}", did.to_host_name());
+        info!("NsProvider query did: {} ...", did.to_host_name());
         
         let name_info = self
             .query(&did.to_host_name(), Some(RecordType::TXT), None)
             .await?;
 
-        info!("NsProvicer will parse_txt_record_to_did_document... for {}",did.to_host_name());
+        //info!("NsProvicer will parse_txt_record_to_did_document... for {}",did.to_host_name());
 
         //识别TXT记录中的特殊记录
         let new_name_info = name_info.parse_txt_record_to_did_document()?;
@@ -180,10 +179,13 @@ impl NsProvider for DnsProvider {
 
 #[cfg(test)]
 mod tests {
+    use buckyos_kit::init_logging;
+
     use super::*;
 
     #[tokio::test]
     async fn test_dns_provider() {
+        init_logging("test_dns_provider", false);
         let dns_provider = DnsProvider::new(None);
         let result = dns_provider.query("test.buckyos.io", None, None).await;
         assert!(result.is_ok(), "query should succeed");
@@ -208,6 +210,14 @@ mod tests {
         let result = result.unwrap();
         let result_str = result.to_string();
         println!("* result_str: {}", result_str);
+
+        let result = dns_provider.query_did(&DID::from_str(" filebrowser.buckyos.web3.devtests.org").unwrap(), None, None).await;
+        if result.is_err() {
+            let err = result.err().unwrap();
+            warn!("query_did failed! {}", err.to_string());
+        }
+
+       
 
         println!("✓ test_dns_provider passed");
     }
