@@ -75,7 +75,7 @@ impl NameQuery {
         let mut level_providers = Vec::new();
         
         for (provider, level) in providers.iter() {
-            if *level > allowed_max_trust {
+            if *level >= allowed_max_trust {
                 break;
             }
             if current_level.is_none() {
