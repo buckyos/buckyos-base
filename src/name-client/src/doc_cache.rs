@@ -9,6 +9,8 @@ use name_lib::{EncodedDocument, DEFAULT_EXPIRE_TIME, DID};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::DEFAULT_PROVIDER_TRUST_LEVEL;
+
 /// 支持两种存储后端的 DID 文档缓存：文件系统和 SQLite。
 /// 通过 `CacheBackend` 选择实现，默认推荐 SQLite 以避免大量小文件。
 #[derive(Clone, Copy, Debug)]
@@ -129,10 +131,11 @@ impl DIDDocumentFsCache {
 
     pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
         let doc = self.load_from_disk(did, doc_type)?;
-        let meta = self.load_meta(did, doc_type);
+        let meta = self
+            .load_meta(did, doc_type)
+            .unwrap_or_else(|| CacheMeta { trust_level: DEFAULT_PROVIDER_TRUST_LEVEL, exp: None });
         let exp = meta
-            .as_ref()
-            .and_then(|m| m.exp)
+            .exp
             .or_else(|| extract_timestamp(&doc, "exp"))
             .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
         if is_expired(exp) {
@@ -140,7 +143,7 @@ impl DIDDocumentFsCache {
             self.delete(did.clone(), doc_type);
             return None;
         }
-        let trust_level = meta.map(|m| m.trust_level).unwrap_or(i32::MAX);
+        let trust_level = meta.trust_level;
         Some((doc, exp, trust_level))
     }
 
@@ -264,8 +267,27 @@ impl DIDDocumentFsCache {
     fn load_meta(&self, did: &DID, doc_type: Option<&str>) -> Option<CacheMeta> {
         let meta_path = self.meta_path(did, doc_type);
         match fs::read_to_string(&meta_path) {
-            Ok(content) => serde_json::from_str::<CacheMeta>(&content).ok(),
-            Err(_) => None,
+            Ok(content) => match serde_json::from_str::<CacheMeta>(&content) {
+                Ok(meta) => Some(meta),
+                Err(err) => {
+                    warn!(
+                        "failed to parse did doc meta {}: {}",
+                        meta_path.display(),
+                        err
+                    );
+                    None
+                }
+            },
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "failed to read did doc meta {}: {}",
+                        meta_path.display(),
+                        err
+                    );
+                }
+                None
+            }
         }
     }
 
