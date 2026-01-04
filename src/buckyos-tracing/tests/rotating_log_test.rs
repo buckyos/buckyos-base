@@ -39,7 +39,7 @@ fn test_log_file_naming() {
     // 验证文件名格式
     let app_name = "test_app";
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let epoch = chrono::Local::now().timestamp();
+    let _epoch = chrono::Local::now().timestamp();
     
     let expected_pattern = format!("{}_{}_{}", app_name, pid, timestamp);
     assert!(expected_pattern.contains(&pid.to_string()), 

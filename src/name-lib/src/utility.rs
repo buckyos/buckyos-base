@@ -74,6 +74,15 @@ pub fn get_x_from_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> NSResult<String> {
     Ok(x_str)
 }
 
+pub fn create_jwt_by_x(x: &str) -> NSResult<jsonwebtoken::jwk::Jwk> {
+    let jwk = json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": x,
+    });
+    serde_json::from_value(jwk).map_err(|_| NSError::Failed("Invalid jwk".to_string()))
+}
+
 pub fn get_x_from_jwk_string(jwk_string: &str) -> NSResult<String> {
     let jwk_json = serde_json::from_str::<serde_json::Value>(jwk_string)
         .map_err(|_| NSError::Failed("Invalid jwk".to_string()))?;

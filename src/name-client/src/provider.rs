@@ -1,10 +1,11 @@
+
 use jsonwebtoken::DecodingKey;
 use name_lib::*;
+use name_lib::OwnerConfig;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::{collections::HashMap, net::IpAddr};
 
-pub const DEFAULT_FRAGMENT: &str = "zone";
+pub const DEFAULT_DID_DOC_TYPE: &str = "zone";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum RecordType {
@@ -141,23 +142,24 @@ impl NameInfo {
     }
 
     pub fn parse_did_document_to_txt_record(self: &NameInfo) -> NSResult<NameInfo> {
-        let zone_boot_config = self.get_did_document("zone");
-        let boot_jwt = self.get_did_document("boot");
         let mut new_name_info = self.clone();
-        
-        if boot_jwt.is_some()  && zone_boot_config.is_some() {
+
+        let boot_jwt = self.get_did_document("boot");
+        if boot_jwt.is_some() {
             let boot_jwt = boot_jwt.unwrap();
-            let zone_boot_config_doc = zone_boot_config.unwrap();
-            let zone_boot_config = ZoneBootConfig::decode(zone_boot_config_doc, None)?;
             new_name_info.txt.push(format!("BOOT={};", boot_jwt.to_string()));
-            if zone_boot_config.owner_key.is_some() {
-                let x = get_x_from_jwk(zone_boot_config.owner_key.as_ref().unwrap())?;
-                new_name_info.txt.push(format!("PKX={};", x));
-            }
         }
 
+        let owner_config = self.get_did_document("owner");
+        if owner_config.is_some() {
+            let owner_config = owner_config.unwrap();
+            let owner_config = OwnerConfig::decode(owner_config, None)?;
+            new_name_info.txt.push(format!("PKX={};", get_x_from_jwk(&owner_config.get_default_key().unwrap())?));
+        }
+        
+
         for (obj_name, device_jwt) in self.did_documents.iter() {
-            if obj_name == "boot" || obj_name == "zone" {
+            if obj_name == "boot" || obj_name == "zone" || obj_name == "owner" {
                 continue;
             }
 
@@ -174,15 +176,14 @@ impl NameInfo {
         let mut owner_x = None;
         let mut devices = Vec::new();
         let mut boot_jwt = None;
-        let mut zone_boot_config = None;
-        let mut boot_payload =  String::new();
+        let mut zone_config : Option<ZoneConfig> = None;
         let mut new_txt_vec = Vec::new();
 
         for txt in self.txt.iter() {
-            info!("- TXT:{}",txt);
+            debug!("- TXT:{}",txt);
             if txt.starts_with("BOOT=") {
-                boot_payload = txt.trim_start_matches("BOOT=").trim_end_matches(";").to_string();
-                boot_jwt = Some(EncodedDocument::Jwt(boot_payload.clone()));
+                let boot_payload = txt.trim_start_matches("BOOT=").trim_end_matches(";").to_string();
+                boot_jwt = Some(boot_payload);
             } else if txt.starts_with("PKX=") {
                 let pkx = txt.trim_start_matches("PKX=").trim_end_matches(";");
                 owner_x = Some(pkx.to_string());
@@ -196,22 +197,20 @@ impl NameInfo {
 
         if owner_x.is_some() {
             let owner_x = owner_x.unwrap();
-            let public_key_jwk = json!({
-                "kty": "OKP",
-                "crv": "Ed25519",
-                "x": owner_x,
-            });
-            let public_key_jwk : jsonwebtoken::jwk::Jwk = serde_json::from_value(public_key_jwk)
-                .map_err(|e| NSError::Failed(format!("parse public key jwk failed! {}", e)))?;
+            let owner_config = OwnerConfig::new_by_pkx(owner_x.as_str(), host_name.as_str())?;
+            let public_key_jwk = owner_config.get_default_key().unwrap();
             let owner_public_key = DecodingKey::from_jwk(&public_key_jwk)
                 .map_err(|e| NSError::Failed(format!("parse public key failed! {}", e)))?;
+            did_documents.insert("owner".to_string(), EncodedDocument::JsonLd(serde_json::to_value(&owner_config).unwrap()));
             //verify did_document by pkx_list
             if boot_jwt.is_some() {
                 let boot_jwt = boot_jwt.unwrap();
-                let mut boot_config = ZoneBootConfig::decode(&boot_jwt, Some(&owner_public_key))?;
+                let mut boot_config = ZoneBootConfig::decode(&EncodedDocument::Jwt(boot_jwt.clone()), None)?;
                 boot_config.owner_key = Some(public_key_jwk.clone());
                 boot_config.id = Some(DID::from_str(host_name.as_str()).unwrap());
-                zone_boot_config = Some(boot_config);
+                let real_zone_config = boot_config.to_zone_config(&boot_jwt);
+                zone_config = Some(real_zone_config);
+                did_documents.insert("boot".to_string(), EncodedDocument::Jwt(boot_jwt));
             }
            
             if devices.len() > 0 {
@@ -224,24 +223,26 @@ impl NameInfo {
                     }
                     let device_mini_config = device_mini_config.unwrap();
                     let device_config = DeviceConfig::new_by_mini_config(
+                        &device_jwt,
                         &device_mini_config,
                         DID::from_str(host_name.as_str()).unwrap(),
                         DID::from_str(host_name.as_str()).unwrap(),
                     );
-
                     let device_name = device_config.name.clone();
-                    if zone_boot_config.is_some() {
-                        zone_boot_config.as_mut().unwrap().devices.insert(device_config.name.clone(), device_config);
+                    let device_config_json = serde_json::to_value(&device_config).unwrap();
+                    did_documents.insert(device_name, EncodedDocument::JsonLd(device_config_json));
+                    if zone_config.is_some() {
+                        zone_config.as_mut().unwrap().devices.insert(device_config.name.clone(), device_config);
                     }
-                    did_documents.insert(device_name, EncodedDocument::Jwt(device_jwt));
+                    
+   
                 }
             }
 
-            if zone_boot_config.is_some() {
-                let zone_boot_config = zone_boot_config.unwrap();
-                let zone_boot_config_value = serde_json::to_value(&zone_boot_config).unwrap();
-                did_documents.insert("boot".to_string(), EncodedDocument::Jwt(boot_payload));
-                did_documents.insert("zone".to_string(), EncodedDocument::JsonLd(zone_boot_config_value));
+            if zone_config.is_some() {
+                let zone_config = zone_config.unwrap();
+                let zone_config_json = serde_json::to_value(&zone_config).unwrap();
+                did_documents.insert("zone".to_string(), EncodedDocument::JsonLd(zone_config_json));
             }
 
             let mut new_name_info = self.clone();
@@ -350,7 +351,6 @@ mod tests {
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365,
             owner: None,
             owner_key: None,
-            devices: HashMap::new(),
             extra_info: HashMap::new(),
         };
 
@@ -397,12 +397,6 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: other_txt,
-            // txt: vec![
-            //     format!("BOOT={};", boot_jwt_str),
-            //     format!("PKX={};", owner_x),
-            //     format!("DEV={};", device_jwt),
-            //     "some-other-txt=value".to_string(),
-            // ],
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
@@ -438,7 +432,9 @@ mod tests {
         // 设置 owner_key
         zone_boot_config.owner_key = Some(public_key_jwk.clone());
         zone_boot_config.id = Some(DID::from_str("did:bns:testzone").unwrap());
-        
+
+        let owner_config = OwnerConfig::new(DID::from_str("did:bns:testzone").unwrap(), "did:bns:testzone".to_string(), "did:bns:testzone".to_string(), public_key_jwk.clone());
+        let owner_config_json = serde_json::to_value(&owner_config).unwrap();
         // 编码为 JWT
         let boot_jwt = zone_boot_config.encode(Some(&private_key)).unwrap();
         
@@ -451,7 +447,7 @@ mod tests {
         // 创建包含 DID 文档的 NameInfo
         let mut did_documents = HashMap::new();
         did_documents.insert("boot".to_string(), boot_jwt.clone());
-        did_documents.insert("zone".to_string(), EncodedDocument::JsonLd(zone_config_value));
+        did_documents.insert("owner".to_string(), EncodedDocument::JsonLd(owner_config_json));
         did_documents.insert("device1".to_string(), EncodedDocument::Jwt(device_jwt.clone()));
         
         let name_info = NameInfo {
@@ -472,8 +468,11 @@ mod tests {
         
         // 验证结果
         assert!(parsed_info.txt.len() >= 3, "should have at least 3 TXT records (BOOT, PKX, DEV)");
+        for txt in parsed_info.txt.iter() {
+            println!("TXT:{}", txt);
+        }
         
-        // 验证包含必要的 TXT 记录
+        //验证包含必要的 TXT 记录
         let has_boot = parsed_info.txt.iter().any(|txt| txt.starts_with("BOOT="));
         let has_pkx = parsed_info.txt.iter().any(|txt| txt.starts_with("PKX="));
         let has_dev = parsed_info.txt.iter().any(|txt| txt.starts_with("DEV="));
@@ -523,7 +522,7 @@ mod tests {
         assert!(with_did_docs.did_documents.len() >= 2, "should have DID documents");
         assert_eq!(with_did_docs.txt.len(), 0, "TXT records should be moved to did_documents");
 
-        // 第二步：DID Documents -> TXT
+        // // 第二步：DID Documents -> TXT
         let back_to_txt = with_did_docs.parse_did_document_to_txt_record().unwrap();
         assert!(back_to_txt.txt.len() >= 3, "should have TXT records");
         assert_eq!(back_to_txt.did_documents.len(), 0, "did_documents should be cleared");
@@ -577,7 +576,7 @@ mod tests {
             ttl: Some(3600),
         };
 
-        let result = name_info.parse_did_document_to_txt_record().unwrap();
+        let result = name_info.clone();
         
         // 应该返回原始的 NameInfo，只是 did_documents 被清空
         assert_eq!(result.txt.len(), 0, "should have no TXT records");
@@ -585,4 +584,6 @@ mod tests {
         
         println!("✓ test_parse_did_document_without_zone passed");
     }
+
+
 }

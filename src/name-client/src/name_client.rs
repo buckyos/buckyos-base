@@ -255,7 +255,7 @@ mod tests {
     }
 
     fn client_with_temp_cache(cache_backend: CacheBackend) -> NameClient {
-        let tmp = tempdir().unwrap().into_path(); // 持久化临时目录，避免 drop 后被删除
+        let tmp = tempdir().unwrap().keep(); // 持久化临时目录，避免 drop 后被删除
         let cfg = NameClientConfig {
             enable_cache: true,
             local_cache_dir: Some(tmp.to_string_lossy().to_string()),
@@ -308,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_removes_cache() {
-        let tmp_dir = tempdir().unwrap().into_path();
+        let tmp_dir = tempdir().unwrap().keep();
         let did = DID::from_str("did:web:example.com").unwrap();
         let now = buckyos_get_unix_timestamp();
         let cached = make_doc(now, now + 1000, "cached");
@@ -335,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn cache_from_high_priority_works_when_only_low_priority_available() {
         // 第一次客户端：有高优先级 provider，生成缓存
-        let tmp_dir = tempdir().unwrap().into_path();
+        let tmp_dir = tempdir().unwrap().keep();
         let did = DID::from_str("did:web:example.com").unwrap();
         let now = buckyos_get_unix_timestamp();
         let high_doc = make_doc(now, now + 2000, "high");

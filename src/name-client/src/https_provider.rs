@@ -4,7 +4,7 @@
 向https://resolver.example.com/1.0/identifiers/did:example:1234#doc_type发送http GET请求，获取did文档
 */
 
-use crate::{DEFAULT_FRAGMENT, NameInfo, NsProvider, RecordType};
+use crate::{NameInfo, NsProvider, RecordType};
 use async_trait::async_trait;
 use log::info;
 use name_lib::{DID, EncodedDocument, NSError, NSResult};
@@ -50,10 +50,9 @@ impl HttpsProvider {
     }
 
     fn build_url(&self, did: &DID, doc_type: Option<&str>) -> String {
-        let frag = doc_type.unwrap_or(DEFAULT_FRAGMENT);
         // Encode doc_type as %23doc_type so the resolver can receive it.
         let target = if doc_type.is_some() {
-            format!("{}%23{}", did.to_string(), frag)
+            format!("{}?type={}", did.to_string(), doc_type.unwrap())
         } else {
             did.to_string()
         };
@@ -150,8 +149,8 @@ mod tests {
         let provider = HttpsProvider::new("resolver.identity.foundation");
         // 使用 resolver.identity.foundation 自身的 did:web 作为稳定样例
         let did = DID::from_str("did:web:identity.foundation").unwrap();
-        // 携带 doc_type，验证 URL 编码（%23）路径能被解析服务接受
-        match provider.query_did(&did, Some("domain"), None).await {
+
+        match provider.query_did(&did, None, None).await {
             Ok(doc) => {
                 let json = doc.to_json_value().unwrap();
                 println!("json: {}", serde_json::to_string_pretty(&json).unwrap());
@@ -172,7 +171,7 @@ mod tests {
         // did:key 由密钥直接派生，uniresolver 官方示例，可稳定解析
         let did = DID::from_str("did:key:z6Mksw4bDmn77uB5iVbQJBALV4CfqUGNoTCJQwdse1dQcvbK").unwrap();
         // 携带 doc_type，验证 URL 编码（%23）路径能被解析服务接受
-        let doc = provider.query_did(&did, Some("key1"), None).await.unwrap();
+        let doc = provider.query_did(&did, None, None).await.unwrap();
         let json = doc.to_json_value().unwrap();
         println!("json: {}", serde_json::to_string_pretty(&json).unwrap());
         assert_eq!(json.get("id").unwrap().as_str().unwrap(), did.to_string());

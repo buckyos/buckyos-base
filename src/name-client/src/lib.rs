@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-mod config_provider;
+mod local_ns_provider;
 mod dns_provider;
 mod doc_cache;
 mod bns_provider;
@@ -10,7 +10,7 @@ mod name_query;
 mod provider;
 mod utility;
 
-pub use config_provider::*;
+pub use local_ns_provider::*;
 pub use dns_provider::*;
 pub use doc_cache::*;
 pub use bns_provider::*;

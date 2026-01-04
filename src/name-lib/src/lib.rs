@@ -1,16 +1,18 @@
 #![allow(dead_code)]
 #![allow(unused)]
 
-mod config;
+mod zone;
 mod device;
 mod did;
 mod utility;
+mod user;
 
-pub use config::*;
+pub use zone::*;
 pub use device::*;
 pub use did::*;
 use serde::{Deserialize, Serialize};
 pub use utility::*;
+pub use user::OwnerConfig;
 
 use log::*;
 use once_cell::sync::Lazy;
@@ -85,6 +87,8 @@ impl NodeIdentityConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zone::OODDescriptionString;
+    use std::str::FromStr;
     #[test]
     fn test_utility() {
         assert_eq!(is_did("did:example:123456789abcdefghi"), true);
@@ -93,7 +97,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_device_info() {
-        let mut device_info = DeviceInfo::new("ood1", DID::new("bns", "ood1"));
+        let ood_string = OODDescriptionString::from_str("ood1").unwrap();
+        let mut device_info = DeviceInfo::new(&ood_string, DID::new("bns", "ood1"));
         device_info.auto_fill_by_system_info().await.unwrap();
         println!("device_info: {:?}", device_info);
     }

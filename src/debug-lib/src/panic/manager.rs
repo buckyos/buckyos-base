@@ -214,20 +214,3 @@ impl PanicBuilder {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test() {
-        //cyfs_base::init_simple_log("test-panic", None);
-
-        // PanicBuilder::new("test", "test-panic").build().start();
-
-        // async_std::task::block_on(async move {
-        //     async_std::task::sleep(std::time::Duration::from_secs(2)).await;
-
-        //     unreachable!("panic");
-        // });
-    }
-}

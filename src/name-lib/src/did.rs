@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use crate::config::{OwnerConfig, ZoneBootConfig, ZoneConfig};
+use crate::zone::{ZoneBootConfig, ZoneConfig};
+use crate::user::OwnerConfig;
 use crate::DeviceConfig;
 use crate::{decode_jwt_claim_without_verify, NSError, NSResult};
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use base64::{
     engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _,
 };
 use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
-use log::info;
+use log::{debug, info};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
@@ -281,13 +282,7 @@ pub static KNOWN_WEB3_BRIDGE_CONFIG: OnceCell<HashMap<String, String>> = OnceCel
 
 pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>> {
     let doc_value = doc.to_json_value()?;
-    info!("parse_did_doc: doc_value: {}", serde_json::to_string_pretty(&doc_value).unwrap());
-    if doc_value.get("verificationMethod").is_none() {
-        let zone_boot_config = serde_json::from_value::<ZoneBootConfig>(doc_value)
-            .map_err(|e| NSError::Failed(format!("parse zone boot config failed: {}", e)))?;
-        
-        return Ok(Box::new(zone_boot_config));
-    }
+    debug!("parse_did_doc: doc_value: {}", serde_json::to_string_pretty(&doc_value).unwrap());
 
     if doc_value.get("full_name").is_some() {
         let owner_config = serde_json::from_value::<OwnerConfig>(doc_value)

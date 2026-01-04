@@ -11,7 +11,7 @@ use hickory_resolver::{config::*, Resolver};
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
-use crate::{DEFAULT_FRAGMENT, NameInfo, NsProvider, RecordType};
+use crate::{DEFAULT_DID_DOC_TYPE, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -32,33 +32,6 @@ impl DnsProvider {
         }
         Ok(Self { dns_server: None })
     }
-
-    
-
-    // fn parse_dns_response(resp: DnsResponse) -> NSResult<NameInfo> {
-    //     let mut txt_list = Vec::new();
-    //     for record in resp.answers() {
-    //         if record.record_type() == RecordType::TXT {
-    //             let data = record.data();
-    //             if data.is_some() {
-    //                 let data = data.unwrap();
-    //                 if let RData::TXT(txt) = data {
-    //                     for txt in txt.txt_data() {
-    //                         let txt = String::from_utf8_lossy(txt).to_string();
-    //                         txt_list.push(txt);
-    //                     }
-    //                 }
-
-    //             }
-    //         }
-    //     }
-    //     if txt_list.len() == 0 {
-    //         return Err(ns_err!(NSErrorCode::NotFound, "txt data is empty"));
-    //     }
-
-    //     let txt = DnsTxtCodec::decode(txt_list)?;
-    //     return Ok(serde_json::from_str(txt.as_str()).map_err(into_ns_err!(NSErrorCode::InvalidData, "Failed to parse txt {}", txt))?);
-    // }
 }
 
 #[async_trait::async_trait]
@@ -191,12 +164,48 @@ impl NsProvider for DnsProvider {
         //识别TXT记录中的特殊记录
         let new_name_info = name_info.parse_txt_record_to_did_document()?;
 
-        let doc_type = doc_type.unwrap_or(DEFAULT_FRAGMENT);
+        let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
         let did_document = new_name_info.get_did_document(doc_type);
         if did_document.is_some() {
             return Ok(did_document.unwrap().clone());
         }
         warn!("NsProvider::query_did{}: DID Document not found: {}", did.to_host_name(), doc_type);
         return Err(NSError::NotFound(format!("DID Document not found: {}", doc_type)));
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_dns_provider() {
+        let dns_provider = DnsProvider::new(None);
+        let result = dns_provider.query("test.buckyos.io", None, None).await;
+        assert!(result.is_ok(), "query should succeed");
+        let result = result.unwrap();
+        assert!(result.address.len() > 0, "address should not be empty");
+
+        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), None, None).await;
+        assert!(result.is_ok(), "query_did should succeed");
+        let result = result.unwrap();
+        let result_str = result.to_string();
+        println!("* result_str: {}", result_str);
+
+
+        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), Some("boot"), None).await;
+        assert!(result.is_ok(), "query_did should succeed");
+        let result = result.unwrap();
+        let result_str = result.to_string();
+        println!("* result_str: {}", result_str);
+
+        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), Some("owner"), None).await;
+        assert!(result.is_ok(), "query_did should succeed");
+        let result = result.unwrap();
+        let result_str = result.to_string();
+        println!("* result_str: {}", result_str);
+
+        println!("✓ test_dns_provider passed");
     }
 }
