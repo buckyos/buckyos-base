@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 pub const DEFAULT_PROVIDER_TRUST_LEVEL:i32 = 100;
 pub const ROOT_TRUST_LEVEL:i32 = 0;
-pub const DNS_TRUST_LEVEL:i32 = 50;
+pub const DNS_TRUST_LEVEL:i32 = 16;
 
 
 pub struct NameClientConfig {

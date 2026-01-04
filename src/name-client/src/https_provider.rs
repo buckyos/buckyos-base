@@ -62,7 +62,7 @@ impl HttpsProvider {
         )
     }
 
-    async fn parse_response(&self, did: &DID, resp: reqwest::Response) -> NSResult<EncodedDocument> {
+    async fn parse_response( did: &DID, resp: reqwest::Response) -> NSResult<EncodedDocument> {
         let status = resp.status();
         let body = resp
             .text()
@@ -75,8 +75,8 @@ impl HttpsProvider {
                 StatusCode::FORBIDDEN => Err(NSError::Forbid),
                 StatusCode::GONE => Err(NSError::Disabled(format!("{} disabled", did.to_string()))),
                 _ => Err(NSError::Failed(format!(
-                    "resolver {} returned {}: {}",
-                    self.resolver_host, status, body
+                    "https provider returned {}: {}",
+                    status, body
                 ))),
             };
         }
@@ -134,7 +134,61 @@ impl NsProvider for HttpsProvider {
             .send()
             .await
             .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
-        self.parse_response(did, resp).await
+        HttpsProvider::parse_response(did, resp).await
+    }
+}
+
+//TODO:支持用任意协议连接zone
+pub struct SmartProvider {
+    client: Client,
+}
+
+impl SmartProvider {
+    pub fn new() -> Self {
+        Self { client: Client::new() }
+    }
+}
+
+#[async_trait]
+impl NsProvider for SmartProvider {
+    fn get_id(&self) -> String {
+        "smart-resolver".to_string()
+    }
+
+    async fn query(
+        &self,
+        _name: &str,
+        _record_type: Option<RecordType>,
+        _from_ip: Option<IpAddr>,
+    ) -> NSResult<NameInfo> {
+        Err(NSError::NotFound(
+            "smart-resolver does not resolve dns records".to_string(),
+        ))
+    }
+
+    async fn query_did(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        _from_ip: Option<IpAddr>,
+    ) -> NSResult<EncodedDocument> {
+        let hostname = did.to_host_name();
+        let path = did.get_path_from_id();
+        let real_doc_type = doc_type.unwrap_or("did");
+        let url = if path.is_some() {
+            format!("https://{}/{}/{}.json", hostname, path.unwrap(), real_doc_type)
+        } else {
+            format!("https://{}/.well-known/{}", hostname, real_doc_type)
+        };
+
+        let resp = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
+
+        HttpsProvider::parse_response(did, resp).await
     }
 }
 

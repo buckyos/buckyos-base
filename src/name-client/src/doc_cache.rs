@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 
 use buckyos_kit::{
     buckyos_get_unix_timestamp, get_buckyos_service_local_data_dir, get_buckyos_system_etc_dir,
@@ -9,7 +10,7 @@ use name_lib::{EncodedDocument, DEFAULT_EXPIRE_TIME, DID};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::DEFAULT_PROVIDER_TRUST_LEVEL;
+use crate::ROOT_TRUST_LEVEL;
 
 /// 支持两种存储后端的 DID 文档缓存：文件系统和 SQLite。
 /// 通过 `CacheBackend` 选择实现，默认推荐 SQLite 以避免大量小文件。
@@ -130,19 +131,14 @@ impl DIDDocumentFsCache {
     }
 
     pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
-        let doc = self.load_from_disk(did, doc_type)?;
-        let meta = self
-            .load_meta(did, doc_type)
-            .unwrap_or_else(|| CacheMeta { trust_level: DEFAULT_PROVIDER_TRUST_LEVEL, exp: None });
+        let (doc, meta_fallback) = self.load_from_disk(did, doc_type)?;
+        //默认的过期时间，使用磁盘文件的修改时间 + DEFAULT_EXPIRE_TIME
+        let meta = self.load_meta(did, doc_type).unwrap_or(meta_fallback);
         let exp = meta
             .exp
             .or_else(|| extract_timestamp(&doc, "exp"))
             .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
-        if is_expired(exp) {
-            warn!("did doc is expired, delete it: {}", did.to_raw_host_name());
-            self.delete(did.clone(), doc_type);
-            return None;
-        }
+
         let trust_level = meta.trust_level;
         Some((doc, exp, trust_level))
     }
@@ -200,7 +196,7 @@ impl DIDDocumentFsCache {
         self.delete_meta(&did, doc_type);
     }
 
-    fn load_from_disk(&self, did: &DID, doc_type: Option<&str>) -> Option<EncodedDocument> {
+    fn load_from_disk(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, CacheMeta)> {
         let file_path = self
             .cache_dir
             .join(format!("{}.doc.json", combine_key(did, doc_type)));
@@ -209,7 +205,16 @@ impl DIDDocumentFsCache {
             Ok(content) => match EncodedDocument::from_str(content) {
                 Ok(doc) => {
                     debug!("load did doc from local cache: {}", file_path.display());
-                    Some(doc)
+                    let default_exp = fs::metadata(&file_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() + 3600*24);
+                    let meta = CacheMeta {
+                        trust_level: ROOT_TRUST_LEVEL,
+                        exp: default_exp,
+                    };
+                    Some((doc, meta))
                 }
                 Err(err) => {
                     error!(
@@ -664,8 +669,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         let (loaded_doc, loaded_exp, trust) = cache.get(&did, None).expect("doc should still load");
         assert_eq!(loaded_doc, doc);
-        assert_eq!(loaded_exp, exp);
-        assert_eq!(trust, DEFAULT_PROVIDER_TRUST_LEVEL);
+        assert_eq!(trust, ROOT_TRUST_LEVEL);
     }
 
     #[test]

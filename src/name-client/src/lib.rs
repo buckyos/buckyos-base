@@ -70,7 +70,13 @@ pub async fn init_name_lib_ex(
     }
 
     let client = NameClient::new(config);
-    client.add_provider(Box::new(DnsProvider::new(None)), None).await;
+    let bns_provider = BnsProvider::new()?;
+    client
+        .add_provider(Box::new(bns_provider), Some(ROOT_TRUST_LEVEL))
+        .await;
+    client.add_provider(Box::new(DnsProvider::new(None)), Some(DNS_TRUST_LEVEL)).await;
+    //基于当前zone创建https provider?
+    client.add_provider(Box::new(SmartProvider::new()), Some(DEFAULT_PROVIDER_TRUST_LEVEL)).await;
     let set_result = GLOBAL_NAME_CLIENT.set(client);
     if set_result.is_err() {
         return Err(NSError::Failed(

@@ -149,9 +149,10 @@
 - 有ip,有exchange_key
 - did:bns:$name,did:web:$hostname
   - doc_type = $devcie_friendly_name，(比如ood1,ood2)
-- did:bns:$device_friendlyname.$name, did:web:$device_friendlyname.$hostname,did:dev:$pubkey,did:dev:$pubkey.$name
+- did:bns:$device_friendlyname.$name, did:web:$device_friendlyname.$hostname,did:dev:$pubkey
   - doc_type = 无，使用二级did的时候，名字是精确的所以也可以不指定
-- did:bns:$
+  - 没必要支持did:dev:$pubkey:$hostname?
+- 注意device-did的确定，可能会深刻的影响rtcp stack中的session管理
 - 由MiniConfig构造时无签名，但大多数时候，都是使用有签名的DeviceConfig.
 
 注意当DeviceConfig中包含address的时候，说明该Device的netid是WAN，其resolve-ip的结果与resolve-did相关

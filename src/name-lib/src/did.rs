@@ -71,6 +71,14 @@ impl DID {
         self.method == "dev"
     }
 
+    pub fn get_path_from_id(&self) -> Option<String> {
+        let parts: Vec<&str> = self.id.split(':').collect();
+        if parts.len() > 1 {
+            return Some(parts[1..].join("/"));
+        }
+        None
+    }
+
     pub fn from_str(did: &str) -> NSResult<Self> {
         let parts: Vec<&str> = did.split(':').collect();
         if parts[0] != "did" {
@@ -93,17 +101,19 @@ impl DID {
     }
 
     pub fn to_raw_host_name(&self) -> String {
+        let real_id = self.id.split(':').nth(0).unwrap();
         if self.method == "web" {
-            return self.id.clone();
+            return real_id.to_string();
         }
-        format!("{}.{}.did", self.id, self.method)
+        format!("{}.{}.did", real_id, self.method)
     }
 
     pub fn to_host_name_by_bridge(&self, bridge_base_hostname: &str) -> String {
+        let real_id = self.id.split(':').nth(0).unwrap();
         if self.method == "web" {
-            return self.id.clone();
+            return real_id.to_string();
         }
-        return format!("{}.{}", self.id, bridge_base_hostname);
+        return format!("{}.{}", real_id, bridge_base_hostname);
     }
 
     pub fn from_host_name_by_bridge(host_name: &str, method: &str, bridge_base_hostname: &str) -> Option<Self> {
@@ -129,8 +139,9 @@ impl DID {
     }
 
     pub fn to_host_name(&self) -> String {
+        let real_id = self.id.split(':').nth(0).unwrap();
         if self.method == "web" {
-            return self.id.clone();
+            return real_id.to_string();
         }
 
         let web3_bridge_config = KNOWN_WEB3_BRIDGE_CONFIG.get();
@@ -138,11 +149,11 @@ impl DID {
             let web3_bridge_config = web3_bridge_config.unwrap();
             let bridge_base_hostname = web3_bridge_config.get(self.method.as_str());
             if bridge_base_hostname.is_some() {
-                return format!("{}.{}", self.id, bridge_base_hostname.unwrap());
+                return format!("{}.{}", real_id, bridge_base_hostname.unwrap());
             }
         }
         //todo: find web3 bridge config
-        format!("{}.{}.did", self.id, self.method)
+        format!("{}.{}.did", real_id, self.method)
     }
 
     fn from_host_name(host_name: &str) -> Option<Self> {
@@ -325,6 +336,14 @@ mod tests {
         let did = DID::from_str("web3.buckyos.io").unwrap();
         assert_eq!(did.method, "web");
         assert_eq!(did.id, "web3.buckyos.io");
+
+        let did = DID::from_str("did:web:web3.buckyos.io:users:bob").unwrap();
+        assert_eq!(did.method, "web");
+        assert_eq!(did.id, "web3.buckyos.io:users:bob");
+        let host_name = did.to_host_name();
+        assert_eq!(host_name, "web3.buckyos.io");
+        let path = did.get_path_from_id();
+        assert_eq!(path, Some("users/bob".to_string()));
 
         let did = DID::from_host_name("waterflier.web3.buckyos.io").unwrap();
         assert_eq!(did.method, "bns");
