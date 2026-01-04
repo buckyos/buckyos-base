@@ -71,22 +71,20 @@ impl NsProvider for DnsProvider {
             }
             resolver = system_resolver.unwrap();
         }
-        info!("dns query: {}", name);
-        //resolver.lookup(name, record_type)
-        //for dns proivder,default record type is A.
-        let record_type_str = record_type
-            .map(|rt| rt.to_string())
-            .unwrap_or_else(|| "A".to_string());
-
+       
         match record_type.unwrap_or(RecordType::A) {
             RecordType::TXT => {
+                info!("dns query txt: {}", name);
                 let response = resolver.txt_lookup(name).await;
                 if response.is_err() {
+                    let err = response.err().unwrap();
+                    warn!("lookup txt failed! {}", err.to_string());
                     return Err(NSError::Failed(format!(
                         "lookup txt failed! {}",
-                        response.err().unwrap()
+                        err
                     )));
                 }
+
                 let response = response.unwrap();
                 let mut txt_vec = Vec::new();
                 for record in response.iter() {
@@ -95,6 +93,7 @@ impl NsProvider for DnsProvider {
                         .iter()
                         .map(|s| -> String {
                             let byte_slice: &[u8] = &s;
+                            info!("bytes:{:?}", byte_slice);
                             return String::from_utf8_lossy(byte_slice).to_string();
                         })
                         .collect::<Vec<String>>()
@@ -102,6 +101,7 @@ impl NsProvider for DnsProvider {
                     txt_vec.push(txt);
                 }
 
+                info!("lookup txt success! {}", name);
                 let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(300);
                 let name_info = NameInfo {
                     name: name.to_string(),
@@ -115,6 +115,7 @@ impl NsProvider for DnsProvider {
                 return Ok(name_info);
             }
             RecordType::A | RecordType::AAAA => {
+                info!("dns query txt: {}", name);
                 let response = resolver.lookup_ip(name).await;
                 if response.is_err() {
                     return Err(NSError::Failed(format!(
