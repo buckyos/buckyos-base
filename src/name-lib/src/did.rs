@@ -37,6 +37,10 @@ impl DID {
         }
     }
 
+    pub fn is_undefined(&self) -> bool {
+        self.method == "undefined"
+    }
+
     pub fn is_valid(&self) -> bool {
         self.method != "undefined"
     }
