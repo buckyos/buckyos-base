@@ -17,7 +17,11 @@ fn main() {
 
     println!(
         "cargo:rustc-env=BUILDDATE={}",
-        ::chrono::Local::now().format("%y-%m-%d")
+        ::chrono::Local::now().format("%y%m%d")
+    );
+    println!(
+        "cargo:rustc-env=VERSION_EXTEND={}",
+        std::env::var("VERSION_EXTEND").map(|s| format!(".{}", s)).unwrap_or("".to_owned())
     );
 
     println!("cargo:rerun-if-changed=protos");

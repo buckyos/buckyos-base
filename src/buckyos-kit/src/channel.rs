@@ -1,5 +1,7 @@
+use std::env;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BuckyOSChannel {
@@ -59,23 +61,17 @@ pub fn get_target() -> &'static str {
 }
 
 fn get_version_impl() -> String {
-    let channel_ver = get_channel().get_ver();
-    format!(
-        "1.1.{}.{}-{} ({})",
-        channel_ver,
-        env!("VERSION"),
-        get_channel(),
-        env!("BUILDDATE")
-    )
+    format!("{}+build{}{} ({})",
+         env!("VERSION"), 
+         env!("BUILDDATE"),
+         env!("VERSION_EXTEND"),
+         get_channel())
 }
 
 fn get_channel_impl() -> BuckyOSChannel {
     let channel_str = match std::env::var("CYFS_CHANNEL") {
         Ok(channel) => {
-            info!(
-                "got channel config from CYFS_CHANNEL env: channel={}",
-                channel
-            );
+            info!("got channel config from CYFS_CHANNEL env: channel={}", channel);
             channel
         }
         Err(_) => {
@@ -84,7 +80,7 @@ fn get_channel_impl() -> BuckyOSChannel {
             channel
         }
     };
-
+    
     BuckyOSChannel::from_str(channel_str.as_str()).unwrap()
 }
 
