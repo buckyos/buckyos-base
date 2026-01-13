@@ -96,18 +96,26 @@ impl NsProvider for DnsProvider {
             }
             resolver = system_resolver.unwrap();
         }
-        info!("dns query: {}",name);
         //resolver.lookup(name, record_type)
         //for dns proivder,default record type is A.
         let record_type_str = record_type
             .map(|rt| rt.to_string())
             .unwrap_or_else(|| "A".to_string());
+        info!("dns query {}: {}", record_type_str, name);
 
         match record_type.unwrap_or(RecordType::A) {
             RecordType::TXT => {
                 let response = resolver.txt_lookup(name).await;
                 if response.is_err() {
-                    return Err(NSError::Failed(format!("lookup txt failed! {}",response.err().unwrap())));
+                    let err = response.err().unwrap();
+                    warn!(
+                        "dns txt lookup failed for {} (resolver may append search domains); err={}",
+                        name, err
+                    );
+                    return Err(NSError::Failed(format!(
+                        "dns txt lookup failed for {}: {}",
+                        name, err
+                    )));
                 }
                 let response = response.unwrap();
                 let mut whole_txt = String::new();
@@ -158,8 +166,15 @@ impl NsProvider for DnsProvider {
             RecordType::DID => {
                 let response = resolver.txt_lookup(name).await;
                 if response.is_err() {
-                    warn!("lookup {} txt record failed! {}",name,response.err().unwrap());
-                    return Err(NSError::Failed(format!("lookup txt failed! {}",name)));
+                    let err = response.err().unwrap();
+                    warn!(
+                        "dns txt lookup failed for {} (resolver may append search domains); err={}",
+                        name, err
+                    );
+                    return Err(NSError::Failed(format!(
+                        "dns txt lookup failed for {}: {}",
+                        name, err
+                    )));
                 }
                 let response = response.unwrap();
                 //let mut did_tx:String;
@@ -176,6 +191,9 @@ impl NsProvider for DnsProvider {
                     create_time: 0,
                     ttl: None,
                 };
+                let mut has_boot = false;
+                let mut has_dev = false;
+                let mut has_pkx = false;
                 for record in response.iter() {
                     let txt = record.txt_data().iter().map(|s| -> String {
                         let byte_slice: &[u8] = &s;
@@ -193,11 +211,39 @@ impl NsProvider for DnsProvider {
                     if txt.starts_with("PKX=") {
                         let pkx = txt.trim_start_matches("PKX=").trim_end_matches(";");
                         pkx_list.push(pkx.to_string());
+                        has_pkx = true;
+                    }
+
+                    if txt.starts_with("BOOT=") {
+                        has_boot = true;
+                    }
+                    if txt.starts_with("DEV=") {
+                        has_dev = true;
                     }
                 }
 
                 if name_info.did_document.is_none() {
-                    return Err(NSError::Failed("DID Document not found".to_string()));
+                    if has_boot || has_dev {
+                        warn!(
+                            "dns txt for {} has BOOT/DEV but missing DID=; cannot build DID document",
+                            name
+                        );
+                    } else {
+                        warn!(
+                            "dns txt for {} missing DID=; cannot build DID document",
+                            name
+                        );
+                    }
+                    return Err(NSError::Failed(format!(
+                        "DID TXT record missing DID= for {}",
+                        name
+                    )));
+                }
+                if !has_pkx {
+                    warn!(
+                        "dns txt for {} missing PKX=; cannot verify DID document",
+                        name
+                    );
                 }
                 if pkx_list.len() > 0 {
                     debug!("pkx_list: {:?}",pkx_list);
@@ -253,4 +299,3 @@ impl NsProvider for DnsProvider {
         return Err(NSError::Failed("DID Document not found".to_string()));
     }
 }
-
