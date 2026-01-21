@@ -1,9 +1,9 @@
 use super::super::request::PanicReportRequest;
 use crate::panic::BugReportHandler;
 use crate::panic::PanicInfo;
-use http_types::StatusCode;
+use reqwest::StatusCode;
+use reqwest::Url;
 use std::str::FromStr;
-use tide::http::Url;
 
 // Default notify addr
 // const NOTIFY_ADDR: &str = "http://127.0.0.1:40001/bugs/";
@@ -11,6 +11,7 @@ use tide::http::Url;
 #[derive(Clone)]
 pub struct HttpBugReporter {
     notify_addr: Url,
+    client: reqwest::Client,
 }
 
 impl HttpBugReporter {
@@ -18,7 +19,10 @@ impl HttpBugReporter {
         info!("new http bug reporter: {}", addr);
 
         let url = Url::from_str(addr).unwrap();
-        Self { notify_addr: url }
+        Self {
+            notify_addr: url,
+            client: reqwest::Client::new(),
+        }
     }
 
     pub async fn notify(&self, req: PanicReportRequest) -> Result<(), Box<dyn std::error::Error>> {
@@ -28,15 +32,20 @@ impl HttpBugReporter {
     async fn post(&self, req: PanicReportRequest) -> Result<(), Box<dyn std::error::Error>> {
         let report_url = self.notify_addr.join(&req.info.hash).unwrap();
 
-        let mut resp = surf::post(report_url).body_json(&req)?.await?;
+        let resp = self
+            .client
+            .post(report_url)
+            .json(&req)
+            .send()
+            .await?;
         match resp.status() {
-            StatusCode::Ok => {
+            StatusCode::OK => {
                 info!("post to http notify addr success");
 
                 Ok(())
             }
             code @ _ => {
-                let body = resp.body_string().await;
+                let body = resp.text().await;
                 let msg = format!(
                     "post to http notify addr failed! addr={}, status={}, msg={:?}",
                     self.notify_addr, code, body

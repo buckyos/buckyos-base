@@ -9,9 +9,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 backtrace = { workspace = true }
 chrono = { workspace = true }
-tide = { workspace = true }
-http-types = { workspace = true }
-surf = { workspace = true }
+reqwest = { workspace = true }
 buckyos-kit = { workspace = true }
 tokio = { workspace = true }
 sha2 = { workspace = true }

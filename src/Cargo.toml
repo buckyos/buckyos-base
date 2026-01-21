@@ -67,9 +67,6 @@ jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # HTTP clients and servers
 reqwest = { version = "0.12", features = ["json","rustls-tls-native-roots"] }
-tide = "0.16"
-http-types = "2.12"
-surf = "2.3"
 
 # DNS
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
