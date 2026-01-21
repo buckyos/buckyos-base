@@ -1,7 +1,12 @@
 use std::{
     env,
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
+
+lazy_static::lazy_static! {
+    static ref BUCKYOS_ROOT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+}
 
 pub fn normalize_path(path_str: &str) -> String {
     let path_str = path_str.replace("\\", "/");
@@ -35,17 +40,49 @@ pub fn normalize_path(path_str: &str) -> String {
 }
 
 pub fn get_buckyos_root_dir() -> PathBuf {
-    if env::var("BUCKYOS_ROOT").is_ok() {
-        return Path::new(&env::var("BUCKYOS_ROOT").unwrap()).to_path_buf();
+    // 检查缓存
+    {
+        let cache = BUCKYOS_ROOT_DIR.lock().unwrap();
+        if let Some(cached_path) = cache.as_ref() {
+            let result = cached_path.clone();
+            drop(cache); // 显式释放锁
+            return result;
+        }
     }
 
-    if cfg!(target_os = "windows") {
-        let user_data_dir = env::var("APPDATA")
-            .unwrap_or_else(|_| env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
-        Path::new(&user_data_dir).join("buckyos")
+    // 第一次调用，计算路径
+    let root_dir = if env::var("BUCKYOS_ROOT").is_ok() {
+        Path::new(&env::var("BUCKYOS_ROOT").unwrap()).to_path_buf()
     } else {
-        Path::new("/opt/buckyos").to_path_buf()
+        //获得当前可执行文件所在的目录，并向上级目录寻找，直到找到包含applist.json的bin目录
+        let mut current_dir = env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        while !current_dir.join("applist.json").exists() {
+            if let Some(parent) = current_dir.parent() {
+                current_dir = parent.to_path_buf();
+            } else {
+                // 如果到达根目录还没找到，使用默认路径
+                break;
+            }
+        }
+
+        if current_dir.join("applist.json").exists() {
+            current_dir.parent().unwrap().to_path_buf()
+        } else if cfg!(target_os = "windows") {
+            let user_data_dir = env::var("APPDATA")
+                .unwrap_or_else(|_| env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
+            Path::new(&user_data_dir).join("buckyos")
+        } else {
+            Path::new("/opt/buckyos").to_path_buf()
+        }
+    };
+
+    // 缓存结果
+    {
+        let mut cache = BUCKYOS_ROOT_DIR.lock().unwrap();
+        *cache = Some(root_dir.clone());
     }
+
+    root_dir
 }
 
 pub fn get_buckyos_dev_user_home() -> PathBuf {
@@ -88,6 +125,10 @@ pub fn get_buckyos_service_data_dir(service_name: &str) -> PathBuf {
     get_buckyos_root_dir().join("data").join(service_name)
 }
 
+pub fn get_buckyos_app_data_dir(app_name: &str,owner_id: &str) -> PathBuf {
+    get_buckyos_root_dir().join("data").join(owner_id).join(app_name)
+}
+
 pub fn get_buckyos_service_local_data_dir(service_name: &str, disk_id: Option<&str>) -> PathBuf {
     if disk_id.is_some() {
         get_buckyos_root_dir()
@@ -96,6 +137,49 @@ pub fn get_buckyos_service_local_data_dir(service_name: &str, disk_id: Option<&s
             .join(service_name)
     } else {
         get_buckyos_root_dir().join("local").join(service_name)
+    }
+}
+
+pub fn get_buckyos_user_home_dir(user_id: &str) -> PathBuf {
+    get_buckyos_root_dir().join("home").join(user_id)
+}
+
+pub enum LibraryCategory {
+    Public,
+    Shared,
+    Photo,//所有自己拍的照片，视频
+    Pciture,
+    Music,
+    Video,
+    ROMS,
+    ISO,
+    Book,
+    Softwares,//各种软件安装包
+}
+
+impl LibraryCategory {
+    pub fn to_string(&self) -> Option<&str> {
+        match self {
+            LibraryCategory::Public => Some("public"),
+            LibraryCategory::Shared => Some("shared"),
+            LibraryCategory::Photo => Some("photo"),
+            LibraryCategory::Pciture => Some("picture"),
+            LibraryCategory::Music => Some("music"),
+            LibraryCategory::Video => Some("video"),
+            LibraryCategory::ROMS => Some("roms"),
+            LibraryCategory::ISO => Some("iso"),
+            LibraryCategory::Book => Some("book"),
+            LibraryCategory::Softwares => Some("softwares"),
+        }
+    }
+}
+
+pub fn get_buckyos_library_dir(category: LibraryCategory) -> Option<PathBuf> {
+    let category_str = category.to_string();
+    if category_str.is_some() {
+        Some(get_buckyos_root_dir().join("library").join(category_str.unwrap()))
+    } else {
+        None
     }
 }
 

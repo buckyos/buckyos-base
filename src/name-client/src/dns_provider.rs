@@ -1,14 +1,19 @@
 #![allow(unused)]
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
-use hickory_resolver::{config::*, Resolver};
+use buckyos_kit::buckyos_get_unix_timestamp;
 use hickory_resolver::proto::rr::record_type;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::config::*;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
+use serde_json::json;
 
-use crate::{NsProvider, NameInfo, NameProof, RecordType};
+use crate::{DEFAULT_DID_DOC_TYPE, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -16,49 +21,19 @@ pub struct DnsProvider {
 
 impl DnsProvider {
     pub fn new(dns_server: Option<String>) -> Self {
-        Self {
-            dns_server,
-        }
+        Self { dns_server }
     }
 
     pub fn new_with_config(config: serde_json::Value) -> NSResult<Self> {
         let dns_server = config.get("dns_server");
         if dns_server.is_some() {
             let dns_server = dns_server.unwrap().as_str();
-            return Ok( Self {
-                dns_server : dns_server.map(|s| s.to_string())
-            })
+            return Ok(Self {
+                dns_server: dns_server.map(|s| s.to_string()),
+            });
         }
-        Ok(Self {
-            dns_server: None,
-        })
+        Ok(Self { dns_server: None })
     }
-
-    // fn parse_dns_response(resp: DnsResponse) -> NSResult<NameInfo> {
-    //     let mut txt_list = Vec::new();
-    //     for record in resp.answers() {
-    //         if record.record_type() == RecordType::TXT {
-    //             let data = record.data();
-    //             if data.is_some() {
-    //                 let data = data.unwrap();
-    //                 if let RData::TXT(txt) = data {
-    //                     for txt in txt.txt_data() {
-    //                         let txt = String::from_utf8_lossy(txt).to_string();
-    //                         txt_list.push(txt);
-    //                     }
-    //                 }
-
-    //             }
-    //         }
-    //     }
-    //     if txt_list.len() == 0 {
-    //         return Err(ns_err!(NSErrorCode::NotFound, "txt data is empty"));
-    //     }
-
-    //     let txt = DnsTxtCodec::decode(txt_list)?;
-    //     return Ok(serde_json::from_str(txt.as_str()).map_err(into_ns_err!(NSErrorCode::InvalidData, "Failed to parse txt {}", txt))?);
-    // }
-
 }
 
 #[async_trait::async_trait]
@@ -67,7 +42,12 @@ impl NsProvider for DnsProvider {
         return "dns provider".to_string();
     }
 
-    async fn query(&self, name: &str, record_type: Option<RecordType>, from_ip: Option<IpAddr>) -> NSResult<NameInfo> {
+    async fn query(
+        &self,
+        name: &str,
+        record_type: Option<RecordType>,
+        from_ip: Option<IpAddr>,
+    ) -> NSResult<NameInfo> {
         let mut server_config = ResolverConfig::default();
         let resolver;
         if self.dns_server.is_some() {
@@ -75,227 +55,168 @@ impl NsProvider for DnsProvider {
             let dns_ip_addr = if let Ok(ip) = IpAddr::from_str(&dns_server) {
                 SocketAddr::new(ip, 53)
             } else {
-                let dns_ip_addr = SocketAddr::from_str(&dns_server)
-                    .map_err(|e| NSError::ReadLocalFileError(format!("Invalid dns server: {}", e)))?;
+                let dns_ip_addr = SocketAddr::from_str(&dns_server).map_err(|e| {
+                    NSError::ReadLocalFileError(format!("Invalid dns server: {}", e))
+                })?;
                 dns_ip_addr
             };
-            let name_server_configs = vec![NameServerConfig::new(
-                dns_ip_addr,
-                Protocol::Udp,
-            )];
-            server_config = ResolverConfig::from_parts(
-                None,
-                vec![],
-                name_server_configs,
-            );
-            resolver = TokioAsyncResolver::tokio(server_config, ResolverOpts::default());
+            let name_server_configs = vec![NameServerConfig::new(dns_ip_addr, Protocol::Udp)];
+            server_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
+            resolver = TokioResolver::builder_with_config(server_config, TokioConnectionProvider::default())
+                .build();
         } else {
-            let system_resolver = TokioAsyncResolver::tokio_from_system_conf();
-            if system_resolver.is_err() {
-                return Err(NSError::Failed(format!("create system resolver failed! {}",system_resolver.err().unwrap())));
-            }
-            resolver = system_resolver.unwrap();
+            resolver = TokioResolver::builder_tokio()
+                .map_err(|e| NSError::Failed(format!("create system resolver failed! {}", e)))?
+                .build();
         }
-        //resolver.lookup(name, record_type)
-        //for dns proivder,default record type is A.
-        let record_type_str = record_type
-            .map(|rt| rt.to_string())
-            .unwrap_or_else(|| "A".to_string());
-        info!("dns query {}: {}", record_type_str, name);
-
+       
         match record_type.unwrap_or(RecordType::A) {
             RecordType::TXT => {
+                //TODO: 这里似乎有崩溃bug，需要排查
+                info!("dns query txt: {}", name);
                 let response = resolver.txt_lookup(name).await;
                 if response.is_err() {
                     let err = response.err().unwrap();
-                    warn!(
-                        "dns txt lookup failed for {} (resolver may append search domains); err={}",
-                        name, err
-                    );
+                    warn!("lookup txt failed! {}", err.to_string());
                     return Err(NSError::Failed(format!(
-                        "dns txt lookup failed for {}: {}",
-                        name, err
+                        "lookup txt failed! {}",
+                        err
                     )));
                 }
+
                 let response = response.unwrap();
-                let mut whole_txt = String::new();
+                let mut txt_vec = Vec::new();
                 for record in response.iter() {
-                    let txt = record.txt_data().iter().map(|s| -> String {
-                        let byte_slice: &[u8] = &s;
-                        return String::from_utf8_lossy(byte_slice).to_string();
-                    }).collect::<Vec<String>>().join("");
-                    whole_txt.push_str(&txt);
+                    let txt = record
+                        .txt_data()
+                        .iter()
+                        .map(|s| -> String {
+                            String::from_utf8_lossy(s).to_string()
+                        })
+                        .collect::<Vec<String>>()
+                        .join("");
+                    txt_vec.push(txt);
                 }
 
+                info!("lookup txt success! {}", name);
+                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(300);
                 let name_info = NameInfo {
                     name: name.to_string(),
                     address: Vec::new(),
                     cname: None,
-                    txt: Some(whole_txt),
-                    did_document: None,
-                    pk_x_list: None,
-                    proof_type: NameProof::None,
-                    create_time: 0,
-                    ttl: None,
+                    txt: txt_vec,
+                    did_documents: HashMap::new(),
+                    iat: buckyos_get_unix_timestamp(),
+                    ttl: Some(ttl),
                 };
                 return Ok(name_info);
-            },
+            }
             RecordType::A | RecordType::AAAA => {
+                info!("dns query ip: {}", name);
                 let response = resolver.lookup_ip(name).await;
                 if response.is_err() {
-                    return Err(NSError::Failed(format!("lookup ip failed! {}",response.err().unwrap())));
+                    return Err(NSError::Failed(format!(
+                        "lookup ip failed! {}",
+                        response.err().unwrap()
+                    )));
                 }
                 let response = response.unwrap();
                 let mut addrs = Vec::new();
                 for ip in response.iter() {
                     addrs.push(ip);
                 }
+                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
                 let name_info = NameInfo {
                     name: name.to_string(),
-                    address:addrs,
+                    address: addrs,
                     cname: None,
-                    txt: None,
-                    did_document: None,
-                    pk_x_list: None,
-                    proof_type: NameProof::None,
-                    create_time: 0,
-                    ttl: None,
+                    txt: Vec::new(),
+                    did_documents: HashMap::new(),
+                    iat: buckyos_get_unix_timestamp(),
+                    ttl: Some(ttl),
                 };
                 return Ok(name_info);
-            },
-            RecordType::DID => {
-                let response = resolver.txt_lookup(name).await;
-                if response.is_err() {
-                    let err = response.err().unwrap();
-                    warn!(
-                        "dns txt lookup failed for {} (resolver may append search domains); err={}",
-                        name, err
-                    );
-                    return Err(NSError::Failed(format!(
-                        "dns txt lookup failed for {}: {}",
-                        name, err
-                    )));
-                }
-                let response = response.unwrap();
-                //let mut did_tx:String;
-                //let mut did_doc = DIDSimpleDocument::new();
-                let mut pkx_list = Vec::new();
-                let mut name_info = NameInfo {
-                    name: name.to_string(),
-                    address:Vec::new(),
-                    cname: None,
-                    txt: None,
-                    did_document: None,
-                    pk_x_list: None,
-                    proof_type: NameProof::None,
-                    create_time: 0,
-                    ttl: None,
-                };
-                let mut has_boot = false;
-                let mut has_dev = false;
-                let mut has_pkx = false;
-                for record in response.iter() {
-                    let txt = record.txt_data().iter().map(|s| -> String {
-                        let byte_slice: &[u8] = &s;
-                        return String::from_utf8_lossy(byte_slice).to_string();
-                    }).collect::<Vec<String>>().join("");
-
-                    if txt.starts_with("DID=") {
-                        let did_payload = txt.trim_start_matches("DID=").trim_end_matches(";");
-                        debug!("did_payload: {}",did_payload);
-
-                        let did_doc = EncodedDocument::Jwt(did_payload.to_string());
-                        name_info.did_document = Some(did_doc);
-                    }
-
-                    if txt.starts_with("PKX=") {
-                        let pkx = txt.trim_start_matches("PKX=").trim_end_matches(";");
-                        pkx_list.push(pkx.to_string());
-                        has_pkx = true;
-                    }
-
-                    if txt.starts_with("BOOT=") {
-                        has_boot = true;
-                    }
-                    if txt.starts_with("DEV=") {
-                        has_dev = true;
-                    }
-                }
-
-                if name_info.did_document.is_none() {
-                    if has_boot || has_dev {
-                        warn!(
-                            "dns txt for {} has BOOT/DEV but missing DID=; cannot build DID document",
-                            name
-                        );
-                    } else {
-                        warn!(
-                            "dns txt for {} missing DID=; cannot build DID document",
-                            name
-                        );
-                    }
-                    return Err(NSError::Failed(format!(
-                        "DID TXT record missing DID= for {}",
-                        name
-                    )));
-                }
-                if !has_pkx {
-                    warn!(
-                        "dns txt for {} missing PKX=; cannot verify DID document",
-                        name
-                    );
-                }
-                if pkx_list.len() > 0 {
-                    debug!("pkx_list: {:?}",pkx_list);
-                    name_info.pk_x_list = Some(pkx_list);
-
-                    //verify did_document by pkx_list
-                    let jwt_str = name_info.did_document.as_ref().unwrap();
-                    let owner_public_key = name_info.get_owner_pk();
-                    if owner_public_key.is_none() {
-                        return Err(NSError::Failed("Owner public key not found".to_string()));
-                    }
-                    let public_key_jwk = owner_public_key.unwrap();
-                    let public_key = DecodingKey::from_jwk(&public_key_jwk);
-                    if public_key.is_err() {
-                        error!("parse public key failed! {}",public_key.err().unwrap());
-                        return Err(NSError::Failed("parse public key failed! ".to_string()));
-                    }
-                    let public_key = public_key.unwrap();
-
-                    let mut zone_boot_config = ZoneBootConfig::decode(&jwt_str, Some(&public_key));
-                    if zone_boot_config.is_err() {
-                        return Err(NSError::Failed("parse zone boot config failed!".to_string()));
-                    }
-
-                    let mut zone_boot_config = zone_boot_config.unwrap();
-                    zone_boot_config.owner_key = Some(public_key_jwk);
-                    zone_boot_config.id = Some(DID::from_str(name).unwrap());
-                    let gateway_devs = name_info.get_gateway_device_list();
-                    if gateway_devs.is_some() {
-                        zone_boot_config.gateway_devs =  gateway_devs.unwrap();
-                    }
-
-                    info!("resolve & verify zone_boot_config from {} TXT record OK.",name);
-                    let zone_boot_config_value = serde_json::to_value(&zone_boot_config).unwrap();
-                    //info!("zone_boot_config_value: {:?}",zone_boot_config_value);
-                    name_info.did_document = Some(EncodedDocument::JsonLd(zone_boot_config_value));
-                }
-                return Ok(name_info);
-            },
+            }
             _ => {
-                return Err(NSError::Failed(format!("Invalid record type: {:?}", record_type)));
+                return Err(NSError::Failed(format!(
+                    "Invalid record type: {:?}",
+                    record_type
+                )));
             }
         }
-
     }
 
-    async fn query_did(&self, did: &DID, fragment: Option<&str>, from_ip: Option<IpAddr>) -> NSResult<EncodedDocument> {
-        info!("query_did: {}",did.to_string());
-        let name_info = self.query(&did.to_host_name(), Some(RecordType::DID), None).await?;
-        if name_info.did_document.is_some() {
-            return Ok(name_info.did_document.unwrap());
+    async fn query_did(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        from_ip: Option<IpAddr>,
+    ) -> NSResult<EncodedDocument> {
+        info!("NsProvider query did: {} ...", did.to_host_name());
+        
+        let name_info = self
+            .query(&did.to_host_name(), Some(RecordType::TXT), None)
+            .await?;
+
+        //info!("NsProvicer will parse_txt_record_to_did_document... for {}",did.to_host_name());
+
+        //识别TXT记录中的特殊记录
+        let new_name_info = name_info.parse_txt_record_to_did_document()?;
+
+        let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
+        let did_document = new_name_info.get_did_document(doc_type);
+        if did_document.is_some() {
+            info!("NsProvider::query_did{}: DID Document found: {}", did.to_host_name(), doc_type);
+            return Ok(did_document.unwrap().clone());
         }
-        return Err(NSError::Failed("DID Document not found".to_string()));
+        warn!("NsProvider::query_did{}: DID Document not found: {}", did.to_host_name(), doc_type);
+        return Err(NSError::NotFound(format!("DID Document not found: {}", doc_type)));
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use buckyos_kit::init_logging;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_dns_provider() {
+        init_logging("test_dns_provider", false);
+        let dns_provider = DnsProvider::new(None);
+        let result = dns_provider.query("test.buckyos.io", None, None).await;
+        assert!(result.is_ok(), "query should succeed");
+        let result = result.unwrap();
+        assert!(result.address.len() > 0, "address should not be empty");
+
+        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), None, None).await;
+        assert!(result.is_ok(), "query_did should succeed");
+        let result = result.unwrap();
+        let result_str = result.to_string();
+        println!("* result_str: {}", result_str);
+
+
+        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), Some("boot"), None).await;
+        assert!(result.is_ok(), "query_did should succeed");
+        let result = result.unwrap();
+        let result_str = result.to_string();
+        println!("* result_str: {}", result_str);
+
+        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), Some("owner"), None).await;
+        assert!(result.is_ok(), "query_did should succeed");
+        let result = result.unwrap();
+        let result_str = result.to_string();
+        println!("* result_str: {}", result_str);
+
+        let result = dns_provider.query_did(&DID::from_str(" filebrowser.buckyos.web3.devtests.org").unwrap(), None, None).await;
+        if result.is_err() {
+            let err = result.err().unwrap();
+            warn!("query_did failed! {}", err.to_string());
+        }
+
+       
+
+        println!("✓ test_dns_provider passed");
     }
 }

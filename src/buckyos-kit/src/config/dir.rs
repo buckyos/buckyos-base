@@ -98,11 +98,12 @@ async fn load_file(file: &Path) -> Result<JsonValue, Box<dyn std::error::Error>>
             }
             "yaml" | "yml" => {
                 // Parse YAML file directly
-                let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&content).map_err(|e| {
-                    let msg = format!("Failed to parse YAML: {:?}", e);
-                    error!("{}", msg);
-                    msg
-                })?;
+                let yaml_value: serde_yaml_ng::Value =
+                    serde_yaml_ng::from_str(&content).map_err(|e| {
+                        let msg = format!("Failed to parse YAML: {:?}", e);
+                        error!("{}", msg);
+                        msg
+                    })?;
 
                 return yaml_to_json(yaml_value);
             }
@@ -151,7 +152,6 @@ async fn load_file(file: &Path) -> Result<JsonValue, Box<dyn std::error::Error>>
 /// }
 ///
 ///
-
 
 pub async fn load_dir_with_root(
     dir: &Path,
@@ -252,7 +252,7 @@ fn extract_index_from_filename(path: &Path) -> Option<u32> {
     //println!("index_part: {}", index_part);
     let index = index_part.parse::<u32>().ok();
     if index.is_none() {
-        let index_part =  file_stem.rsplit('.').nth(1)?;
+        let index_part = file_stem.rsplit('.').nth(1)?;
         let index = index_part.parse::<u32>().ok();
         return index;
     }

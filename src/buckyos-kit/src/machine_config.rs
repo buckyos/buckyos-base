@@ -1,12 +1,12 @@
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
-use std::fs::File;
 use crate::get_buckyos_system_etc_dir;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct BuckyOSMachineConfig {
     pub web3_bridge: HashMap<String, String>,
-    pub trust_did: Vec<String>,//did
+    pub trust_did: Vec<String>, //did
     pub force_https: bool,
 
     #[serde(flatten)]
@@ -20,15 +20,16 @@ impl Default for BuckyOSMachineConfig {
 
         Self {
             web3_bridge,
-            trust_did: vec!["did:web:buckyos.org".to_string(),
-            "did:web:buckyos.ai".to_string(),
-            "did:web:buckyos.io".to_string()],
+            trust_did: vec![
+                "did:web:buckyos.org".to_string(),
+                "did:web:buckyos.ai".to_string(),
+                "did:web:buckyos.io".to_string(),
+            ],
             force_https: true,
             extra_info: HashMap::new(),
         }
     }
 }
-
 
 impl BuckyOSMachineConfig {
     pub fn load_machine_config() -> Option<Self> {
@@ -37,7 +38,7 @@ impl BuckyOSMachineConfig {
         if machine_config_file.is_err() {
             return None;
         }
-        let machine_config  = serde_json::from_reader(machine_config_file.unwrap());
+        let machine_config = serde_json::from_reader(machine_config_file.unwrap());
         if machine_config.is_err() {
             return None;
         }

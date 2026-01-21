@@ -59,12 +59,7 @@ impl PanicInfo {
             None => {
                 unique_info = format!("{}", msg);
 
-                format!(
-                    "thread '{}' panicked at '{}'\n{}",
-                    thread,
-                    msg,
-                    backtrace
-                )
+                format!("thread '{}' panicked at '{}'\n{}", thread, msg, backtrace)
             }
         };
 

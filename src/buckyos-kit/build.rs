@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=VERSION");
     println!("cargo:rerun-if-env-changed=CHANNEL");
     println!("cargo:rerun-if-env-changed=TARGET");
+    println!("cargo:rerun-if-env-changed=VERSION_EXTEND");
     println!(
         "cargo:rustc-env=VERSION={}",
         std::env::var("VERSION").unwrap_or("0".to_owned())

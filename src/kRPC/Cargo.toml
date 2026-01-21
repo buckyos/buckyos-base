@@ -1,21 +1,21 @@
 [package]
 name = "kRPC"
-version = "0.4.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["BuckyOS DAO","@waterflier"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-trait = "*"
-tokio = { version = "1", features = ["full"] }
-log = "*"
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
-thiserror = "*"
-openssl = { version = "*", features = ["vendored"] }
-reqwest = {version = "*", features = ["json", "rustls-tls"]}
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+#openssl = { workspace = true }
+reqwest = { workspace = true }
+jsonwebtoken = { workspace = true }
 
-buckyos-kit = { path = "../buckyos-kit" }
-name-lib = { path = "../name-lib" }
-rbac = { path = "../rbac" }
+buckyos-kit = { workspace = true }
+name-lib = { workspace = true }
+rbac = { workspace = true }

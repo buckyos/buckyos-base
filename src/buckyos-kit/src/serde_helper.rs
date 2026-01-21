@@ -1,8 +1,8 @@
-pub fn is_true(v:&bool) -> bool {
+pub fn is_true(v: &bool) -> bool {
     return *v;
 }
 
-pub fn is_false(v:&bool) -> bool {
+pub fn is_false(v: &bool) -> bool {
     return !*v;
 }
 
@@ -11,5 +11,9 @@ pub fn bool_default_true() -> bool {
 }
 
 pub fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    t == &T::default()
+}
+
+pub fn is_zero<T: Default + PartialEq>(t: &T) -> bool {
     t == &T::default()
 }

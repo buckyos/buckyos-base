@@ -58,14 +58,28 @@ impl DingtalkNotifier {
             }
         });
 
-        let client = surf::client();
-        let req = surf::post(&self.dingtalk_url).body(msg);
-
-        let mut _res = client.send(req).await.map_err(|e| {
+        let client = reqwest::Client::new();
+        let res = client
+            .post(&self.dingtalk_url)
+            .json(&msg)
+            .send()
+            .await
+            .map_err(|e| {
             let msg = format!("report to dingtalk error! {}", e);
             error!("{}", msg);
             msg
         })?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.ok();
+            let msg = format!(
+                "report to dingtalk failed! status={}, body={:?}",
+                status, body
+            );
+            error!("{}", msg);
+            return Err(msg.into());
+        }
 
         info!("Report to dingtalk success!");
         Ok(())

@@ -1,17 +1,80 @@
-
-use std::collections::HashMap;
-use serde::{Serialize,Deserialize};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use serde_json::Value;
+use std::collections::HashMap;
 
-#[derive(Debug,Clone,Serialize,Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KVAction {
-    Create(String),//创建一个节点并设置值
-    Update(String),//完整更新
-    Append(String),//追加
-    SetByJsonPath(HashMap<String,Option<Value>>),//当成json设置其中的一个值,针对一个对象,set可以是一个数组
-    Remove,//删除
-    //Create(String),
+    Create(String),                                //创建一个节点并设置值
+    Update(String),                                //完整更新
+    Append(String),                                //追加
+    SetByJsonPath(HashMap<String, Option<Value>>), //当成json设置其中的一个值,针对一个对象,set可以是一个数组
+    Remove,                                        //删除
+                                                   //Create(String),
+}
+
+
+
+pub fn apply_params_to_json(input_json: &Value, ext_params: Option<&HashMap<String, String>>) -> Result<Value, String> {
+    let mut real_params = HashMap::new();
+    
+    // 先添加内部参数
+    let inneer_params = input_json.get("params");
+    if inneer_params.is_some() {
+        let result  = serde_json::from_value(inneer_params.unwrap().clone());
+        if result.is_err() {
+            return Err(format!("Failed to parse inner params: {}", result.err().unwrap()));
+        }
+        let inner_params : HashMap<String, String> = result.unwrap();
+        real_params.extend(inner_params.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    
+    // 再添加外部参数，外部参数会覆盖内部参数
+    if ext_params.is_some() {
+        real_params.extend(ext_params.unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
+    if real_params.is_empty() {
+        return Ok(input_json.clone());
+    }
+
+    //展开json成string
+    let json_str = serde_json::to_string(input_json)
+        .map_err(|e| format!("Failed to serialize JSON: {}", e))?;
+
+    //对string中的{{param}} 进行替换
+    let mut result_str = json_str;
+    for (key, value) in real_params.iter() {
+        let pattern = format!("{{{{{}}}}}", key);
+        result_str = result_str.replace(&pattern, value);
+    }
+
+    //判断是否有未替换的{{}}
+    if result_str.contains("{{") && result_str.contains("}}") {
+        // 找出所有未替换的参数
+        let mut unreplaced = Vec::new();
+        let mut start = 0;
+        while let Some(open_pos) = result_str[start..].find("{{") {
+            let abs_open_pos = start + open_pos;
+            if let Some(close_pos) = result_str[abs_open_pos..].find("}}") {
+                let param = &result_str[abs_open_pos + 2..abs_open_pos + close_pos];
+                unreplaced.push(param.to_string());
+                start = abs_open_pos + close_pos + 2;
+            } else {
+                break;
+            }
+        }
+        if !unreplaced.is_empty() {
+            return Err(format!("Found unreplaced template parameters: {:?}", unreplaced));
+        }
+    }
+
+    //再次转换成json
+    let result_json = serde_json::from_str(&result_str)
+        .map_err(|e| format!("Failed to parse JSON after parameter replacement: {}", e))?;
+
+    Ok(result_json)
+
 }
 
 pub fn split_json_path(path: &str) -> Vec<String> {
@@ -29,7 +92,7 @@ pub fn split_json_path(path: &str) -> Vec<String> {
                     parts.push(current.trim().to_string());
                     current = String::new();
                 }
-            },
+            }
             _ => {
                 if escaped && c != '"' && c != '\\' {
                     current.push('\\');
@@ -39,14 +102,12 @@ pub fn split_json_path(path: &str) -> Vec<String> {
             }
         }
     }
-    
+
     if !current.is_empty() {
         parts.push(current.trim().to_string());
     }
-    
-    parts.into_iter()
-        .filter(|s| !s.is_empty())
-        .collect()
+
+    parts.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 // pub fn set_json_by_path(data: &mut Value, path: &str, value: Option<&Value>) {
@@ -55,12 +116,12 @@ pub fn split_json_path(path: &str) -> Vec<String> {
 //     } else {
 //         let _ = data.merge_in(path, &json!(null));
 //     }
-// } 
+// }
 
 pub fn set_json_by_path(data: &mut Value, path: &str, value: Option<&Value>) {
     // 使用新的路径解析方法
     let parts = split_json_path(path);
-    
+
     // 如果路径为空，直接替换或删除整个 Value
     if parts.is_empty() {
         match value {
@@ -69,7 +130,7 @@ pub fn set_json_by_path(data: &mut Value, path: &str, value: Option<&Value>) {
         }
         return;
     }
-    
+
     // 从根开始遍历和构建路径
     let mut current = data;
     for (i, part) in parts.iter().enumerate() {
@@ -79,7 +140,7 @@ pub fn set_json_by_path(data: &mut Value, path: &str, value: Option<&Value>) {
                 match value {
                     Some(v) => {
                         map.insert(part.to_string(), v.clone());
-                    },
+                    }
                     None => {
                         map.remove(part);
                     }
@@ -87,7 +148,7 @@ pub fn set_json_by_path(data: &mut Value, path: &str, value: Option<&Value>) {
             }
             break;
         }
-        
+
         // 确保中间路径存在
         current = current
             .as_object_mut()
@@ -109,7 +170,7 @@ pub fn get_by_json_path(data: &Value, path: &str) -> Option<Value> {
             current.get(part).unwrap_or(&json!(null))
         };
     }
-    
+
     if current.is_null() {
         None
     } else {
@@ -117,37 +178,35 @@ pub fn get_by_json_path(data: &Value, path: &str) -> Option<Value> {
     }
 }
 
-pub fn extend_kv_action_map(dest_map: &mut HashMap<String, KVAction>, from_map: &HashMap<String, KVAction>) {
+pub fn extend_kv_action_map(
+    dest_map: &mut HashMap<String, KVAction>,
+    from_map: &HashMap<String, KVAction>,
+) {
     for (key, value) in from_map.iter() {
         let old_value = dest_map.get_mut(key);
         match old_value {
-            Some(old_value) => {
-                match value {
-                    KVAction::Create(new_value) => {
-                        *old_value = KVAction::Create(new_value.clone());
-                    },
-                    KVAction::Update(new_value) => {
-                        *old_value = KVAction::Update(new_value.clone());
-                    },
-                    KVAction::Append(new_value) => {
-                        *old_value = KVAction::Append(new_value.clone());
-                    },
-                    KVAction::SetByJsonPath(new_value) => {
-                        match old_value {
-                            KVAction::SetByJsonPath(old_value) => {
-                                old_value.extend(new_value.clone());
-                            }
-                            _ => {
-                                *old_value = KVAction::SetByJsonPath(new_value.clone());
-                            }
-                        }
-                    },
-                    KVAction::Remove => {
-                        *old_value = KVAction::Remove;
-                    }
+            Some(old_value) => match value {
+                KVAction::Create(new_value) => {
+                    *old_value = KVAction::Create(new_value.clone());
                 }
-
-            }
+                KVAction::Update(new_value) => {
+                    *old_value = KVAction::Update(new_value.clone());
+                }
+                KVAction::Append(new_value) => {
+                    *old_value = KVAction::Append(new_value.clone());
+                }
+                KVAction::SetByJsonPath(new_value) => match old_value {
+                    KVAction::SetByJsonPath(old_value) => {
+                        old_value.extend(new_value.clone());
+                    }
+                    _ => {
+                        *old_value = KVAction::SetByJsonPath(new_value.clone());
+                    }
+                },
+                KVAction::Remove => {
+                    *old_value = KVAction::Remove;
+                }
+            },
             None => {
                 dest_map.insert(key.clone(), value.clone());
             }
@@ -155,21 +214,20 @@ pub fn extend_kv_action_map(dest_map: &mut HashMap<String, KVAction>, from_map: 
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn test_hash_map_option_value() {
-        let mut test_map:HashMap<String,Option<Value>> = HashMap::new();
- 
-        test_map.insert("state".to_string(),None);
-        test_map.insert("abc".to_string(),Some(json!("123")));
+        let mut test_map: HashMap<String, Option<Value>> = HashMap::new();
+
+        test_map.insert("state".to_string(), None);
+        test_map.insert("abc".to_string(), Some(json!("123")));
         let test_value = serde_json::to_value(test_map).unwrap();
         let test_str = serde_json::to_string(&test_value).unwrap();
-        let test_value2 : HashMap<String,Option<Value>> = serde_json::from_str(&test_str).unwrap();
-        for (key,value) in test_value2.iter() {
-            println!("key:{},value:{:?}",key,value);
+        let test_value2: HashMap<String, Option<Value>> = serde_json::from_str(&test_str).unwrap();
+        for (key, value) in test_value2.iter() {
+            println!("key:{},value:{:?}", key, value);
         }
     }
 
@@ -185,7 +243,7 @@ mod tests {
             }
         });
 
-        let data2 =  json!({
+        let data2 = json!({
             "user": {
                 "age": 30,
                 "name": "Alice",
@@ -195,11 +253,18 @@ mod tests {
             }
         });
 
-        assert_eq!(data,data2);
-        let json_path = format!("servers/main_http_server/hosts/*/routes/\"/kapi/{}\"","ood1");
-        set_json_by_path(&mut data,json_path.as_str(),Some(&json!({
-            "upstream":format!("http://127.0.0.1:{}",3200),
-        })));
+        assert_eq!(data, data2);
+        let json_path = format!(
+            "servers/main_http_server/hosts/*/routes/\"/kapi/{}\"",
+            "ood1"
+        );
+        set_json_by_path(
+            &mut data,
+            json_path.as_str(),
+            Some(&json!({
+                "upstream":format!("http://127.0.0.1:{}",3200),
+            })),
+        );
 
         // 设置值
         set_json_by_path(&mut data, "state", Some(&json!("Normal")));
@@ -219,7 +284,6 @@ mod tests {
         set_json_by_path(&mut data, "/user/address", None);
         println!("{}", data);
     }
-
 
     #[test]
     fn test_get_by_json_path() {
@@ -244,8 +308,7 @@ mod tests {
         });
 
         let name = get_by_json_path(&data, "/user/friends/0/name").unwrap();
-        assert_eq!(name.as_str().unwrap(),"Bob");
-
+        assert_eq!(name.as_str().unwrap(), "Bob");
     }
 
     #[test]
@@ -263,7 +326,11 @@ mod tests {
     #[test]
     fn test_set_json_by_path_with_spaces() {
         let mut data = json!({});
-        set_json_by_path(&mut data, r#"/state/"space add"/value"#, Some(&json!("test")));
+        set_json_by_path(
+            &mut data,
+            r#"/state/"space add"/value"#,
+            Some(&json!("test")),
+        );
         assert_eq!(
             data,
             json!({
@@ -274,5 +341,105 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn test_apply_params_to_json() {
+        // Test 1: 使用外部参数替换
+        let input = json!({
+            "name": "{{user_name}}",
+            "age": "{{user_age}}",
+            "city": "{{city}}"
+        });
+        let mut ext_params = HashMap::new();
+        ext_params.insert("user_name".to_string(), "Alice".to_string());
+        ext_params.insert("user_age".to_string(), "30".to_string());
+        ext_params.insert("city".to_string(), "New York".to_string());
+        
+        let result = apply_params_to_json(&input, Some(&ext_params)).unwrap();
+        assert_eq!(result.get("name").unwrap().as_str().unwrap(), "Alice");
+        assert_eq!(result.get("age").unwrap().as_str().unwrap(), "30");
+        assert_eq!(result.get("city").unwrap().as_str().unwrap(), "New York");
+
+        // Test 2: 使用内部参数替换
+        let input_with_inner = json!({
+            "params": {
+                "service_name": "api-server",
+                "port": "8080"
+            },
+            "config": {
+                "name": "{{service_name}}",
+                "endpoint": "http://localhost:{{port}}"
+            }
+        });
+        
+        let result = apply_params_to_json(&input_with_inner, None).unwrap();
+        assert_eq!(
+            result.get("config").unwrap().get("name").unwrap().as_str().unwrap(),
+            "api-server"
+        );
+        assert_eq!(
+            result.get("config").unwrap().get("endpoint").unwrap().as_str().unwrap(),
+            "http://localhost:8080"
+        );
+
+        // Test 3: 外部参数覆盖内部参数
+        let input = json!({
+            "params": {
+                "env": "dev"
+            },
+            "environment": "{{env}}"
+        });
+        let mut ext_params = HashMap::new();
+        ext_params.insert("env".to_string(), "production".to_string());
+        
+        let result = apply_params_to_json(&input, Some(&ext_params)).unwrap();
+        assert_eq!(
+            result.get("environment").unwrap().as_str().unwrap(),
+            "production"
+        );
+
+        // Test 4: 没有参数的情况，直接返回原JSON
+        let input = json!({
+            "name": "Bob",
+            "age": 25
+        });
+        
+        let result = apply_params_to_json(&input, None).unwrap();
+        assert_eq!(result, input);
+
+        // Test 5: 存在未替换的参数应该返回错误
+        let input = json!({
+            "name": "{{user_name}}",
+            "age": "{{user_age}}"
+        });
+        let mut ext_params = HashMap::new();
+        ext_params.insert("user_name".to_string(), "Charlie".to_string());
+        
+        let result = apply_params_to_json(&input, Some(&ext_params));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("user_age"));
+
+        // Test 6: 嵌套对象中的参数替换
+        let input = json!({
+            "params": {
+                "db_host": "localhost",
+                "db_port": "5432",
+                "db_name": "mydb"
+            },
+            "database": {
+                "connection": {
+                    "host": "{{db_host}}",
+                    "port": "{{db_port}}",
+                    "database": "{{db_name}}"
+                }
+            }
+        });
+        
+        let result = apply_params_to_json(&input, None).unwrap();
+        let connection = result.get("database").unwrap().get("connection").unwrap();
+        assert_eq!(connection.get("host").unwrap().as_str().unwrap(), "localhost");
+        assert_eq!(connection.get("port").unwrap().as_str().unwrap(), "5432");
+        assert_eq!(connection.get("database").unwrap().as_str().unwrap(), "mydb");
     }
 }

@@ -56,7 +56,7 @@ where
     E: 'static,
 {
     next_cookie: u32,
-    listeners: Vec<(u32, Box<dyn EventListenerSyncRoutine<P, R, E>>),>,
+    listeners: Vec<(u32, Box<dyn EventListenerSyncRoutine<P, R, E>>)>,
 }
 
 impl<P, R, E> SyncEventManager<P, R, E>

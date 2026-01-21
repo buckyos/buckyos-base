@@ -2,7 +2,7 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey};
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::ToSocketAddrs;
@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-use crate::config::DeviceConfig;
+use crate::{DeviceConfig, DID};
 use base64::prelude::BASE64_STANDARD_NO_PAD;
 use base64::{
     engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _,
@@ -34,6 +34,8 @@ pub enum NSError {
     InvalidDID(String),
     #[error("{0} not found")]
     NotFound(String),
+    #[error("Disabled: {0}")]
+    Disabled(String),
     #[error("decode txt record error")]
     DnsTxtEncodeError,
     #[error("forbidden")]
@@ -70,6 +72,15 @@ pub fn get_x_from_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> NSResult<String> {
         .ok_or(NSError::Failed("Invalid jwk".to_string()))?;
     let x_str = x.as_str().unwrap().to_string();
     Ok(x_str)
+}
+
+pub fn create_jwt_by_x(x: &str) -> NSResult<jsonwebtoken::jwk::Jwk> {
+    let jwk = json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": x,
+    });
+    serde_json::from_value(jwk).map_err(|_| NSError::Failed("Invalid jwk".to_string()))
 }
 
 pub fn get_x_from_jwk_string(jwk_string: &str) -> NSResult<String> {
@@ -300,7 +311,7 @@ pub fn generate_ed25519_key_pair_from_mnemonic(
 
 // Generate a random private key and return the PKCS#8 encoded bytes
 pub fn generate_ed25519_key() -> (SigningKey, [u8; 48]) {
-    let mut csprng = rand::rngs::OsRng {};
+    let mut csprng = OsRng;
     let signing_key: SigningKey = SigningKey::generate(&mut csprng);
     let private_key_bytes = signing_key.to_bytes();
     let pkcs8_bytes = build_pkcs8(&private_key_bytes);

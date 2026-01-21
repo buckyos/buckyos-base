@@ -1,7 +1,7 @@
-use log::*; 
-use tokio::net::{TcpListener, TcpStream};
+use log::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, TcpStream};
 // use crate::init_logging;
 
 pub async fn start_tcp_echo_server(bind_addr: &str) {
@@ -20,7 +20,6 @@ pub async fn start_tcp_echo_server(bind_addr: &str) {
                 let mut buffer = [0; 1024 * 10];
 
                 loop {
-
                     match reader.read(&mut buffer).await {
                         Ok(0) => {
                             info!("Connection closed on echo server: {}", addr);
@@ -34,7 +33,7 @@ pub async fn start_tcp_echo_server(bind_addr: &str) {
                             }
                         }
                         Err(e) => {
-                            info!("Failed to read from socket: {} err = {:?}",  addr, e);
+                            info!("Failed to read from socket: {} err = {:?}", addr, e);
                             break;
                         }
                     }
@@ -60,7 +59,6 @@ pub async fn start_tcp_echo_client(server_addr: &str) {
     assert_eq!(data, &buffer[..]);
     info!("TCP echo test passed!");
 }
-
 
 pub async fn start_udp_echo_server(bind_addr: &str) {
     let socket = UdpSocket::bind(bind_addr).await.unwrap();
@@ -101,8 +99,7 @@ pub async fn start_udp_echo_client(server_addr: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
- 
-    
+
     #[tokio::test]
     async fn test_tcp_echo_server() {
         //init_logging("test_tcp_echo_server");
