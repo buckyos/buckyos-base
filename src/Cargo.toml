@@ -31,16 +31,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 tracing-appender = "0.2"
-console-subscriber = "0.4"
+console-subscriber = "0.5"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "*"
 
 # System utilities
 sysinfo = "0.31"
 
 # Cryptography
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 x25519-dalek = { version = "2.0", features = ["static_secrets","getrandom"] }
 curve25519-dalek = "4.1"
 ed25519_to_curve25519 = "0.2"
@@ -66,18 +66,19 @@ json_value_merge = "2.0"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # HTTP clients and servers
-reqwest = { version = "0.12", features = ["json","rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json","rustls-tls-native-roots"] }
 
 # DNS
-hickory-resolver = { version = "0.24", features = ["dns-over-rustls"] }
+hickory-resolver = { version = "0.25", features = ["tls-ring", "webpki-roots"] }
 
 # Random
-rand = "0.8"
+rand = "0.9"
+rand_core = "0.6"
 
 # Other
 backtrace = "0.3"
 casbin = { version = "2.9", features = ["logging","explain"] }
-nvml-wrapper = "0.10"
+nvml-wrapper = "0.11"
 bip39 = "2.0"
 cfg-if = "1.0"
 

@@ -6,8 +6,10 @@ use std::str::FromStr;
 
 use buckyos_kit::buckyos_get_unix_timestamp;
 use hickory_resolver::proto::rr::record_type;
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::{config::*, Resolver};
+use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::config::*;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
@@ -60,16 +62,12 @@ impl NsProvider for DnsProvider {
             };
             let name_server_configs = vec![NameServerConfig::new(dns_ip_addr, Protocol::Udp)];
             server_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
-            resolver = TokioAsyncResolver::tokio(server_config, ResolverOpts::default());
+            resolver = TokioResolver::builder_with_config(server_config, TokioConnectionProvider::default())
+                .build();
         } else {
-            let system_resolver = TokioAsyncResolver::tokio_from_system_conf();
-            if system_resolver.is_err() {
-                return Err(NSError::Failed(format!(
-                    "create system resolver failed! {}",
-                    system_resolver.err().unwrap()
-                )));
-            }
-            resolver = system_resolver.unwrap();
+            resolver = TokioResolver::builder_tokio()
+                .map_err(|e| NSError::Failed(format!("create system resolver failed! {}", e)))?
+                .build();
         }
        
         match record_type.unwrap_or(RecordType::A) {
@@ -93,8 +91,7 @@ impl NsProvider for DnsProvider {
                         .txt_data()
                         .iter()
                         .map(|s| -> String {
-                            let byte_slice: &[u8] = &s;
-                            return String::from_utf8_lossy(byte_slice).to_string();
+                            String::from_utf8_lossy(s).to_string()
                         })
                         .collect::<Vec<String>>()
                         .join("");

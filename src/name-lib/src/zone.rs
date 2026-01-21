@@ -578,7 +578,8 @@ impl ZoneConfig {
 
     pub fn select_same_subnet_ood(&self, device_info: &DeviceInfo) -> Option<String> {
         let mut ood_list = self.oods.clone();
-        ood_list.shuffle(&mut rand::thread_rng());
+        let mut rng = rand::rng();
+        ood_list.shuffle(&mut rng);
 
         for ood in ood_list.iter() {
             if ood.node_type.is_ood() {
@@ -593,7 +594,8 @@ impl ZoneConfig {
 
     pub fn select_wan_ood(&self) -> Option<String> {
         let mut ood_list = self.oods.clone();
-        ood_list.shuffle(&mut rand::thread_rng());
+        let mut rng = rand::rng();
+        ood_list.shuffle(&mut rng);
         for ood in self.oods.iter() {
             if ood.node_type.is_ood() {
                 if ood.net_id.is_some() {

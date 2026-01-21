@@ -2,7 +2,7 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey};
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::ToSocketAddrs;
@@ -311,7 +311,7 @@ pub fn generate_ed25519_key_pair_from_mnemonic(
 
 // Generate a random private key and return the PKCS#8 encoded bytes
 pub fn generate_ed25519_key() -> (SigningKey, [u8; 48]) {
-    let mut csprng = rand::rngs::OsRng {};
+    let mut csprng = OsRng;
     let signing_key: SigningKey = SigningKey::generate(&mut csprng);
     let private_key_bytes = signing_key.to_bytes();
     let pkcs8_bytes = build_pkcs8(&private_key_bytes);
