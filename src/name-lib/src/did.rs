@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::zone::{ZoneBootConfig, ZoneConfig};
 use crate::user::OwnerConfig;
+use crate::zone::{ZoneBootConfig, ZoneConfig};
 use crate::DeviceConfig;
 use crate::{decode_jwt_claim_without_verify, NSError, NSResult};
 use async_trait::async_trait;
@@ -44,7 +44,6 @@ impl DID {
     pub fn is_valid(&self) -> bool {
         self.method != "undefined"
     }
-
 
     pub fn get_ed25519_auth_key(&self) -> Option<[u8; 32]> {
         if self.method == "dev" {
@@ -120,7 +119,11 @@ impl DID {
         return format!("{}.{}", real_id, bridge_base_hostname);
     }
 
-    pub fn from_host_name_by_bridge(host_name: &str, method: &str, bridge_base_hostname: &str) -> Option<Self> {
+    pub fn from_host_name_by_bridge(
+        host_name: &str,
+        method: &str,
+        bridge_base_hostname: &str,
+    ) -> Option<Self> {
         loop {
             if host_name.ends_with(bridge_base_hostname) {
                 if host_name == bridge_base_hostname {
@@ -297,7 +300,10 @@ pub static KNOWN_WEB3_BRIDGE_CONFIG: OnceCell<HashMap<String, String>> = OnceCel
 
 pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>> {
     let doc_value = doc.to_json_value()?;
-    debug!("parse_did_doc: doc_value: {}", serde_json::to_string_pretty(&doc_value).unwrap());
+    debug!(
+        "parse_did_doc: doc_value: {}",
+        serde_json::to_string_pretty(&doc_value).unwrap()
+    );
 
     if doc_value.get("full_name").is_some() {
         let owner_config = serde_json::from_value::<OwnerConfig>(doc_value)
@@ -322,6 +328,7 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_did_from_str() {
@@ -387,19 +394,72 @@ mod tests {
         let host_name = did.to_host_name();
         assert_eq!(host_name, "app1.waterflier.web3.buckyos.io");
 
-        let did = DID::from_host_name_by_bridge("app1.waterflier.web3.buckyos.io", "bns", "web3.buckyos.io").unwrap();
+        let did = DID::from_host_name_by_bridge(
+            "app1.waterflier.web3.buckyos.io",
+            "bns",
+            "web3.buckyos.io",
+        )
+        .unwrap();
         assert_eq!(did.method, "bns");
         assert_eq!(did.id, "app1.waterflier");
         let did_str = did.to_string();
         assert_eq!(did_str, "did:bns:app1.waterflier");
         let host_name = did.to_host_name_by_bridge("web3.buckyos.io");
         assert_eq!(host_name, "app1.waterflier.web3.buckyos.io");
-        let did = DID::from_host_name_by_bridge("waterflier.buckyos.io", "bns", "web3.buckyos.io").unwrap();
+        let did = DID::from_host_name_by_bridge("waterflier.buckyos.io", "bns", "web3.buckyos.io")
+            .unwrap();
         assert_eq!(did.method, "web");
         assert_eq!(did.id, "waterflier.buckyos.io");
         let did_str = did.to_string();
         assert_eq!(did_str, "did:web:waterflier.buckyos.io");
         let host_name = did.to_host_name_by_bridge("web3.buckyos.io");
         assert_eq!(host_name, "waterflier.buckyos.io");
+    }
+
+    #[test]
+    fn test_encoded_document_from_str_detects_format() {
+        let json_doc = EncodedDocument::from_str("{\"a\":1}".to_string()).unwrap();
+        assert!(matches!(json_doc, EncodedDocument::JsonLd(_)));
+
+        let jwt_doc = EncodedDocument::from_str("header.payload.signature".to_string()).unwrap();
+        assert!(matches!(jwt_doc, EncodedDocument::Jwt(_)));
+    }
+
+    #[test]
+    fn test_parse_did_doc_routes_by_shape() {
+        let owner_jwk: Jwk = serde_json::from_value(json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+        }))
+        .unwrap();
+
+        let owner = OwnerConfig::new(
+            DID::new("bns", "alice"),
+            "alice".to_string(),
+            "alice@bns".to_string(),
+            owner_jwk.clone(),
+        );
+        let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner).unwrap());
+        let owner_parsed = parse_did_doc(owner_doc).unwrap();
+        assert_eq!(owner_parsed.get_id(), owner.id);
+
+        let device = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        let device_doc = EncodedDocument::JsonLd(serde_json::to_value(&device).unwrap());
+        let device_parsed = parse_did_doc(device_doc).unwrap();
+        assert_eq!(device_parsed.get_id(), device.id);
+
+        let mut zone = ZoneConfig::new(
+            DID::new("bns", "zone1"),
+            DID::new("bns", "alice"),
+            owner_jwk,
+        );
+        zone.oods = vec!["ood1".parse().unwrap()];
+        let zone_doc = EncodedDocument::JsonLd(serde_json::to_value(&zone).unwrap());
+        let zone_parsed = parse_did_doc(zone_doc).unwrap();
+        assert_eq!(zone_parsed.get_id(), zone.id);
     }
 }

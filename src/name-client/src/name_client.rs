@@ -193,6 +193,7 @@ impl NameClient {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use crate::{init_name_lib_ex, resolve_did};
 
@@ -200,6 +201,7 @@ mod tests {
     use async_trait::async_trait;
     use buckyos_kit::init_logging;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     fn make_doc(iat: u64, exp: u64, marker: &str) -> EncodedDocument {
         EncodedDocument::JsonLd(serde_json::json!({
@@ -256,6 +258,37 @@ mod tests {
                 Some(MockErr::Disabled) => Err(NSError::Disabled("mock disabled".into())),
                 None => Ok(self.doc.as_ref().unwrap().clone()),
             }
+        }
+    }
+
+    struct NameMockProvider {
+        called_name: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl NsProvider for NameMockProvider {
+        fn get_id(&self) -> String {
+            "name-mock".to_string()
+        }
+
+        async fn query(
+            &self,
+            name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            let mut guard = self.called_name.lock().await;
+            *guard = Some(name.to_string());
+            Ok(NameInfo::new(name))
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            _doc_type: Option<&str>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            Err(NSError::NotFound("not implemented".into()))
         }
     }
 
@@ -428,5 +461,26 @@ mod tests {
         crate::update_did_cache(did.clone(), doc.clone()).await.unwrap();
         let resolved = resolve_did(&did, None).await.unwrap();
         assert_eq!(resolved, doc);
+    }
+
+    #[tokio::test]
+    async fn resolve_did_web_normalizes_to_host_name() {
+        let called_name = Arc::new(Mutex::new(None));
+        let provider = NameMockProvider {
+            called_name: called_name.clone(),
+        };
+        let tmp_dir = tempdir().unwrap().keep();
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
+            cache_backend: CacheBackend::Filesystem,
+        });
+        client.add_provider(Box::new(provider), Some(DEFAULT_PROVIDER_TRUST_LEVEL)).await;
+
+        let result = client.resolve("did:web:example.com", None).await.unwrap();
+        assert_eq!(result.name, "example.com".to_string());
+
+        let observed = called_name.lock().await.clone().unwrap();
+        assert_eq!(observed, "example.com".to_string());
     }
 }

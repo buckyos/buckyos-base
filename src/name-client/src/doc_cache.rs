@@ -781,4 +781,41 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(loaded.0, doc);
         Ok(())
     }
+
+    #[test]
+    fn fs_update_does_not_replace_named_obj() {
+        let (_tmp_dir, cache, _) = setup_fs_cache();
+        let did = DID::from_str("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE").unwrap();
+        let now = buckyos_get_unix_timestamp();
+
+        let doc_v1 = EncodedDocument::JsonLd(json!({
+            "iat": now,
+            "exp": now + DEFAULT_EXPIRE_TIME,
+            "marker": "v1"
+        }));
+        cache.insert(
+            did.clone(),
+            None,
+            doc_v1.clone(),
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        let doc_v2 = EncodedDocument::JsonLd(json!({
+            "iat": now + 1000,
+            "exp": now + DEFAULT_EXPIRE_TIME + 1000,
+            "marker": "v2"
+        }));
+        let updated = cache.update(
+            did.clone(),
+            None,
+            doc_v2.clone(),
+            now + DEFAULT_EXPIRE_TIME + 1000,
+            DEFAULT_PROVIDER_TRUST_LEVEL - 10,
+        );
+        assert!(!updated);
+
+        let loaded = cache.get(&did, None).unwrap();
+        assert_eq!(loaded.0, doc_v1);
+    }
 }

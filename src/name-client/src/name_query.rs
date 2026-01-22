@@ -378,5 +378,16 @@ mod tests {
         let result = q.query_did(&did, None, None).await;
         assert!(matches!(result, Err(NSError::Disabled(_))));
     }
+
+    #[tokio::test]
+    async fn error_when_no_providers_configured() {
+        let q = NameQuery::new();
+        let err = q.query("example.com", None).await.unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let err = q.query_did(&did, None, None).await.unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+    }
     
 }
