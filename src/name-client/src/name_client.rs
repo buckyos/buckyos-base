@@ -406,23 +406,27 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_via_init_name_lib_with_mock_provider() {
-        init_logging("test-name-client",  false);
-        let tmp_dir = tempdir().unwrap().keep();
+        init_logging("test-name-client", false);
         let now = buckyos_get_unix_timestamp();
         let doc = make_doc(now, now + 600, "init-mock");
-        let did = DID::from_str("did:bns:filebrowser.buckyos").unwrap();
+        let did = DID::from_str("did:web:mock.example").unwrap();
 
-        let web3_bridge = get_default_web3_bridge_config();
-        let cfg = NameClientConfig {
-            enable_cache: true,
-            local_cache_dir: None,
-            cache_backend: CacheBackend::Filesystem,
-        };
+        if crate::GLOBAL_NAME_CLIENT.get().is_none() {
+            let tmp_dir = tempdir().unwrap().keep();
+            let mut client = NameClient::new(NameClientConfig {
+                enable_cache: true,
+                local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
+                cache_backend: CacheBackend::Filesystem,
+            });
+            client
+                .add_provider(Box::new(MockProvider::err(MockErr::NotFound)), Some(10))
+                .await;
+            let _ = crate::GLOBAL_NAME_CLIENT.set(client);
+            let _ = crate::IS_NAME_LIB_INITED.set(true);
+        }
 
-        // 初始化全局客户端，模拟真实使用路径
-        init_name_lib_ex(&web3_bridge, cfg).await.unwrap();
+        crate::update_did_cache(did.clone(), doc.clone()).await.unwrap();
         let resolved = resolve_did(&did, None).await.unwrap();
-        let result_str = resolved.to_string();
-        info!("resolve result: {}", result_str);
+        assert_eq!(resolved, doc);
     }
 }

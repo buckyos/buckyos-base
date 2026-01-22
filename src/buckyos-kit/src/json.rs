@@ -13,25 +13,34 @@ pub enum KVAction {
                                                    //Create(String),
 }
 
-
-
-pub fn apply_params_to_json(input_json: &Value, ext_params: Option<&HashMap<String, String>>) -> Result<Value, String> {
+pub fn apply_params_to_json(
+    input_json: &Value,
+    ext_params: Option<&HashMap<String, String>>,
+) -> Result<Value, String> {
     let mut real_params = HashMap::new();
-    
+
     // 先添加内部参数
     let inneer_params = input_json.get("params");
     if inneer_params.is_some() {
-        let result  = serde_json::from_value(inneer_params.unwrap().clone());
+        let result = serde_json::from_value(inneer_params.unwrap().clone());
         if result.is_err() {
-            return Err(format!("Failed to parse inner params: {}", result.err().unwrap()));
+            return Err(format!(
+                "Failed to parse inner params: {}",
+                result.err().unwrap()
+            ));
         }
-        let inner_params : HashMap<String, String> = result.unwrap();
+        let inner_params: HashMap<String, String> = result.unwrap();
         real_params.extend(inner_params.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    
+
     // 再添加外部参数，外部参数会覆盖内部参数
     if ext_params.is_some() {
-        real_params.extend(ext_params.unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+        real_params.extend(
+            ext_params
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
     }
 
     if real_params.is_empty() {
@@ -65,7 +74,10 @@ pub fn apply_params_to_json(input_json: &Value, ext_params: Option<&HashMap<Stri
             }
         }
         if !unreplaced.is_empty() {
-            return Err(format!("Found unreplaced template parameters: {:?}", unreplaced));
+            return Err(format!(
+                "Found unreplaced template parameters: {:?}",
+                unreplaced
+            ));
         }
     }
 
@@ -74,7 +86,6 @@ pub fn apply_params_to_json(input_json: &Value, ext_params: Option<&HashMap<Stri
         .map_err(|e| format!("Failed to parse JSON after parameter replacement: {}", e))?;
 
     Ok(result_json)
-
 }
 
 pub fn split_json_path(path: &str) -> Vec<String> {
@@ -217,6 +228,292 @@ pub fn extend_kv_action_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_apply_params_to_json_error_cases_table() {
+        struct Case {
+            name: &'static str,
+            input: Value,
+            ext_params: Option<HashMap<String, String>>,
+            expected_unreplaced: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "inner_params_wrong_type",
+                input: json!({
+                    "params": "not-a-map",
+                    "value": "{{x}}"
+                }),
+                ext_params: None,
+                expected_unreplaced: None,
+            },
+            Case {
+                name: "unreplaced_single",
+                input: json!({
+                    "name": "{{user}}",
+                    "age": "{{age}}"
+                }),
+                ext_params: Some(HashMap::from([("user".to_string(), "alice".to_string())])),
+                expected_unreplaced: Some("age"),
+            },
+            Case {
+                name: "unreplaced_with_unicode_keys",
+                input: json!({
+                    "greet": "{{name}}-{{city}}"
+                }),
+                ext_params: Some(HashMap::from([("name".to_string(), "张三".to_string())])),
+                expected_unreplaced: Some("city"),
+            },
+            Case {
+                name: "unmatched_braces",
+                input: json!({
+                    "value": "{{name"
+                }),
+                ext_params: Some(HashMap::from([("name".to_string(), "alice".to_string())])),
+                expected_unreplaced: None,
+            },
+            Case {
+                name: "ext_params_only_no_placeholders",
+                input: json!({
+                    "value": "plain"
+                }),
+                ext_params: Some(HashMap::from([("name".to_string(), "alice".to_string())])),
+                expected_unreplaced: None,
+            },
+        ];
+
+        for case in cases {
+            let result = apply_params_to_json(&case.input, case.ext_params.as_ref());
+            match case.name {
+                "inner_params_wrong_type" => {
+                    assert!(result.is_err(), "case: {}", case.name);
+                }
+                _ => {
+                    if let Some(expected) = case.expected_unreplaced {
+                        let err = result.unwrap_err();
+                        assert!(err.contains(expected), "case: {}", case.name);
+                    } else {
+                        assert!(result.is_ok(), "case: {}", case.name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_json_path_table() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: Vec<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "empty",
+                input: "",
+                expected: vec![],
+            },
+            Case {
+                name: "root_only",
+                input: "/",
+                expected: vec![],
+            },
+            Case {
+                name: "simple",
+                input: "/a/b/c",
+                expected: vec!["a", "b", "c"],
+            },
+            Case {
+                name: "quoted_with_slash",
+                input: r#"/state/"space add"/value"#,
+                expected: vec!["state", "space add", "value"],
+            },
+            Case {
+                name: "escaped_space",
+                input: r#"/path/with\ space/value"#,
+                expected: vec!["path", r#"with\ space"#, "value"],
+            },
+            Case {
+                name: "unicode_and_emoji",
+                input: "/用户/😀/数据",
+                expected: vec!["用户", "😀", "数据"],
+            },
+            Case {
+                name: "multiple_separators",
+                input: "//a///b/",
+                expected: vec!["a", "b"],
+            },
+        ];
+
+        for case in cases {
+            let result = split_json_path(case.input);
+            let expected: Vec<String> = case.expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(result, expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_set_json_by_path_table() {
+        struct Case {
+            name: &'static str,
+            initial: Value,
+            path: &'static str,
+            value: Option<Value>,
+            expected: Value,
+        }
+
+        let cases = vec![
+            Case {
+                name: "set_root",
+                initial: json!({"a": 1}),
+                path: "",
+                value: Some(json!({"b": 2})),
+                expected: json!({"b": 2}),
+            },
+            Case {
+                name: "delete_root",
+                initial: json!({"a": 1}),
+                path: "",
+                value: None,
+                expected: json!(null),
+            },
+            Case {
+                name: "set_nested_create",
+                initial: json!({}),
+                path: "/user/name",
+                value: Some(json!("Alice")),
+                expected: json!({"user": {"name": "Alice"}}),
+            },
+            Case {
+                name: "delete_nested",
+                initial: json!({"user": {"name": "Alice", "age": 30}}),
+                path: "/user/age",
+                value: None,
+                expected: json!({"user": {"name": "Alice"}}),
+            },
+            Case {
+                name: "quoted_key_with_space",
+                initial: json!({}),
+                path: r#"/state/"space add"/value"#,
+                value: Some(json!("test")),
+                expected: json!({"state": {"space add": {"value": "test"}}}),
+            },
+        ];
+
+        for case in cases {
+            let mut data = case.initial.clone();
+            let value_ref = case.value.as_ref();
+            set_json_by_path(&mut data, case.path, value_ref);
+            assert_eq!(data, case.expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_set_json_by_path_panics_on_non_object_parent() {
+        let mut data = json!("not-object");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set_json_by_path(&mut data, "/a/b", Some(&json!(1)));
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_by_json_path_table() {
+        struct Case {
+            name: &'static str,
+            path: &'static str,
+            expected: Option<Value>,
+        }
+
+        let data = json!({
+            "user": {
+                "name": "Alice",
+                "age": 30,
+                "friends": [
+                    {"name": "Bob", "age": 25},
+                    {"name": "Charlie", "age": 28}
+                ]
+            }
+        });
+
+        let cases = vec![
+            Case {
+                name: "object_key",
+                path: "/user/name",
+                expected: Some(json!("Alice")),
+            },
+            Case {
+                name: "array_index",
+                path: "/user/friends/1/name",
+                expected: Some(json!("Charlie")),
+            },
+            Case {
+                name: "missing_key",
+                path: "/user/address",
+                expected: None,
+            },
+            Case {
+                name: "out_of_range_index",
+                path: "/user/friends/5",
+                expected: None,
+            },
+            Case {
+                name: "path_without_leading_slash",
+                path: "user/age",
+                expected: Some(json!(30)),
+            },
+            Case {
+                name: "empty_path_returns_input",
+                path: "",
+                expected: None,
+            },
+        ];
+
+        for case in cases {
+            let result = get_by_json_path(&data, case.path);
+            assert_eq!(result, case.expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_extend_kv_action_map_table() {
+        let mut dest: HashMap<String, KVAction> = HashMap::new();
+        dest.insert("a".to_string(), KVAction::Create("v1".to_string()));
+        dest.insert(
+            "set".to_string(),
+            KVAction::SetByJsonPath(HashMap::from([(String::from("k1"), Some(json!(1)))])),
+        );
+
+        let mut from: HashMap<String, KVAction> = HashMap::new();
+        from.insert("a".to_string(), KVAction::Update("v2".to_string()));
+        from.insert("b".to_string(), KVAction::Append("v3".to_string()));
+        from.insert(
+            "set".to_string(),
+            KVAction::SetByJsonPath(HashMap::from([(String::from("k2"), Some(json!("v")))])),
+        );
+        from.insert("remove".to_string(), KVAction::Remove);
+
+        extend_kv_action_map(&mut dest, &from);
+
+        match dest.get("a").unwrap() {
+            KVAction::Update(v) => assert_eq!(v, "v2"),
+            _ => panic!("expected update"),
+        }
+        match dest.get("b").unwrap() {
+            KVAction::Append(v) => assert_eq!(v, "v3"),
+            _ => panic!("expected append"),
+        }
+        match dest.get("set").unwrap() {
+            KVAction::SetByJsonPath(map) => {
+                assert_eq!(map.get("k1").unwrap().as_ref().unwrap(), &json!(1));
+                assert_eq!(map.get("k2").unwrap().as_ref().unwrap(), &json!("v"));
+            }
+            _ => panic!("expected set"),
+        }
+        assert!(matches!(dest.get("remove").unwrap(), KVAction::Remove));
+    }
     #[test]
     fn test_hash_map_option_value() {
         let mut test_map: HashMap<String, Option<Value>> = HashMap::new();
@@ -355,7 +652,7 @@ mod tests {
         ext_params.insert("user_name".to_string(), "Alice".to_string());
         ext_params.insert("user_age".to_string(), "30".to_string());
         ext_params.insert("city".to_string(), "New York".to_string());
-        
+
         let result = apply_params_to_json(&input, Some(&ext_params)).unwrap();
         assert_eq!(result.get("name").unwrap().as_str().unwrap(), "Alice");
         assert_eq!(result.get("age").unwrap().as_str().unwrap(), "30");
@@ -372,14 +669,26 @@ mod tests {
                 "endpoint": "http://localhost:{{port}}"
             }
         });
-        
+
         let result = apply_params_to_json(&input_with_inner, None).unwrap();
         assert_eq!(
-            result.get("config").unwrap().get("name").unwrap().as_str().unwrap(),
+            result
+                .get("config")
+                .unwrap()
+                .get("name")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "api-server"
         );
         assert_eq!(
-            result.get("config").unwrap().get("endpoint").unwrap().as_str().unwrap(),
+            result
+                .get("config")
+                .unwrap()
+                .get("endpoint")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             "http://localhost:8080"
         );
 
@@ -392,7 +701,7 @@ mod tests {
         });
         let mut ext_params = HashMap::new();
         ext_params.insert("env".to_string(), "production".to_string());
-        
+
         let result = apply_params_to_json(&input, Some(&ext_params)).unwrap();
         assert_eq!(
             result.get("environment").unwrap().as_str().unwrap(),
@@ -404,7 +713,7 @@ mod tests {
             "name": "Bob",
             "age": 25
         });
-        
+
         let result = apply_params_to_json(&input, None).unwrap();
         assert_eq!(result, input);
 
@@ -415,7 +724,7 @@ mod tests {
         });
         let mut ext_params = HashMap::new();
         ext_params.insert("user_name".to_string(), "Charlie".to_string());
-        
+
         let result = apply_params_to_json(&input, Some(&ext_params));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("user_age"));
@@ -435,11 +744,17 @@ mod tests {
                 }
             }
         });
-        
+
         let result = apply_params_to_json(&input, None).unwrap();
         let connection = result.get("database").unwrap().get("connection").unwrap();
-        assert_eq!(connection.get("host").unwrap().as_str().unwrap(), "localhost");
+        assert_eq!(
+            connection.get("host").unwrap().as_str().unwrap(),
+            "localhost"
+        );
         assert_eq!(connection.get("port").unwrap().as_str().unwrap(), "5432");
-        assert_eq!(connection.get("database").unwrap().as_str().unwrap(), "mydb");
+        assert_eq!(
+            connection.get("database").unwrap().as_str().unwrap(),
+            "mydb"
+        );
     }
 }

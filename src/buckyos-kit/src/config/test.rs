@@ -140,6 +140,7 @@ fn create_test_directory_without_root(base_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn create_test_directory_with_root(base_dir: &Path) -> std::io::Result<()> {
     // main directory
     let main_files = vec![

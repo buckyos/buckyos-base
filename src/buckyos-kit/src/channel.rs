@@ -2,7 +2,6 @@ use std::env;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BuckyOSChannel {
     Nightly,
@@ -39,6 +38,7 @@ impl Display for BuckyOSChannel {
 }
 
 impl BuckyOSChannel {
+    #[allow(dead_code)]
     fn get_ver(&self) -> u8 {
         match self {
             BuckyOSChannel::Nightly => 0,
@@ -61,17 +61,22 @@ pub fn get_target() -> &'static str {
 }
 
 fn get_version_impl() -> String {
-    format!("{}+build{}{} ({})",
-         env!("VERSION"), 
-         env!("BUILDDATE"),
-         env!("VERSION_EXTEND"),
-         get_channel())
+    format!(
+        "{}+build{}{} ({})",
+        env!("VERSION"),
+        env!("BUILDDATE"),
+        env!("VERSION_EXTEND"),
+        get_channel()
+    )
 }
 
 fn get_channel_impl() -> BuckyOSChannel {
     let channel_str = match std::env::var("CYFS_CHANNEL") {
         Ok(channel) => {
-            info!("got channel config from CYFS_CHANNEL env: channel={}", channel);
+            info!(
+                "got channel config from CYFS_CHANNEL env: channel={}",
+                channel
+            );
             channel
         }
         Err(_) => {
@@ -80,7 +85,7 @@ fn get_channel_impl() -> BuckyOSChannel {
             channel
         }
     };
-    
+
     BuckyOSChannel::from_str(channel_str.as_str()).unwrap()
 }
 
@@ -88,4 +93,65 @@ lazy_static::lazy_static! {
     static ref CHANNEL: BuckyOSChannel = get_channel_impl();
     static ref VERSION: String = get_version_impl();
     static ref TARGET: &'static str = env!("TARGET");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_channel_from_str_table() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: BuckyOSChannel,
+        }
+
+        let cases = vec![
+            Case {
+                name: "nightly",
+                input: "nightly",
+                expected: BuckyOSChannel::Nightly,
+            },
+            Case {
+                name: "beta",
+                input: "beta",
+                expected: BuckyOSChannel::Beta,
+            },
+            Case {
+                name: "stable",
+                input: "stable",
+                expected: BuckyOSChannel::Stable,
+            },
+            Case {
+                name: "unknown_defaults",
+                input: "unknown",
+                expected: BuckyOSChannel::Nightly,
+            },
+        ];
+
+        for case in cases {
+            let parsed = BuckyOSChannel::from_str(case.input).unwrap();
+            assert_eq!(parsed, case.expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_channel_display_and_version_output() {
+        let cases = vec![
+            ("nightly", BuckyOSChannel::Nightly, 0_u8),
+            ("beta", BuckyOSChannel::Beta, 1_u8),
+            ("stable", BuckyOSChannel::Stable, 2_u8),
+        ];
+
+        for (expected, channel, ver) in cases {
+            assert_eq!(channel.to_string(), expected);
+            assert_eq!(channel.get_ver(), ver);
+        }
+
+        let version = get_version();
+        assert!(version.contains(env!("VERSION")));
+        let target = get_target();
+        assert!(!target.is_empty());
+    }
 }
