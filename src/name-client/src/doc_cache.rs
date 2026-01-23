@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::time::UNIX_EPOCH;
 
 use buckyos_kit::{
@@ -18,11 +20,13 @@ use crate::ROOT_TRUST_LEVEL;
 pub enum CacheBackend {
     Filesystem,
     Sqlite,
+    Memory,
 }
 
 pub enum DIDDocumentCache {
     Fs(DIDDocumentFsCache),
     Db(DIDDocumentDBCache),
+    Mem(DIDDocumentMemCache),
 }
 
 impl DIDDocumentCache {
@@ -34,6 +38,11 @@ impl DIDDocumentCache {
     /// 显式创建 SQLite 缓存。
     pub fn new_db(cache_dir: Option<PathBuf>) -> name_lib::NSResult<Self> {
         Ok(Self::Db(DIDDocumentDBCache::new(cache_dir)?))
+    }
+
+    /// 显式创建 Memory 缓存（测试用）。
+    pub fn new_mem() -> Self {
+        Self::Mem(DIDDocumentMemCache::new())
     }
 
     pub fn get_default_cache_dir() -> PathBuf {
@@ -52,6 +61,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.get(did, doc_type),
             Self::Db(inner) => inner.get(did, doc_type),
+            Self::Mem(inner) => inner.get(did, doc_type),
         }
     }
 
@@ -66,6 +76,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.update(did, doc_type, doc, exp, trust_level),
             Self::Db(inner) => inner.update(did, doc_type, doc, exp, trust_level),
+            Self::Mem(inner) => inner.update(did, doc_type, doc, exp, trust_level),
         }
     }
 
@@ -80,6 +91,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
             Self::Db(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
+            Self::Mem(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
         }
     }
 
@@ -87,6 +99,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.delete(did, doc_type),
             Self::Db(inner) => inner.delete(did, doc_type),
+            Self::Mem(inner) => inner.delete(did, doc_type),
         }
     }
 }
@@ -496,6 +509,102 @@ impl DIDDocumentDBCache {
     }
 }
 
+// ------------------------ 内存实现（测试用） ------------------------
+
+#[derive(Clone)]
+pub struct DIDDocumentMemCache {
+    entries: std::sync::Arc<RwLock<HashMap<String, MemoryEntry>>>,
+}
+
+#[derive(Clone)]
+struct MemoryEntry {
+    doc: EncodedDocument,
+    exp: u64,
+    trust_level: i32,
+}
+
+impl DIDDocumentMemCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
+        let key = combine_key(did, doc_type);
+        let entry = match self.entries.read() {
+            Ok(guard) => guard.get(&key).cloned(),
+            Err(_) => None,
+        }?;
+        if is_expired(entry.exp) {
+            self.delete(did.clone(), doc_type);
+            return None;
+        }
+        Some((entry.doc, entry.exp, entry.trust_level))
+    }
+
+    pub fn update(
+        &self,
+        did: DID,
+        doc_type: Option<&str>,
+        doc: EncodedDocument,
+        exp: u64,
+        trust_level: i32,
+    ) -> bool {
+        if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
+            let mut need_update = false;
+            if did.is_named_obj_id() {
+                need_update = false;
+            } else {
+                let new_iat = get_doc_iat(&doc);
+                let current_iat = get_doc_iat(&existing);
+                if trust_level < current_trust {
+                    need_update = true;
+                } else if trust_level == current_trust && new_iat > current_iat {
+                    need_update = true;
+                }
+            }
+
+            if need_update {
+                self.insert(did, doc_type, doc, exp, trust_level);
+                return true;
+            }
+            return false;
+        } else {
+            self.insert(did, doc_type, doc, exp, trust_level);
+            return true;
+        }
+    }
+
+    pub fn insert(
+        &self,
+        did: DID,
+        doc_type: Option<&str>,
+        doc: EncodedDocument,
+        exp: u64,
+        trust_level: i32,
+    ) {
+        let key = combine_key(&did, doc_type);
+        if let Ok(mut guard) = self.entries.write() {
+            guard.insert(
+                key,
+                MemoryEntry {
+                    doc,
+                    exp,
+                    trust_level,
+                },
+            );
+        }
+    }
+
+    pub fn delete(&self, did: DID, doc_type: Option<&str>) {
+        let key = combine_key(&did, doc_type);
+        if let Ok(mut guard) = self.entries.write() {
+            guard.remove(&key);
+        }
+    }
+}
+
 // ------------------------ 工具函数 ------------------------
 
 fn is_expired(exp_ts: u64) -> bool {
@@ -565,6 +674,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let cache = DIDDocumentCache::new_db(Some(tmp_dir.path().to_path_buf())).unwrap();
         let did = DID::from_str("did:web:example.com").unwrap();
         (tmp_dir, cache, did)
+    }
+
+    fn setup_mem_cache() -> (DIDDocumentCache, DID) {
+        let cache = DIDDocumentCache::new_mem();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        (cache, did)
     }
 
     fn doc_path(base: &tempfile::TempDir, did: &DID) -> PathBuf {
@@ -780,6 +895,39 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let loaded = cache.get(&did, None).expect("doc should be available");
         assert_eq!(loaded.0, doc);
         Ok(())
+    }
+
+    #[test]
+    fn mem_roundtrip() {
+        let (cache, did) = setup_mem_cache();
+        let now = buckyos_get_unix_timestamp();
+        let exp = now + DEFAULT_EXPIRE_TIME;
+        let doc = build_zone_doc(&did, exp, "mem");
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc.clone(),
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
+        let loaded = cache.get(&did, None).expect("doc should be available");
+        assert_eq!(loaded.0, doc);
+    }
+
+    #[test]
+    fn mem_get_removes_expired_document() {
+        let (cache, did) = setup_mem_cache();
+        let past_exp = buckyos_get_unix_timestamp().saturating_sub(10);
+        let doc = build_zone_doc(&did, past_exp, "mem-expired");
+        cache.insert(
+            did.clone(),
+            None,
+            doc,
+            past_exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        assert!(cache.get(&did, None).is_none());
     }
 
     #[test]

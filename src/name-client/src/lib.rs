@@ -53,6 +53,12 @@ pub async fn init_name_lib(web3_bridge_config: &HashMap<String, String>) -> NSRe
     init_name_lib_ex(web3_bridge_config, NameClientConfig::default()).await
 }
 
+pub async fn init_name_lib_for_test(web3_bridge_config: &HashMap<String, String>) -> NSResult<()> {
+    let mut config = NameClientConfig::default();
+    config.cache_backend = CacheBackend::Memory;
+    init_name_lib_ex(web3_bridge_config, config).await
+}
+
 pub async fn init_name_lib_ex(
     web3_bridge_config: &HashMap<String, String>,
     config: NameClientConfig,

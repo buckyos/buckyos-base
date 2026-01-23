@@ -61,6 +61,7 @@ impl NameClient {
                     DIDDocumentCache::new(doc_cache_dir.clone())
                 }),
             CacheBackend::Filesystem => DIDDocumentCache::new(doc_cache_dir),
+            CacheBackend::Memory => DIDDocumentCache::new_mem(),
         };
 
         Self {
