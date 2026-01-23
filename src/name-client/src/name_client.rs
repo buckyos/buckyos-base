@@ -11,7 +11,9 @@ use name_lib::*;
 use name_lib::DEFAULT_EXPIRE_TIME;
 
 use log::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use tokio::sync::RwLock;
 
 
 pub const DEFAULT_PROVIDER_TRUST_LEVEL:i32 = 100;
@@ -38,6 +40,7 @@ pub struct NameClient {
     name_query: NameQuery,
     config: NameClientConfig,
     doc_cache: DIDDocumentCache,
+    nameinfo_cache: Option<std::sync::Arc<RwLock<HashMap<String, NameInfo>>>>,
 }
 
 impl NameClient {
@@ -64,10 +67,16 @@ impl NameClient {
             CacheBackend::Memory => DIDDocumentCache::new_mem(),
         };
 
+        let nameinfo_cache = match config.cache_backend {
+            CacheBackend::Memory => Some(std::sync::Arc::new(RwLock::new(HashMap::new()))),
+            _ => None,
+        };
+
         Self {
             name_query,
             config: config,
             doc_cache,
+            nameinfo_cache,
         }
     }
 
@@ -76,15 +85,37 @@ impl NameClient {
         self.name_query.add_provider(provider, trust_level).await;
     }
 
-    pub fn update_did_cache(&self, did: DID, doc: EncodedDocument) -> NSResult<()> {
+    pub fn update_did_cache(
+        &self,
+        did: DID,
+        doc_type: Option<&str>,
+        doc: EncodedDocument,
+    ) -> NSResult<()> {
         let exp = Self::extract_exp(&doc)
             .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
         self.doc_cache
-            .update(did, None, doc, exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+            .update(did, doc_type, doc, exp, DEFAULT_PROVIDER_TRUST_LEVEL);
         Ok(())
     }
 
+    //only for test
     pub fn add_nameinfo_cache(&self, name: &str, info: NameInfo) -> NSResult<()> {
+        let cache = match &self.nameinfo_cache {
+            Some(cache) => cache,
+            None => return Ok(()),
+        };
+
+        let mut real_name = name.to_string();
+        if name.starts_with("did") {
+            if let Ok(name_did) = DID::from_str(name) {
+                if name_did.method.as_str() == "web" {
+                    real_name = name_did.id.clone();
+                }
+            }
+        }
+
+        let mut cache = cache.blocking_write();
+        cache.insert(real_name, info);
         Ok(())
     }
 
@@ -104,11 +135,31 @@ impl NameClient {
             }
         }
 
+        if let Some(cache) = &self.nameinfo_cache {
+            let cache = cache.read().await;
+            if let Some(info) = cache.get(real_name.as_str()) {
+                if Self::nameinfo_matches_record_type(record_type, info) {
+                    return Ok(info.clone());
+                }
+            }
+        }
+
         let name_info = self
             .name_query
             .query(real_name.as_str(), record_type)
             .await?;
         return Ok(name_info);
+    }
+
+    fn nameinfo_matches_record_type(record_type: Option<RecordType>, info: &NameInfo) -> bool {
+        match record_type {
+            None => true,
+            Some(RecordType::A) => info.address.iter().any(|ip| ip.is_ipv4()),
+            Some(RecordType::AAAA) => info.address.iter().any(|ip| ip.is_ipv6()),
+            Some(RecordType::CNAME) => info.cname.is_some(),
+            Some(RecordType::TXT) => !info.txt.is_empty() || !info.did_documents.is_empty(),
+            _ => false,
+        }
     }
 
     fn is_doc_type_is_owner(&self, doc_type: Option<&str>) -> bool {
@@ -459,7 +510,9 @@ mod tests {
             let _ = crate::IS_NAME_LIB_INITED.set(true);
         }
 
-        crate::update_did_cache(did.clone(), doc.clone()).await.unwrap();
+        crate::update_did_cache(did.clone(), None, doc.clone())
+            .await
+            .unwrap();
         let resolved = resolve_did(&did, None).await.unwrap();
         assert_eq!(resolved, doc);
     }

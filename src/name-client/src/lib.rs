@@ -183,13 +183,17 @@ pub async fn resolve_did(did: &DID, doc_type: Option<&str>) -> NSResult<EncodedD
     client.resolve_did(did, doc_type).await
 }
 
-pub async fn update_did_cache(did: DID, doc: EncodedDocument) -> NSResult<()> {
+pub async fn update_did_cache(
+    did: DID,
+    doc_type: Option<&str>,
+    doc: EncodedDocument,
+) -> NSResult<()> {
     let client = get_name_client();
     if client.is_none() {
         return Err(NSError::NotFound("Name client not found".to_string()));
     }
     let client = client.unwrap();
-    client.update_did_cache(did, doc)
+    client.update_did_cache(did, doc_type, doc)
 }
 
 pub async fn add_nameinfo_cache(hostname: &str, info: NameInfo) -> NSResult<()> {
@@ -275,7 +279,7 @@ mod tests {
             let _ = IS_NAME_LIB_INITED.set(true);
         }
 
-        update_did_cache(did.clone(), doc.clone()).await.unwrap();
+        update_did_cache(did.clone(), None, doc.clone()).await.unwrap();
         let did_doc = resolve_did(&did, None).await.unwrap();
         assert_eq!(did_doc, doc);
     }
