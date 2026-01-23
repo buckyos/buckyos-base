@@ -99,7 +99,7 @@ impl NameClient {
     }
 
     //only for test
-    pub fn add_nameinfo_cache(&self, name: &str, info: NameInfo) -> NSResult<()> {
+    pub async fn add_nameinfo_cache(&self, name: &str, info: NameInfo) -> NSResult<()> {
         let cache = match &self.nameinfo_cache {
             Some(cache) => cache,
             None => return Ok(()),
@@ -114,8 +114,8 @@ impl NameClient {
             }
         }
 
-        let mut cache = cache.blocking_write();
-        cache.insert(real_name, info);
+        //let mut cache = cache.blocking_write();
+        cache.write().await.insert(real_name, info);
         Ok(())
     }
 

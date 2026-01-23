@@ -202,7 +202,7 @@ pub async fn add_nameinfo_cache(hostname: &str, info: NameInfo) -> NSResult<()> 
         return Err(NSError::NotFound("Name client not found".to_string()));
     }
     let client = client.unwrap();
-    client.add_nameinfo_cache(hostname, info)
+    client.add_nameinfo_cache(hostname, info).await
 }
 
 #[cfg(test)]
