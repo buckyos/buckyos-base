@@ -543,4 +543,25 @@ mod test {
         assert!(jwk.get("crv").unwrap() == "Ed25519");
         assert!(jwk.get("x").is_some());
     }
+
+    #[test]
+    fn test_decode_jwt_claim_without_verify_rejects_invalid() {
+        let err = decode_jwt_claim_without_verify("not-a-jwt").unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+
+        let err = decode_jwt_claim_without_verify("a.b").unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+    }
+
+    #[test]
+    fn test_from_pkcs8_rejects_invalid_data() {
+        let too_short = vec![0u8; 10];
+        let err = from_pkcs8(&too_short).unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+
+        let mut invalid_header = vec![0u8; 48];
+        invalid_header[0] = 0x31; // wrong first byte
+        let err = from_pkcs8(&invalid_header).unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+    }
 }

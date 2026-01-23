@@ -125,8 +125,11 @@ pub fn get_buckyos_service_data_dir(service_name: &str) -> PathBuf {
     get_buckyos_root_dir().join("data").join(service_name)
 }
 
-pub fn get_buckyos_app_data_dir(app_name: &str,owner_id: &str) -> PathBuf {
-    get_buckyos_root_dir().join("data").join(owner_id).join(app_name)
+pub fn get_buckyos_app_data_dir(app_name: &str, owner_id: &str) -> PathBuf {
+    get_buckyos_root_dir()
+        .join("data")
+        .join(owner_id)
+        .join(app_name)
 }
 
 pub fn get_buckyos_service_local_data_dir(service_name: &str, disk_id: Option<&str>) -> PathBuf {
@@ -147,14 +150,14 @@ pub fn get_buckyos_user_home_dir(user_id: &str) -> PathBuf {
 pub enum LibraryCategory {
     Public,
     Shared,
-    Photo,//所有自己拍的照片，视频
+    Photo, //所有自己拍的照片，视频
     Pciture,
     Music,
     Video,
     ROMS,
     ISO,
     Book,
-    Softwares,//各种软件安装包
+    Softwares, //各种软件安装包
 }
 
 impl LibraryCategory {
@@ -177,7 +180,11 @@ impl LibraryCategory {
 pub fn get_buckyos_library_dir(category: LibraryCategory) -> Option<PathBuf> {
     let category_str = category.to_string();
     if category_str.is_some() {
-        Some(get_buckyos_root_dir().join("library").join(category_str.unwrap()))
+        Some(
+            get_buckyos_root_dir()
+                .join("library")
+                .join(category_str.unwrap()),
+        )
     } else {
         None
     }
@@ -265,5 +272,123 @@ mod tests {
         let path = "/opt/buckyos/data/chunk/../1234567890";
         let normalized = normalize_path(path);
         assert_eq!(normalized.as_str(), "/opt/buckyos/data/1234567890");
+    }
+
+    #[test]
+    fn test_normalize_path_table_cases() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "current_dir",
+                input: "./a/./b",
+                expected: "a/b",
+            },
+            Case {
+                name: "parent_overflow",
+                input: "../../a",
+                expected: "a",
+            },
+            Case {
+                name: "double_slash",
+                input: "//tmp//buckyos//logs",
+                expected: "/tmp/buckyos/logs",
+            },
+            Case {
+                name: "mixed_separators",
+                input: "a\\b/c",
+                expected: "a/b/c",
+            },
+            Case {
+                name: "trailing_parent",
+                input: "/opt/buckyos/data/../",
+                expected: "/opt/buckyos",
+            },
+        ];
+
+        for case in cases {
+            let result = normalize_path(case.input);
+            assert_eq!(result, case.expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_get_relative_path_table_cases() {
+        struct Case {
+            name: &'static str,
+            base: &'static str,
+            full: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "matching_without_trailing",
+                base: "/opt/buckyos/data",
+                full: "/opt/buckyos/data/file.txt",
+                expected: "/file.txt",
+            },
+            Case {
+                name: "matching_with_trailing",
+                base: "/opt/buckyos/data/",
+                full: "/opt/buckyos/data/file.txt",
+                expected: "/file.txt",
+            },
+            Case {
+                name: "non_matching",
+                base: "/opt/buckyos/data",
+                full: "/var/tmp/file.txt",
+                expected: "/var/tmp/file.txt",
+            },
+            Case {
+                name: "base_equals_full",
+                base: "/opt/buckyos/data",
+                full: "/opt/buckyos/data",
+                expected: "",
+            },
+        ];
+
+        for case in cases {
+            let result = get_relative_path(case.base, case.full);
+            assert_eq!(result, case.expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_path_join_table_cases() {
+        let cases = vec![
+            ("basic", "/opt/buckyos", "logs", "/opt/buckyos/logs"),
+            ("absolute_sub", "/opt/buckyos", "/tmp/data", "/tmp/data"),
+            ("empty_sub", "/opt/buckyos", "", "/opt/buckyos/"),
+        ];
+
+        for (name, base, sub, expected) in cases {
+            let joined = path_join(base, sub);
+            assert_eq!(joined.to_string_lossy(), expected, "case: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_library_category_to_string_table() {
+        let cases = vec![
+            (LibraryCategory::Public, "public"),
+            (LibraryCategory::Shared, "shared"),
+            (LibraryCategory::Photo, "photo"),
+            (LibraryCategory::Pciture, "picture"),
+            (LibraryCategory::Music, "music"),
+            (LibraryCategory::Video, "video"),
+            (LibraryCategory::ROMS, "roms"),
+            (LibraryCategory::ISO, "iso"),
+            (LibraryCategory::Book, "book"),
+            (LibraryCategory::Softwares, "softwares"),
+        ];
+
+        for (category, expected) in cases {
+            assert_eq!(category.to_string(), Some(expected));
+        }
     }
 }

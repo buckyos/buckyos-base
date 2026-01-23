@@ -152,3 +152,69 @@ where
         self.0.lock().unwrap().emit(param)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct CounterContext {
+        count: usize,
+    }
+
+    #[test]
+    fn test_sync_event_manager_on_off_emit() {
+        let mut manager: SyncEventManager<CounterContext, usize, &'static str> =
+            SyncEventManager::new();
+        assert!(manager.is_empty());
+        assert_eq!(manager.listener_count(), 0);
+
+        let cookie1 = manager.on(Box::new(|ctx: &CounterContext| Ok(ctx.count + 1)));
+        let cookie2 = manager.on(Box::new(|ctx: &CounterContext| Ok(ctx.count + 2)));
+
+        assert_eq!(manager.listener_count(), 2);
+        let ctx = CounterContext { count: 1 };
+        let result = manager.emit(&ctx).unwrap();
+        assert_eq!(result, Some(3));
+
+        assert!(manager.off(cookie1));
+        assert!(!manager.off(cookie1));
+        assert_eq!(manager.listener_count(), 1);
+
+        let result_after = manager.emit(&ctx).unwrap();
+        assert_eq!(result_after, Some(3));
+
+        assert!(manager.off(cookie2));
+        assert!(manager.is_empty());
+        assert_eq!(manager.listener_count(), 0);
+    }
+
+    #[test]
+    fn test_sync_event_manager_emit_error() {
+        let mut manager: SyncEventManager<CounterContext, usize, &'static str> =
+            SyncEventManager::new();
+        manager.on(Box::new(|_ctx: &CounterContext| Err("boom")));
+
+        let ctx = CounterContext { count: 0 };
+        let result = manager.emit(&ctx);
+        assert!(matches!(result, Err("boom")));
+    }
+
+    #[test]
+    fn test_sync_event_manager_sync_wrapper() {
+        let manager: SyncEventManagerSync<CounterContext, usize, &'static str> =
+            SyncEventManagerSync::new();
+        assert!(manager.is_empty());
+        assert_eq!(manager.listener_count(), 0);
+
+        let cookie = manager.on(Box::new(|ctx: &CounterContext| Ok(ctx.count + 10)));
+        assert_eq!(manager.listener_count(), 1);
+
+        let ctx = CounterContext { count: 2 };
+        let result = manager.emit(&ctx).unwrap();
+        assert_eq!(result, Some(12));
+
+        assert!(manager.off(cookie));
+        assert!(manager.is_empty());
+    }
+}

@@ -209,4 +209,54 @@ mod test {
         // 处理请求
         processor.process(&mut context).unwrap();
     }
+
+    #[test]
+    fn test_parse_fn_process_config_errors() {
+        let mut registry = ProviderFnRegistry::new();
+        registry.register("ok", |_config| {
+            let provider: ProviderFn = Arc::new(|_ctx| Ok(()));
+            Ok(provider)
+        });
+
+        let mut processor = FnProcessor::new();
+        let configs = vec![
+            json!({"type": "ok"}),
+            json!({"type": "missing"}),
+            json!({"type": "also_missing"}),
+        ];
+
+        let result = parse_fn_process_config(&registry, &configs, &mut processor);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|e| e.contains("missing")));
+        assert!(errors.iter().any(|e| e.contains("also_missing")));
+        assert_eq!(processor.providers.len(), 1);
+    }
+
+    #[test]
+    fn test_fn_processor_collects_errors() {
+        let mut processor = FnProcessor::new();
+        let ok_provider: ProviderFn = Arc::new(|_ctx| Ok(()));
+        let err_provider: ProviderFn = Arc::new(|_ctx| Err("failed".to_string()));
+        let err_provider2: ProviderFn = Arc::new(|_ctx| Err("failed2".to_string()));
+
+        processor.add_provider(ok_provider);
+        processor.add_provider(err_provider);
+        processor.add_provider(err_provider2);
+
+        let mut context = RequestContext {
+            request_id: "req-999".to_string(),
+            data: HashMap::new(),
+        };
+        assert_eq!(context.request_id, "req-999");
+        assert!(context.data.is_empty());
+
+        let result = processor.process(&mut context);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 2);
+        assert!(errors.iter().any(|e| e == "failed"));
+        assert!(errors.iter().any(|e| e == "failed2"));
+    }
 }

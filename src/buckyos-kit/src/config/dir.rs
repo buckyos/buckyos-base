@@ -296,6 +296,7 @@ pub async fn load_dir(dir: &Path) -> Result<Vec<ConfigItem>, Box<dyn std::error:
 #[cfg(test)]
 mod test {
     use crate::config::dir::load_file;
+    use serde_json::json;
 
     #[test]
     fn test_file_index() {
@@ -336,5 +337,127 @@ test:
         assert_eq!(value["test"][0]["b"], 2);
         assert_eq!(value["test"][1]["a"], 3);
         assert_eq!(value["test"][1]["b"], 4);
+    }
+
+    #[tokio::test]
+    async fn test_load_file_error_cases_table() {
+        struct Case {
+            name: &'static str,
+            suffix: &'static str,
+            content: &'static str,
+            expected_contains: &'static str,
+        }
+
+        let cases = vec![
+            Case {
+                name: "invalid_json",
+                suffix: ".json",
+                content: "{",
+                expected_contains: "Failed to parse JSON",
+            },
+            Case {
+                name: "invalid_toml",
+                suffix: ".toml",
+                content: "a = [",
+                expected_contains: "Failed to parse TOML",
+            },
+            Case {
+                name: "invalid_yaml",
+                suffix: ".yaml",
+                content: "a: [",
+                expected_contains: "Failed to parse YAML",
+            },
+            Case {
+                name: "unknown_extension_fallback_toml_error",
+                suffix: ".conf",
+                content: "a = [",
+                expected_contains: "Failed to parse TOML",
+            },
+        ];
+
+        for case in cases {
+            let tmp_file = tempfile::NamedTempFile::with_suffix(case.suffix).unwrap();
+            std::fs::write(tmp_file.path(), case.content).unwrap();
+
+            let result = load_file(tmp_file.path()).await;
+            assert!(result.is_err(), "case: {}", case.name);
+            let err = format!("{}", result.unwrap_err());
+            assert!(err.contains(case.expected_contains), "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_extract_index_from_filename_table() {
+        struct Case {
+            name: &'static str,
+            path: &'static str,
+            expected: Option<u32>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "simple_index",
+                path: "name.1.json",
+                expected: Some(1),
+            },
+            Case {
+                name: "toml_index",
+                path: "name.20.toml",
+                expected: Some(20),
+            },
+            Case {
+                name: "dir_index",
+                path: "dir.3",
+                expected: Some(3),
+            },
+            Case {
+                name: "double_extension",
+                path: "name.4.conf.json",
+                expected: None,
+            },
+            Case {
+                name: "no_index",
+                path: "name.json",
+                expected: None,
+            },
+            Case {
+                name: "non_numeric",
+                path: "name.xx.json",
+                expected: None,
+            },
+        ];
+
+        for case in cases {
+            let path = std::path::Path::new(case.path);
+            let result = super::extract_index_from_filename(path);
+            assert_eq!(result, case.expected, "case: {}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_toml_to_json_basic() {
+        let input = toml::toml! {
+            title = "buckyos"
+            [db]
+            host = "localhost"
+            port = 5432
+        };
+
+        let result = super::toml_to_json(toml::Value::Table(input)).unwrap();
+        assert_eq!(result["title"], json!("buckyos"));
+        assert_eq!(result["db"]["host"], json!("localhost"));
+        assert_eq!(result["db"]["port"], json!(5432));
+    }
+
+    #[test]
+    fn test_yaml_to_json_basic() {
+        let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            "name: buckyos\nitems:\n  - 1\n  - 2\n",
+        )
+        .unwrap();
+        let result = super::yaml_to_json(yaml_value).unwrap();
+        assert_eq!(result["name"], json!("buckyos"));
+        assert_eq!(result["items"][0], json!(1));
+        assert_eq!(result["items"][1], json!(2));
     }
 }

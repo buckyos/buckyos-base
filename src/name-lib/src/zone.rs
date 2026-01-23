@@ -748,6 +748,7 @@ mod tests {
 
     use serde::de;
     use serde_json::json;
+    use jsonwebtoken::{DecodingKey, EncodingKey};
     use std::{
         alloc::System,
         hash::Hash,
@@ -955,6 +956,42 @@ mod tests {
         }
 
         return device_jwt2.to_string();
+    }
+
+    #[test]
+    fn test_zone_config_encode_decode() {
+        let owner_private_key_pem = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
+-----END PRIVATE KEY-----"#;
+        let owner_jwk: Jwk = serde_json::from_value(json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+        }))
+        .unwrap();
+        let owner_private_key = EncodingKey::from_ed_pem(owner_private_key_pem.as_bytes()).unwrap();
+        let owner_public_key = DecodingKey::from_jwk(&owner_jwk).unwrap();
+
+        let mut zone = ZoneConfig::new(
+            DID::new("bns", "zone1"),
+            DID::new("bns", "alice"),
+            owner_jwk.clone(),
+        );
+        zone.oods = vec!["ood1".parse().unwrap()];
+        zone.iat = buckyos_get_unix_timestamp() as u64;
+        zone.exp = buckyos_get_unix_timestamp() as u64 + 3600 * 24 * 365 * 10;
+
+        let encoded = zone.encode(Some(&owner_private_key)).unwrap();
+        let decoded = ZoneConfig::decode(&encoded, Some(&owner_public_key)).unwrap();
+
+        assert_eq!(decoded.id, zone.id);
+        assert_eq!(decoded.owner, zone.owner);
+        assert_eq!(decoded.oods, zone.oods);
+
+        let auth_key = decoded.get_auth_key(None).unwrap();
+        let auth_key_x = get_x_from_jwk(&auth_key.1).unwrap();
+        let owner_x = get_x_from_jwk(&owner_jwk).unwrap();
+        assert_eq!(auth_key_x, owner_x);
     }
 
     

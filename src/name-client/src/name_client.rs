@@ -11,7 +11,9 @@ use name_lib::*;
 use name_lib::DEFAULT_EXPIRE_TIME;
 
 use log::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use tokio::sync::RwLock;
 
 
 pub const DEFAULT_PROVIDER_TRUST_LEVEL:i32 = 100;
@@ -38,6 +40,7 @@ pub struct NameClient {
     name_query: NameQuery,
     config: NameClientConfig,
     doc_cache: DIDDocumentCache,
+    nameinfo_cache: Option<std::sync::Arc<RwLock<HashMap<String, NameInfo>>>>,
 }
 
 impl NameClient {
@@ -61,12 +64,19 @@ impl NameClient {
                     DIDDocumentCache::new(doc_cache_dir.clone())
                 }),
             CacheBackend::Filesystem => DIDDocumentCache::new(doc_cache_dir),
+            CacheBackend::Memory => DIDDocumentCache::new_mem(),
+        };
+
+        let nameinfo_cache = match config.cache_backend {
+            CacheBackend::Memory => Some(std::sync::Arc::new(RwLock::new(HashMap::new()))),
+            _ => None,
         };
 
         Self {
             name_query,
             config: config,
             doc_cache,
+            nameinfo_cache,
         }
     }
 
@@ -75,15 +85,37 @@ impl NameClient {
         self.name_query.add_provider(provider, trust_level).await;
     }
 
-    pub fn update_did_cache(&self, did: DID, doc: EncodedDocument) -> NSResult<()> {
+    pub fn update_did_cache(
+        &self,
+        did: DID,
+        doc_type: Option<&str>,
+        doc: EncodedDocument,
+    ) -> NSResult<()> {
         let exp = Self::extract_exp(&doc)
             .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
         self.doc_cache
-            .update(did, None, doc, exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+            .update(did, doc_type, doc, exp, DEFAULT_PROVIDER_TRUST_LEVEL);
         Ok(())
     }
 
+    //only for test
     pub fn add_nameinfo_cache(&self, name: &str, info: NameInfo) -> NSResult<()> {
+        let cache = match &self.nameinfo_cache {
+            Some(cache) => cache,
+            None => return Ok(()),
+        };
+
+        let mut real_name = name.to_string();
+        if name.starts_with("did") {
+            if let Ok(name_did) = DID::from_str(name) {
+                if name_did.method.as_str() == "web" {
+                    real_name = name_did.id.clone();
+                }
+            }
+        }
+
+        let mut cache = cache.blocking_write();
+        cache.insert(real_name, info);
         Ok(())
     }
 
@@ -103,11 +135,31 @@ impl NameClient {
             }
         }
 
+        if let Some(cache) = &self.nameinfo_cache {
+            let cache = cache.read().await;
+            if let Some(info) = cache.get(real_name.as_str()) {
+                if Self::nameinfo_matches_record_type(record_type, info) {
+                    return Ok(info.clone());
+                }
+            }
+        }
+
         let name_info = self
             .name_query
             .query(real_name.as_str(), record_type)
             .await?;
         return Ok(name_info);
+    }
+
+    fn nameinfo_matches_record_type(record_type: Option<RecordType>, info: &NameInfo) -> bool {
+        match record_type {
+            None => true,
+            Some(RecordType::A) => info.address.iter().any(|ip| ip.is_ipv4()),
+            Some(RecordType::AAAA) => info.address.iter().any(|ip| ip.is_ipv6()),
+            Some(RecordType::CNAME) => info.cname.is_some(),
+            Some(RecordType::TXT) => !info.txt.is_empty() || !info.did_documents.is_empty(),
+            _ => false,
+        }
     }
 
     fn is_doc_type_is_owner(&self, doc_type: Option<&str>) -> bool {
@@ -193,6 +245,7 @@ impl NameClient {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use crate::{init_name_lib_ex, resolve_did};
 
@@ -200,6 +253,7 @@ mod tests {
     use async_trait::async_trait;
     use buckyos_kit::init_logging;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     fn make_doc(iat: u64, exp: u64, marker: &str) -> EncodedDocument {
         EncodedDocument::JsonLd(serde_json::json!({
@@ -256,6 +310,37 @@ mod tests {
                 Some(MockErr::Disabled) => Err(NSError::Disabled("mock disabled".into())),
                 None => Ok(self.doc.as_ref().unwrap().clone()),
             }
+        }
+    }
+
+    struct NameMockProvider {
+        called_name: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl NsProvider for NameMockProvider {
+        fn get_id(&self) -> String {
+            "name-mock".to_string()
+        }
+
+        async fn query(
+            &self,
+            name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            let mut guard = self.called_name.lock().await;
+            *guard = Some(name.to_string());
+            Ok(NameInfo::new(name))
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            _doc_type: Option<&str>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            Err(NSError::NotFound("not implemented".into()))
         }
     }
 
@@ -406,23 +491,50 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_via_init_name_lib_with_mock_provider() {
-        init_logging("test-name-client",  false);
-        let tmp_dir = tempdir().unwrap().keep();
+        init_logging("test-name-client", false);
         let now = buckyos_get_unix_timestamp();
         let doc = make_doc(now, now + 600, "init-mock");
-        let did = DID::from_str("did:bns:filebrowser.buckyos").unwrap();
+        let did = DID::from_str("did:web:mock.example").unwrap();
 
-        let web3_bridge = get_default_web3_bridge_config();
-        let cfg = NameClientConfig {
-            enable_cache: true,
-            local_cache_dir: None,
-            cache_backend: CacheBackend::Filesystem,
-        };
+        if crate::GLOBAL_NAME_CLIENT.get().is_none() {
+            let tmp_dir = tempdir().unwrap().keep();
+            let mut client = NameClient::new(NameClientConfig {
+                enable_cache: true,
+                local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
+                cache_backend: CacheBackend::Filesystem,
+            });
+            client
+                .add_provider(Box::new(MockProvider::err(MockErr::NotFound)), Some(10))
+                .await;
+            let _ = crate::GLOBAL_NAME_CLIENT.set(client);
+            let _ = crate::IS_NAME_LIB_INITED.set(true);
+        }
 
-        // 初始化全局客户端，模拟真实使用路径
-        init_name_lib_ex(&web3_bridge, cfg).await.unwrap();
+        crate::update_did_cache(did.clone(), None, doc.clone())
+            .await
+            .unwrap();
         let resolved = resolve_did(&did, None).await.unwrap();
-        let result_str = resolved.to_string();
-        info!("resolve result: {}", result_str);
+        assert_eq!(resolved, doc);
+    }
+
+    #[tokio::test]
+    async fn resolve_did_web_normalizes_to_host_name() {
+        let called_name = Arc::new(Mutex::new(None));
+        let provider = NameMockProvider {
+            called_name: called_name.clone(),
+        };
+        let tmp_dir = tempdir().unwrap().keep();
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
+            cache_backend: CacheBackend::Filesystem,
+        });
+        client.add_provider(Box::new(provider), Some(DEFAULT_PROVIDER_TRUST_LEVEL)).await;
+
+        let result = client.resolve("did:web:example.com", None).await.unwrap();
+        assert_eq!(result.name, "example.com".to_string());
+
+        let observed = called_name.lock().await.clone().unwrap();
+        assert_eq!(observed, "example.com".to_string());
     }
 }

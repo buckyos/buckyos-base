@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::time::UNIX_EPOCH;
 
 use buckyos_kit::{
@@ -18,11 +20,13 @@ use crate::ROOT_TRUST_LEVEL;
 pub enum CacheBackend {
     Filesystem,
     Sqlite,
+    Memory,
 }
 
 pub enum DIDDocumentCache {
     Fs(DIDDocumentFsCache),
     Db(DIDDocumentDBCache),
+    Mem(DIDDocumentMemCache),
 }
 
 impl DIDDocumentCache {
@@ -34,6 +38,11 @@ impl DIDDocumentCache {
     /// 显式创建 SQLite 缓存。
     pub fn new_db(cache_dir: Option<PathBuf>) -> name_lib::NSResult<Self> {
         Ok(Self::Db(DIDDocumentDBCache::new(cache_dir)?))
+    }
+
+    /// 显式创建 Memory 缓存（测试用）。
+    pub fn new_mem() -> Self {
+        Self::Mem(DIDDocumentMemCache::new())
     }
 
     pub fn get_default_cache_dir() -> PathBuf {
@@ -52,6 +61,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.get(did, doc_type),
             Self::Db(inner) => inner.get(did, doc_type),
+            Self::Mem(inner) => inner.get(did, doc_type),
         }
     }
 
@@ -66,6 +76,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.update(did, doc_type, doc, exp, trust_level),
             Self::Db(inner) => inner.update(did, doc_type, doc, exp, trust_level),
+            Self::Mem(inner) => inner.update(did, doc_type, doc, exp, trust_level),
         }
     }
 
@@ -80,6 +91,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
             Self::Db(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
+            Self::Mem(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
         }
     }
 
@@ -87,6 +99,7 @@ impl DIDDocumentCache {
         match self {
             Self::Fs(inner) => inner.delete(did, doc_type),
             Self::Db(inner) => inner.delete(did, doc_type),
+            Self::Mem(inner) => inner.delete(did, doc_type),
         }
     }
 }
@@ -140,6 +153,10 @@ impl DIDDocumentFsCache {
             .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
 
         let trust_level = meta.trust_level;
+        if is_expired(exp) {
+            self.delete(did.clone(), doc_type);
+            return None;
+        }
         Some((doc, exp, trust_level))
     }
 
@@ -185,10 +202,14 @@ impl DIDDocumentFsCache {
         trust_level: i32,
     ) {
         self.save_to_disk(&did, doc_type, &doc);
-        self.save_meta(&did, doc_type, CacheMeta {
-            trust_level,
-            exp: Some(exp),
-        });
+        self.save_meta(
+            &did,
+            doc_type,
+            CacheMeta {
+                trust_level,
+                exp: Some(exp),
+            },
+        );
     }
 
     pub fn delete(&self, did: DID, doc_type: Option<&str>) {
@@ -196,7 +217,11 @@ impl DIDDocumentFsCache {
         self.delete_meta(&did, doc_type);
     }
 
-    fn load_from_disk(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, CacheMeta)> {
+    fn load_from_disk(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+    ) -> Option<(EncodedDocument, CacheMeta)> {
         let file_path = self
             .cache_dir
             .join(format!("{}.doc.json", combine_key(did, doc_type)));
@@ -204,17 +229,20 @@ impl DIDDocumentFsCache {
         match fs::read_to_string(&file_path) {
             Ok(content) => match EncodedDocument::from_str(content) {
                 Ok(doc) => {
-                    
                     let default_exp = fs::metadata(&file_path)
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() + 3600*24);
+                        .map(|d| d.as_secs() + 3600 * 24);
                     let meta = CacheMeta {
                         trust_level: ROOT_TRUST_LEVEL,
                         exp: default_exp,
                     };
-                    info!("load did-cache from {} success. meta: {:?}", file_path.display(), meta);
+                    info!(
+                        "load did-cache from {} success. meta: {:?}",
+                        file_path.display(),
+                        meta
+                    );
                     Some((doc, meta))
                 }
                 Err(err) => {
@@ -432,13 +460,17 @@ impl DIDDocumentDBCache {
                 return;
             }
         };
-        if let Err(err) = conn.execute("DELETE FROM did_docs WHERE doc_key = ?1", params![combine_key(&did, doc_type)]) {
+        if let Err(err) = conn.execute(
+            "DELETE FROM did_docs WHERE doc_key = ?1",
+            params![combine_key(&did, doc_type)],
+        ) {
             warn!("delete did doc sqlite cache failed: {}", err);
         }
     }
 
     fn resolve_db_path(cache_dir: Option<PathBuf>) -> name_lib::NSResult<PathBuf> {
-        let base_dir = cache_dir.unwrap_or_else(|| get_buckyos_service_local_data_dir("did_docs", None));
+        let base_dir =
+            cache_dir.unwrap_or_else(|| get_buckyos_service_local_data_dir("did_docs", None));
         if let Err(err) = fs::create_dir_all(&base_dir) {
             return Err(name_lib::NSError::ReadLocalFileError(format!(
                 "prepare sqlite cache dir failed: {}",
@@ -456,9 +488,9 @@ impl DIDDocumentDBCache {
     }
 
     fn init_schema(&self) -> name_lib::NSResult<()> {
-        let conn = self
-            .open_conn()
-            .map_err(|e| name_lib::NSError::ReadLocalFileError(format!("open sqlite failed: {}", e)))?;
+        let conn = self.open_conn().map_err(|e| {
+            name_lib::NSError::ReadLocalFileError(format!("open sqlite failed: {}", e))
+        })?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS did_docs (
                 doc_key TEXT PRIMARY KEY,
@@ -470,8 +502,106 @@ impl DIDDocumentDBCache {
             )",
             [],
         )
-        .map_err(|e| name_lib::NSError::ReadLocalFileError(format!("create table failed: {}", e)))?;
+        .map_err(|e| {
+            name_lib::NSError::ReadLocalFileError(format!("create table failed: {}", e))
+        })?;
         Ok(())
+    }
+}
+
+// ------------------------ 内存实现（测试用） ------------------------
+
+#[derive(Clone)]
+pub struct DIDDocumentMemCache {
+    entries: std::sync::Arc<RwLock<HashMap<String, MemoryEntry>>>,
+}
+
+#[derive(Clone)]
+struct MemoryEntry {
+    doc: EncodedDocument,
+    exp: u64,
+    trust_level: i32,
+}
+
+impl DIDDocumentMemCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
+        let key = combine_key(did, doc_type);
+        let entry = match self.entries.read() {
+            Ok(guard) => guard.get(&key).cloned(),
+            Err(_) => None,
+        }?;
+        if is_expired(entry.exp) {
+            self.delete(did.clone(), doc_type);
+            return None;
+        }
+        Some((entry.doc, entry.exp, entry.trust_level))
+    }
+
+    pub fn update(
+        &self,
+        did: DID,
+        doc_type: Option<&str>,
+        doc: EncodedDocument,
+        exp: u64,
+        trust_level: i32,
+    ) -> bool {
+        if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
+            let mut need_update = false;
+            if did.is_named_obj_id() {
+                need_update = false;
+            } else {
+                let new_iat = get_doc_iat(&doc);
+                let current_iat = get_doc_iat(&existing);
+                if trust_level < current_trust {
+                    need_update = true;
+                } else if trust_level == current_trust && new_iat > current_iat {
+                    need_update = true;
+                }
+            }
+
+            if need_update {
+                self.insert(did, doc_type, doc, exp, trust_level);
+                return true;
+            }
+            return false;
+        } else {
+            self.insert(did, doc_type, doc, exp, trust_level);
+            return true;
+        }
+    }
+
+    pub fn insert(
+        &self,
+        did: DID,
+        doc_type: Option<&str>,
+        doc: EncodedDocument,
+        exp: u64,
+        trust_level: i32,
+    ) {
+        let key = combine_key(&did, doc_type);
+        if let Ok(mut guard) = self.entries.write() {
+            guard.insert(
+                key,
+                MemoryEntry {
+                    doc,
+                    exp,
+                    trust_level,
+                },
+            );
+        }
+    }
+
+    pub fn delete(&self, did: DID, doc_type: Option<&str>) {
+        let key = combine_key(&did, doc_type);
+        if let Ok(mut guard) = self.entries.write() {
+            guard.remove(&key);
+        }
     }
 }
 
@@ -515,12 +645,12 @@ fn combine_key(did: &DID, doc_type: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_PROVIDER_TRUST_LEVEL;
     use jsonwebtoken::EncodingKey;
-    use name_lib::{DIDDocumentTrait, OwnerConfig, ZoneBootConfig, DEFAULT_EXPIRE_TIME, NSError};
+    use name_lib::{DIDDocumentTrait, NSError, OwnerConfig, ZoneBootConfig, DEFAULT_EXPIRE_TIME};
     use serde_json::json;
     use std::collections::HashMap;
     use tempfile::tempdir;
-    use crate::DEFAULT_PROVIDER_TRUST_LEVEL;
 
     const TEST_OWNER_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -546,12 +676,20 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         (tmp_dir, cache, did)
     }
 
+    fn setup_mem_cache() -> (DIDDocumentCache, DID) {
+        let cache = DIDDocumentCache::new_mem();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        (cache, did)
+    }
+
     fn doc_path(base: &tempfile::TempDir, did: &DID) -> PathBuf {
-        base.path().join(format!("{}.doc.json", did.to_raw_host_name()))
+        base.path()
+            .join(format!("{}.doc.json", did.to_raw_host_name()))
     }
 
     fn meta_path(base: &tempfile::TempDir, did: &DID) -> PathBuf {
-        base.path().join(format!("{}.meta.json", did.to_raw_host_name()))
+        base.path()
+            .join(format!("{}.meta.json", did.to_raw_host_name()))
     }
 
     fn owner_encoding_key() -> EncodingKey {
@@ -598,7 +736,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let exp = now + DEFAULT_EXPIRE_TIME;
         let doc = build_zone_doc(&did, exp, "json-v1");
-        cache.insert(did.clone(), None, doc.clone(), exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+        cache.insert(
+            did.clone(),
+            None,
+            doc.clone(),
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
 
         assert!(doc_path(&tmp_dir, &did).exists());
         let loaded = cache.get(&did, None).expect("doc should be available");
@@ -611,7 +755,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let (tmp_dir, cache, did) = setup_fs_cache();
         let past_exp = buckyos_get_unix_timestamp().saturating_sub(10);
         let doc = build_zone_doc(&did, past_exp, "expired");
-        cache.insert(did.clone(), None, doc, past_exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+        cache.insert(
+            did.clone(),
+            None,
+            doc,
+            past_exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
 
         assert!(cache.get(&did, None).is_none());
         assert!(
@@ -625,16 +775,48 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let (_tmp_dir, cache, did) = setup_fs_cache();
         let now = buckyos_get_unix_timestamp();
         let doc_v1 = build_owner_doc(now, "jwt-v1");
-        let exp_v1 = doc_v1.clone().to_json_value().unwrap().get("exp").unwrap().as_u64().unwrap();
-        assert!(cache.update(did.clone(), None, doc_v1.clone(), exp_v1, DEFAULT_PROVIDER_TRUST_LEVEL));
+        let exp_v1 = doc_v1
+            .clone()
+            .to_json_value()
+            .unwrap()
+            .get("exp")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v1.clone(),
+            exp_v1,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
 
         let doc_v2 = build_owner_doc(now + 1_000, "jwt-v2");
-        let exp_v2 = doc_v2.clone().to_json_value().unwrap().get("exp").unwrap().as_u64().unwrap();
-        assert!(cache.update(did.clone(), None, doc_v2.clone(), exp_v2, DEFAULT_PROVIDER_TRUST_LEVEL));
+        let exp_v2 = doc_v2
+            .clone()
+            .to_json_value()
+            .unwrap()
+            .get("exp")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v2.clone(),
+            exp_v2,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
         assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
 
         let older_doc = build_owner_doc(now + 500, "jwt-old");
-        assert!(!cache.update(did.clone(), None, older_doc, now + DEFAULT_EXPIRE_TIME, DEFAULT_PROVIDER_TRUST_LEVEL));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            older_doc,
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
         assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
     }
 
@@ -644,15 +826,33 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let exp_v1 = now + (DEFAULT_EXPIRE_TIME * 2);
         let doc_v1 = build_zone_doc(&did, exp_v1, "no-iat-v1");
-        assert!(cache.update(did.clone(), None, doc_v1.clone(), exp_v1, DEFAULT_PROVIDER_TRUST_LEVEL));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v1.clone(),
+            exp_v1,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
 
         let exp_v2 = exp_v1 + 10;
         let doc_v2 = build_zone_doc(&did, exp_v2, "no-iat-v2");
-        assert!(cache.update(did.clone(), None, doc_v2.clone(), exp_v2, DEFAULT_PROVIDER_TRUST_LEVEL));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v2.clone(),
+            exp_v2,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
 
         let exp_v3 = exp_v2 - 5;
         let doc_v3 = build_zone_doc(&did, exp_v3, "no-iat-older");
-        assert!(!cache.update(did.clone(), None, doc_v3, exp_v3, DEFAULT_PROVIDER_TRUST_LEVEL));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            doc_v3,
+            exp_v3,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
 
         assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
     }
@@ -663,7 +863,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let exp = now + DEFAULT_EXPIRE_TIME;
         let doc = build_zone_doc(&did, exp, "missing-meta");
-        cache.insert(did.clone(), None, doc.clone(), exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+        cache.insert(
+            did.clone(),
+            None,
+            doc.clone(),
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
 
         // Simulate meta file being deleted/corrupted
         std::fs::remove_file(meta_path(&tmp_dir, &did)).unwrap();
@@ -679,9 +885,85 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let exp = now + DEFAULT_EXPIRE_TIME;
         let doc = build_zone_doc(&did, exp, "db");
-        assert!(cache.update(did.clone(), None, doc.clone(), exp, DEFAULT_PROVIDER_TRUST_LEVEL));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc.clone(),
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
         let loaded = cache.get(&did, None).expect("doc should be available");
         assert_eq!(loaded.0, doc);
         Ok(())
+    }
+
+    #[test]
+    fn mem_roundtrip() {
+        let (cache, did) = setup_mem_cache();
+        let now = buckyos_get_unix_timestamp();
+        let exp = now + DEFAULT_EXPIRE_TIME;
+        let doc = build_zone_doc(&did, exp, "mem");
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc.clone(),
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
+        let loaded = cache.get(&did, None).expect("doc should be available");
+        assert_eq!(loaded.0, doc);
+    }
+
+    #[test]
+    fn mem_get_removes_expired_document() {
+        let (cache, did) = setup_mem_cache();
+        let past_exp = buckyos_get_unix_timestamp().saturating_sub(10);
+        let doc = build_zone_doc(&did, past_exp, "mem-expired");
+        cache.insert(
+            did.clone(),
+            None,
+            doc,
+            past_exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        assert!(cache.get(&did, None).is_none());
+    }
+
+    #[test]
+    fn fs_update_does_not_replace_named_obj() {
+        let (_tmp_dir, cache, _) = setup_fs_cache();
+        let did = DID::from_str("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE").unwrap();
+        let now = buckyos_get_unix_timestamp();
+
+        let doc_v1 = EncodedDocument::JsonLd(json!({
+            "iat": now,
+            "exp": now + DEFAULT_EXPIRE_TIME,
+            "marker": "v1"
+        }));
+        cache.insert(
+            did.clone(),
+            None,
+            doc_v1.clone(),
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        let doc_v2 = EncodedDocument::JsonLd(json!({
+            "iat": now + 1000,
+            "exp": now + DEFAULT_EXPIRE_TIME + 1000,
+            "marker": "v2"
+        }));
+        let updated = cache.update(
+            did.clone(),
+            None,
+            doc_v2.clone(),
+            now + DEFAULT_EXPIRE_TIME + 1000,
+            DEFAULT_PROVIDER_TRUST_LEVEL - 10,
+        );
+        assert!(!updated);
+
+        let loaded = cache.get(&did, None).unwrap();
+        assert_eq!(loaded.0, doc_v1);
     }
 }
