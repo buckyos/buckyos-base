@@ -3,6 +3,8 @@
 #![allow(non_snake_case)]
 mod protocol;
 mod session_token;
+mod example_krpc_client;
+
 pub use protocol::*;
 pub use session_token::*;
 
@@ -194,7 +196,6 @@ mod test {
         let resp = RPCResponse {
             result: RPCResult::Success(json!(100)),
             seq: 100,
-            token: Some("$3232323".to_string()),
             trace_id: Some("$trace_id".to_string()),
         };
         let encoded = serde_json::to_string(&resp).unwrap();
@@ -205,7 +206,6 @@ mod test {
         let resp = RPCResponse {
             result: RPCResult::Failed("game over".to_string()),
             seq: 100,
-            token: None,
             trace_id: None,
         };
         let encoded = serde_json::to_string(&resp).unwrap();

@@ -137,7 +137,6 @@ pub struct RPCResponse {
     pub result: RPCResult,
 
     pub seq: u64,
-    pub token: Option<String>,
     pub trace_id: Option<String>,
 }
 
@@ -146,8 +145,15 @@ impl RPCResponse {
         RPCResponse {
             result: result,
             seq: seq,
-            token: None,
             trace_id: None,
+        }
+    }
+
+    pub fn create_by_req(result: RPCResult, req: &RPCRequest) -> Self {
+        RPCResponse {
+            result: result,
+            seq: req.id,
+            trace_id: req.trace_id.clone(),
         }
     }
 }
@@ -164,7 +170,7 @@ impl Serialize for RPCResponse {
                 state.serialize_field("result", &value)?;
 
                 let mut sys_vec = serde_json::json! {
-                    [self.seq,self.token,self.trace_id]
+                    [self.seq,self.trace_id]
                 };
                 array_remove_none_value(&mut sys_vec.as_array_mut().unwrap());
                 state.serialize_field("sys", &sys_vec)?;
@@ -175,7 +181,7 @@ impl Serialize for RPCResponse {
                 let mut state = serializer.serialize_struct("RPCResponse", 1)?;
                 state.serialize_field("error", &err)?;
                 let mut sys_vec = serde_json::json! {
-                    [self.seq,self.token,self.trace_id]
+                    [self.seq,self.trace_id]
                 };
                 array_remove_none_value(&mut sys_vec.as_array_mut().unwrap());
                 state.serialize_field("sys", &sys_vec)?;
@@ -193,7 +199,6 @@ impl<'de> Deserialize<'de> for RPCResponse {
         let v = Value::deserialize(deserializer)?;
         let sys = v.get("sys");
         let mut seq: u64 = 0;
-        let mut token: Option<String> = None;
         let mut trace_id: Option<String> = None;
         if sys.is_some() {
             let sys = sys
@@ -207,16 +212,11 @@ impl<'de> Deserialize<'de> for RPCResponse {
                     .ok_or(serde::de::Error::custom("sys[0] seq is not u64"))?;
                 seq = _seq;
             }
+
             if sys.len() > 1 {
-                let _token = sys[1]
+                let _trace_id = sys[1]
                     .as_str()
-                    .ok_or(serde::de::Error::custom("sys[1] token is not string"))?;
-                token = Some(_token.to_string());
-            }
-            if sys.len() > 2 {
-                let _trace_id = sys[2]
-                    .as_str()
-                    .ok_or(serde::de::Error::custom("sys[2] trace_id is not string"))?;
+                    .ok_or(serde::de::Error::custom("sys[1] trace_id is not string"))?;
                 trace_id = Some(_trace_id.to_string());
             }
         }
@@ -225,14 +225,12 @@ impl<'de> Deserialize<'de> for RPCResponse {
             Ok(RPCResponse {
                 result: RPCResult::Failed(v.get("error").unwrap().as_str().unwrap().to_string()),
                 seq: seq,
-                token: token,
                 trace_id: trace_id,
             })
         } else {
             Ok(RPCResponse {
                 result: RPCResult::Success(v.get("result").unwrap().clone()),
                 seq: seq,
-                token: token,
                 trace_id: trace_id,
             })
         }
