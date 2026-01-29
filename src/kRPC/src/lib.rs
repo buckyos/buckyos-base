@@ -9,7 +9,7 @@ pub use protocol::*;
 pub use session_token::*;
 
 use reqwest::{Client, ClientBuilder};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -150,6 +150,7 @@ impl kRPC {
 #[cfg(test)]
 mod test {
     use super::*;
+    use serde_json::json;
     #[test]
     fn test_encode_decode() {
         let req = RPCRequest {
