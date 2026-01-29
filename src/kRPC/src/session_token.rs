@@ -39,6 +39,8 @@ pub struct RPCSessionToken {
     pub session: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appid: Option<String>,
 }
 
 impl RPCSessionToken {
@@ -52,7 +54,8 @@ impl RPCSessionToken {
         let mut session_token = RPCSessionToken {
             token_type: RPCSessionTokenType::JWT,
             token: None,
-            aud: Some(app_id.to_string()),
+            aud: None,
+            appid: Some(app_id.to_string()),
             exp: Some(timestamp + DEFAULT_SESSION_TOKEN_EXPIRE_TIME),
             iss: Some(user_id.to_string()),
             jti: None,
@@ -79,6 +82,7 @@ impl RPCSessionToken {
                 token: Some(token.to_string()),
                 iss: None,
                 exp: None,
+                appid: None,
             });
         } else {
             let payload = decode_jwt_claim_without_verify(token).map_err(|e| {
@@ -93,15 +97,15 @@ impl RPCSessionToken {
         }
     }
 
-    pub fn get_values(&self) -> Result<(String, String)> {
-        if self.sub.is_none() || self.aud.is_none() {
+    pub fn get_subs(&self) -> Result<(String, String)> {
+        if self.sub.is_none() || self.appid.is_none() {
             return Err(RPCErrors::InvalidToken(
                 "Invalid token: sub or aud is none".to_string(),
             ));
         }
         Ok((
             self.sub.as_ref().unwrap().to_string(),
-            self.aud.as_ref().unwrap().to_string(),
+            self.appid.as_ref().unwrap().to_string(),
         ))
     }
 
@@ -179,8 +183,16 @@ impl RPCSessionToken {
         let sub = sub_value
             .as_str()
             .ok_or(RPCErrors::InvalidToken("Invalid sub".to_string()))?;
+        let appid = decoded_json.get("appid");
+        if let Some(appid) = appid {
+            if appid.is_null() {
+                self.appid = None;
+            } else {
+                self.appid = Some(appid.as_str().unwrap().to_string());
+            }
+        }
 
-        let aud = decoded_json.get("aud").or_else(|| decoded_json.get("appid"));
+        let aud = decoded_json.get("aud");
         if let Some(aud) = aud {
             if aud.is_null() {
                 self.aud = None;
@@ -288,7 +300,16 @@ impl RPCSessionToken {
             .as_str()
             .ok_or(RPCErrors::InvalidToken("Invalid sub".to_string()))?;
 
-        let aud = decoded_json.get("aud").or_else(|| decoded_json.get("appid"));
+        let appid = decoded_json.get("appid");
+        if let Some(appid) = appid {
+            if appid.is_null() {
+                self.appid = None;
+            } else {
+                self.appid = Some(appid.as_str().unwrap().to_string());
+            }
+        }
+
+        let aud = decoded_json.get("aud");
         if let Some(aud) = aud {
             if aud.is_null() {
                 self.aud = None;
