@@ -14,7 +14,7 @@ pub struct RPCRequest {
     pub params: Value,
     //0: seq,1:token(option),2:trace_id(option)
     //pub sys:  Option<Vec<Value>>,
-    pub id: u64,
+    pub seq: u64,
     pub token: Option<String>,
     pub trace_id: Option<String>,
 }
@@ -24,7 +24,7 @@ impl RPCRequest {
         RPCRequest {
             method: method.to_string(),
             params: params,
-            id: 0,
+            seq: 0,
             token: None,
             trace_id: None,
         }
@@ -42,16 +42,7 @@ impl RPCRequest {
     }
 }
 
-fn array_remove_none_value(array: &mut Vec<Value>) {
-    let mut i = 0;
-    while i < array.len() {
-        if array[i].is_null() {
-            array.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-}
+
 
 impl Serialize for RPCRequest {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -61,10 +52,16 @@ impl Serialize for RPCRequest {
         let mut state = serializer.serialize_struct("RPCRequest", 2)?;
         state.serialize_field("method", &self.method)?;
         state.serialize_field("params", &self.params)?;
-        let mut sys_vec = serde_json::json! {
-            [self.id,self.token,self.trace_id]
-        };
-        array_remove_none_value(&mut sys_vec.as_array_mut().unwrap());
+        let mut sys_vec = vec![Value::from(self.seq)];
+        if let Some(token) = self.token.as_ref() {
+            sys_vec.push(Value::from(token.clone()));
+        } else if self.trace_id.is_some() {
+            // keep slot for token when trace_id exists
+            sys_vec.push(Value::Null);
+        }
+        if let Some(trace_id) = self.trace_id.as_ref() {
+            sys_vec.push(Value::from(trace_id.clone()));
+        }
         state.serialize_field("sys", &sys_vec)?;
         state.end()
     }
@@ -103,23 +100,29 @@ impl<'de> Deserialize<'de> for RPCRequest {
                 seq = _seq;
             }
             if sys.len() > 1 {
-                let _token = sys[1]
-                    .as_str()
-                    .ok_or(serde::de::Error::custom("sys[1] token is not string"))?;
-                token = Some(_token.to_string());
+                let token_value = &sys[1];
+                if !token_value.is_null() {
+                    let _token = token_value
+                        .as_str()
+                        .ok_or(serde::de::Error::custom("sys[1] token is not string"))?;
+                    token = Some(_token.to_string());
+                }
             }
             if sys.len() > 2 {
-                let _trace_id = sys[2]
-                    .as_str()
-                    .ok_or(serde::de::Error::custom("sys[2] trace_id is not string"))?;
-                trace_id = Some(_trace_id.to_string());
+                let trace_value = &sys[2];
+                if !trace_value.is_null() {
+                    let _trace_id = trace_value
+                        .as_str()
+                        .ok_or(serde::de::Error::custom("sys[2] trace_id is not string"))?;
+                    trace_id = Some(_trace_id.to_string());
+                }
             }
         }
 
         Ok(RPCRequest {
             method: method.to_string(),
             params: params.clone(),
-            id: seq,
+            seq,
             token: token,
             trace_id: trace_id,
         })
@@ -152,7 +155,7 @@ impl RPCResponse {
     pub fn create_by_req(result: RPCResult, req: &RPCRequest) -> Self {
         RPCResponse {
             result: result,
-            seq: req.id,
+            seq: req.seq,
             trace_id: req.trace_id.clone(),
         }
     }
@@ -169,10 +172,11 @@ impl Serialize for RPCResponse {
                     serializer.serialize_struct("RPCResponse", 1)?;
                 state.serialize_field("result", &value)?;
 
-                let mut sys_vec = serde_json::json! {
-                    [self.seq,self.trace_id]
-                };
-                array_remove_none_value(&mut sys_vec.as_array_mut().unwrap());
+                let mut sys_vec = vec![Value::from(self.seq)];
+                if let Some(trace_id) = self.trace_id.as_ref() {
+                    sys_vec.push(Value::from(trace_id.clone()));
+                }
+      
                 state.serialize_field("sys", &sys_vec)?;
 
                 state.end()
@@ -180,10 +184,11 @@ impl Serialize for RPCResponse {
             RPCResult::Failed(err) => {
                 let mut state = serializer.serialize_struct("RPCResponse", 1)?;
                 state.serialize_field("error", &err)?;
-                let mut sys_vec = serde_json::json! {
-                    [self.seq,self.trace_id]
-                };
-                array_remove_none_value(&mut sys_vec.as_array_mut().unwrap());
+                let mut sys_vec = vec![Value::from(self.seq)];
+                if let Some(trace_id) = self.trace_id.as_ref() {
+                    sys_vec.push(Value::from(trace_id.clone()));
+                }
+
                 state.serialize_field("sys", &sys_vec)?;
                 state.end()
             }
@@ -244,4 +249,112 @@ pub trait RPCHandler {
         req: RPCRequest,
         ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn serialize_request_sys_len_1() {
+        let mut req = RPCRequest::new("ping", json!({"k":"v"}));
+        req.seq = 7;
+        let value = serde_json::to_value(req).expect("serialize request");
+        assert_eq!(value.get("sys").unwrap(), &json!([7]));
+    }
+
+    #[test]
+    fn serialize_request_sys_len_2() {
+        let mut req = RPCRequest::new("ping", json!({"k":"v"}));
+        req.seq = 8;
+        req.token = Some("t1".to_string());
+        let value = serde_json::to_value(req).expect("serialize request");
+        assert_eq!(value.get("sys").unwrap(), &json!([8, "t1"]));
+    }
+
+    #[test]
+    fn serialize_request_sys_len_3_with_null_token() {
+        let mut req = RPCRequest::new("ping", json!({"k":"v"}));
+        req.seq = 9;
+        req.trace_id = Some("tr1".to_string());
+        let value = serde_json::to_value(req).expect("serialize request");
+        assert_eq!(value.get("sys").unwrap(), &json!([9, null, "tr1"]));
+    }
+
+    #[test]
+    fn deserialize_request_sys_len_1() {
+        let value = json!({
+            "method": "ping",
+            "params": {"k": "v"},
+            "sys": [7]
+        });
+        let req: RPCRequest = serde_json::from_value(value).expect("deserialize request");
+        assert_eq!(req.seq, 7);
+        assert_eq!(req.token, None);
+        assert_eq!(req.trace_id, None);
+    }
+
+    #[test]
+    fn deserialize_request_sys_len_2() {
+        let value = json!({
+            "method": "ping",
+            "params": {"k": "v"},
+            "sys": [7, "t1"]
+        });
+        let req: RPCRequest = serde_json::from_value(value).expect("deserialize request");
+        assert_eq!(req.seq, 7);
+        assert_eq!(req.token, Some("t1".to_string()));
+        assert_eq!(req.trace_id, None);
+    }
+
+    #[test]
+    fn deserialize_request_sys_len_3_null_token() {
+        let value = json!({
+            "method": "ping",
+            "params": {"k": "v"},
+            "sys": [7, null, "tr1"]
+        });
+        let req: RPCRequest = serde_json::from_value(value).expect("deserialize request");
+        assert_eq!(req.seq, 7);
+        assert_eq!(req.token, None);
+        assert_eq!(req.trace_id, Some("tr1".to_string()));
+    }
+
+    #[test]
+    fn deserialize_request_sys_len_3_token_trace() {
+        let value = json!({
+            "method": "ping",
+            "params": {"k": "v"},
+            "sys": [7, "t1", "tr1"]
+        });
+        let req: RPCRequest = serde_json::from_value(value).expect("deserialize request");
+        assert_eq!(req.seq, 7);
+        assert_eq!(req.token, Some("t1".to_string()));
+        assert_eq!(req.trace_id, Some("tr1".to_string()));
+    }
+
+    #[test]
+    fn deserialize_response_success() {
+        let value = json!({
+            "result": {"ok": true},
+            "sys": [11, "tr1"]
+        });
+        let resp: RPCResponse = serde_json::from_value(value).expect("deserialize response");
+        assert_eq!(resp.seq, 11);
+        assert_eq!(resp.trace_id, Some("tr1".to_string()));
+        assert_eq!(resp.result, RPCResult::Success(json!({"ok": true})));
+    }
+
+    #[test]
+    fn deserialize_response_error() {
+        let value = json!({
+            "error": "boom",
+            "sys": [12]
+        });
+        let resp: RPCResponse = serde_json::from_value(value).expect("deserialize response");
+        assert_eq!(resp.seq, 12);
+        assert_eq!(resp.trace_id, None);
+        assert_eq!(resp.result, RPCResult::Failed("boom".to_string()));
+    }
 }

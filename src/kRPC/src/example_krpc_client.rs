@@ -77,7 +77,7 @@ impl<T: MyApiHandler> RPCHandler for T {
         req: RPCRequest,
         _ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
-        let seq = req.id;
+        let seq = req.seq;
         let trace_id = req.trace_id.clone();
         
         let result = match req.method.as_str() {
@@ -149,7 +149,7 @@ mod tests {
         let rpc_req = RPCRequest {
             method: "add".to_string(),
             params: json!({"a": 5, "b": 7}),
-            id: 1,
+            seq: 1,
             token: None,
             trace_id: None,
         };
@@ -176,7 +176,7 @@ mod tests {
         let rpc_req = RPCRequest {
             method: "unknown_method".to_string(),
             params: json!({}),
-            id: 1,
+            seq: 1,
             token: None,
             trace_id: None,
         };

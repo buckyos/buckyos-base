@@ -88,7 +88,7 @@ impl kRPC {
     }
 
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        //retry 2 times here.
+        //TODO: do auto-retry by config
         self._call(method, params).await
     }
 
@@ -101,20 +101,13 @@ impl kRPC {
             current_seq = *seq;
 
             let session_token = self.session_token.read().await;
-
-            if session_token.is_some() {
-                request_body = json!({
-                    "method": method,
-                    "params": params,
-                    "sys": [*seq, session_token.as_ref().unwrap()]
-                });
-            } else {
-                request_body = json!({
-                    "method": method,
-                    "params": params,
-                    "sys": [*seq]
-                });
-            }
+            let mut request = RPCRequest::new(method, params);
+            request.seq = *seq;
+            request.token = session_token.clone();
+            request_body =
+                serde_json::to_value(&request).map_err(|err| {
+                    RPCErrors::ParseRequestError(format!("serialize request failed: {}", err))
+                })?;
         }
 
         let response = self
@@ -126,45 +119,24 @@ impl kRPC {
             .map_err(|err| RPCErrors::ReasonError(format!("{}", err)))?;
 
         if response.status().is_success() {
-            let rpc_response: Value = response
+            let rpc_response: RPCResponse = response
                 .json()
                 .await
-                .map_err(|err| RPCErrors::ReasonError(format!("{}", err)))?;
-            let sys_vec = rpc_response.get("sys");
-            if sys_vec.is_some() {
-                let sys = sys_vec
-                    .unwrap()
-                    .as_array()
-                    .ok_or(RPCErrors::ParserResponseError(
-                        "sys is not array".to_string(),
-                    ))?;
+                .map_err(|err| RPCErrors::ParserResponseError(format!("{}", err)))?;
 
-                if sys.len() >= 1 {
-                    let seq = sys[0].as_u64().ok_or(RPCErrors::ParserResponseError(
-                        "sys[0] is not u64".to_string(),
-                    ))?;
-                    if seq != current_seq {
-                        return Err(RPCErrors::ParserResponseError(format!(
-                            "seq not match: {}!={}",
-                            seq, current_seq
-                        )));
-                    }
-                }
-                if sys.len() >= 2 {
-                    let token = sys[1].as_str().ok_or(RPCErrors::ParserResponseError(
-                        "sys[1] is not string".to_string(),
-                    ))?;
-                    self.session_token.write().await.replace(token.to_string());
-                }
+            if rpc_response.seq != current_seq {
+                return Err(RPCErrors::ParserResponseError(format!(
+                    "seq not match: {}!={}",
+                    rpc_response.seq, current_seq
+                )));
             }
 
-            if rpc_response.get("error").is_some() {
-                Err(RPCErrors::ReasonError(format!(
+            match rpc_response.result {
+                RPCResult::Success(value) => Ok(value),
+                RPCResult::Failed(err) => Err(RPCErrors::ReasonError(format!(
                     "rpc call error: {}",
-                    rpc_response.get("error").unwrap()
-                )))
-            } else {
-                Ok(rpc_response.get("result").unwrap().clone())
+                    err
+                ))),
             }
         } else {
             Err(RPCErrors::ReasonError(format!(
@@ -183,8 +155,8 @@ mod test {
         let req = RPCRequest {
             method: "add".to_string(),
             params: json!({"a":1,"b":2}),
-            id: 100,
-            token: Some("$dsdsd".to_string()),
+            seq: 100,
+            token: None,
             trace_id: Some("$trace_id".to_string()),
         };
         let encoded = serde_json::to_string(&req).unwrap();
