@@ -1,7 +1,6 @@
 use crate::{RPCErrors, Result};
 use buckyos_kit::buckyos_get_unix_timestamp;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use log::*;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use name_lib::decode_jwt_claim_without_verify;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::HashMap;
@@ -16,7 +15,7 @@ pub enum RPCSessionTokenType {
 
 impl Default for RPCSessionTokenType {
     fn default() -> Self {
-        RPCSessionTokenType::JWT
+        RPCSessionTokenType::Normal
     }
 }
 
@@ -41,6 +40,11 @@ pub struct RPCSessionToken {
     pub sub: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub appid: Option<String>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl RPCSessionToken {
@@ -61,6 +65,7 @@ impl RPCSessionToken {
             jti: None,
             session: None,
             sub: Some(user_id.to_string()),
+            extra: HashMap::new(),
         };
         let result_str = session_token.generate_jwt(kid, private_key).map_err(|e| {
             RPCErrors::ReasonError(format!("Failed to generate session token: {}", e))
@@ -71,19 +76,12 @@ impl RPCSessionToken {
     }
 
     pub fn from_string(token: &str) -> Result<Self> {
-        let have_dot = token.find('.');
-        if have_dot.is_none() {
-            return Ok(RPCSessionToken {
-                token_type: RPCSessionTokenType::Normal,
-                jti: None,
-                session: None,
-                aud: None,
-                sub: None,
-                token: Some(token.to_string()),
-                iss: None,
-                exp: None,
-                appid: None,
-            });
+        if token.trim().starts_with('{') {
+            let mut result_token: RPCSessionToken = serde_json::from_str(token).map_err(|e| {
+                RPCErrors::ReasonError(format!("Failed to deserialize session token: {}", e))
+            })?;
+            result_token.token_type = RPCSessionTokenType::Normal;
+            return Ok(result_token);
         } else {
             let payload = decode_jwt_claim_without_verify(token).map_err(|e| {
                 RPCErrors::ReasonError(format!("Failed to decode session token: {}", e))
@@ -92,6 +90,7 @@ impl RPCSessionToken {
                 serde_json::from_value::<RPCSessionToken>(payload).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to decode session token: {}", e))
                 })?;
+            session_token.token_type = RPCSessionTokenType::JWT;
             session_token.token = Some(token.to_string());
             return Ok(session_token);
         }
@@ -149,242 +148,270 @@ impl RPCSessionToken {
         }
     }
 
-    pub fn verify_by_key(&mut self, public_key: &DecodingKey) -> Result<()> {
-        if !self.is_self_verify() {
-            return Err(RPCErrors::InvalidToken(
-                "Not a self verify token".to_string(),
-            ));
-        }
-        let token_str = self.token.as_ref().unwrap();
-        let header: jsonwebtoken::Header =
-            jsonwebtoken::decode_header(token_str).map_err(|error| {
-                RPCErrors::InvalidToken(format!("JWT decode header error : {}", error))
-            })?;
+    // pub fn verify_by_key(&mut self, public_key: &DecodingKey) -> Result<()> {
+    //     if !self.is_self_verify() {
+    //         return Err(RPCErrors::InvalidToken(
+    //             "Not a self verify token".to_string(),
+    //         ));
+    //     }
+    //     let token_str = self.token.as_ref().unwrap();
+    //     let header: jsonwebtoken::Header =
+    //         jsonwebtoken::decode_header(token_str).map_err(|error| {
+    //             RPCErrors::InvalidToken(format!("JWT decode header error : {}", error))
+    //         })?;
 
-        if header.kid.is_some() {
-            warn!("JWT kid could be none at specific key verify model");
-            //return Err(RPCErrors::InvalidToken("JWT kid is not allowed at specific key verify_model".to_string()));
-        }
+    //     if header.kid.is_some() {
+    //         warn!("JWT kid could be none at specific key verify model");
+    //         //return Err(RPCErrors::InvalidToken("JWT kid is not allowed at specific key verify_model".to_string()));
+    //     }
 
-        let validation = Validation::new(header.alg);
-        let decoded_token = decode::<serde_json::Value>(token_str, &public_key, &validation)
-            .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error:{}", error)))?;
+    //     let validation = Validation::new(header.alg);
+    //     let decoded_token = decode::<serde_json::Value>(token_str, &public_key, &validation)
+    //         .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error:{}", error)))?;
 
-        let decoded_json = decoded_token
-            .claims
-            .as_object()
-            .ok_or(RPCErrors::InvalidToken("Invalid token".to_string()))?;
-        debug!("decoded token: {:?}", decoded_json);
+    //     let decoded_json = decoded_token
+    //         .claims
+    //         .as_object()
+    //         .ok_or(RPCErrors::InvalidToken("Invalid token".to_string()))?;
+    //     debug!("decoded token: {:?}", decoded_json);
 
-        let sub_value = decoded_json
-            .get("sub")
-            .or_else(|| decoded_json.get("userid"))
-            .ok_or(RPCErrors::InvalidToken("Missing sub".to_string()))?;
-        let sub = sub_value
-            .as_str()
-            .ok_or(RPCErrors::InvalidToken("Invalid sub".to_string()))?;
-        let appid = decoded_json.get("appid");
-        if let Some(appid) = appid {
-            if appid.is_null() {
-                self.appid = None;
-            } else {
-                self.appid = Some(appid.as_str().unwrap().to_string());
-            }
-        }
+    //     let sub_value = decoded_json
+    //         .get("sub")
+    //         .or_else(|| decoded_json.get("userid"))
+    //         .ok_or(RPCErrors::InvalidToken("Missing sub".to_string()))?;
+    //     let sub = sub_value
+    //         .as_str()
+    //         .ok_or(RPCErrors::InvalidToken("Invalid sub".to_string()))?;
+    //     let appid = decoded_json.get("appid");
+    //     if let Some(appid) = appid {
+    //         if appid.is_null() {
+    //             self.appid = None;
+    //         } else {
+    //             self.appid = Some(appid.as_str().unwrap().to_string());
+    //         }
+    //     }
 
-        let aud = decoded_json.get("aud");
-        if let Some(aud) = aud {
-            if aud.is_null() {
-                self.aud = None;
-            } else if let Some(aud) = aud.as_str() {
-                self.aud = Some(aud.to_string());
-            } else if let Some(aud_list) = aud.as_array() {
-                let first = aud_list
-                    .iter()
-                    .find_map(|item| item.as_str())
-                    .ok_or(RPCErrors::InvalidToken("Invalid aud".to_string()))?;
-                self.aud = Some(first.to_string());
-            } else {
-                return Err(RPCErrors::InvalidToken("Invalid aud".to_string()));
-            }
-        }
+    //     let aud = decoded_json.get("aud");
+    //     if let Some(aud) = aud {
+    //         if aud.is_null() {
+    //             self.aud = None;
+    //         } else if let Some(aud) = aud.as_str() {
+    //             self.aud = Some(aud.to_string());
+    //         } else if let Some(aud_list) = aud.as_array() {
+    //             let first = aud_list
+    //                 .iter()
+    //                 .find_map(|item| item.as_str())
+    //                 .ok_or(RPCErrors::InvalidToken("Invalid aud".to_string()))?;
+    //             self.aud = Some(first.to_string());
+    //         } else {
+    //             return Err(RPCErrors::InvalidToken("Invalid aud".to_string()));
+    //         }
+    //     }
 
-        let iss = decoded_json.get("iss");
-        if let Some(iss) = iss {
-            if iss.is_null() {
-                self.iss = None;
-            } else {
-                let iss = iss
-                    .as_str()
-                    .ok_or(RPCErrors::InvalidToken("Invalid iss".to_string()))?;
-                self.iss = Some(iss.to_string());
-            }
-        }
+    //     let iss = decoded_json.get("iss");
+    //     if let Some(iss) = iss {
+    //         if iss.is_null() {
+    //             self.iss = None;
+    //         } else {
+    //             let iss = iss
+    //                 .as_str()
+    //                 .ok_or(RPCErrors::InvalidToken("Invalid iss".to_string()))?;
+    //             self.iss = Some(iss.to_string());
+    //         }
+    //     }
 
-        let exp = decoded_json.get("exp");
-        if let Some(exp) = exp {
-            if exp.is_null() {
-                self.exp = None;
-            } else {
-                let exp = exp
-                    .as_u64()
-                    .ok_or(RPCErrors::InvalidToken("Invalid expire time".to_string()))?;
-                self.exp = Some(exp);
-            }
-        }
+    //     let exp = decoded_json.get("exp");
+    //     if let Some(exp) = exp {
+    //         if exp.is_null() {
+    //             self.exp = None;
+    //         } else {
+    //             let exp = exp
+    //                 .as_u64()
+    //                 .ok_or(RPCErrors::InvalidToken("Invalid expire time".to_string()))?;
+    //             self.exp = Some(exp);
+    //         }
+    //     }
 
-        let jti = decoded_json.get("jti").or_else(|| decoded_json.get("nonce"));
-        if let Some(jti) = jti {
-            if jti.is_null() {
-                self.jti = None;
-            } else if let Some(jti) = jti.as_str() {
-                self.jti = Some(jti.to_string());
-            } else if let Some(jti) = jti.as_u64() {
-                self.jti = Some(jti.to_string());
-            } else {
-                return Err(RPCErrors::InvalidToken("Invalid jti".to_string()));
-            }
-        }
+    //     let jti = decoded_json.get("jti").or_else(|| decoded_json.get("nonce"));
+    //     if let Some(jti) = jti {
+    //         if jti.is_null() {
+    //             self.jti = None;
+    //         } else if let Some(jti) = jti.as_str() {
+    //             self.jti = Some(jti.to_string());
+    //         } else if let Some(jti) = jti.as_u64() {
+    //             self.jti = Some(jti.to_string());
+    //         } else {
+    //             return Err(RPCErrors::InvalidToken("Invalid jti".to_string()));
+    //         }
+    //     }
 
-        self.sub = Some(sub.to_string());
-        Ok(())
+    //     self.sub = Some(sub.to_string());
+    //     Ok(())
+    // }
+
+    // //return kid
+    // pub fn verify_by_key_map(
+    //     &mut self,
+    //     trust_keys: &HashMap<String, DecodingKey>,
+    // ) -> Result<String> {
+    //     if !self.is_self_verify() {
+    //         return Err(RPCErrors::InvalidToken(
+    //             "Not a self verify token".to_string(),
+    //         ));
+    //     }
+    //     if self.token.is_none() {
+    //         return Err(RPCErrors::InvalidToken("Token is empty".to_string()));
+    //     }
+
+    //     let token_str = self.token.as_ref().unwrap();
+    //     let header: jsonwebtoken::Header =
+    //         jsonwebtoken::decode_header(token_str).map_err(|error| {
+    //             RPCErrors::InvalidToken(format!("JWT decode header error : {}", error))
+    //         })?;
+
+    //     if header.alg != Algorithm::EdDSA {
+    //         return Err(RPCErrors::ReasonError("JWT algorithm not allowed".to_string()));
+    //     }
+
+    //     let kid: String;
+    //     if header.kid.is_none() {
+    //         kid = "$default".to_string();
+    //     } else {
+    //         kid = header.kid.unwrap();
+    //     }
+    //     let public_key = trust_keys.get(kid.as_str());
+    //     if public_key.is_none() {
+    //         return Err(RPCErrors::KeyNotExist(kid.clone()));
+    //     }
+    //     let public_key = public_key.unwrap();
+
+    //     let validation = Validation::new(header.alg);
+    //     let decoded_token = decode::<serde_json::Value>(token_str, &public_key, &validation)
+    //         .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error:{}", error)))?;
+
+    //     let decoded_json = decoded_token
+    //         .claims
+    //         .as_object()
+    //         .ok_or(RPCErrors::InvalidToken("Invalid token".to_string()))?;
+    //     debug!("decoded token: {:?}", decoded_json);
+
+    //     let sub_value = decoded_json
+    //         .get("sub")
+    //         .or_else(|| decoded_json.get("userid"))
+    //         .ok_or(RPCErrors::InvalidToken("Missing sub".to_string()))?;
+    //     let sub = sub_value
+    //         .as_str()
+    //         .ok_or(RPCErrors::InvalidToken("Invalid sub".to_string()))?;
+
+    //     let appid = decoded_json.get("appid");
+    //     if let Some(appid) = appid {
+    //         if appid.is_null() {
+    //             self.appid = None;
+    //         } else {
+    //             self.appid = Some(appid.as_str().unwrap().to_string());
+    //         }
+    //     }
+
+    //     let aud = decoded_json.get("aud");
+    //     if let Some(aud) = aud {
+    //         if aud.is_null() {
+    //             self.aud = None;
+    //         } else if let Some(aud) = aud.as_str() {
+    //             self.aud = Some(aud.to_string());
+    //         } else if let Some(aud_list) = aud.as_array() {
+    //             let first = aud_list
+    //                 .iter()
+    //                 .find_map(|item| item.as_str())
+    //                 .ok_or(RPCErrors::InvalidToken("Invalid aud".to_string()))?;
+    //             self.aud = Some(first.to_string());
+    //         } else {
+    //             return Err(RPCErrors::InvalidToken("Invalid aud".to_string()));
+    //         }
+    //     }
+
+    //     let iss = decoded_json.get("iss");
+    //     if let Some(iss) = iss {
+    //         if iss.is_null() {
+    //             self.iss = None;
+    //         } else {
+    //             let iss = iss
+    //                 .as_str()
+    //                 .ok_or(RPCErrors::InvalidToken("Invalid iss".to_string()))?;
+    //             self.iss = Some(iss.to_string());
+    //         }
+    //     }
+
+    //     let exp = decoded_json.get("exp");
+    //     if let Some(exp) = exp {
+    //         if exp.is_null() {
+    //             self.exp = None;
+    //         } else {
+    //             let exp = exp
+    //                 .as_u64()
+    //                 .ok_or(RPCErrors::InvalidToken("Invalid expire time".to_string()))?;
+    //             self.exp = Some(exp);
+    //         }
+    //     }
+
+    //     let jti = decoded_json.get("jti").or_else(|| decoded_json.get("nonce"));
+    //     if let Some(jti) = jti {
+    //         if jti.is_null() {
+    //             self.jti = None;
+    //         } else if let Some(jti) = jti.as_str() {
+    //             self.jti = Some(jti.to_string());
+    //         } else if let Some(jti) = jti.as_u64() {
+    //             self.jti = Some(jti.to_string());
+    //         } else {
+    //             return Err(RPCErrors::InvalidToken("Invalid jti".to_string()));
+    //         }
+    //     }
+
+    //     self.sub = Some(sub.to_string());
+    //     Ok(kid)
+    // }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn test_session_token_serialize_deserialize() {
+        let session_token = RPCSessionToken {
+            token_type: RPCSessionTokenType::Normal,
+            token: None,
+            aud: Some("aud".to_string()),
+            exp: Some(1000),
+            iss: Some("iss".to_string()),
+            jti: Some("jti".to_string()),
+            session: Some(1000),
+            sub: Some("sub".to_string()),
+            appid: Some("appid".to_string()),
+            extra: HashMap::new(),
+        };
+        let serialized = serde_json::to_string(&session_token).unwrap();
+        println!("serialized = {}", serialized);
+        let deserialized: RPCSessionToken = RPCSessionToken::from_string(&serialized).unwrap();
+        assert_eq!(session_token, deserialized);
+
+        let session_token_with_extra = json!({
+            "aud": "aud",
+            "exp": 1000,
+            "iss": "iss",
+            "jti": "jti",
+            "session": 1000,
+            "sub": "sub",
+            "appid": "appid",
+            "new_field": "new.value",
+        });
+        let new_session_token = serde_json::from_value::<RPCSessionToken>(session_token_with_extra).unwrap();
+        assert_eq!(new_session_token.extra.get("new_field").unwrap().as_str().unwrap(), "new.value");
+
+        let  serialized = serde_json::to_string(&new_session_token).unwrap();
+        println!("serialized = {}", serialized);
+        let new_serialized = format!("\n\n    {}   \n\n", serialized);
+        let deserialized: RPCSessionToken = RPCSessionToken::from_string(&new_serialized).unwrap();
+        assert_eq!(new_session_token, deserialized);
+
     }
-
-    //return kid
-    pub fn verify_by_key_map(
-        &mut self,
-        trust_keys: &HashMap<String, DecodingKey>,
-    ) -> Result<String> {
-        if !self.is_self_verify() {
-            return Err(RPCErrors::InvalidToken(
-                "Not a self verify token".to_string(),
-            ));
-        }
-        if self.token.is_none() {
-            return Err(RPCErrors::InvalidToken("Token is empty".to_string()));
-        }
-
-        let token_str = self.token.as_ref().unwrap();
-        let header: jsonwebtoken::Header =
-            jsonwebtoken::decode_header(token_str).map_err(|error| {
-                RPCErrors::InvalidToken(format!("JWT decode header error : {}", error))
-            })?;
-
-        let kid: String;
-        if header.kid.is_none() {
-            kid = "$default".to_string();
-        } else {
-            kid = header.kid.unwrap();
-        }
-        let public_key = trust_keys.get(kid.as_str());
-        if public_key.is_none() {
-            return Err(RPCErrors::KeyNotExist(kid.clone()));
-        }
-        let public_key = public_key.unwrap();
-
-        let validation = Validation::new(header.alg);
-        let decoded_token = decode::<serde_json::Value>(token_str, &public_key, &validation)
-            .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error:{}", error)))?;
-
-        let decoded_json = decoded_token
-            .claims
-            .as_object()
-            .ok_or(RPCErrors::InvalidToken("Invalid token".to_string()))?;
-        debug!("decoded token: {:?}", decoded_json);
-
-        let sub_value = decoded_json
-            .get("sub")
-            .or_else(|| decoded_json.get("userid"))
-            .ok_or(RPCErrors::InvalidToken("Missing sub".to_string()))?;
-        let sub = sub_value
-            .as_str()
-            .ok_or(RPCErrors::InvalidToken("Invalid sub".to_string()))?;
-
-        let appid = decoded_json.get("appid");
-        if let Some(appid) = appid {
-            if appid.is_null() {
-                self.appid = None;
-            } else {
-                self.appid = Some(appid.as_str().unwrap().to_string());
-            }
-        }
-
-        let aud = decoded_json.get("aud");
-        if let Some(aud) = aud {
-            if aud.is_null() {
-                self.aud = None;
-            } else if let Some(aud) = aud.as_str() {
-                self.aud = Some(aud.to_string());
-            } else if let Some(aud_list) = aud.as_array() {
-                let first = aud_list
-                    .iter()
-                    .find_map(|item| item.as_str())
-                    .ok_or(RPCErrors::InvalidToken("Invalid aud".to_string()))?;
-                self.aud = Some(first.to_string());
-            } else {
-                return Err(RPCErrors::InvalidToken("Invalid aud".to_string()));
-            }
-        }
-
-        let iss = decoded_json.get("iss");
-        if let Some(iss) = iss {
-            if iss.is_null() {
-                self.iss = None;
-            } else {
-                let iss = iss
-                    .as_str()
-                    .ok_or(RPCErrors::InvalidToken("Invalid iss".to_string()))?;
-                self.iss = Some(iss.to_string());
-            }
-        }
-
-        let exp = decoded_json.get("exp");
-        if let Some(exp) = exp {
-            if exp.is_null() {
-                self.exp = None;
-            } else {
-                let exp = exp
-                    .as_u64()
-                    .ok_or(RPCErrors::InvalidToken("Invalid expire time".to_string()))?;
-                self.exp = Some(exp);
-            }
-        }
-
-        let jti = decoded_json.get("jti").or_else(|| decoded_json.get("nonce"));
-        if let Some(jti) = jti {
-            if jti.is_null() {
-                self.jti = None;
-            } else if let Some(jti) = jti.as_str() {
-                self.jti = Some(jti.to_string());
-            } else if let Some(jti) = jti.as_u64() {
-                self.jti = Some(jti.to_string());
-            } else {
-                return Err(RPCErrors::InvalidToken("Invalid jti".to_string()));
-            }
-        }
-
-        self.sub = Some(sub.to_string());
-        Ok(kid)
-    }
-}
-
-//store verified session tokens
-pub struct SessionTokenManager {
-    cache_tokens: HashMap<String, RPCSessionToken>,
-}
-
-impl SessionTokenManager {
-    pub fn new() -> Self {
-        SessionTokenManager {
-            cache_tokens: HashMap::new(),
-        }
-    }
-}
-
-pub async fn request_session_token() -> String {
-    unimplemented!();
-}
-
-pub async fn requst_verify_session_token(_token: &str) -> bool {
-    unimplemented!();
 }
