@@ -476,6 +476,7 @@ pub struct ZoneConfig {
     pub extra_info: HashMap<String, serde_json::Value>,
 
     //--------------------------------
+    pub hostname: String,
     pub owner: DID,
     pub oods: Vec<OODDescriptionString>,
     pub boot_jwt:String,
@@ -516,6 +517,7 @@ impl ZoneConfig {
             extra_info: HashMap::new(),
             boot_jwt: "".to_string(),
             owner: owner_did,
+            hostname: id.to_host_name(),
             devices: HashMap::new(),
             oods: vec![],
             sn: None,
