@@ -1,4 +1,4 @@
-use crate::get_buckyos_log_dir;
+use crate::{get_buckyos_log_dir, get_version};
 use simplelog::*;
 use std::{fs::File, panic};
 
@@ -42,6 +42,7 @@ pub fn init_logging(app_name: &str, is_service: bool) {
         ),
     ]);
 
+    info!("{} start logging, pid: {}, buckyos version {}", app_name, pid, get_version());
     info!("log level: {}", log_level);
 
     if init_result.is_err() {
