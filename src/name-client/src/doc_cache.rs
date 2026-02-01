@@ -115,6 +115,8 @@ pub struct DIDDocumentFsCache {
 struct CacheMeta {
     trust_level: i32,
     exp: Option<u64>,
+    #[serde(default)]
+    update_from_remote_time: Option<u64>,
 }
 
 impl DIDDocumentFsCache {
@@ -154,8 +156,16 @@ impl DIDDocumentFsCache {
 
         let trust_level = meta.trust_level;
         if is_expired(exp) {
-            self.delete(did.clone(), doc_type);
-            return None;
+            if meta.update_from_remote_time.is_some() {
+                self.delete(did.clone(), doc_type);
+                return None;
+            } else {
+                debug!(
+                    "doc cache {}#{} expired but kept because never fetched from remote",
+                    did.to_string(),
+                    doc_type.unwrap_or_default()
+                );
+            }
         }
         Some((doc, exp, trust_level))
     }
@@ -208,6 +218,7 @@ impl DIDDocumentFsCache {
             CacheMeta {
                 trust_level,
                 exp: Some(exp),
+                update_from_remote_time: Some(buckyos_get_unix_timestamp()),
             },
         );
     }
@@ -237,6 +248,7 @@ impl DIDDocumentFsCache {
                     let meta = CacheMeta {
                         trust_level: ROOT_TRUST_LEVEL,
                         exp: default_exp,
+                        update_from_remote_time: None,
                     };
                     info!(
                         "load did-cache from {} success. meta: {:?}",
@@ -373,22 +385,38 @@ impl DIDDocumentDBCache {
     pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
         let conn = self.open_conn().ok()?;
         let mut stmt = conn
-            .prepare("SELECT doc, exp, trust_level FROM did_docs WHERE doc_key = ?1")
+            .prepare(
+                "SELECT doc, exp, trust_level, update_from_remote_time FROM did_docs WHERE doc_key = ?1",
+            )
             .ok()?;
         let row = stmt
             .query_row(params![combine_key(did, doc_type)], |row| {
                 let doc_str: String = row.get(0)?;
                 let exp: i64 = row.get(1)?;
                 let trust_level: i32 = row.get(2)?;
-                Ok((doc_str, exp as u64, trust_level))
+                let update_from_remote_time: Option<i64> = row.get(3).unwrap_or(None);
+                Ok((
+                    doc_str,
+                    exp as u64,
+                    trust_level,
+                    update_from_remote_time.map(|v| v as u64),
+                ))
             })
             .ok();
 
-        let (doc_str, exp, trust_level) = row?;
+        let (doc_str, exp, trust_level, update_from_remote_time) = row?;
         let doc = EncodedDocument::from_str(doc_str).ok()?;
         if is_expired(exp) {
-            self.delete(did.clone(), doc_type);
-            return None;
+            if update_from_remote_time.is_some() {
+                self.delete(did.clone(), doc_type);
+                return None;
+            } else {
+                debug!(
+                    "db doc cache {}#{} expired but kept because never fetched from remote",
+                    did.to_string(),
+                    doc_type.unwrap_or_default()
+                );
+            }
         }
         Some((doc, exp, trust_level))
     }
@@ -437,15 +465,16 @@ impl DIDDocumentDBCache {
             }
         };
         if let Err(err) = conn.execute(
-            "INSERT INTO did_docs (doc_key, did, doc_type, doc, exp, trust_level) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(doc_key) DO UPDATE SET doc = excluded.doc, exp = excluded.exp, trust_level = excluded.trust_level",
+            "INSERT INTO did_docs (doc_key, did, doc_type, doc, exp, trust_level, update_from_remote_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(doc_key) DO UPDATE SET doc = excluded.doc, exp = excluded.exp, trust_level = excluded.trust_level, update_from_remote_time = excluded.update_from_remote_time",
             params![
                 combine_key(&did, doc_type),
                 did.to_raw_host_name(),
                 doc_type.unwrap_or_default(),
                 doc.to_string(),
                 exp as i64,
-                trust_level
+                trust_level,
+                buckyos_get_unix_timestamp() as i64
             ],
         ) {
             warn!("write did doc sqlite cache failed: {}", err);
@@ -498,15 +527,40 @@ impl DIDDocumentDBCache {
                 doc_type TEXT NOT NULL,
                 doc TEXT NOT NULL,
                 exp INTEGER NOT NULL,
-                trust_level INTEGER NOT NULL
+                trust_level INTEGER NOT NULL,
+                update_from_remote_time INTEGER
             )",
             [],
         )
         .map_err(|e| {
             name_lib::NSError::ReadLocalFileError(format!("create table failed: {}", e))
         })?;
+
+        // schema migration for existing databases
+        ensure_update_from_remote_time_column(&conn).map_err(|e| {
+            name_lib::NSError::ReadLocalFileError(format!("migrate table failed: {}", e))
+        })?;
         Ok(())
     }
+}
+
+fn ensure_update_from_remote_time_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(did_docs)")?;
+    let mut has_column = false;
+    let column_iter = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for col_name in column_iter.flatten() {
+        if col_name == "update_from_remote_time" {
+            has_column = true;
+            break;
+        }
+    }
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE did_docs ADD COLUMN update_from_remote_time INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 // ------------------------ 内存实现（测试用） ------------------------
@@ -521,6 +575,7 @@ struct MemoryEntry {
     doc: EncodedDocument,
     exp: u64,
     trust_level: i32,
+    update_from_remote_time: Option<u64>,
 }
 
 impl DIDDocumentMemCache {
@@ -537,8 +592,16 @@ impl DIDDocumentMemCache {
             Err(_) => None,
         }?;
         if is_expired(entry.exp) {
-            self.delete(did.clone(), doc_type);
-            return None;
+            if entry.update_from_remote_time.is_some() {
+                self.delete(did.clone(), doc_type);
+                return None;
+            } else {
+                debug!(
+                    "mem doc cache {}#{} expired but kept because never fetched from remote",
+                    did.to_string(),
+                    doc_type.unwrap_or_default()
+                );
+            }
         }
         Some((entry.doc, entry.exp, entry.trust_level))
     }
@@ -592,6 +655,7 @@ impl DIDDocumentMemCache {
                     doc,
                     exp,
                     trust_level,
+                    update_from_remote_time: Some(buckyos_get_unix_timestamp()),
                 },
             );
         }
@@ -650,7 +714,9 @@ mod tests {
     use name_lib::{DIDDocumentTrait, NSError, OwnerConfig, ZoneBootConfig, DEFAULT_EXPIRE_TIME};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::fs;
     use tempfile::tempdir;
+    use rusqlite::{Connection, params};
 
     const TEST_OWNER_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -771,6 +837,29 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[test]
+    fn fs_get_keeps_expired_document_without_remote_fetch() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let past_exp = buckyos_get_unix_timestamp().saturating_sub(10);
+        let doc = build_zone_doc(&did, past_exp, "expired-local");
+
+        fs::write(doc_path(&tmp_dir, &did), doc.to_string()).unwrap();
+        let meta = CacheMeta {
+            trust_level: ROOT_TRUST_LEVEL,
+            exp: Some(past_exp),
+            update_from_remote_time: None,
+        };
+        fs::write(
+            meta_path(&tmp_dir, &did),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = cache.get(&did, None).expect("doc should remain available");
+        assert_eq!(loaded.0, doc);
+        assert!(doc_path(&tmp_dir, &did).exists());
+    }
+
+    #[test]
     fn fs_update_only_writes_when_newer_iat_or_higher_trust() {
         let (_tmp_dir, cache, did) = setup_fs_cache();
         let now = buckyos_get_unix_timestamp();
@@ -874,7 +963,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         // Simulate meta file being deleted/corrupted
         std::fs::remove_file(meta_path(&tmp_dir, &did)).unwrap();
 
-        let (loaded_doc, loaded_exp, trust) = cache.get(&did, None).expect("doc should still load");
+        let (loaded_doc, _loaded_exp, trust) = cache.get(&did, None).expect("doc should still load");
         assert_eq!(loaded_doc, doc);
         assert_eq!(trust, ROOT_TRUST_LEVEL);
     }
@@ -928,6 +1017,64 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
 
         assert!(cache.get(&did, None).is_none());
+    }
+
+    #[test]
+    fn mem_get_keeps_expired_document_without_remote_fetch() {
+        let (cache, did) = setup_mem_cache();
+        let past_exp = buckyos_get_unix_timestamp().saturating_sub(10);
+        let doc = build_zone_doc(&did, past_exp, "mem-expired-local");
+
+        let mem_cache = match &cache {
+            DIDDocumentCache::Mem(inner) => inner,
+            _ => unreachable!(),
+        };
+
+        if let Ok(mut guard) = mem_cache.entries.write() {
+            guard.insert(
+                combine_key(&did, None),
+                MemoryEntry {
+                    doc: doc.clone(),
+                    exp: past_exp,
+                    trust_level: DEFAULT_PROVIDER_TRUST_LEVEL,
+                    update_from_remote_time: None,
+                },
+            );
+        }
+
+        let loaded = cache.get(&did, None).expect("doc should remain available");
+        assert_eq!(loaded.0, doc);
+    }
+
+    #[test]
+    fn db_get_keeps_expired_document_without_remote_fetch() -> Result<(), NSError> {
+        let (_tmp_dir, cache, did) = setup_db_cache();
+        let past_exp = buckyos_get_unix_timestamp().saturating_sub(10);
+        let doc = build_zone_doc(&did, past_exp, "db-expired-local");
+
+        let db_cache = match &cache {
+            DIDDocumentCache::Db(inner) => inner,
+            _ => unreachable!(),
+        };
+
+        let conn = Connection::open(&db_cache.db_path).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO did_docs (doc_key, did, doc_type, doc, exp, trust_level, update_from_remote_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                combine_key(&did, None),
+                did.to_raw_host_name(),
+                "",
+                doc.to_string(),
+                past_exp as i64,
+                DEFAULT_PROVIDER_TRUST_LEVEL
+            ],
+        )
+        .unwrap();
+
+        let loaded = cache.get(&did, None).expect("doc should remain available");
+        assert_eq!(loaded.0, doc);
+        Ok(())
     }
 
     #[test]
