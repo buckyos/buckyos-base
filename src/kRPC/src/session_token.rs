@@ -166,7 +166,8 @@ impl RPCSessionToken {
             //return Err(RPCErrors::InvalidToken("JWT kid is not allowed at specific key verify_model".to_string()));
         }
 
-        let validation = Validation::new(header.alg);
+        let mut validation = Validation::new(header.alg);
+        validation.validate_aud = false;
         let decoded_token = decode::<serde_json::Value>(token_str, &public_key, &validation)
             .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error:{}", error)))?;
 
