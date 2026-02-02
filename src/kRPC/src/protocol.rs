@@ -1,5 +1,6 @@
 use crate::RPCErrors;
 use async_trait::async_trait;
+use buckyos_kit::buckyos_get_unix_timestamp;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
@@ -238,6 +239,43 @@ impl<'de> Deserialize<'de> for RPCResponse {
                 seq: seq,
                 trace_id: trace_id,
             })
+        }
+    }
+}
+
+//通过RPCContext可以方便跟踪和调试一个长的call chain
+//call chain用trace_id来定义
+pub struct RPCContext {
+    pub seq: u64,
+    pub start_time: u64,
+    pub token: Option<String>,//jwt session token
+    pub trace_id: Option<String>,
+    pub from_ip: Option<IpAddr>,
+    pub is_rpc:bool,
+}
+
+impl Default for RPCContext {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            start_time: 0,
+            token: None,
+            trace_id: None,
+            from_ip: None,
+            is_rpc: false,
+        }
+    }
+}
+
+impl RPCContext {
+    pub fn from_request(req: &RPCRequest, ip_from: IpAddr) -> Self {
+        Self {
+            seq: req.seq,
+            start_time: buckyos_get_unix_timestamp(),
+            token: req.token.clone(),
+            trace_id: req.trace_id.clone(),
+            from_ip: Some(ip_from),
+            is_rpc: true,
         }
     }
 }

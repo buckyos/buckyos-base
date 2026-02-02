@@ -48,7 +48,7 @@ pub struct kRPC {
     protcol_type: RPCProtoclType,
     seq: RwLock<u64>,
     session_token: RwLock<Option<String>>,
-    init_token: Option<String>,
+    trace_id: RwLock<Option<String>>,
 }
 
 impl kRPC {
@@ -73,7 +73,7 @@ impl kRPC {
             protcol_type: RPCProtoclType::HttpPostJson,
             seq: RwLock::new(timestamp_millis),
             session_token: RwLock::new(token.clone()),
-            init_token: token.clone(),
+            trace_id: RwLock::new(None),
         }
     }
 
@@ -92,18 +92,36 @@ impl kRPC {
         self._call(method, params).await
     }
 
-    pub async fn _call(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn set_context(&self, context: RPCContext) {
+        let mut session_token = self.session_token.write().await;
+        *session_token = context.token.clone();
+        drop(session_token);
+        
+        let mut trace_id = self.trace_id.write().await;
+        *trace_id = context.trace_id.clone();
+        drop(trace_id);
+    }
+
+    async fn _call(&self, method: &str, params: Value) -> Result<Value> {
         let request_body: Value;
         let current_seq: u64;
+        let current_trace_id: Option<String>;
+        let current_session_token: Option<String>;
         {
             let mut seq = self.seq.write().await;
             *seq += 1;
             current_seq = *seq;
+            drop(seq);
 
             let session_token = self.session_token.read().await;
+            current_session_token = session_token.clone();
+            let trace_id = self.trace_id.read().await;
+            current_trace_id = trace_id.clone();
+
             let mut request = RPCRequest::new(method, params);
-            request.seq = *seq;
-            request.token = session_token.clone();
+            request.seq = current_seq;
+            request.token = current_session_token;
+            request.trace_id = current_trace_id;
             request_body =
                 serde_json::to_value(&request).map_err(|err| {
                     RPCErrors::ParseRequestError(format!("serialize request failed: {}", err))

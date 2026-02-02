@@ -1,6 +1,6 @@
 //! # kRPC API Definition Example
 
-use crate::{kRPC, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
+use crate::{RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult, kRPC};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,6 +25,22 @@ impl MyApiAddReq {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyApiDeleteAppDataReq {
+    pub userid: String,
+    pub appid: String,
+}
+
+impl MyApiDeleteAppDataReq {
+    pub fn new(userid: &str, appid: &str) -> Self {
+        Self { userid: userid.to_string(), appid: appid.to_string() }
+    }
+
+    pub fn from_json(value: Value) -> Result<Self, RPCErrors> {
+        serde_json::from_value(value)
+            .map_err(|e| RPCErrors::ParseRequestError(format!("Failed to parse MyApiDeleteAppDataReq: {}", e)))
+    }
+}
 // Client Implementation
 pub enum MyApiClient {
     InProcess(Box<dyn MyApiHandler>),
@@ -44,7 +60,8 @@ impl MyApiClient {
     pub async fn add(&self, a: i32, b: i32) -> Result<i32, RPCErrors> {
         match self {
             Self::InProcess(handler) => {
-                handler.handle_add(a, b).await
+                let ctx = RPCContext::default();
+                handler.handle_add(a, b,ctx).await
             }
             Self::KRPC(client) => {
 
@@ -60,33 +77,70 @@ impl MyApiClient {
             }
         }
     }
+
+    pub async fn delete_app_data(&self, userid:&str, appid:&str) -> Result<(), RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_delete_app_data(userid, appid,ctx).await
+            }
+            Self::KRPC(client) => {
+                let req = MyApiDeleteAppDataReq::new(userid, appid);
+                let req_json = serde_json::to_value(&req)
+                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                
+                let result = client.call("delete_app_data", req_json).await?;
+                
+                let is_deleted = result.as_bool().ok_or_else(|| RPCErrors::ParserResponseError("Expected bool result".to_string()))?;
+                if !is_deleted {
+                    return Err(RPCErrors::ParserResponseError("Failed to delete app data".to_string()));
+                }
+                return Ok(());
+            }
+        }
+    }
 }
 
 
 #[async_trait]
 pub trait MyApiHandler: Send + Sync {
-    async fn handle_add(&self, a: i32, b: i32) -> Result<i32, RPCErrors>;
+    async fn handle_add(&self, a: i32, b: i32,ctx:RPCContext) -> Result<i32, RPCErrors>;
+    async fn handle_delete_app_data(&self, userid:&str, appid:&str,ctx:RPCContext) -> Result<(), RPCErrors>;
+}
+
+
+pub struct MyApiRpcHandler<T: MyApiHandler>(pub T);
+
+impl<T: MyApiHandler> MyApiRpcHandler<T> {
+    pub fn new(handler: T) -> Self {
+        Self(handler)
+    }
 }
 
 
 /// Blanket implementation: 任何实现了 MyApiHandler 的类型自动实现 RPCHandler
 #[async_trait]
-impl<T: MyApiHandler> RPCHandler for T {
+impl<T: MyApiHandler> RPCHandler for MyApiRpcHandler<T> {
     async fn handle_rpc_call(
         &self,
         req: RPCRequest,
-        _ip_from: IpAddr,
+        ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
         let seq = req.seq;
         let trace_id = req.trace_id.clone();
+        let ctx = RPCContext::from_request(&req, ip_from);
         
         let result = match req.method.as_str() {
             "add" => {
                 let add_req = MyApiAddReq::from_json(req.params)?;
-                let result = self.handle_add(add_req.a, add_req.b).await?;
+                let result = self.0.handle_add(add_req.a, add_req.b,ctx).await?;
                 RPCResult::Success(json!(result))
             }
-    
+            "delete_app_data" => {
+                let delete_app_data_req = MyApiDeleteAppDataReq::from_json(req.params)?;
+                let result = self.0.handle_delete_app_data(&delete_app_data_req.userid, &delete_app_data_req.appid,ctx).await?;
+                RPCResult::Success(json!(result))
+            }
             _ => {
                 return Err(RPCErrors::UnknownMethod(req.method.clone()));
             }
@@ -110,9 +164,19 @@ mod tests {
 
     #[async_trait]
     impl MyApiHandler for ExampleServer {
-        async fn handle_add(&self, a: i32, b: i32) -> Result<i32, RPCErrors> {
+        async fn handle_add(&self, a: i32, b: i32,_ctx:RPCContext) -> Result<i32, RPCErrors> {
             // Business logic here
             Ok(a + b)
+        }
+
+        async fn handle_delete_app_data(&self, _userid:&str, _appid:&str,_ctx:RPCContext) -> Result<(), RPCErrors> {
+            // Business logic here
+            if _ctx.is_rpc {
+                // let control_panel_client = get_runtime().get_control_panel_client();
+                // control_panel_client.set_context(_ctx);
+                // control_panel_client.delete_app_data(_userid, _appid).await?;
+            }
+            Ok(())
         }
     }
 
@@ -121,7 +185,8 @@ mod tests {
         let server = ExampleServer;
         
         // Test through MyApiHandler directly
-        let result = server.handle_add(10, 20).await.unwrap();
+        let ctx = RPCContext::default();
+        let result = server.handle_add(10, 20,ctx).await.unwrap();
         assert_eq!(result, 30);
     }
 
@@ -144,7 +209,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         
         // Test through RPCHandler (auto-implemented via blanket impl)
-        let rpc_handler: &dyn RPCHandler = &server;
+        let rpc_handler: &dyn RPCHandler = &MyApiRpcHandler::new(server);
         
         let rpc_req = RPCRequest {
             method: "add".to_string(),
@@ -171,7 +236,7 @@ mod tests {
         let server = ExampleServer;
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         
-        let rpc_handler: &dyn RPCHandler = &server;
+        let rpc_handler: &dyn RPCHandler = &MyApiRpcHandler::new(server);
         
         let rpc_req = RPCRequest {
             method: "unknown_method".to_string(),
