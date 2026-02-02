@@ -376,7 +376,18 @@ impl RPCSessionToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{DecodingKey, EncodingKey};
     use serde_json::json;
+
+    const TEST_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
+-----END PRIVATE KEY-----"#;
+
+    const TEST_PUBLIC_JWK: &str = r#"{
+  "kty": "OKP",
+  "crv": "Ed25519",
+  "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+}"#;
     #[test]
     fn test_session_token_serialize_deserialize() {
         let session_token = RPCSessionToken {
@@ -415,5 +426,53 @@ mod tests {
         let deserialized: RPCSessionToken = RPCSessionToken::from_string(&new_serialized).unwrap();
         assert_eq!(new_session_token, deserialized);
 
+    }
+
+    #[test]
+    fn verify_by_key_accepts_valid_token_and_populates_claims() {
+        let now = buckyos_get_unix_timestamp();
+
+        // Build the claims we expect to read back after verification.
+        let mut claims = RPCSessionToken {
+            token_type: RPCSessionTokenType::Normal,
+            token: None,
+            aud: Some("test-aud".to_string()),
+            exp: Some(now + 60),
+            iss: Some("issuer-123".to_string()),
+            jti: Some("nonce-1".to_string()),
+            session: None,
+            sub: Some("user-123".to_string()),
+            appid: Some("app-42".to_string()),
+            extra: HashMap::new(),
+        };
+
+        let private_key = EncodingKey::from_ed_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        let jwt = claims.generate_jwt(None, &private_key).unwrap();
+
+        // Simulate receiving a token that still needs verification/signature checking.
+        let mut token_to_verify = RPCSessionToken {
+            token_type: RPCSessionTokenType::JWT,
+            token: Some(jwt),
+            aud: None,
+            exp: None,
+            iss: None,
+            jti: None,
+            session: None,
+            sub: None,
+            appid: None,
+            extra: HashMap::new(),
+        };
+
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_str(TEST_PUBLIC_JWK).unwrap();
+        let public_key = DecodingKey::from_jwk(&jwk).unwrap();
+
+        token_to_verify.verify_by_key(&public_key).expect("verification should succeed");
+
+        assert_eq!(token_to_verify.sub.as_deref(), Some("user-123"));
+        assert_eq!(token_to_verify.appid.as_deref(), Some("app-42"));
+        assert_eq!(token_to_verify.aud.as_deref(), Some("test-aud"));
+        assert_eq!(token_to_verify.iss.as_deref(), Some("issuer-123"));
+        assert_eq!(token_to_verify.jti.as_deref(), Some("nonce-1"));
+        assert!(token_to_verify.exp.unwrap() >= now);
     }
 }
