@@ -245,6 +245,7 @@ impl<'de> Deserialize<'de> for RPCResponse {
 
 //通过RPCContext可以方便跟踪和调试一个长的call chain
 //call chain用trace_id来定义
+#[derive(Debug, PartialEq,Clone)]
 pub struct RPCContext {
     pub seq: u64,
     pub start_time: u64,
