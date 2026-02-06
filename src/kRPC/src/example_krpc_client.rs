@@ -57,6 +57,15 @@ impl MyApiClient {
         Self::KRPC(client)
     }
 
+    pub async fn set_context(&self, context: RPCContext)  {
+        match self {
+            Self::InProcess(_) => {}
+            Self::KRPC(client) => {
+                client.set_context(context).await
+            }
+        }
+    }
+
     pub async fn add(&self, a: i32, b: i32) -> Result<i32, RPCErrors> {
         match self {
             Self::InProcess(handler) => {

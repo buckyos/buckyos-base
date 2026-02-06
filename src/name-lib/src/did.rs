@@ -22,6 +22,16 @@ pub struct DID {
 
 pub const DID_DOC_AUTHKEY: &str = "#auth-key";
 
+impl Default for DID {
+    fn default() -> Self {
+        Self {
+            method:"undefined".to_string(),
+            id:"undefined".to_string(),
+        }
+    }
+}
+
+
 impl DID {
     pub fn new(method: &str, id: &str) -> Self {
         DID {
