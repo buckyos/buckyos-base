@@ -3,12 +3,14 @@
 
 mod zone;
 mod device;
+mod agent;
 mod did;
 mod utility;
 mod user;
 
 pub use zone::*;
 pub use device::*;
+pub use agent::*;
 pub use did::*;
 use serde::{Deserialize, Serialize};
 pub use utility::*;

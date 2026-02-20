@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::agent::AgentDocument;
 use crate::user::OwnerConfig;
 use crate::zone::{ZoneBootConfig, ZoneConfig};
 use crate::DeviceConfig;
@@ -320,6 +321,11 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>
             .map_err(|e| NSError::Failed(format!("parse owner config failed: {}", e)))?;
         return Ok(Box::new(owner_config));
     }
+    if doc_value.get("httpServicePorts").is_some() {
+        let agent_document = serde_json::from_value::<AgentDocument>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse agent document failed: {}", e)))?;
+        return Ok(Box::new(agent_document));
+    }
     if doc_value.get("device_type").is_some() {
         let device_config = serde_json::from_value::<DeviceConfig>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse device config failed: {}", e)))?;
@@ -453,6 +459,17 @@ mod tests {
         let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner).unwrap());
         let owner_parsed = parse_did_doc(owner_doc).unwrap();
         assert_eq!(owner_parsed.get_id(), owner.id);
+
+        let mut agent = AgentDocument::new(
+            DID::new("bns", "agent.alice"),
+            DID::new("bns", "alice"),
+            owner_jwk.clone(),
+        );
+        agent.support_public_access = true;
+        agent.set_send_msg_port(8081);
+        let agent_doc = EncodedDocument::JsonLd(serde_json::to_value(&agent).unwrap());
+        let agent_parsed = parse_did_doc(agent_doc).unwrap();
+        assert_eq!(agent_parsed.get_id(), agent.id);
 
         let device = DeviceConfig::new(
             "ood1",
