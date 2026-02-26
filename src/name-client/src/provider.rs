@@ -84,6 +84,9 @@ pub struct NameInfo {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub txt: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub ptr_records: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
     /// key is the doc_type,used by query_did
@@ -101,6 +104,7 @@ impl Default for NameInfo {
             address: Vec::new(),
             cname: None,
             txt: Vec::new(),
+            ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: 0,
             ttl: None,
@@ -122,6 +126,7 @@ impl NameInfo {
             address: vec![address],
             cname: None,
             txt: Vec::new(),
+            ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: 0,
             ttl: Some(ttl),
@@ -135,6 +140,7 @@ impl NameInfo {
             address: address_vec,
             cname: None,
             txt: Vec::new(),
+            ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: 0,
             ttl: Some(ttl),
@@ -397,6 +403,7 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: other_txt,
+            ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
@@ -455,6 +462,7 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: Vec::new(),
+            ptr_records: Vec::new(),
             did_documents,
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
@@ -512,6 +520,7 @@ mod tests {
                 format!("PKX={};", owner_x),
                 format!("DEV={};", device_jwt),
             ],
+            ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
@@ -549,6 +558,7 @@ mod tests {
             txt: vec![
                 "some-txt=value".to_string(),
             ],
+            ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
@@ -571,6 +581,7 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: Vec::new(),
+            ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),

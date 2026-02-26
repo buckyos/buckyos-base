@@ -5,7 +5,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use buckyos_kit::buckyos_get_unix_timestamp;
-use hickory_resolver::proto::rr::record_type;
 use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::config::*;
 use hickory_resolver::name_server::TokioConnectionProvider;
@@ -105,6 +104,7 @@ impl NsProvider for DnsProvider {
                     address: Vec::new(),
                     cname: None,
                     txt: txt_vec,
+                    ptr_records: Vec::new(),
                     did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
@@ -131,6 +131,43 @@ impl NsProvider for DnsProvider {
                     address: addrs,
                     cname: None,
                     txt: Vec::new(),
+                    ptr_records: Vec::new(),
+                    did_documents: HashMap::new(),
+                    iat: buckyos_get_unix_timestamp(),
+                    ttl: Some(ttl),
+                };
+                return Ok(name_info);
+            }
+            RecordType::PTR => {
+                info!("dns query PTR: {}", name);
+
+                let ip = IpAddr::from_str(name).map_err(|e| {
+                    NSError::InvalidParam(format!(
+                        "PTR query requires IP input, got '{}': {}",
+                        name, e
+                    ))
+                })?;
+                let response = resolver.reverse_lookup(ip).await.map_err(|e| {
+                    NSError::Failed(format!("reverse lookup failed! {}", e))
+                })?;
+
+                let mut ptr_records = Vec::new();
+                for ptr in response.iter() {
+                    ptr_records.push(ptr.to_utf8());
+                }
+                let ttl = response
+                    .as_lookup()
+                    .record_iter()
+                    .next()
+                    .map(|r| r.ttl())
+                    .unwrap_or(0);
+
+                let name_info = NameInfo {
+                    name: name.to_string(),
+                    address: Vec::new(),
+                    cname: None,
+                    txt: Vec::new(),
+                    ptr_records,
                     did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),

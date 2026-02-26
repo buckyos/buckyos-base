@@ -45,6 +45,7 @@ pub struct LocalConfigDnsProvider {
 
 struct ConfigProviderInner {
     config: DnsLocalConfig,
+    ptr_index: HashMap<IpAddr, Vec<String>>,
     config_path: PathBuf,
     last_modified: SystemTime,
 }
@@ -68,6 +69,7 @@ impl LocalConfigDnsProvider {
             .map_err(|_e| NSError::ReadLocalFileError("Failed to get modified time".to_string()))?;
 
         let inner = ConfigProviderInner {
+            ptr_index: Self::build_ptr_index(&config),
             config,
             config_path: config_path.to_path_buf(),
             last_modified,
@@ -110,6 +112,7 @@ impl LocalConfigDnsProvider {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
             inner.config = new_config;
+            inner.ptr_index = Self::build_ptr_index(&inner.config);
             inner.last_modified = current_modified;
             info!("Config file reloaded successfully");
             Ok(true)
@@ -134,6 +137,32 @@ impl LocalConfigDnsProvider {
             .iter()
             .zip(name_parts.iter())
             .all(|(p, n)| *p == "*" || *p == *n)
+    }
+
+    fn build_ptr_index(config: &DnsLocalConfig) -> HashMap<IpAddr, Vec<String>> {
+        let mut ptr_index: HashMap<IpAddr, Vec<String>> = HashMap::new();
+
+        for (domain, name_info) in &config.domains {
+            let mut ptr_values = name_info.ptr_records.clone();
+            if ptr_values.is_empty() && !domain.contains('*') {
+                ptr_values.push(domain.clone());
+            }
+
+            if ptr_values.is_empty() {
+                continue;
+            }
+
+            for ip in &name_info.address {
+                let records = ptr_index.entry(*ip).or_default();
+                for ptr in &ptr_values {
+                    if !records.contains(ptr) {
+                        records.push(ptr.clone());
+                    }
+                }
+            }
+        }
+
+        ptr_index
     }
 
     // fn convert_domain_config_to_records(
@@ -246,13 +275,45 @@ impl NsProvider for LocalConfigDnsProvider {
     async fn query(
         &self,
         domain: &str,
-        _record_type: Option<RecordType>,
+        record_type: Option<RecordType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<NameInfo> {
         let mut domain = domain.to_string();
         if domain.ends_with(".") {
             domain = domain.trim_end_matches('.').to_string();
         }
+
+        if matches!(record_type, Some(RecordType::PTR)) {
+            let ip = domain.parse::<IpAddr>().map_err(|e| {
+                NSError::InvalidParam(format!(
+                    "PTR query requires IP input, got '{}': {}",
+                    domain, e
+                ))
+            })?;
+
+            let mut inner = self.inner.lock().unwrap();
+            if let Err(e) = Self::check_and_reload_config(&mut inner) {
+                warn!("Failed to reload config: {},still use old config", e);
+            }
+
+            let ptr_records = inner
+                .ptr_index
+                .get(&ip)
+                .cloned()
+                .ok_or_else(|| NSError::NotFound(domain.clone()))?;
+
+            return Ok(NameInfo {
+                name: domain,
+                address: Vec::new(),
+                cname: None,
+                txt: Vec::new(),
+                ptr_records,
+                ttl: None,
+                did_documents: HashMap::new(),
+                iat: 0,
+            });
+        }
+
         let mut name_info = self.get_name_info(&domain)?;
         //name_info.ttl = Some(300);
         name_info.name = domain.to_string();
@@ -308,6 +369,11 @@ address = ["192.168.1.3"]
 ["mail.example.com"]
 ttl = 300
 address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]
+
+["reverse.example.com"]
+ttl = 300
+address = ["192.168.1.10"]
+ptr_records = ["node1.example.com", "node1-alt.example.com"]
 "#;
 
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -392,6 +458,25 @@ address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]
         assert_eq!(result.name, "mail.example.com");
         assert_eq!(result.address.len(), 1);
         assert_eq!(result.address[0].to_string(), "2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa");
+
+        let result = provider
+            .query("192.168.1.1", Some(RecordType::PTR), None)
+            .await
+            .unwrap();
+        assert_eq!(result.name, "192.168.1.1");
+        assert!(result.ptr_records.contains(&"www.example.com".to_string()));
+
+        let result = provider
+            .query("192.168.1.10", Some(RecordType::PTR), None)
+            .await
+            .unwrap();
+        assert!(result.ptr_records.contains(&"node1.example.com".to_string()));
+        assert!(result.ptr_records.contains(&"node1-alt.example.com".to_string()));
+
+        let result = provider
+            .query("192.168.1.254", Some(RecordType::PTR), None)
+            .await;
+        assert!(result.is_err());
 
         // Test non-existent domain
         let result = provider
