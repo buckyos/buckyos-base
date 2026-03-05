@@ -42,6 +42,8 @@ pub enum RPCErrors {
     ServiceNotValid(String),
 }
 pub type Result<T> = std::result::Result<T, RPCErrors>;
+const DEFAULT_KRPC_TIMEOUT_SECS: u64 = 15;
+
 pub struct kRPC {
     client: Client,
     server_url: String,
@@ -53,6 +55,15 @@ pub struct kRPC {
 
 impl kRPC {
     pub fn new(url: &str, token: Option<String>) -> Self {
+        Self::new_with_timeout_secs(url, token, DEFAULT_KRPC_TIMEOUT_SECS)
+    }
+
+    pub fn new_with_timeout_secs(url: &str, token: Option<String>, timeout_secs: u64) -> Self {
+        let timeout_secs = timeout_secs.max(1);
+        Self::new_with_timeout(url, token, Duration::from_secs(timeout_secs))
+    }
+
+    pub fn new_with_timeout(url: &str, token: Option<String>, timeout: Duration) -> Self {
         let start = SystemTime::now();
         let since_the_epoch = start
             .duration_since(UNIX_EPOCH)
@@ -63,7 +74,7 @@ impl kRPC {
             //.https_only(true)
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .pool_max_idle_per_host(10)
-            .timeout(Duration::from_secs(15))
+            .timeout(timeout)
             .build()
             .expect("Failed to build reqwest client");
 
