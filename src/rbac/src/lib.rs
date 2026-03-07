@@ -30,48 +30,48 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 
 pub const DEFAULT_POLICY: &str = r#"
 
-p, kernel, kv://*, read|write,allow
+p, kernel, /config/*, read|write,allow
 p, kernel, dfs://*, read|write,allow
 p, kernel, ndn://*, read|write,allow
 
 
-p, root, kv://*, read|write,allow
+p, root, /config/*, read|write,allow
 p, root, dfs://*, read|write,allow
 p, root, ndn://*, read|write,allow
 
-p, ood,kv://*,read,allow
-p, ood,kv://users/*/apps/*,read|write,allow
-p, ood,kv://nodes/{device}/*,read|write,allow
-p, ood,kv://services/*,read|write,allow
-p, ood,kv://system/rbac/policy,read|write,allow
+p, ood,/config/*,read,allow
+p, ood,/config/users/*/apps/*,read|write,allow
+p, ood,/config/nodes/{device}/*,read|write,allow
+p, ood,/config/services/*,read|write,allow
+p, ood,/config/system/rbac/policy,read|write,allow
 
-p, client, kv://boot/*, read,allow
-p, client,kv://devices/{device}/*,read,allow
-p, client,kv://devices/{device}/info,read|write,allow
+p, client, /config/boot/*, read,allow
+p, client,/config/devices/{device}/*,read,allow
+p, client,/config/devices/{device}/info,read|write,allow
 
-p, service, kv://boot/*, read,allow
-p, service,kv://services/{service}/*,read|write,allow
-p, service,kv://services/*/info,read,allow
-p, service,kv://users*,read,allow
-p, service,kv://users/*/*,read,allow
-p, service,kv://system/*,read,allow
+p, service, /config/boot/*, read,allow
+p, service,/config/services/{service}/*,read|write,allow
+p, service,/config/services/*/info,read,allow
+p, service,/config/users*,read,allow
+p, service,/config/users/*/*,read,allow
+p, service,/config/system/*,read,allow
 p, service,dfs://system/data/{service}/*,read|write,allow
 p, service,dfs://system/cache/{service}/*,read|write,allow
 
-p, app, kv://boot/*, read,allow
-p, app, kv://users/*/apps/{app}/settings,read|write,allow
-p, app, kv://users/*/apps/{app}/config,read,allow
-p, app, kv://users/*/apps/{app}/info,read,allow
+p, app, /config/boot/*, read,allow
+p, app, /config/users/*/apps/{app}/settings,read|write,allow
+p, app, /config/users/*/apps/{app}/config,read,allow
+p, app, /config/users/*/apps/{app}/info,read,allow
 p, app, dfs://users/*/appdata/{app}/*, read|write,allow
 p, app, dfs://users/*/cache/{app}/*, read|write,allow
-p, admin, kv://boot/*, read,allow
-p, admin,kv://users/{user}/*,read|write,allow
+p, admin, /config/boot/*, read,allow
+p, admin,/config/users/{user}/*,read|write,allow
 p, admin,dfs://users/{user}/*,read|write,allow
-p, admin,kv://services/*,read|write,allow
+p, admin,/config/services/*,read|write,allow
 p, admin,dfs://library/*,read|write,allow
-p, user, kv://boot/*, read,allow
-p, user,kv://users/{user}/*,read,allow
-p, user,kv://users/{user}/apps/*/*,read|write,allow
+p, user, /config/boot/*, read,allow
+p, user,/config/users/{user}/*,read,allow
+p, user,/config/users/{user}/apps/*/*,read|write,allow
 p, user,dfs://users/{user}/*,read|write,allow
 p, user,dfs://users/{user}/home/*,read|write,allow
 p, user,dfs://library/*,read,allow
@@ -193,19 +193,19 @@ m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && regexMatch(r.act, p.act)
 
         // 定义策略配置
         let policy_str = r#"
-        p, owner, kv://*, read|write,allow
+        p, owner, /config/*, read|write,allow
         p, owner, dfs://*, read|write,allow
         p, owner, fs://$device_id:/, read,allow
     
-        p, kernel_service, kv://*, read,allow
+        p, kernel_service, /config/*, read,allow
         p, kernel_service, dfs://*, read,allow
         p, kernel_service, fs://$device_id:/, read,allow
     
-        p, frame_service, kv://*, read,allow
+        p, frame_service, /config/*, read,allow
         p, frame_service, dfs://*, read,allow
         p, frame_service, fs://$device_id:/, read,allow
     
-        p, sudo_user, kv://*, read|write,allow
+        p, sudo_user, /config/*, read|write,allow
         p, sudo_user, dfs://*, read|write,allow
     
     
@@ -245,8 +245,8 @@ m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && regexMatch(r.act, p.act)
         }
 
         // 测试权限
-        let alice_read_kv = e.enforce(("alice", "write", "kv://config")).unwrap();
-        println!("Alice can write kv://config: {}", alice_read_kv); // true
+        let alice_read_kv = e.enforce(("alice", "write", "/config/config")).unwrap();
+        println!("Alice can write /config/config: {}", alice_read_kv); // true
         assert_eq!(alice_read_kv, true);
 
         Ok(())
@@ -268,34 +268,34 @@ g, alice,admin
 g, smb-service,service
 g, repo-service,service
 g, bob,user
-p, su_bob,kv://users/bob/*,read|write,allow
+p, su_bob,/config/users/bob/*,read|write,allow
         "#;
         create_enforcer(None, Some(&policy_str)).await.unwrap();
-        let res = enforce("ood", Some("node-daemon"), "kv://boot/config", "read").await;
+        let res = enforce("ood", Some("node-daemon"), "/config/boot/config", "read").await;
         assert_eq!(res, true);
         assert_eq!(
-            enforce("ood1", Some("node-daemon"), "kv://boot/config", "write").await,
+            enforce("ood1", Some("node-daemon"), "/config/boot/config", "write").await,
             false
         );
         assert_eq!(
             enforce(
                 "ood1",
                 Some("verify-hub"),
-                "kv://system/verify-hub/key",
+                "/config/system/verify-hub/key",
                 "read"
             )
             .await,
             true
         );
         assert_eq!(
-            enforce("root", Some("node-daemon"), "kv://boot/config", "write").await,
+            enforce("root", Some("node-daemon"), "/config/boot/config", "write").await,
             true
         );
         assert_eq!(
             enforce(
                 "ood1",
                 Some("repo-service"),
-                "kv://services/repo-service/instance/ood1",
+                "/config/services/repo-service/instance/ood1",
                 "write"
             )
             .await,
@@ -305,21 +305,21 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "ood1",
                 Some("smb-service"),
-                "kv://services/smb-service/latest_smb_items",
+                "/config/services/smb-service/latest_smb_items",
                 "read"
             )
             .await,
             true
         );
         assert_eq!(
-            enforce("ood1", Some("smb-service"), "kv://boot/config", "read").await,
+            enforce("ood1", Some("smb-service"), "/config/boot/config", "read").await,
             true
         );
         assert_eq!(
             enforce(
                 "ood1",
                 Some("scheduler"),
-                "kv://users/alice/apps/app2/config",
+                "/config/users/alice/apps/app2/config",
                 "write"
             )
             .await,
@@ -329,7 +329,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "bob",
                 Some("node-daemon"),
-                "kv://users/alice/apps/app2",
+                "/config/users/alice/apps/app2",
                 "read"
             )
             .await,
@@ -339,7 +339,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "bob",
                 Some("app1"),
-                "kv://users/bob/apps/app1/settings",
+                "/config/users/bob/apps/app1/settings",
                 "read"
             )
             .await,
@@ -349,7 +349,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "bob",
                 Some("control-panel"),
-                "kv://users/bob/settings",
+                "/config/users/bob/settings",
                 "read"
             )
             .await,
@@ -359,7 +359,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "bob",
                 Some("control-panel"),
-                "kv://users/bob/settings",
+                "/config/users/bob/settings",
                 "write"
             )
             .await,
@@ -369,7 +369,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "su_bob",
                 Some("control-panel"),
-                "kv://users/bob/settings",
+                "/config/users/bob/settings",
                 "write"
             )
             .await,
@@ -399,14 +399,14 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "ood1",
                 Some("repo-service"),
-                "kv://services/verify-hub/info",
+                "/config/services/verify-hub/info",
                 "read"
             )
             .await,
             true
         );
         assert_eq!(
-            enforce("ood1", Some("cyfs-gateway"), "kv://boot/config", "read").await,
+            enforce("ood1", Some("cyfs-gateway"), "/config/boot/config", "read").await,
             true
         );
         //app1 can read and write config and info
@@ -414,7 +414,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "kv://users/alice/apps/app1/config",
+                "/config/users/alice/apps/app1/config",
                 "read"
             )
             .await,
@@ -424,7 +424,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "kv://users/alice/apps/app1/config",
+                "/config/users/alice/apps/app1/config",
                 "write"
             )
             .await,
@@ -434,7 +434,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "kv://users/alice/apps/app1/info",
+                "/config/users/alice/apps/app1/info",
                 "read"
             )
             .await,
@@ -444,7 +444,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "kv://users/alice/apps/app1/info",
+                "/config/users/alice/apps/app1/info",
                 "write"
             )
             .await,
@@ -474,7 +474,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "root",
                 Some("app1"),
-                "kv://users/alice/apps/app1/settings",
+                "/config/users/alice/apps/app1/settings",
                 "write"
             )
             .await,
@@ -528,7 +528,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "kv://users/alice/apps/app2/settings",
+                "/config/users/alice/apps/app2/settings",
                 "write"
             )
             .await,
@@ -538,7 +538,7 @@ p, su_bob,kv://users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "kv://users/alice/apps/app2/info",
+                "/config/users/alice/apps/app2/info",
                 "read"
             )
             .await,
@@ -587,6 +587,6 @@ p, su_bob,kv://users/bob/*,read|write,allow
         assert_eq!(true, true);
         assert_eq!(false, false);
         //su_alice has more permission than alice
-        //assert_eq!(enforce("su_alice", Some("control_panel"), "kv://users/alice/apps/app2/config", "write").await, true);
+        //assert_eq!(enforce("su_alice", Some("control_panel"), "/config/users/alice/apps/app2/config", "write").await, true);
     }
 }

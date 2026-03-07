@@ -97,6 +97,39 @@ mod tests {
         assert_eq!(is_did("www.buckyos.org"), false);
     }
 
+    #[test]
+    fn test_is_valid_name() {
+        // length must be > 6
+        assert!(!is_valid_name("short", NameType::User));
+        assert!(!is_valid_name("abc123", NameType::Device)); // len 6, need > 6
+        assert!(is_valid_name("mydevice", NameType::Device));
+        assert!(is_valid_name("waterflier", NameType::User));
+        assert!(is_valid_name("myagent1", NameType::Agent));
+
+        // valid DNS: lowercase, letter start, no hyphen at end
+        assert!(!is_valid_name("MyDevice", NameType::Device)); // uppercase
+        assert!(!is_valid_name("1device", NameType::Device)); // start with digit
+        assert!(!is_valid_name("device-", NameType::Device)); // hyphen at end
+        assert!(is_valid_name("my-device", NameType::Device));
+        assert!(is_valid_name("sub.domain", NameType::User));
+
+        // App: username-appname, both parts valid and length > 6
+        assert!(is_valid_name("waterflier-myapp12", NameType::App)); // user 10, app 8
+        assert!(!is_valid_name("waterflier-myapp", NameType::App)); // app "myapp" len 5
+        assert!(!is_valid_name("user-app", NameType::App)); // user len 4, app len 3
+        assert!(!is_valid_name("user123-app", NameType::App)); // app len 3
+        assert!(!is_valid_name("user123-app456", NameType::App)); // app456 len 6
+        assert!(is_valid_name("user1234-app4567", NameType::App));
+        assert!(!is_valid_name("no-hyphen-here", NameType::App)); // splitn(2,'-') gives ["no","hyphen-here"], user "no" len 2
+
+        // blacklist (exact match on each label)
+        assert!(!is_valid_name("administrator", NameType::User)); // in blacklist
+        assert!(!is_valid_name("localhost", NameType::Device)); // in blacklist
+        assert!(!is_valid_name("sub.admin.domain", NameType::User)); // label "admin" blacklisted
+        assert!(!is_valid_name("administrator-myapp123", NameType::App)); // username blacklisted
+        assert!(!is_valid_name("user12345-administrator", NameType::App)); // appname blacklisted
+    }
+
     #[tokio::test]
     async fn test_get_device_info() {
         let ood_string = OODDescriptionString::from_str("ood1").unwrap();

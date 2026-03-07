@@ -121,73 +121,140 @@ pub fn get_buckyos_log_dir(service: &str, is_service: bool) -> PathBuf {
     }
 }
 
+// $buckyos_service_data => cyfs://$zone_id/var/$service_name/ => $buckyos_root/data/var/$service_name
 pub fn get_buckyos_service_data_dir(service_name: &str) -> PathBuf {
-    get_buckyos_root_dir().join("data").join(service_name)
-}
-
-pub fn get_buckyos_app_data_dir(app_name: &str, owner_id: &str) -> PathBuf {
     get_buckyos_root_dir()
         .join("data")
-        .join(owner_id)
-        .join(app_name)
+        .join("var")
+        .join(service_name)
 }
 
-pub fn get_buckyos_service_local_data_dir(service_name: &str, disk_id: Option<&str>) -> PathBuf {
-    if disk_id.is_some() {
-        get_buckyos_root_dir()
-            .join("local")
-            .join(disk_id.unwrap())
+// $buckyos_service_cache => cyfs://$zone_id/cache/$service_name/ => $buckyos_root/data/cache/$service_name
+pub fn get_buckyos_service_cache_dir(service_name: &str) -> PathBuf {
+    get_buckyos_root_dir()
+        .join("data")
+        .join("cache")
+        .join(service_name)
+}
+
+// $buckyos_service_home => cyfs://$zone_id/srv/$service_name/ => $buckyos_root/data/srv/$service_name
+pub fn get_buckyos_service_home_dir(service_name: &str) -> PathBuf {
+    get_buckyos_root_dir()
+        .join("data")
+        .join("srv")
+        .join(service_name)
+}
+
+// $buckyos_service_local_data => /opt/buckyos/local/$service_name (discouraged)
+pub fn get_buckyos_service_local_data_dir(service_name: &str) -> PathBuf {
+    get_buckyos_root_dir().join("local").join(service_name)
+}
+
+// $buckyos_service_local_cache => /tmp/buckyos/$service_name (discouraged)
+pub fn get_buckyos_service_local_cache_dir(service_name: &str) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        let temp_dir = env::var("TEMP")
+            .or_else(|_| env::var("TMP"))
+            .unwrap_or_else(|_| {
+                let user_profile = env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
+                format!("{}\\AppData\\Local\\Temp", user_profile)
+            });
+        Path::new(&temp_dir)
+            .join("buckyos")
             .join(service_name)
     } else {
-        get_buckyos_root_dir().join("local").join(service_name)
+        Path::new("/tmp")
+            .join("buckyos")
+            .join(service_name)
     }
 }
 
+// cyfs://$zone_id/home/$username => $buckyos_root/data/home/$username
 pub fn get_buckyos_user_home_dir(user_id: &str) -> PathBuf {
-    get_buckyos_root_dir().join("home").join(user_id)
+    get_buckyos_root_dir()
+        .join("data")
+        .join("home")
+        .join(user_id)
+}
+
+// cyfs://$zone_id/home/$username/shared/ => $buckyos_root/data/home/$username/shared
+pub fn get_buckyos_user_shared_dir(user_id: &str) -> PathBuf {
+    get_buckyos_user_home_dir(user_id).join("shared")
+}
+
+// /home/$username/.local/share/$appid => $buckyos_root/data/home/$owner/.local/share/$appid
+pub fn get_buckyos_app_data_dir(app_name: &str, owner_id: &str) -> PathBuf {
+    get_buckyos_user_home_dir(owner_id)
+        .join(".local")
+        .join("share")
+        .join(app_name)
+}
+
+// /tmp/buckyos/$appid
+pub fn get_buckyos_app_tmp_dir(app_id: &str) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        let temp_dir = env::var("TEMP")
+            .or_else(|_| env::var("TMP"))
+            .unwrap_or_else(|_| {
+                let user_profile = env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
+                format!("{}\\AppData\\Local\\Temp", user_profile)
+            });
+        Path::new(&temp_dir).join("buckyos").join(app_id)
+    } else {
+        Path::new("/tmp").join("buckyos").join(app_id)
+    }
+}
+
+// $buckyos_root/storage - kernel infrastructure persistent storage
+pub fn get_buckyos_storage_dir() -> PathBuf {
+    get_buckyos_root_dir().join("storage")
+}
+
+// cyfs://$zone_id/srv/publish/ => $buckyos_root/data/srv/publish
+pub fn get_buckyos_publish_dir() -> PathBuf {
+    get_buckyos_root_dir()
+        .join("data")
+        .join("srv")
+        .join("publish")
 }
 
 pub enum LibraryCategory {
     Public,
     Shared,
-    Photo, //所有自己拍的照片，视频
-    Pciture,
+    Photo,
+    Picture,
     Music,
     Video,
     ROMS,
     ISO,
     Book,
-    Softwares, //各种软件安装包
+    Softwares,
 }
 
 impl LibraryCategory {
-    pub fn to_string(&self) -> Option<&str> {
+    pub fn as_str(&self) -> &str {
         match self {
-            LibraryCategory::Public => Some("public"),
-            LibraryCategory::Shared => Some("shared"),
-            LibraryCategory::Photo => Some("photo"),
-            LibraryCategory::Pciture => Some("picture"),
-            LibraryCategory::Music => Some("music"),
-            LibraryCategory::Video => Some("video"),
-            LibraryCategory::ROMS => Some("roms"),
-            LibraryCategory::ISO => Some("iso"),
-            LibraryCategory::Book => Some("book"),
-            LibraryCategory::Softwares => Some("softwares"),
+            LibraryCategory::Public => "public",
+            LibraryCategory::Shared => "shared",
+            LibraryCategory::Photo => "photo",
+            LibraryCategory::Picture => "picture",
+            LibraryCategory::Music => "music",
+            LibraryCategory::Video => "video",
+            LibraryCategory::ROMS => "roms",
+            LibraryCategory::ISO => "iso",
+            LibraryCategory::Book => "book",
+            LibraryCategory::Softwares => "softwares",
         }
     }
 }
 
-pub fn get_buckyos_library_dir(category: LibraryCategory) -> Option<PathBuf> {
-    let category_str = category.to_string();
-    if category_str.is_some() {
-        Some(
-            get_buckyos_root_dir()
-                .join("library")
-                .join(category_str.unwrap()),
-        )
-    } else {
-        None
-    }
+// cyfs://$zone_id/srv/library/ => $buckyos_root/data/srv/library
+pub fn get_buckyos_library_dir(category: LibraryCategory) -> PathBuf {
+    get_buckyos_root_dir()
+        .join("data")
+        .join("srv")
+        .join("library")
+        .join(category.as_str())
 }
 
 pub fn adjust_path(old_path: &str) -> std::io::Result<PathBuf> {
@@ -373,12 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn test_library_category_to_string_table() {
+    fn test_library_category_as_str_table() {
         let cases = vec![
             (LibraryCategory::Public, "public"),
             (LibraryCategory::Shared, "shared"),
             (LibraryCategory::Photo, "photo"),
-            (LibraryCategory::Pciture, "picture"),
+            (LibraryCategory::Picture, "picture"),
             (LibraryCategory::Music, "music"),
             (LibraryCategory::Video, "video"),
             (LibraryCategory::ROMS, "roms"),
@@ -388,7 +455,7 @@ mod tests {
         ];
 
         for (category, expected) in cases {
-            assert_eq!(category.to_string(), Some(expected));
+            assert_eq!(category.as_str(), expected);
         }
     }
 }

@@ -134,7 +134,7 @@ impl DIDDocumentFsCache {
     }
 
     pub fn get_default_cache_dir() -> PathBuf {
-        get_buckyos_service_local_data_dir("did_docs", None)
+        get_buckyos_service_local_data_dir("did_docs")
     }
 
     pub fn with_default_dir() -> Self {
@@ -499,7 +499,7 @@ impl DIDDocumentDBCache {
 
     fn resolve_db_path(cache_dir: Option<PathBuf>) -> name_lib::NSResult<PathBuf> {
         let base_dir =
-            cache_dir.unwrap_or_else(|| get_buckyos_service_local_data_dir("did_docs", None));
+            cache_dir.unwrap_or_else(|| get_buckyos_service_local_data_dir("did_docs"));
         if let Err(err) = fs::create_dir_all(&base_dir) {
             return Err(name_lib::NSError::ReadLocalFileError(format!(
                 "prepare sqlite cache dir failed: {}",
