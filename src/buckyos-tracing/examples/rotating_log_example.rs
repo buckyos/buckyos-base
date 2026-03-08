@@ -29,4 +29,3 @@ fn main() {
 
     info!("Application finished");
 }
-

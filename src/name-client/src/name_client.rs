@@ -7,19 +7,17 @@ use crate::provider::RecordType;
 use crate::{NameInfo, NsProvider};
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
-use name_lib::*;
 use name_lib::DEFAULT_EXPIRE_TIME;
+use name_lib::*;
 
 use log::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 
-
-pub const DEFAULT_PROVIDER_TRUST_LEVEL:i32 = 100;
-pub const ROOT_TRUST_LEVEL:i32 = 0;
-pub const DNS_TRUST_LEVEL:i32 = 16;
-
+pub const DEFAULT_PROVIDER_TRUST_LEVEL: i32 = 100;
+pub const ROOT_TRUST_LEVEL: i32 = 0;
+pub const DNS_TRUST_LEVEL: i32 = 16;
 
 pub struct NameClientConfig {
     pub enable_cache: bool,
@@ -31,7 +29,7 @@ impl Default for NameClientConfig {
     fn default() -> Self {
         Self {
             enable_cache: true,
-            local_cache_dir:None,
+            local_cache_dir: None,
             cache_backend: CacheBackend::Filesystem,
         }
     }
@@ -55,14 +53,12 @@ impl NameClient {
             .map(|dir| PathBuf::from(dir));
 
         let doc_cache = match config.cache_backend {
-            CacheBackend::Sqlite => DIDDocumentCache::new_db(doc_cache_dir.clone())
-                .unwrap_or_else(|e| {
-                    warn!(
-                        "init sqlite cache failed ({}), fallback to fs cache",
-                        e
-                    );
+            CacheBackend::Sqlite => {
+                DIDDocumentCache::new_db(doc_cache_dir.clone()).unwrap_or_else(|e| {
+                    warn!("init sqlite cache failed ({}), fallback to fs cache", e);
                     DIDDocumentCache::new(doc_cache_dir.clone())
-                }),
+                })
+            }
             CacheBackend::Filesystem => DIDDocumentCache::new(doc_cache_dir),
             CacheBackend::Memory => DIDDocumentCache::new_mem(),
         };
@@ -184,7 +180,6 @@ impl NameClient {
             .and_then(|value| value.get("exp").and_then(|ts| ts.as_u64()))
     }
 
-
     pub async fn resolve_did(
         &self,
         did: &DID,
@@ -196,7 +191,12 @@ impl NameClient {
             cached_result = self.doc_cache.get(did, doc_type);
             if let Some((_, exp, trust_level)) = cached_result.as_ref() {
                 if !self.is_expired(*exp) {
-                    info!("cached did:{}#{} is not expired, trust_level set to: {}", did.to_string(), doc_type.unwrap_or(""), trust_level);
+                    info!(
+                        "cached did:{}#{} is not expired, trust_level set to: {}",
+                        did.to_string(),
+                        doc_type.unwrap_or(""),
+                        trust_level
+                    );
                     cached_trust_level = *trust_level;
                 }
             }
@@ -209,39 +209,47 @@ impl NameClient {
 
         match reslove_result {
             Ok((did_doc, exp, result_trust_level)) => {
-                info!("resolve did:{}#{} success, exp:{}", did.to_string(), doc_type.unwrap_or(""), exp);
+                info!(
+                    "resolve did:{}#{} success, exp:{}",
+                    did.to_string(),
+                    doc_type.unwrap_or(""),
+                    exp
+                );
                 if self.config.enable_cache {
-                    self.doc_cache
-                        .update(did.clone(), doc_type, did_doc.clone(), exp, result_trust_level);
+                    self.doc_cache.update(
+                        did.clone(),
+                        doc_type,
+                        did_doc.clone(),
+                        exp,
+                        result_trust_level,
+                    );
                 }
                 Ok(did_doc)
             }
-            Err(result_error) => {
-                match result_error {
-                    NSError::Disabled(msg) => {
-                        info!(
-                            "{}'s doc disabled, delete cache",
-                            did.to_string()
-                        );
-                        if self.config.enable_cache {
-                            self.doc_cache.delete(did.clone(), doc_type);
-                        }
-                        Err(NSError::Disabled(msg))
+            Err(result_error) => match result_error {
+                NSError::Disabled(msg) => {
+                    info!("{}'s doc disabled, delete cache", did.to_string());
+                    if self.config.enable_cache {
+                        self.doc_cache.delete(did.clone(), doc_type);
                     }
-                    _ => {
-                        if let Some((doc, exp, _)) = cached_result {
-                            info!("resolve did:{}#{} by cache success, exp:{}", did.to_string(), doc_type.unwrap_or(""), exp);
-                            return Ok(doc.clone());
-                        }
-                        Err(result_error)
-                    }
+                    Err(NSError::Disabled(msg))
                 }
-            }
+                _ => {
+                    if let Some((doc, exp, _)) = cached_result {
+                        info!(
+                            "resolve did:{}#{} by cache success, exp:{}",
+                            did.to_string(),
+                            doc_type.unwrap_or(""),
+                            exp
+                        );
+                        return Ok(doc.clone());
+                    }
+                    Err(result_error)
+                }
+            },
         }
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -277,11 +285,17 @@ mod tests {
 
     impl MockProvider {
         fn ok(doc: EncodedDocument) -> Self {
-            Self { doc: Some(doc), err: None }
+            Self {
+                doc: Some(doc),
+                err: None,
+            }
         }
 
         fn err(err: MockErr) -> Self {
-            Self { doc: None, err: Some(err) }
+            Self {
+                doc: None,
+                err: Some(err),
+            }
         }
     }
 
@@ -481,9 +495,13 @@ mod tests {
             cache_backend: CacheBackend::Filesystem,
         });
 
-        client
-            .doc_cache
-            .insert(did.clone(), None, cached_doc.clone(), now + 1800, DEFAULT_PROVIDER_TRUST_LEVEL);
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached_doc.clone(),
+            now + 1800,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
 
         // 未配置任何 provider，仍应直接从缓存返回
         let resolved = client.resolve_did(&did, None).await.unwrap();
@@ -530,7 +548,9 @@ mod tests {
             local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
             cache_backend: CacheBackend::Filesystem,
         });
-        client.add_provider(Box::new(provider), Some(DEFAULT_PROVIDER_TRUST_LEVEL)).await;
+        client
+            .add_provider(Box::new(provider), Some(DEFAULT_PROVIDER_TRUST_LEVEL))
+            .await;
 
         let result = client.resolve("did:web:example.com", None).await.unwrap();
         assert_eq!(result.name, "example.com".to_string());

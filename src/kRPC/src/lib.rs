@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+mod example_krpc_client;
 mod protocol;
 mod session_token;
-mod example_krpc_client;
 
 pub use protocol::*;
 pub use session_token::*;
@@ -107,7 +107,7 @@ impl kRPC {
         let mut session_token = self.session_token.write().await;
         *session_token = context.token.clone();
         drop(session_token);
-        
+
         let mut trace_id = self.trace_id.write().await;
         *trace_id = context.trace_id.clone();
         drop(trace_id);
@@ -133,10 +133,9 @@ impl kRPC {
             request.seq = current_seq;
             request.token = current_session_token;
             request.trace_id = current_trace_id;
-            request_body =
-                serde_json::to_value(&request).map_err(|err| {
-                    RPCErrors::ParseRequestError(format!("serialize request failed: {}", err))
-                })?;
+            request_body = serde_json::to_value(&request).map_err(|err| {
+                RPCErrors::ParseRequestError(format!("serialize request failed: {}", err))
+            })?;
         }
 
         let response = self
@@ -162,10 +161,9 @@ impl kRPC {
 
             match rpc_response.result {
                 RPCResult::Success(value) => Ok(value),
-                RPCResult::Failed(err) => Err(RPCErrors::ReasonError(format!(
-                    "rpc call error: {}",
-                    err
-                ))),
+                RPCResult::Failed(err) => {
+                    Err(RPCErrors::ReasonError(format!("rpc call error: {}", err)))
+                }
             }
         } else {
             Err(RPCErrors::ReasonError(format!(

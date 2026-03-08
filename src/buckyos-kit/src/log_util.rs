@@ -42,23 +42,27 @@ pub fn init_logging(app_name: &str, is_service: bool) {
         ),
     ]);
 
-    info!("{} start logging, pid: {}, buckyos version {}", app_name, pid, get_version());
+    info!(
+        "{} start logging, pid: {}, buckyos version {}",
+        app_name,
+        pid,
+        get_version()
+    );
     info!("log level: {}", log_level);
 
     if init_result.is_err() {
         println!("Failed to init logging: {}", init_result.err().unwrap());
     }
-
 }
-
 
 pub fn init_log_panic() {
     // 设置全局 panic hook，捕获所有 unwrap 失败
     panic::set_hook(Box::new(|panic_info| {
-        let location = panic_info.location()
+        let location = panic_info
+            .location()
             .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
             .unwrap_or_else(|| "unknown location".to_string());
-        
+
         let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             format!("panic message: {}", s)
         } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
@@ -66,7 +70,7 @@ pub fn init_log_panic() {
         } else {
             "panic occurred".to_string()
         };
-        
+
         error!("[PANIC] unwrap/panic failed at {} - {}", location, message);
         eprintln!("[PANIC] unwrap/panic failed at {} - {}", location, message);
     }));

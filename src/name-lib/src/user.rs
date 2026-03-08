@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -12,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     create_jwt_by_x, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify,
-    default_context, EncodedDocument, NSError, NSResult, DID, DIDDocumentTrait, ServiceNode,
-    VerificationMethodNode,
+    default_context, DIDDocumentTrait, EncodedDocument, NSError, NSResult, ServiceNode,
+    VerificationMethodNode, DID,
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -59,7 +58,7 @@ impl OwnerConfig {
         Ok(())
     }
 
-    pub fn new_by_pkx(pkx: &str,hostname: &str) -> NSResult<Self> {
+    pub fn new_by_pkx(pkx: &str, hostname: &str) -> NSResult<Self> {
         //pkx like "qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM[:bns:waterflier];"
         let parts = pkx.split(":").collect::<Vec<&str>>();
         if parts.is_empty() || parts[0].is_empty() {
@@ -71,7 +70,7 @@ impl OwnerConfig {
             let owenr_did = DID::from_str(hostname)?;
             let owner_name = owenr_did.id.clone();
             let full_name = format!("{}@{}", owner_name, hostname);
- 
+
             return Ok(OwnerConfig::new(
                 owenr_did,
                 owner_name.clone(),
@@ -100,7 +99,7 @@ impl OwnerConfig {
             key_type: "Ed25519VerificationKey2020".to_string(),
             key_id: "#main_key".to_string(),
             key_controller: id.to_string(),
-            public_key: public_key
+            public_key: public_key,
         }];
 
         OwnerConfig {

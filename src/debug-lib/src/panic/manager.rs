@@ -213,4 +213,3 @@ impl PanicBuilder {
         PanicManager::new(self)
     }
 }
-

@@ -349,10 +349,17 @@ mod tests {
             Some("@alice_agent")
         );
         assert_eq!(
-            parsed_by_serde.contact.extra_info.get("email").map(|v| v.as_str()),
+            parsed_by_serde
+                .contact
+                .extra_info
+                .get("email")
+                .map(|v| v.as_str()),
             Some("alice@example.com")
         );
-        assert_eq!(parsed_by_serde.get_http_service_port("send_msg"), Some(8081));
+        assert_eq!(
+            parsed_by_serde.get_http_service_port("send_msg"),
+            Some(8081)
+        );
         assert_eq!(parsed_by_serde.get_http_service_port("status"), Some(8082));
         assert_eq!(
             parsed_by_serde

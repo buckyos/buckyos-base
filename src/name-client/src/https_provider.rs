@@ -7,7 +7,7 @@
 use crate::{NameInfo, NsProvider, RecordType};
 use async_trait::async_trait;
 use log::info;
-use name_lib::{DID, EncodedDocument, NSError, NSResult};
+use name_lib::{EncodedDocument, NSError, NSResult, DID};
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::net::IpAddr;
@@ -62,7 +62,7 @@ impl HttpsProvider {
         )
     }
 
-    async fn parse_response( did: &DID, resp: reqwest::Response) -> NSResult<EncodedDocument> {
+    async fn parse_response(did: &DID, resp: reqwest::Response) -> NSResult<EncodedDocument> {
         let status = resp.status();
         let body = resp
             .text()
@@ -88,7 +88,10 @@ impl HttpsProvider {
                 .and_then(|v| v.as_bool())
                 == Some(true)
             {
-                return Err(NSError::Disabled(format!("{} deactivated", did.to_string())));
+                return Err(NSError::Disabled(format!(
+                    "{} deactivated",
+                    did.to_string()
+                )));
             }
 
             let doc_value = value
@@ -145,7 +148,9 @@ pub struct SmartProvider {
 
 impl SmartProvider {
     pub fn new() -> Self {
-        Self { client: Client::new() }
+        Self {
+            client: Client::new(),
+        }
     }
 }
 
@@ -176,7 +181,12 @@ impl NsProvider for SmartProvider {
         let path = did.get_path_from_id();
         let real_doc_type = doc_type.unwrap_or("did");
         let url = if path.is_some() {
-            format!("https://{}/{}/{}.json", hostname, path.unwrap(), real_doc_type)
+            format!(
+                "https://{}/{}/{}.json",
+                hostname,
+                path.unwrap(),
+                real_doc_type
+            )
         } else {
             format!("https://{}/.well-known/{}", hostname, real_doc_type)
         };
@@ -196,7 +206,6 @@ impl NsProvider for SmartProvider {
 mod tests {
     use super::*;
     use name_lib::DID;
-
 
     #[tokio::test]
     async fn resolve_did_via_identity_foundation() {
@@ -218,12 +227,12 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn resolve_did_via_uniresolver() {
         let provider = HttpsProvider::new("uniresolver.io");
         // did:key 由密钥直接派生，uniresolver 官方示例，可稳定解析
-        let did = DID::from_str("did:key:z6Mksw4bDmn77uB5iVbQJBALV4CfqUGNoTCJQwdse1dQcvbK").unwrap();
+        let did =
+            DID::from_str("did:key:z6Mksw4bDmn77uB5iVbQJBALV4CfqUGNoTCJQwdse1dQcvbK").unwrap();
         // 携带 doc_type，验证 URL 编码（%23）路径能被解析服务接受
         let doc = provider.query_did(&did, None, None).await.unwrap();
         let json = doc.to_json_value().unwrap();

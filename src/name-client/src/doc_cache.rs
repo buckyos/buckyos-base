@@ -498,8 +498,7 @@ impl DIDDocumentDBCache {
     }
 
     fn resolve_db_path(cache_dir: Option<PathBuf>) -> name_lib::NSResult<PathBuf> {
-        let base_dir =
-            cache_dir.unwrap_or_else(|| get_buckyos_service_local_data_dir("did_docs"));
+        let base_dir = cache_dir.unwrap_or_else(|| get_buckyos_service_local_data_dir("did_docs"));
         if let Err(err) = fs::create_dir_all(&base_dir) {
             return Err(name_lib::NSError::ReadLocalFileError(format!(
                 "prepare sqlite cache dir failed: {}",
@@ -712,11 +711,11 @@ mod tests {
     use crate::DEFAULT_PROVIDER_TRUST_LEVEL;
     use jsonwebtoken::EncodingKey;
     use name_lib::{DIDDocumentTrait, NSError, OwnerConfig, ZoneBootConfig, DEFAULT_EXPIRE_TIME};
+    use rusqlite::{params, Connection};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
-    use rusqlite::{Connection, params};
 
     const TEST_OWNER_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -963,7 +962,8 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         // Simulate meta file being deleted/corrupted
         std::fs::remove_file(meta_path(&tmp_dir, &did)).unwrap();
 
-        let (loaded_doc, _loaded_exp, trust) = cache.get(&did, None).expect("doc should still load");
+        let (loaded_doc, _loaded_exp, trust) =
+            cache.get(&did, None).expect("doc should still load");
         assert_eq!(loaded_doc, doc);
         assert_eq!(trust, ROOT_TRUST_LEVEL);
     }

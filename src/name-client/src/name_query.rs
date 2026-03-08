@@ -1,7 +1,7 @@
 use buckyos_kit::buckyos_get_unix_timestamp;
 use log::{error, info};
-use name_lib::*;
 use name_lib::DEFAULT_EXPIRE_TIME;
+use name_lib::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -73,7 +73,7 @@ impl NameQuery {
         // 按 trust_level 分组，相同优先级的 provider 并发请求
         let mut current_level: Option<i32> = None;
         let mut level_providers = Vec::new();
-        
+
         for (provider, level) in providers.iter() {
             if *level >= allowed_max_trust {
                 break;
@@ -81,7 +81,7 @@ impl NameQuery {
             if current_level.is_none() {
                 current_level = Some(*level);
             }
-            
+
             // 如果遇到不同的优先级，处理当前优先级组
             if current_level != Some(*level) {
                 match self
@@ -100,10 +100,10 @@ impl NameQuery {
                 level_providers.clear();
                 current_level = Some(*level);
             }
-            
+
             level_providers.push(provider);
         }
-        
+
         // 处理最后一组
         if !level_providers.is_empty() {
             match self
@@ -119,10 +119,10 @@ impl NameQuery {
                 _ => {}
             }
         }
-        
+
         Err(NSError::NotFound(did.to_host_name()))
     }
-    
+
     // 从一组相同优先级的 provider 中并发查询，返回 iat 最大的结果
     async fn query_did_from_providers(
         &self,
@@ -133,29 +133,29 @@ impl NameQuery {
         if providers.is_empty() {
             return Ok(None);
         }
-        
+
         use futures::future::join_all;
-        
+
         // 收集所有的 futures（不立即 await，保持并发）
         let futures: Vec<_> = providers
             .iter()
             .map(|provider| provider.query_did(did, doc_type, None))
             .collect();
-        
+
         // 并发等待所有 futures 完成
         let results = join_all(futures).await;
-        
+
         // 从所有成功的结果中选择 iat 最大的
         let mut best_doc: Option<EncodedDocument> = None;
         let mut best_iat: Option<u64> = None;
         let mut best_exp: Option<u64> = None;
-        
+
         for result in results {
             match result {
                 Ok(doc) => {
                     // 先 clone 一份用于提取 iat
                     let doc_for_iat = doc.clone();
-                    
+
                     // 提取 iat 字段
                     let iat = Self::extract_timestamp(&doc_for_iat, "iat");
                     let exp = Self::extract_timestamp(&doc_for_iat, "exp")
@@ -181,8 +181,13 @@ impl NameQuery {
                 }
             }
         }
-        
-        Ok(best_doc.map(|doc| (doc, best_exp.unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME))))
+
+        Ok(best_doc.map(|doc| {
+            (
+                doc,
+                best_exp.unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME),
+            )
+        }))
     }
 
     fn extract_timestamp(doc: &EncodedDocument, field: &str) -> Option<u64> {
@@ -299,10 +304,16 @@ mod tests {
         let doc_low_priority = make_doc(1_000, 2_000, "low");
 
         // trust level 数字越小优先级越高
-        q.add_provider(Box::new(MockProvider::ok("high", doc_high_priority.clone())), 5)
-            .await;
-        q.add_provider(Box::new(MockProvider::ok("low", doc_low_priority.clone())), 50)
-            .await;
+        q.add_provider(
+            Box::new(MockProvider::ok("high", doc_high_priority.clone())),
+            5,
+        )
+        .await;
+        q.add_provider(
+            Box::new(MockProvider::ok("low", doc_low_priority.clone())),
+            50,
+        )
+        .await;
 
         let (doc, exp, trust) = q.query_did(&did, None, None).await.unwrap();
         assert_eq!(doc, doc_high_priority);
@@ -318,14 +329,14 @@ mod tests {
         let doc_lower_priority = make_doc(50, 100, "low");
 
         // 高优先级 provider 返回错误
+        q.add_provider(Box::new(MockProvider::err("high", MockErr::NotFound)), 5)
+            .await;
+        // 低优先级 provider 有结果
         q.add_provider(
-            Box::new(MockProvider::err("high", MockErr::NotFound)),
-            5,
+            Box::new(MockProvider::ok("low", doc_lower_priority.clone())),
+            50,
         )
         .await;
-        // 低优先级 provider 有结果
-        q.add_provider(Box::new(MockProvider::ok("low", doc_lower_priority.clone())), 50)
-            .await;
 
         // 限制最大 trust_level = 10，应当直接 NotFound，而不会落到低优先级
         let result = q.query_did(&did, None, Some(10)).await;
@@ -343,16 +354,10 @@ mod tests {
         let q = NameQuery::new();
         let did = DID::from_str("did:web:example.com").unwrap();
 
-        q.add_provider(
-            Box::new(MockProvider::err("high", MockErr::Disabled)),
-            5,
-        )
-        .await;
-        q.add_provider(
-            Box::new(MockProvider::ok("low", make_doc(1, 2, "low"))),
-            50,
-        )
-        .await;
+        q.add_provider(Box::new(MockProvider::err("high", MockErr::Disabled)), 5)
+            .await;
+        q.add_provider(Box::new(MockProvider::ok("low", make_doc(1, 2, "low"))), 50)
+            .await;
 
         let result = q.query_did(&did, None, None).await;
         assert!(matches!(result, Err(NSError::Disabled(_))));
@@ -364,16 +369,10 @@ mod tests {
         let did = DID::from_str("did:web:example.com").unwrap();
 
         // 同一优先级：一个 Disabled，一个成功
-        q.add_provider(
-            Box::new(MockProvider::err("p1", MockErr::Disabled)),
-            10,
-        )
-        .await;
-        q.add_provider(
-            Box::new(MockProvider::ok("p2", make_doc(5, 10, "ok"))),
-            10,
-        )
-        .await;
+        q.add_provider(Box::new(MockProvider::err("p1", MockErr::Disabled)), 10)
+            .await;
+        q.add_provider(Box::new(MockProvider::ok("p2", make_doc(5, 10, "ok"))), 10)
+            .await;
 
         let result = q.query_did(&did, None, None).await;
         assert!(matches!(result, Err(NSError::Disabled(_))));
@@ -389,5 +388,4 @@ mod tests {
         let err = q.query_did(&did, None, None).await.unwrap_err();
         assert!(matches!(err, NSError::Failed(_)));
     }
-    
 }

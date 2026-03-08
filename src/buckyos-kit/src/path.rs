@@ -159,13 +159,9 @@ pub fn get_buckyos_service_local_cache_dir(service_name: &str) -> PathBuf {
                 let user_profile = env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
                 format!("{}\\AppData\\Local\\Temp", user_profile)
             });
-        Path::new(&temp_dir)
-            .join("buckyos")
-            .join(service_name)
+        Path::new(&temp_dir).join("buckyos").join(service_name)
     } else {
-        Path::new("/tmp")
-            .join("buckyos")
-            .join(service_name)
+        Path::new("/tmp").join("buckyos").join(service_name)
     }
 }
 

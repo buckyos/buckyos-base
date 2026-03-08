@@ -1,21 +1,21 @@
 #![allow(dead_code)]
 
-mod local_ns_provider;
+mod bns_provider;
 mod dns_provider;
 mod doc_cache;
-mod bns_provider;
 mod https_provider;
+mod local_ns_provider;
 mod name_client;
 mod name_query;
 mod provider;
 mod utility;
 
-pub use local_ns_provider::*;
+pub use bns_provider::*;
 pub use dns_provider::*;
 pub use doc_cache::*;
-pub use bns_provider::*;
 pub use https_provider::*;
 use jsonwebtoken::DecodingKey;
+pub use local_ns_provider::*;
 pub use name_client::*;
 pub use name_query::*;
 pub use provider::*;
@@ -86,9 +86,16 @@ pub async fn init_name_lib_ex(
     client
         .add_provider(Box::new(bns_provider), Some(ROOT_TRUST_LEVEL))
         .await;
-    client.add_provider(Box::new(DnsProvider::new(None)), Some(DNS_TRUST_LEVEL)).await;
+    client
+        .add_provider(Box::new(DnsProvider::new(None)), Some(DNS_TRUST_LEVEL))
+        .await;
     //基于当前zone创建https provider?
-    client.add_provider(Box::new(SmartProvider::new()), Some(DEFAULT_PROVIDER_TRUST_LEVEL)).await;
+    client
+        .add_provider(
+            Box::new(SmartProvider::new()),
+            Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+        )
+        .await;
     let set_result = GLOBAL_NAME_CLIENT.set(client);
     if set_result.is_err() {
         if GLOBAL_NAME_CLIENT.get().is_none() {
@@ -279,7 +286,9 @@ mod tests {
             let _ = IS_NAME_LIB_INITED.set(true);
         }
 
-        update_did_cache(did.clone(), None, doc.clone()).await.unwrap();
+        update_did_cache(did.clone(), None, doc.clone())
+            .await
+            .unwrap();
         let did_doc = resolve_did(&did, None).await.unwrap();
         assert_eq!(did_doc, doc);
     }

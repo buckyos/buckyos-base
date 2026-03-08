@@ -32,7 +32,6 @@ MX=["mail.example.com"]
 
 */
 
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct DnsLocalConfig {
     #[serde(flatten)]
@@ -327,14 +326,17 @@ impl NsProvider for LocalConfigDnsProvider {
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         let host_name = did.to_host_name();
-        let name_info = self.get_name_info(&host_name)?; 
+        let name_info = self.get_name_info(&host_name)?;
         let new_name_info = name_info.parse_txt_record_to_did_document()?;
         let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
         let did_document = new_name_info.get_did_document(doc_type);
         if did_document.is_some() {
             return Ok(did_document.unwrap().clone());
         }
-        return Err(NSError::NotFound(format!("DID Document not found: {}", doc_type)));
+        return Err(NSError::NotFound(format!(
+            "DID Document not found: {}",
+            doc_type
+        )));
     }
 }
 
@@ -428,7 +430,7 @@ ptr_records = ["node1.example.com", "node1-alt.example.com"]
             .unwrap();
         let boot_jwt = result.to_string();
         assert_eq!(boot_jwt.as_str(),"eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg");
- 
+
         let result = provider
             .query("www.example.com", Some(RecordType::TXT), None)
             .await
@@ -452,12 +454,16 @@ ptr_records = ["node1.example.com", "node1-alt.example.com"]
         assert_eq!(result.name, "foo.sub.example.com");
         assert_eq!(result.ttl.unwrap(), 300);
 
-        let result = provider.query("mail.example.com", Some(RecordType::AAAA), None)
+        let result = provider
+            .query("mail.example.com", Some(RecordType::AAAA), None)
             .await
             .unwrap();
         assert_eq!(result.name, "mail.example.com");
         assert_eq!(result.address.len(), 1);
-        assert_eq!(result.address[0].to_string(), "2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa");
+        assert_eq!(
+            result.address[0].to_string(),
+            "2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"
+        );
 
         let result = provider
             .query("192.168.1.1", Some(RecordType::PTR), None)
@@ -470,8 +476,12 @@ ptr_records = ["node1.example.com", "node1-alt.example.com"]
             .query("192.168.1.10", Some(RecordType::PTR), None)
             .await
             .unwrap();
-        assert!(result.ptr_records.contains(&"node1.example.com".to_string()));
-        assert!(result.ptr_records.contains(&"node1-alt.example.com".to_string()));
+        assert!(result
+            .ptr_records
+            .contains(&"node1.example.com".to_string()));
+        assert!(result
+            .ptr_records
+            .contains(&"node1-alt.example.com".to_string()));
 
         let result = provider
             .query("192.168.1.254", Some(RecordType::PTR), None)

@@ -32,12 +32,7 @@ impl HttpBugReporter {
     async fn post(&self, req: PanicReportRequest) -> Result<(), Box<dyn std::error::Error>> {
         let report_url = self.notify_addr.join(&req.info.hash).unwrap();
 
-        let resp = self
-            .client
-            .post(report_url)
-            .json(&req)
-            .send()
-            .await?;
+        let resp = self.client.post(report_url).json(&req).send().await?;
         match resp.status() {
             StatusCode::OK => {
                 info!("post to http notify addr success");

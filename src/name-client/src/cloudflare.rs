@@ -278,7 +278,6 @@ impl NsProvider for CloudflareProvider {
 
         let mut name_info = NameInfo::default();
 
-
         match record_type {
             RecordType::A | RecordType::AAAA => {
                 for record in records {

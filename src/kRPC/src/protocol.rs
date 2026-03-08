@@ -43,8 +43,6 @@ impl RPCRequest {
     }
 }
 
-
-
 impl Serialize for RPCRequest {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -177,7 +175,7 @@ impl Serialize for RPCResponse {
                 if let Some(trace_id) = self.trace_id.as_ref() {
                     sys_vec.push(Value::from(trace_id.clone()));
                 }
-      
+
                 state.serialize_field("sys", &sys_vec)?;
 
                 state.end()
@@ -245,14 +243,14 @@ impl<'de> Deserialize<'de> for RPCResponse {
 
 //通过RPCContext可以方便跟踪和调试一个长的call chain
 //call chain用trace_id来定义
-#[derive(Debug, PartialEq,Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct RPCContext {
     pub seq: u64,
     pub start_time: u64,
-    pub token: Option<String>,//jwt session token
+    pub token: Option<String>, //jwt session token
     pub trace_id: Option<String>,
     pub from_ip: Option<IpAddr>,
-    pub is_rpc:bool,
+    pub is_rpc: bool,
 }
 
 impl Default for RPCContext {

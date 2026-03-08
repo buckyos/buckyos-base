@@ -90,7 +90,7 @@ impl RotatingFileWriter {
     /// 初始化或打开当前日志文件
     fn init_current_file(&self) -> io::Result<()> {
         let current_path = self.log_dir.join(&self.config.current_name);
-        
+
         // 如果文件存在，检查大小
         let current_size = if current_path.exists() {
             fs::metadata(&current_path)?.len()
@@ -116,14 +116,16 @@ impl RotatingFileWriter {
 
         let pid = std::process::id();
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        
+
         // 生成归档文件名：app_pid_timestamp.log
         let archive_name = format!(
             "{}_{}_{}_{}.log",
-            self.config.app_name, pid, timestamp, 
+            self.config.app_name,
+            pid,
+            timestamp,
             chrono::Local::now().timestamp()
         );
-        
+
         let current_path = self.log_dir.join(&self.config.current_name);
         let archive_path = self.log_dir.join(&archive_name);
 
@@ -147,7 +149,7 @@ impl RotatingFileWriter {
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 let path = entry.path();
-                path.is_file() 
+                path.is_file()
                     && path.extension().and_then(|s| s.to_str()) == Some("log")
                     && path.file_name().and_then(|s| s.to_str()) != Some(&self.config.current_name)
             })
@@ -155,13 +157,22 @@ impl RotatingFileWriter {
 
         // 按修改时间排序（最新的在前）
         log_files.sort_by(|a, b| {
-            let a_time = a.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let b_time = b.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let a_time = a
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let b_time = b
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             b_time.cmp(&a_time)
         });
 
         // 删除超出限制的文件
-        for entry in log_files.iter().skip(self.config.max_files.saturating_sub(1)) {
+        for entry in log_files
+            .iter()
+            .skip(self.config.max_files.saturating_sub(1))
+        {
             if let Err(e) = fs::remove_file(entry.path()) {
                 eprintln!("Failed to remove old log file {:?}: {}", entry.path(), e);
             }
@@ -173,7 +184,7 @@ impl RotatingFileWriter {
     /// 写入数据
     fn write_data(&self, buf: &[u8]) -> io::Result<()> {
         let mut size = self.current_size.lock().unwrap();
-        
+
         // 检查是否需要轮转
         if *size + buf.len() as u64 > self.config.max_file_size {
             drop(size); // 释放锁
@@ -250,8 +261,7 @@ pub fn init_rotating_tracing(config: RotatingLogConfig) -> Result<(), Box<dyn st
     let rotating_writer = RotatingLogMakeWriter::new(config)?;
 
     // 环境变量过滤器
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // 终端层
     let stdout_layer = tracing_subscriber::fmt::layer()
@@ -295,4 +305,3 @@ mod tests {
         writer.flush().unwrap();
     }
 }
-

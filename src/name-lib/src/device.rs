@@ -5,22 +5,21 @@ use log::error;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, ToSocketAddrs};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
+use std::process::Command;
 use std::str::FromStr;
 use thiserror::Error;
-use tokio::net::UdpSocket;
 
 use crate::zone::{default_context, ServiceNode, VerificationMethodNode};
 use crate::{
-    DEFAULT_EXPIRE_TIME, DID, DIDDocumentTrait, EncodedDocument, NSError, NSResult, OODDescriptionString, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk,
+    DIDDocumentTrait, EncodedDocument, NSError, NSResult, OODDescriptionString,
+    DEFAULT_EXPIRE_TIME, DID,
 };
 use nvml_wrapper::enum_wrappers::device::Clock;
 use nvml_wrapper::*;
-use sysinfo::{Components, Disks, Networks, System};
-
-
+use sysinfo::{Disks, Networks, System};
 
 pub enum DeviceType {
     OOD,    //run system config service
@@ -45,7 +44,6 @@ pub struct DeviceMiniConfig {
 }
 
 impl DeviceMiniConfig {
-
     pub fn new_by_device_config(device_config: &DeviceConfig) -> Self {
         let default_key = device_config.get_default_key().unwrap();
         let x = get_x_from_jwk(&default_key).unwrap();
@@ -99,13 +97,13 @@ pub struct DeviceConfig {
     //--------------------------------
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_did: Option<DID>, // The zone did where the Device is located
-    pub owner: DID,//owner did，原则上应该与zone的owner相同
-    
+    pub owner: DID, //owner did，原则上应该与zone的owner相同
+
     pub device_type: String, //[ood,server,sensor
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub device_mini_config_jwt:Option<String>,
-    pub name: String,        //short name,like ood1
+    pub device_mini_config_jwt: Option<String>,
+    pub name: String, //short name,like ood1
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rtcp_port: Option<u32>,
 
@@ -121,7 +119,7 @@ pub struct DeviceConfig {
     pub support_container: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub capbilities: HashMap<String, i64>,//capbility id -> resource value (like memory size, cpu core count, etc.)
+    pub capbilities: HashMap<String, i64>, //capbility id -> resource value (like memory size, cpu core count, etc.)
 }
 
 impl DeviceConfig {
@@ -132,7 +130,7 @@ impl DeviceConfig {
 
     pub fn new_by_mini_config(
         mini_config_jwt: &String,
-        mini_config:&DeviceMiniConfig,
+        mini_config: &DeviceMiniConfig,
         zone_did: DID,
         owner_did: DID,
     ) -> Self {
@@ -343,7 +341,6 @@ impl DIDDocumentTrait for DeviceConfig {
     // }
 }
 
-
 // describe a device runtime info
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeviceInfo {
@@ -352,7 +349,7 @@ pub struct DeviceInfo {
     pub arch: String,
     pub os: String, //linux,windows,apple
     pub update_time: u64,
-    
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
 
@@ -396,7 +393,6 @@ pub struct DeviceInfo {
     pub gpu_used_mem: Option<u64>, //gpu已用内存,单位是bytes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_load: Option<f32>, //gpu负载
-
 }
 
 impl Deref for DeviceInfo {
@@ -525,12 +521,10 @@ impl DeviceInfo {
         let mut sys = System::new_all();
         sys.refresh_all();
 
-        let test_socket = UdpSocket::bind("0.0.0.0:0").await;
-        if test_socket.is_ok() {
-            let test_socket = test_socket.unwrap();
-            test_socket.connect("8.8.8.8:80").await;
-            let local_addr = test_socket.local_addr().unwrap();
-            self.device_doc.ips.push(local_addr.ip());
+        let discovered_ips = collect_reachable_ip_addrs();
+        self.all_ip = discovered_ips.clone();
+        for ip in discovered_ips {
+            push_unique_ip(&mut self.device_doc.ips, ip);
         }
 
         // Get OS information
@@ -696,7 +690,431 @@ impl DeviceInfo {
     }
 }
 
+fn push_unique_ip(ips: &mut Vec<IpAddr>, ip: IpAddr) {
+    if !ips.contains(&ip) {
+        ips.push(ip);
+    }
+}
 
+fn collect_reachable_ip_addrs() -> Vec<IpAddr> {
+    let mut ips = collect_reachable_ip_addrs_from_command()
+        .filter(|ips| !ips.is_empty())
+        .unwrap_or_else(collect_reachable_ip_addrs_from_sysinfo);
+    ips.retain(|ip| should_collect_ip(*ip));
+
+    let mut deduped = Vec::with_capacity(ips.len());
+    for ip in ips {
+        push_unique_ip(&mut deduped, ip);
+    }
+    deduped
+}
+
+fn collect_reachable_ip_addrs_from_sysinfo() -> Vec<IpAddr> {
+    let networks = Networks::new_with_refreshed_list();
+    let mut ips = Vec::new();
+    for (_, network) in &networks {
+        for ip_network in network.ip_networks() {
+            if should_collect_ip(ip_network.addr) {
+                push_unique_ip(&mut ips, ip_network.addr);
+            }
+        }
+    }
+    ips
+}
+
+fn collect_reachable_ip_addrs_from_command() -> Option<Vec<IpAddr>> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = run_command_stdout("ip", &["-j", "addr", "show"])?;
+        return Some(parse_linux_ip_addr_output(&output));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = run_command_stdout("ifconfig", &[])?;
+        return Some(parse_macos_ifconfig_output(&output));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let powershell_args = [
+            "-NoProfile",
+            "-Command",
+            "Get-NetIPAddress | Select-Object IPAddress,AddressFamily,InterfaceOperationalStatus,SkipAsSource,AddressState,Type,PrefixOrigin,SuffixOrigin | ConvertTo-Json -Depth 3",
+        ];
+        let output = run_command_stdout("powershell.exe", &powershell_args)
+            .or_else(|| run_command_stdout("powershell", &powershell_args))?;
+        return Some(parse_windows_net_ip_address_output(&output));
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+fn run_command_stdout(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn parse_linux_ip_addr_output(output: &str) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    let interfaces: serde_json::Value = match serde_json::from_str(output) {
+        Ok(value) => value,
+        Err(_) => return ips,
+    };
+
+    let Some(interfaces) = interfaces.as_array() else {
+        return ips;
+    };
+
+    for interface in interfaces {
+        let is_up = interface
+            .get("operstate")
+            .and_then(|value| value.as_str())
+            .map(|state| matches!(state, "UP" | "UNKNOWN"))
+            .unwrap_or(true);
+        if !is_up {
+            continue;
+        }
+
+        let Some(addr_infos) = interface
+            .get("addr_info")
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+
+        for addr_info in addr_infos {
+            let Some(local) = addr_info.get("local").and_then(|value| value.as_str()) else {
+                continue;
+            };
+
+            let scope = addr_info
+                .get("scope")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if matches!(scope, "host" | "nowhere") {
+                continue;
+            }
+
+            if linux_addr_is_ephemeral(addr_info) {
+                continue;
+            }
+
+            let Ok(ip) = local.parse::<IpAddr>() else {
+                continue;
+            };
+
+            if should_collect_ip(ip) {
+                push_unique_ip(&mut ips, ip);
+            }
+        }
+    }
+
+    ips
+}
+
+fn linux_addr_is_ephemeral(addr_info: &serde_json::Value) -> bool {
+    if addr_info
+        .get("temporary")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if addr_info
+        .get("deprecated")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let Some(flags) = addr_info.get("flags").and_then(|value| value.as_array()) else {
+        return false;
+    };
+
+    flags.iter().filter_map(|value| value.as_str()).any(|flag| {
+        matches!(
+            flag,
+            "temporary" | "deprecated" | "tentative" | "dadfailed" | "optimistic"
+        )
+    })
+}
+
+fn parse_macos_ifconfig_output(output: &str) -> Vec<IpAddr> {
+    #[derive(Default)]
+    struct InterfaceBlock {
+        is_up: bool,
+        is_running: bool,
+        is_active: Option<bool>,
+        addrs: Vec<IpAddr>,
+    }
+
+    let mut ips = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_block = InterfaceBlock::default();
+
+    let mut flush_current = |ips: &mut Vec<IpAddr>,
+                             current_name: &mut Option<String>,
+                             current_block: &mut InterfaceBlock| {
+        if current_name.is_some()
+            && current_block.is_up
+            && current_block.is_running
+            && current_block.is_active.unwrap_or(true)
+        {
+            for ip in current_block.addrs.drain(..) {
+                push_unique_ip(ips, ip);
+            }
+        } else {
+            current_block.addrs.clear();
+        }
+        *current_name = None;
+        *current_block = InterfaceBlock::default();
+    };
+
+    for line in output.lines() {
+        let starts_with_whitespace = line
+            .chars()
+            .next()
+            .map(|ch| ch.is_whitespace())
+            .unwrap_or(false);
+        if !starts_with_whitespace {
+            flush_current(&mut ips, &mut current_name, &mut current_block);
+            current_name = line
+                .split_once(':')
+                .map(|(name, _)| name.trim().to_string())
+                .filter(|name| !name.is_empty());
+
+            let flags = line
+                .split_once('<')
+                .and_then(|(_, rest)| rest.split_once('>'))
+                .map(|(flags, _)| flags)
+                .unwrap_or_default();
+            current_block.is_up = flags.split(',').any(|flag| flag == "UP");
+            current_block.is_running = flags.split(',').any(|flag| flag == "RUNNING");
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if let Some(status) = trimmed.strip_prefix("status:") {
+            current_block.is_active = Some(status.trim() == "active");
+            continue;
+        }
+
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+
+        let family = tokens[0];
+        if family != "inet" && family != "inet6" {
+            continue;
+        }
+
+        let addr_token = tokens[1];
+        let attrs = &tokens[2..];
+
+        if macos_addr_is_ephemeral(family, attrs) {
+            continue;
+        }
+
+        let addr_without_zone = addr_token.split('%').next().unwrap_or(addr_token);
+        let Ok(ip) = addr_without_zone.parse::<IpAddr>() else {
+            continue;
+        };
+
+        if should_collect_ip(ip) {
+            current_block.addrs.push(ip);
+        }
+    }
+
+    flush_current(&mut ips, &mut current_name, &mut current_block);
+    ips
+}
+
+fn parse_windows_net_ip_address_output(output: &str) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    let json: serde_json::Value = match serde_json::from_str(output) {
+        Ok(value) => value,
+        Err(_) => return ips,
+    };
+
+    let entries: Vec<&serde_json::Value> = match &json {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(_) => vec![&json],
+        _ => return ips,
+    };
+
+    for entry in entries {
+        if entry
+            .get("InterfaceOperationalStatus")
+            .and_then(|value| value.as_str())
+            .map(|status| status != "Up")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if entry
+            .get("SkipAsSource")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if entry
+            .get("Type")
+            .and_then(|value| value.as_str())
+            .map(|addr_type| addr_type != "Unicast")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if entry
+            .get("AddressState")
+            .and_then(|value| value.as_str())
+            .map(|state| state != "Preferred")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let Some(ip_str) = entry.get("IPAddress").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Ok(ip) = ip_str.parse::<IpAddr>() else {
+            continue;
+        };
+
+        if windows_addr_is_ephemeral(entry, ip) {
+            continue;
+        }
+
+        if !windows_address_family_matches(entry, ip) {
+            continue;
+        }
+
+        if should_collect_ip(ip) {
+            push_unique_ip(&mut ips, ip);
+        }
+    }
+
+    ips
+}
+
+fn windows_addr_is_ephemeral(entry: &serde_json::Value, ip: IpAddr) -> bool {
+    if !ip.is_ipv6() {
+        return false;
+    }
+
+    if entry
+        .get("SuffixOrigin")
+        .and_then(|value| value.as_str())
+        .map(|origin| origin == "Random")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    entry
+        .get("AddressState")
+        .and_then(|value| value.as_str())
+        .map(|state| matches!(state, "Deprecated" | "Tentative" | "Duplicate" | "Invalid"))
+        .unwrap_or(false)
+}
+
+fn windows_address_family_matches(entry: &serde_json::Value, ip: IpAddr) -> bool {
+    match entry.get("AddressFamily") {
+        Some(serde_json::Value::String(family)) => {
+            matches!(
+                (family.as_str(), ip),
+                ("IPv4", IpAddr::V4(_)) | ("IPv6", IpAddr::V6(_))
+            )
+        }
+        Some(serde_json::Value::Number(family)) => {
+            matches!(
+                (family.as_u64(), ip),
+                (Some(2), IpAddr::V4(_)) | (Some(23), IpAddr::V6(_))
+            )
+        }
+        _ => true,
+    }
+}
+
+fn macos_addr_is_ephemeral(family: &str, attrs: &[&str]) -> bool {
+    if family != "inet6" {
+        return false;
+    }
+
+    attrs.iter().any(|attr| {
+        matches!(
+            *attr,
+            "temporary" | "deprecated" | "tentative" | "duplicated" | "detached"
+        )
+    })
+}
+
+fn should_collect_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => should_collect_ipv4(ipv4),
+        IpAddr::V6(ipv6) => should_collect_ipv6(ipv6),
+    }
+}
+
+fn should_collect_ipv4(ip: Ipv4Addr) -> bool {
+    if ip.is_loopback()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+    {
+        return false;
+    }
+
+    true
+}
+
+fn should_collect_ipv6(ip: Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local() {
+        return false;
+    }
+
+    let segments = ip.segments();
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return false;
+    }
+
+    if segments[0] == 0x2002 {
+        return false;
+    }
+
+    if segments[0] == 0x2001 && segments[1] == 0x0000 {
+        return false;
+    }
+
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0 && segments[3] == 0 {
+        return false;
+    }
+
+    if segments[0] == 0
+        && segments[1] == 0
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0xffff
+    {
+        return false;
+    }
+
+    true
+}
 
 //DeviceMiniInfo 用于激活协议，或向非Zone内用户展示设备信息的场景。不包含敏感信息。
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -706,9 +1124,9 @@ pub struct DeviceMiniInfo {
     pub arch: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_os_info: Option<String>,
-    pub state:String,//actived,inactive,error
+    pub state: String, //actived,inactive,error
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_url:Option<String>,
+    pub active_url: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_info: Option<String>,
@@ -821,7 +1239,6 @@ impl DeviceMiniInfo {
         self.total_space = Some(total_space);
         self.disk_usage = Some(used_space);
 
-
         // First try NVIDIA GPU
         let nvidia_info = match nvml_wrapper::Nvml::init() {
             Ok(nvml) => {
@@ -931,6 +1348,137 @@ mod tests {
         device_info.auto_fill_by_system_info().await.unwrap();
         let device_info_json = serde_json::to_string_pretty(&device_info).unwrap();
         println!("{}", device_info_json);
+    }
+
+    #[test]
+    fn test_filter_collectable_ip_addresses() {
+        assert!(should_collect_ip(
+            "2600:1700:1150:9440::27".parse().unwrap()
+        ));
+        assert!(should_collect_ip("fd00::1".parse().unwrap()));
+        assert!(should_collect_ip("192.168.1.1".parse().unwrap()));
+        assert!(should_collect_ip("169.254.1.1".parse().unwrap()));
+        assert!(!should_collect_ip("fe80::1".parse().unwrap()));
+        assert!(!should_collect_ip("2002:c000:0204::1".parse().unwrap()));
+        assert!(!should_collect_ip(
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap()
+        ));
+        assert!(!should_collect_ip("64:ff9b::c000:0204".parse().unwrap()));
+        assert!(!should_collect_ip("::ffff:192.0.2.128".parse().unwrap()));
+        assert!(!should_collect_ip("::1".parse().unwrap()));
+        assert!(!should_collect_ip("127.0.0.1".parse().unwrap()));
+        assert!(!should_collect_ip("224.0.0.1".parse().unwrap()));
+        assert!(!should_collect_ip("ff02::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_parse_macos_ifconfig_output() {
+        let output = r#"en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet6 fe80::c20:e642:71ec:a899%en0 prefixlen 64 secured scopeid 0xd
+	inet6 2600:1700:1150:9440:8a6:5e43:a1f2:980d prefixlen 64 autoconf secured
+	inet6 2600:1700:1150:9440:2011:5273:b721:1b9 prefixlen 64 deprecated autoconf temporary
+	inet6 2600:1700:1150:9440::27 prefixlen 64 dynamic
+	inet 192.168.1.143 netmask 0xffffff00 broadcast 192.168.1.255
+	status: active
+en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet6 2600:1700:1150:9440:71e1:db03:2c35:ffc1 prefixlen 64 autoconf temporary
+	status: inactive
+"#;
+
+        let ips = parse_macos_ifconfig_output(output);
+        assert_eq!(
+            ips,
+            vec![
+                "2600:1700:1150:9440:8a6:5e43:a1f2:980d"
+                    .parse::<IpAddr>()
+                    .unwrap(),
+                "2600:1700:1150:9440::27".parse::<IpAddr>().unwrap(),
+                "192.168.1.143".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_linux_ip_addr_output() {
+        let output = r#"[
+  {
+    "ifname": "eth0",
+    "operstate": "UP",
+    "addr_info": [
+      { "family": "inet", "local": "192.168.1.143", "scope": "global" },
+      { "family": "inet6", "local": "fe80::1", "scope": "link" },
+      { "family": "inet6", "local": "2404:6800:4008:80b::200e", "scope": "global" },
+      { "family": "inet6", "local": "2404:6800:4008:80b::200f", "scope": "global", "temporary": true },
+      { "family": "inet6", "local": "2404:6800:4008:80b::2010", "scope": "global", "flags": ["deprecated"] }
+    ]
+  },
+  {
+    "ifname": "eth1",
+    "operstate": "DOWN",
+    "addr_info": [
+      { "family": "inet6", "local": "2001:db8::1", "scope": "global" }
+    ]
+  }
+]"#;
+
+        let ips = parse_linux_ip_addr_output(output);
+        assert_eq!(
+            ips,
+            vec![
+                "192.168.1.143".parse::<IpAddr>().unwrap(),
+                "2404:6800:4008:80b::200e".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_windows_net_ip_address_output() {
+        let output = r#"[
+  {
+    "IPAddress": "192.168.1.143",
+    "AddressFamily": "IPv4",
+    "InterfaceOperationalStatus": "Up",
+    "SkipAsSource": false,
+    "AddressState": "Preferred",
+    "Type": "Unicast"
+  },
+  {
+    "IPAddress": "2600:1700:1150:9440::27",
+    "AddressFamily": "IPv6",
+    "InterfaceOperationalStatus": "Up",
+    "SkipAsSource": false,
+    "AddressState": "Preferred",
+    "Type": "Unicast",
+    "SuffixOrigin": "Link"
+  },
+  {
+    "IPAddress": "2600:1700:1150:9440:71e1:db03:2c35:ffc1",
+    "AddressFamily": "IPv6",
+    "InterfaceOperationalStatus": "Up",
+    "SkipAsSource": false,
+    "AddressState": "Preferred",
+    "Type": "Unicast",
+    "SuffixOrigin": "Random"
+  },
+  {
+    "IPAddress": "2600:1700:1150:9440::99",
+    "AddressFamily": "IPv6",
+    "InterfaceOperationalStatus": "Down",
+    "SkipAsSource": false,
+    "AddressState": "Preferred",
+    "Type": "Unicast",
+    "SuffixOrigin": "Link"
+  }
+]"#;
+
+        let ips = parse_windows_net_ip_address_output(output);
+        assert_eq!(
+            ips,
+            vec![
+                "192.168.1.143".parse::<IpAddr>().unwrap(),
+                "2600:1700:1150:9440::27".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 
     #[test]
@@ -1052,8 +1600,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let device_info2_str = serde_json::to_string(&device_info2).unwrap();
         println!("ood device_info2: {}", device_info2_str);
         let device_info3 = serde_json::from_str::<DeviceInfo>(&device_info2_str).unwrap();
-
-
 
         assert_eq!(device_config, decoded);
         assert_eq!(encoded, token2);

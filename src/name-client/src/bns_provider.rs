@@ -10,7 +10,7 @@ use crate::{HttpsProvider, NameInfo, NsProvider, RecordType};
 use async_trait::async_trait;
 use buckyos_kit::BuckyOSMachineConfig;
 use log::info;
-use name_lib::{DID, EncodedDocument, NSError, NSResult};
+use name_lib::{EncodedDocument, NSError, NSResult, DID};
 use serde_json::Value;
 use std::net::IpAddr;
 
@@ -33,7 +33,12 @@ impl BnsProvider {
                 BuckyOSMachineConfig::load_machine_config()
                     .and_then(|mc| mc.web3_bridge.get("bns").cloned())
             })
-            .or_else(|| BuckyOSMachineConfig::default().web3_bridge.get("bns").cloned())
+            .or_else(|| {
+                BuckyOSMachineConfig::default()
+                    .web3_bridge
+                    .get("bns")
+                    .cloned()
+            })
             .ok_or_else(|| NSError::Failed("web3_bridge.bns not set".to_string()))?;
 
         info!("bns provider using resolver host: {}", resolver_host);

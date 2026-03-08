@@ -5,14 +5,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use buckyos_kit::buckyos_get_unix_timestamp;
-use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::config::*;
 use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
-use crate::{DEFAULT_DID_DOC_TYPE, NameInfo, NsProvider, RecordType};
+use crate::{NameInfo, NsProvider, RecordType, DEFAULT_DID_DOC_TYPE};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -61,14 +61,17 @@ impl NsProvider for DnsProvider {
             };
             let name_server_configs = vec![NameServerConfig::new(dns_ip_addr, Protocol::Udp)];
             server_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
-            resolver = TokioResolver::builder_with_config(server_config, TokioConnectionProvider::default())
-                .build();
+            resolver = TokioResolver::builder_with_config(
+                server_config,
+                TokioConnectionProvider::default(),
+            )
+            .build();
         } else {
             resolver = TokioResolver::builder_tokio()
                 .map_err(|e| NSError::Failed(format!("create system resolver failed! {}", e)))?
                 .build();
         }
-       
+
         match record_type.unwrap_or(RecordType::A) {
             RecordType::TXT => {
                 //TODO: 这里似乎有崩溃bug，需要排查
@@ -77,10 +80,7 @@ impl NsProvider for DnsProvider {
                 if response.is_err() {
                     let err = response.err().unwrap();
                     warn!("lookup txt failed! {}", err.to_string());
-                    return Err(NSError::Failed(format!(
-                        "lookup txt failed! {}",
-                        err
-                    )));
+                    return Err(NSError::Failed(format!("lookup txt failed! {}", err)));
                 }
 
                 let response = response.unwrap();
@@ -89,16 +89,19 @@ impl NsProvider for DnsProvider {
                     let txt = record
                         .txt_data()
                         .iter()
-                        .map(|s| -> String {
-                            String::from_utf8_lossy(s).to_string()
-                        })
+                        .map(|s| -> String { String::from_utf8_lossy(s).to_string() })
                         .collect::<Vec<String>>()
                         .join("");
                     txt_vec.push(txt);
                 }
 
                 info!("lookup txt success! {}", name);
-                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(300);
+                let ttl = response
+                    .as_lookup()
+                    .record_iter()
+                    .next()
+                    .map(|r| r.ttl())
+                    .unwrap_or(300);
                 let name_info = NameInfo {
                     name: name.to_string(),
                     address: Vec::new(),
@@ -125,7 +128,12 @@ impl NsProvider for DnsProvider {
                 for ip in response.iter() {
                     addrs.push(ip);
                 }
-                let ttl = response.as_lookup().record_iter().next().map(|r| r.ttl()).unwrap_or(0);
+                let ttl = response
+                    .as_lookup()
+                    .record_iter()
+                    .next()
+                    .map(|r| r.ttl())
+                    .unwrap_or(0);
                 let name_info = NameInfo {
                     name: name.to_string(),
                     address: addrs,
@@ -147,9 +155,10 @@ impl NsProvider for DnsProvider {
                         name, e
                     ))
                 })?;
-                let response = resolver.reverse_lookup(ip).await.map_err(|e| {
-                    NSError::Failed(format!("reverse lookup failed! {}", e))
-                })?;
+                let response = resolver
+                    .reverse_lookup(ip)
+                    .await
+                    .map_err(|e| NSError::Failed(format!("reverse lookup failed! {}", e)))?;
 
                 let mut ptr_records = Vec::new();
                 for ptr in response.iter() {
@@ -190,7 +199,7 @@ impl NsProvider for DnsProvider {
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         info!("NsProvider query did: {} ...", did.to_host_name());
-        
+
         let name_info = self
             .query(&did.to_host_name(), Some(RecordType::TXT), None)
             .await?;
@@ -203,14 +212,24 @@ impl NsProvider for DnsProvider {
         let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
         let did_document = new_name_info.get_did_document(doc_type);
         if did_document.is_some() {
-            info!("NsProvider::query_did{}: DID Document found: {}", did.to_host_name(), doc_type);
+            info!(
+                "NsProvider::query_did{}: DID Document found: {}",
+                did.to_host_name(),
+                doc_type
+            );
             return Ok(did_document.unwrap().clone());
         }
-        warn!("NsProvider::query_did{}: DID Document not found: {}", did.to_host_name(), doc_type);
-        return Err(NSError::NotFound(format!("DID Document not found: {}", doc_type)));
+        warn!(
+            "NsProvider::query_did{}: DID Document not found: {}",
+            did.to_host_name(),
+            doc_type
+        );
+        return Err(NSError::NotFound(format!(
+            "DID Document not found: {}",
+            doc_type
+        )));
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -227,32 +246,53 @@ mod tests {
         let result = result.unwrap();
         assert!(result.address.len() > 0, "address should not be empty");
 
-        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), None, None).await;
+        let result = dns_provider
+            .query_did(
+                &DID::from_str("did:web:test.buckyos.io").unwrap(),
+                None,
+                None,
+            )
+            .await;
         assert!(result.is_ok(), "query_did should succeed");
         let result = result.unwrap();
         let result_str = result.to_string();
         println!("* result_str: {}", result_str);
 
-
-        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), Some("boot"), None).await;
+        let result = dns_provider
+            .query_did(
+                &DID::from_str("did:web:test.buckyos.io").unwrap(),
+                Some("boot"),
+                None,
+            )
+            .await;
         assert!(result.is_ok(), "query_did should succeed");
         let result = result.unwrap();
         let result_str = result.to_string();
         println!("* result_str: {}", result_str);
 
-        let result = dns_provider.query_did(&DID::from_str("did:web:test.buckyos.io").unwrap(), Some("owner"), None).await;
+        let result = dns_provider
+            .query_did(
+                &DID::from_str("did:web:test.buckyos.io").unwrap(),
+                Some("owner"),
+                None,
+            )
+            .await;
         assert!(result.is_ok(), "query_did should succeed");
         let result = result.unwrap();
         let result_str = result.to_string();
         println!("* result_str: {}", result_str);
 
-        let result = dns_provider.query_did(&DID::from_str(" filebrowser.buckyos.web3.devtests.org").unwrap(), None, None).await;
+        let result = dns_provider
+            .query_did(
+                &DID::from_str(" filebrowser.buckyos.web3.devtests.org").unwrap(),
+                None,
+                None,
+            )
+            .await;
         if result.is_err() {
             let err = result.err().unwrap();
             warn!("query_did failed! {}", err.to_string());
         }
-
-       
 
         println!("✓ test_dns_provider passed");
     }

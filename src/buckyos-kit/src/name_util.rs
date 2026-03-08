@@ -146,7 +146,10 @@ pub fn is_valid_name(name: &str, name_type: NameType) -> bool {
     if name.len() < MIN_LEN {
         return false;
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
         return false;
     }
 

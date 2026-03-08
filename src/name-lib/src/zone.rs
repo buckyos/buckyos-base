@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use crate::create_jwt_by_x;
 use crate::get_x_from_jwk;
-use crate::DEFAULT_EXPIRE_TIME;
 use crate::user::OwnerConfig;
+use crate::DEFAULT_EXPIRE_TIME;
 
 use crate::DID;
 use crate::{DeviceConfig, DeviceInfo};
@@ -41,7 +41,7 @@ pub(crate) struct VerificationMethodNode {
     #[serde(rename = "controller")]
     pub key_controller: String,
     #[serde(rename = "publicKeyJwk")]
-    pub public_key: Jwk
+    pub public_key: Jwk,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -288,7 +288,7 @@ pub struct ZoneBootConfig {
 }
 
 impl ZoneBootConfig {
-    pub fn to_zone_config(&self,boot_jwt: &String) -> ZoneConfig {
+    pub fn to_zone_config(&self, boot_jwt: &String) -> ZoneConfig {
         let owenr_did = if self.owner.is_some() {
             self.owner.clone().unwrap()
         } else {
@@ -299,7 +299,7 @@ impl ZoneBootConfig {
             owenr_did,
             self.owner_key.clone().unwrap(),
         );
-        result.init_by_boot_config(self,boot_jwt);
+        result.init_by_boot_config(self, boot_jwt);
         return result;
     }
 
@@ -347,7 +347,6 @@ impl ZoneBootConfig {
         return Ok(EncodedDocument::Jwt(token));
     }
 
-
     pub fn decode(doc: &EncodedDocument, key: Option<&DecodingKey>) -> NSResult<Self>
     where
         Self: Sized,
@@ -375,9 +374,7 @@ impl ZoneBootConfig {
             }
         }
     }
-
 }
-
 
 //     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
 //         if kid.is_none() {
@@ -407,9 +404,6 @@ impl ZoneBootConfig {
 //         }
 //         return None;
 //     }
-
-
-
 
 /*
 How to use OODInfo & ZoneBootInfo
@@ -459,7 +453,7 @@ pub struct VerifyHubInfo {
 pub struct ZoneConfig {
     #[serde(rename = "@context", default = "default_context")]
     pub context: String,
-    pub id: DID,//zone did
+    pub id: DID, //zone did
     #[serde(rename = "verificationMethod")]
     verification_method: Vec<VerificationMethodNode>,
     authentication: Vec<String>,
@@ -479,13 +473,13 @@ pub struct ZoneConfig {
     pub hostname: String,
     pub owner: DID,
     pub oods: Vec<OODDescriptionString>,
-    pub boot_jwt:String,
+    pub boot_jwt: String,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub devices: HashMap<String, DeviceConfig>,
     // Since all Gateways on Nodes are homogeneous, this may not need to be configured? The Gateway on whichever Node the DNS record resolves to is the ZoneGateway
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sn: Option<String>, 
+    pub sn: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_repo_base_url: Option<String>,
@@ -503,7 +497,7 @@ impl ZoneConfig {
                 key_type: "Ed25519VerificationKey2020".to_string(),
                 key_id: "#main_key".to_string(),
                 key_controller: owner_did.to_string(),
-                public_key: public_key
+                public_key: public_key,
             }],
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
@@ -554,7 +548,7 @@ impl ZoneConfig {
         return None;
     }
 
-    pub fn init_by_boot_config(&mut self, boot_config: &ZoneBootConfig,boot_jwt: &String) {
+    pub fn init_by_boot_config(&mut self, boot_config: &ZoneBootConfig, boot_jwt: &String) {
         self.boot_jwt = boot_jwt.clone();
         self.id = boot_config.id.clone().unwrap();
         self.oods = boot_config.oods.clone();
@@ -576,7 +570,6 @@ impl ZoneConfig {
     pub fn get_device_config(&self, device_name: &str) -> Option<&DeviceConfig> {
         return self.devices.get(device_name);
     }
-
 
     pub fn select_same_subnet_ood(&self, device_info: &DeviceInfo) -> Option<String> {
         let mut ood_list = self.oods.clone();
@@ -741,16 +734,15 @@ impl DIDDocumentTrait for ZoneConfig {
     // }
 }
 
-
 // unit tests that depend on external crates are behind an opt-in feature
 
 mod tests {
     use super::super::*;
     use super::*;
 
+    use jsonwebtoken::{DecodingKey, EncodingKey};
     use serde::de;
     use serde_json::json;
-    use jsonwebtoken::{DecodingKey, EncodingKey};
     use std::{
         alloc::System,
         hash::Hash,
@@ -901,7 +893,8 @@ mod tests {
         let decode_device_config = DeviceConfig::decode(&device_jwt2, Some(&decode_key)).unwrap();
         assert_eq!(device_config, decode_device_config);
 
-        let device_mini_doc : DeviceMiniConfig = DeviceMiniConfig::new_by_device_config(&device_config);
+        let device_mini_doc: DeviceMiniConfig =
+            DeviceMiniConfig::new_by_device_config(&device_config);
         let device_mini_doc_jwt = device_mini_doc.to_jwt(&owner_private_key).unwrap();
         println!("device mini doc jwt: {}", device_mini_doc_jwt);
 
@@ -995,8 +988,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let owner_x = get_x_from_jwk(&owner_jwk).unwrap();
         assert_eq!(auth_key_x, owner_x);
     }
-
-    
 
     #[test]
     fn test_ood_description_string_from_str_ood() {
@@ -1715,6 +1706,4 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(zone_config, decoded);
         assert_eq!(encoded, token2);
     }
-
-   
 }

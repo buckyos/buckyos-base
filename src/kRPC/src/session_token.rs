@@ -1,7 +1,7 @@
 use crate::{RPCErrors, Result};
 use buckyos_kit::buckyos_get_unix_timestamp;
-use jsonwebtoken::{Algorithm, decode, DecodingKey, EncodingKey, Header, Validation, encode};
-use log::{debug,warn};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use log::{debug, warn};
 use name_lib::decode_jwt_claim_without_verify;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::HashMap;
@@ -234,7 +234,9 @@ impl RPCSessionToken {
             }
         }
 
-        let jti = decoded_json.get("jti").or_else(|| decoded_json.get("nonce"));
+        let jti = decoded_json
+            .get("jti")
+            .or_else(|| decoded_json.get("nonce"));
         if let Some(jti) = jti {
             if jti.is_null() {
                 self.jti = None;
@@ -417,15 +419,23 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             "appid": "appid",
             "new_field": "new.value",
         });
-        let new_session_token = serde_json::from_value::<RPCSessionToken>(session_token_with_extra).unwrap();
-        assert_eq!(new_session_token.extra.get("new_field").unwrap().as_str().unwrap(), "new.value");
+        let new_session_token =
+            serde_json::from_value::<RPCSessionToken>(session_token_with_extra).unwrap();
+        assert_eq!(
+            new_session_token
+                .extra
+                .get("new_field")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "new.value"
+        );
 
-        let  serialized = serde_json::to_string(&new_session_token).unwrap();
+        let serialized = serde_json::to_string(&new_session_token).unwrap();
         println!("serialized = {}", serialized);
         let new_serialized = format!("\n\n    {}   \n\n", serialized);
         let deserialized: RPCSessionToken = RPCSessionToken::from_string(&new_serialized).unwrap();
         assert_eq!(new_session_token, deserialized);
-
     }
 
     #[test]
@@ -466,7 +476,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_str(TEST_PUBLIC_JWK).unwrap();
         let public_key = DecodingKey::from_jwk(&jwk).unwrap();
 
-        token_to_verify.verify_by_key(&public_key).expect("verification should succeed");
+        token_to_verify
+            .verify_by_key(&public_key)
+            .expect("verification should succeed");
 
         assert_eq!(token_to_verify.sub.as_deref(), Some("user-123"));
         assert_eq!(token_to_verify.appid.as_deref(), Some("app-42"));

@@ -451,10 +451,8 @@ test:
 
     #[test]
     fn test_yaml_to_json_basic() {
-        let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(
-            "name: buckyos\nitems:\n  - 1\n  - 2\n",
-        )
-        .unwrap();
+        let yaml_value: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str("name: buckyos\nitems:\n  - 1\n  - 2\n").unwrap();
         let result = super::yaml_to_json(yaml_value).unwrap();
         assert_eq!(result["name"], json!("buckyos"));
         assert_eq!(result["items"][0], json!(1));

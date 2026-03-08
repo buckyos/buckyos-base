@@ -65,10 +65,10 @@ impl DingtalkNotifier {
             .send()
             .await
             .map_err(|e| {
-            let msg = format!("report to dingtalk error! {}", e);
-            error!("{}", msg);
-            msg
-        })?;
+                let msg = format!("report to dingtalk error! {}", e);
+                error!("{}", msg);
+                msg
+            })?;
 
         if !res.status().is_success() {
             let status = res.status();
