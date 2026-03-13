@@ -29,57 +29,57 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 "#;
 
 pub const DEFAULT_POLICY: &str = r#"
-
 p, kernel, /config/*, read|write,allow
-p, kernel, dfs://*, read|write,allow
-p, kernel, ndn://*, read|write,allow
-
-
 p, root, /config/*, read|write,allow
-p, root, dfs://*, read|write,allow
-p, root, ndn://*, read|write,allow
 
 p, ood,/config/*,read,allow
+p, ood,/config/agents/*/doc,read,allow
 p, ood,/config/users/*/apps/*,read|write,allow
 p, ood,/config/nodes/{device}/*,read|write,allow
 p, ood,/config/services/*,read|write,allow
 p, ood,/config/system/rbac/policy,read|write,allow
 
-p, client, /config/boot/*, read,allow
+p, client,/config/boot/*, read,allow
+p, client,/config/agents/*/doc,read,allow
 p, client,/config/devices/{device}/*,read,allow
 p, client,/config/devices/{device}/info,read|write,allow
 
 p, service, /config/boot/*, read,allow
+p, service, /config/agents/*/doc,read,allow
 p, service,/config/services/{service}/*,read|write,allow
 p, service,/config/services/*/info,read,allow
 p, service,/config/users*,read,allow
 p, service,/config/users/*/*,read,allow
 p, service,/config/system/*,read,allow
-p, service,dfs://system/data/{service}/*,read|write,allow
-p, service,dfs://system/cache/{service}/*,read|write,allow
+
 
 p, app, /config/boot/*, read,allow
+p, app, /config/agents/*/doc,read,allow
 p, app, /config/users/*/apps/{app}/settings,read|write,allow
-p, app, /config/users/*/apps/{app}/config,read,allow
+p, app, /config/users/*/apps/{app}/spec,read,allow
 p, app, /config/users/*/apps/{app}/info,read,allow
-p, app, dfs://users/*/appdata/{app}/*, read|write,allow
-p, app, dfs://users/*/cache/{app}/*, read|write,allow
+p, app, /config/services/*/info,read,allow
+
 p, admin, /config/boot/*, read,allow
+p, admin,/config/agents/*/doc,read|write,allow
 p, admin,/config/users/{user}/*,read|write,allow
-p, admin,dfs://users/{user}/*,read|write,allow
 p, admin,/config/services/*,read|write,allow
-p, admin,dfs://library/*,read|write,allow
-p, user, /config/boot/*, read,allow
+
+p, user,/config/boot/*, read,allow
+p, user,/config/agents/*/doc,read,allow
 p, user,/config/users/{user}/*,read,allow
 p, user,/config/users/{user}/apps/*/*,read|write,allow
-p, user,dfs://users/{user}/*,read|write,allow
-p, user,dfs://users/{user}/home/*,read|write,allow
-p, user,dfs://library/*,read,allow
+p, user,/config/services/*/info,read,allow
+
 
 g, node-daemon, kernel
 g, scheduler, kernel
 g, system-config, kernel
 g, verify-hub, kernel
+g, task-manager, kernel
+g, kmsg, kernel
+g, aicc, kernel
+g, msg-center, kernel
 g, control-panel, kernel
 g, buckycli, kernel
 g, cyfs-gateway, kernel
@@ -268,6 +268,7 @@ g, alice,admin
 g, smb-service,service
 g, repo-service,service
 g, bob,user
+g, jarvis,app
 p, su_bob,/config/users/bob/*,read|write,allow
         "#;
         create_enforcer(None, Some(&policy_str)).await.unwrap();
@@ -276,6 +277,14 @@ p, su_bob,/config/users/bob/*,read|write,allow
         assert_eq!(
             enforce("ood1", Some("node-daemon"), "/config/boot/config", "write").await,
             false
+        );
+        assert_eq!(
+            enforce("jarvis", Some("bob"), "/config/agents/jarvis/doc", "read").await,
+            true
+        );
+        assert_eq!(
+            enforce("jarvis", Some("bob"), "/config/services/task-manager/info", "read").await,
+            true
         );
         assert_eq!(
             enforce(
@@ -375,26 +384,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
             .await,
             true
         );
-        assert_eq!(
-            enforce(
-                "bob",
-                Some("control-panel"),
-                "dfs://library/photos/1.jpg",
-                "read"
-            )
-            .await,
-            true
-        );
-        assert_eq!(
-            enforce(
-                "bob",
-                Some("control-panel"),
-                "dfs://library/photos/1.jpg",
-                "write"
-            )
-            .await,
-            false
-        );
+     
         assert_eq!(
             enforce(
                 "ood1",
@@ -414,7 +404,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "/config/users/alice/apps/app1/config",
+                "/config/users/alice/apps/app1/spec",
                 "read"
             )
             .await,
@@ -424,7 +414,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
             enforce(
                 "alice",
                 Some("app1"),
-                "/config/users/alice/apps/app1/config",
+                "/config/users/alice/apps/app1/spec",
                 "write"
             )
             .await,
@@ -450,26 +440,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
             .await,
             false
         );
-        assert_eq!(
-            enforce(
-                "alice",
-                Some("control-panel"),
-                "dfs://library/photos/1.jpg",
-                "read"
-            )
-            .await,
-            true
-        );
-        assert_eq!(
-            enforce(
-                "alice",
-                Some("control-panel"),
-                "dfs://library/photos/1.jpg",
-                "write"
-            )
-            .await,
-            true
-        );
+      
         assert_eq!(
             enforce(
                 "root",
@@ -480,48 +451,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
             .await,
             true
         );
-        //can read and write appdata
-        assert_eq!(
-            enforce(
-                "alice",
-                Some("app1"),
-                "dfs://users/alice/appdata/app1/readme.txt",
-                "write"
-            )
-            .await,
-            true
-        );
-        assert_eq!(
-            enforce(
-                "alice",
-                Some("app1"),
-                "dfs://users/alice/appdata/app1/readme.txt",
-                "read"
-            )
-            .await,
-            true
-        );
-        //can read and write cache
-        assert_eq!(
-            enforce(
-                "alice",
-                Some("app1"),
-                "dfs://users/alice/cache/app1/readme_cache.txt",
-                "write"
-            )
-            .await,
-            true
-        );
-        assert_eq!(
-            enforce(
-                "alice",
-                Some("app1"),
-                "dfs://users/alice/cache/app1/readme_cache.txt",
-                "read"
-            )
-            .await,
-            true
-        );
+
 
         //can not read and write app2
         assert_eq!(
