@@ -38,6 +38,7 @@ p, ood,/config/users/*/apps/*,read|write,allow
 p, ood,/config/nodes/{device}/*,read|write,allow
 p, ood,/config/services/*,read|write,allow
 p, ood,/config/system/rbac/policy,read|write,allow
+p, ood,/config/system/scheduler/*,read|write,allow
 
 p, client,/config/boot/*, read,allow
 p, client,/config/agents/*/doc,read,allow
@@ -51,13 +52,14 @@ p, service,/config/services/*/info,read,allow
 p, service,/config/users*,read,allow
 p, service,/config/users/*/*,read,allow
 p, service,/config/system/*,read,allow
-
+p, scheduler,/config/services/*/*,read|write,allow
+p, scheduler,/config/system/scheduler/*,read|write,allow
 
 p, app, /config/boot/*, read,allow
 p, app, /config/agents/*/doc,read,allow
 p, app, /config/users/*/apps/{app}/settings,read|write,allow
 p, app, /config/users/*/apps/{app}/spec,read,allow
-p, app, /config/users/*/apps/{app}/info,read,allow
+p, app, /config/users/*/apps/{app}/info,read|write,allow
 p, app, /config/services/*/info,read,allow
 
 p, admin, /config/boot/*, read,allow
@@ -71,13 +73,13 @@ p, user,/config/users/{user}/*,read,allow
 p, user,/config/users/{user}/apps/*/*,read|write,allow
 p, user,/config/services/*/info,read,allow
 
-
 g, node-daemon, kernel
 g, scheduler, kernel
 g, system-config, kernel
 g, verify-hub, kernel
 g, task-manager, kernel
 g, kmsg, kernel
+g, repo-service, kernel
 g, aicc, kernel
 g, msg-center, kernel
 g, control-panel, kernel
@@ -279,6 +281,10 @@ p, su_bob,/config/users/bob/*,read|write,allow
             false
         );
         assert_eq!(
+            enforce("scheduler", Some("ood1"), "/config/system/scheduler/snapshot", "write").await,
+            true
+        );
+        assert_eq!(
             enforce("jarvis", Some("bob"), "/config/agents/jarvis/doc", "read").await,
             true
         );
@@ -438,7 +444,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "write"
             )
             .await,
-            false
+            true
         );
       
         assert_eq!(
