@@ -11,6 +11,9 @@ members = [
     "./rbac",
 ]
 
+[workspace.package]
+version = "0.6.0"
+
 [workspace.dependencies]
 # Async runtime and utilities
 tokio = { version = "1", features = ["full"] }
@@ -93,4 +96,3 @@ debug-lib = { path = "./debug-lib" }
 
 # Dev dependencies
 tempfile = "3.23.0"
-

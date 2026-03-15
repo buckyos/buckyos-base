@@ -1,6 +1,6 @@
 [package]
 name = "name-client"
-version = "0.5.1"
+version.workspace = true
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -35,4 +35,3 @@ kRPC = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-
