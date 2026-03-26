@@ -1087,6 +1087,10 @@ fn should_collect_ipv6(ip: Ipv6Addr) -> bool {
     }
 
     let segments = ip.segments();
+    if (segments[0] & 0xfe00) == 0xfc00 {
+        return false;
+    }
+
     if segments[0] == 0x2001 && segments[1] == 0x0db8 {
         return false;
     }
@@ -1355,7 +1359,7 @@ mod tests {
         assert!(should_collect_ip(
             "2600:1700:1150:9440::27".parse().unwrap()
         ));
-        assert!(should_collect_ip("fd00::1".parse().unwrap()));
+        assert!(!should_collect_ip("fd00::1".parse().unwrap()));
         assert!(should_collect_ip("192.168.1.1".parse().unwrap()));
         assert!(should_collect_ip("169.254.1.1".parse().unwrap()));
         assert!(!should_collect_ip("fe80::1".parse().unwrap()));
@@ -1407,6 +1411,7 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     "addr_info": [
       { "family": "inet", "local": "192.168.1.143", "scope": "global" },
       { "family": "inet6", "local": "fe80::1", "scope": "link" },
+      { "family": "inet6", "local": "fd42:7582::10", "scope": "global" },
       { "family": "inet6", "local": "2404:6800:4008:80b::200e", "scope": "global" },
       { "family": "inet6", "local": "2404:6800:4008:80b::200f", "scope": "global", "temporary": true },
       { "family": "inet6", "local": "2404:6800:4008:80b::2010", "scope": "global", "flags": ["deprecated"] }
@@ -1441,6 +1446,15 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     "SkipAsSource": false,
     "AddressState": "Preferred",
     "Type": "Unicast"
+  },
+  {
+    "IPAddress": "fd42:7582::10",
+    "AddressFamily": "IPv6",
+    "InterfaceOperationalStatus": "Up",
+    "SkipAsSource": false,
+    "AddressState": "Preferred",
+    "Type": "Unicast",
+    "SuffixOrigin": "Manual"
   },
   {
     "IPAddress": "2600:1700:1150:9440::27",
