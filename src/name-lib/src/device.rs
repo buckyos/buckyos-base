@@ -740,7 +740,7 @@ fn collect_reachable_ip_addrs_from_command() -> Option<Vec<IpAddr>> {
         let powershell_args = [
             "-NoProfile",
             "-Command",
-            "Get-NetIPAddress | Select-Object IPAddress,AddressFamily,InterfaceOperationalStatus,SkipAsSource,AddressState,Type,PrefixOrigin,SuffixOrigin | ConvertTo-Json -Depth 3",
+            "Get-NetIPAddress | Select-Object IPAddress,AddressFamily,InterfaceOperationalStatus,SkipAsSource,AddressState,Type,PrefixOrigin,SuffixOrigin,@{Name='AddressOrigin';Expression={ if ($_.PSObject.Properties['AddressOrigin']) { $_.AddressOrigin } else { $_.PrefixOrigin } }} | ConvertTo-Json -Depth 3",
         ];
         let output = run_command_stdout("powershell.exe", &powershell_args)
             .or_else(|| run_command_stdout("powershell", &powershell_args))?;
@@ -808,6 +808,10 @@ fn parse_linux_ip_addr_output(output: &str) -> Vec<IpAddr> {
                 continue;
             };
 
+            if ip.is_ipv6() && scope != "global" {
+                continue;
+            }
+
             if should_collect_ip(ip) {
                 push_unique_ip(&mut ips, ip);
             }
@@ -818,6 +822,15 @@ fn parse_linux_ip_addr_output(output: &str) -> Vec<IpAddr> {
 }
 
 fn linux_addr_is_ephemeral(addr_info: &serde_json::Value) -> bool {
+    if addr_info
+        .get("ifa_flags")
+        .and_then(|value| value.as_u64())
+        .map(|flags| (flags & 0x01) != 0)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
     if addr_info
         .get("temporary")
         .and_then(|value| value.as_bool())
@@ -1012,6 +1025,16 @@ fn parse_windows_net_ip_address_output(output: &str) -> Vec<IpAddr> {
 fn windows_addr_is_ephemeral(entry: &serde_json::Value, ip: IpAddr) -> bool {
     if !ip.is_ipv6() {
         return false;
+    }
+
+    if entry
+        .get("AddressOrigin")
+        .and_then(|value| value.as_str())
+        .or_else(|| entry.get("PrefixOrigin").and_then(|value| value.as_str()))
+        .map(|origin| !matches!(origin, "Dhcp" | "Manual"))
+        .unwrap_or(false)
+    {
+        return true;
     }
 
     if entry
@@ -1379,6 +1402,7 @@ mod tests {
     fn test_parse_macos_ifconfig_output() {
         let output = r#"en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	inet6 fe80::c20:e642:71ec:a899%en0 prefixlen 64 secured scopeid 0xd
+	inet6 fd42:7582::10 prefixlen 64 autoconf secured
 	inet6 2600:1700:1150:9440:8a6:5e43:a1f2:980d prefixlen 64 autoconf secured
 	inet6 2600:1700:1150:9440:2011:5273:b721:1b9 prefixlen 64 deprecated autoconf temporary
 	inet6 2600:1700:1150:9440::27 prefixlen 64 dynamic
@@ -1412,6 +1436,7 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
       { "family": "inet", "local": "192.168.1.143", "scope": "global" },
       { "family": "inet6", "local": "fe80::1", "scope": "link" },
       { "family": "inet6", "local": "fd42:7582::10", "scope": "global" },
+      { "family": "inet6", "local": "2404:6800:4008:80b::200d", "scope": "global", "ifa_flags": 1 },
       { "family": "inet6", "local": "2404:6800:4008:80b::200e", "scope": "global" },
       { "family": "inet6", "local": "2404:6800:4008:80b::200f", "scope": "global", "temporary": true },
       { "family": "inet6", "local": "2404:6800:4008:80b::2010", "scope": "global", "flags": ["deprecated"] }
@@ -1454,6 +1479,7 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     "SkipAsSource": false,
     "AddressState": "Preferred",
     "Type": "Unicast",
+    "AddressOrigin": "Manual",
     "SuffixOrigin": "Manual"
   },
   {
@@ -1463,6 +1489,7 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     "SkipAsSource": false,
     "AddressState": "Preferred",
     "Type": "Unicast",
+    "AddressOrigin": "Dhcp",
     "SuffixOrigin": "Link"
   },
   {
@@ -1472,7 +1499,18 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     "SkipAsSource": false,
     "AddressState": "Preferred",
     "Type": "Unicast",
+    "AddressOrigin": "Dhcp",
     "SuffixOrigin": "Random"
+  },
+  {
+    "IPAddress": "2600:1700:1150:9440::88",
+    "AddressFamily": "IPv6",
+    "InterfaceOperationalStatus": "Up",
+    "SkipAsSource": false,
+    "AddressState": "Preferred",
+    "Type": "Unicast",
+    "AddressOrigin": "RouterAdvertisement",
+    "SuffixOrigin": "Link"
   },
   {
     "IPAddress": "2600:1700:1150:9440::99",
@@ -1481,6 +1519,7 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     "SkipAsSource": false,
     "AddressState": "Preferred",
     "Type": "Unicast",
+    "AddressOrigin": "Dhcp",
     "SuffixOrigin": "Link"
   }
 ]"#;
