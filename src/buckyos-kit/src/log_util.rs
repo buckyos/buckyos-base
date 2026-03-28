@@ -105,7 +105,7 @@ pub fn init_logging(app_name: &str, is_service: bool) {
     let file_spec = FileSpec::default()
         .directory(log_dir.clone())
         .basename(format!("{}.{}", resolved_app_name, pid))
-        .o_suffix(Option::<String>::None);
+        .suffix("log");
 
     let logger = match Logger::try_with_str(settings.level.to_string()) {
         Ok(logger) => logger,
@@ -191,12 +191,18 @@ fn log_format(
     now: &mut DeferredNow,
     record: &Record<'_>,
 ) -> Result<(), std::io::Error> {
+    let file = record
+        .file()
+        .and_then(|path| Path::new(path).file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
     write!(
         writer,
         "{} {:<5} [{}:{}] {}",
         now.format("%m-%d %H:%M:%S%.3f"),
         record.level(),
-        record.file().unwrap_or("unknown"),
+        file,
         record.line().unwrap_or(0),
         record.args()
     )
