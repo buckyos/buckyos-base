@@ -267,7 +267,7 @@ fn resolve_log_settings(app_name: &str) -> ResolvedLogSettings {
 
 fn log_settings_paths() -> [PathBuf; 2] {
     [
-        get_buckyos_root_dir().join("log").join("log_settings.cfg"),
+        get_buckyos_root_dir().join("logs").join("log_settings.cfg"),
         get_buckyos_dev_user_home().join("log_settings.cfg"),
     ]
 }
