@@ -118,7 +118,8 @@ pub fn decode_json_from_jwt_with_default_pk(
         .map_err(|error| NSError::DecodeJWTError("JWT decode header error".to_string()))?;
 
     let public_key = DecodingKey::from_jwk(jwk).unwrap();
-    let validation = Validation::new(header.alg);
+    let mut validation = Validation::new(header.alg);
+    validation.validate_aud = false;
 
     let decoded_token = decode::<serde_json::Value>(jwt, &public_key, &validation)
         .map_err(|error| NSError::DecodeJWTError(format!("JWT decode error:{}", error)))?;
@@ -140,7 +141,8 @@ pub fn decode_json_from_jwt_with_pk(
     let header: jsonwebtoken::Header = jsonwebtoken::decode_header(jwt)
         .map_err(|error| NSError::DecodeJWTError("JWT decode header error".to_string()))?;
 
-    let validation = Validation::new(header.alg);
+    let mut validation = Validation::new(header.alg);
+    validation.validate_aud = false;
 
     let decoded_token = decode::<serde_json::Value>(jwt, pk, &validation)
         .map_err(|error| NSError::DecodeJWTError(format!("JWT decode error:{}", error)))?;
