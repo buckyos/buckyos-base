@@ -11,6 +11,9 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[derive(Error, Debug)]
 pub enum ServiceControlError {
     #[error("File not found: {0}")]
@@ -26,6 +29,18 @@ pub enum ServiceControlError {
 }
 
 type Result<T> = std::result::Result<T, ServiceControlError>;
+
+#[cfg(windows)]
+fn configure_command_for_platform(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    // Prevent console apps from flashing a transient window when invoked
+    // from a GUI/background process on Windows.
+    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_command_for_platform(_command: &mut Command) {}
 
 pub fn restart_program() -> std::io::Result<()> {
     let current_exe = env::current_exe()?;
@@ -107,6 +122,8 @@ pub async fn execute(
 ) -> Result<(i32, Vec<u8>)> {
     let (script_engine, is_script) = parse_script_file(path).await?;
     let mut command = Command::new(script_engine);
+    configure_command_for_platform(&mut command);
+
     if is_script {
         command.arg(path);
     }
@@ -182,5 +199,38 @@ pub async fn execute(
                 "Script execution timed out".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_captures_stdout_and_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let script_path = temp_dir.path().join("test_execute.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\necho hello\necho problem 1>&2\nexit 7\n",
+        )
+        .unwrap();
+
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+
+        let (status, output) = execute(&script_path, 5, None, None, None).await.unwrap();
+
+        assert_eq!(status, 7);
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "[stdout] hello\n[stderr] problem\n"
+        );
     }
 }

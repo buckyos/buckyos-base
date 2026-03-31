@@ -39,10 +39,4 @@ mod test {
         let now = buckyos_get_unix_timestamp();
         assert!(now > 0);
     }
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_execute() {
-        unimplemented!()
-    }
 }
