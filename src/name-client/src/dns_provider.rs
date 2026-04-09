@@ -33,6 +33,33 @@ impl DnsProvider {
         }
         Ok(Self { dns_server: None })
     }
+
+    fn build_resolver(&self) -> NSResult<TokioResolver> {
+        let mut builder = if let Some(dns_server) = &self.dns_server {
+            let dns_ip_addr = if let Ok(ip) = IpAddr::from_str(dns_server) {
+                SocketAddr::new(ip, 53)
+            } else {
+                SocketAddr::from_str(dns_server).map_err(|e| {
+                    NSError::ReadLocalFileError(format!("Invalid dns server: {}", e))
+                })?
+            };
+            let name_server_configs = vec![
+                NameServerConfig::new(dns_ip_addr, Protocol::Udp),
+                NameServerConfig::new(dns_ip_addr, Protocol::Tcp),
+            ];
+            let server_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
+            TokioResolver::builder_with_config(server_config, TokioConnectionProvider::default())
+        } else {
+            TokioResolver::builder_tokio()
+                .map_err(|e| NSError::Failed(format!("create system resolver failed! {}", e)))?
+        };
+
+        let resolver_opts = builder.options_mut();
+        resolver_opts.edns0 = true;
+        resolver_opts.try_tcp_on_error = true;
+
+        Ok(builder.build())
+    }
 }
 
 #[async_trait::async_trait]
@@ -47,30 +74,7 @@ impl NsProvider for DnsProvider {
         record_type: Option<RecordType>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<NameInfo> {
-        let mut server_config = ResolverConfig::default();
-        let resolver;
-        if self.dns_server.is_some() {
-            let dns_server = self.dns_server.clone().unwrap();
-            let dns_ip_addr = if let Ok(ip) = IpAddr::from_str(&dns_server) {
-                SocketAddr::new(ip, 53)
-            } else {
-                let dns_ip_addr = SocketAddr::from_str(&dns_server).map_err(|e| {
-                    NSError::ReadLocalFileError(format!("Invalid dns server: {}", e))
-                })?;
-                dns_ip_addr
-            };
-            let name_server_configs = vec![NameServerConfig::new(dns_ip_addr, Protocol::Udp)];
-            server_config = ResolverConfig::from_parts(None, vec![], name_server_configs);
-            resolver = TokioResolver::builder_with_config(
-                server_config,
-                TokioConnectionProvider::default(),
-            )
-            .build();
-        } else {
-            resolver = TokioResolver::builder_tokio()
-                .map_err(|e| NSError::Failed(format!("create system resolver failed! {}", e)))?
-                .build();
-        }
+        let resolver = self.build_resolver()?;
 
         match record_type.unwrap_or(RecordType::A) {
             RecordType::TXT => {
@@ -236,6 +240,30 @@ mod tests {
     use buckyos_kit::init_logging;
 
     use super::*;
+    use hickory_resolver::proto::xfer::Protocol;
+
+    #[test]
+    fn test_custom_dns_resolver_enables_edns0_and_tcp_fallback() {
+        let dns_provider = DnsProvider::new(Some("1.1.1.1".to_string()));
+        let resolver = dns_provider
+            .build_resolver()
+            .expect("resolver should build");
+
+        assert!(resolver.options().edns0, "edns0 should be enabled");
+        assert!(
+            resolver.options().try_tcp_on_error,
+            "tcp fallback should be enabled"
+        );
+
+        let protocols = resolver
+            .config()
+            .name_servers()
+            .iter()
+            .map(|server| server.protocol)
+            .collect::<Vec<_>>();
+        assert!(protocols.contains(&Protocol::Udp));
+        assert!(protocols.contains(&Protocol::Tcp));
+    }
 
     #[tokio::test]
     async fn test_dns_provider() {
