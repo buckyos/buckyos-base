@@ -739,6 +739,7 @@ fn collect_reachable_ip_addrs_from_command() -> Option<Vec<IpAddr>> {
     {
         let powershell_args = [
             "-NoProfile",
+            "-NonInteractive",
             "-Command",
             "Get-NetIPAddress | Select-Object IPAddress,AddressFamily,InterfaceOperationalStatus,SkipAsSource,AddressState,Type,PrefixOrigin,SuffixOrigin,@{Name='AddressOrigin';Expression={ if ($_.PSObject.Properties['AddressOrigin']) { $_.AddressOrigin } else { $_.PrefixOrigin } }} | ConvertTo-Json -Depth 3",
         ];
@@ -752,11 +753,28 @@ fn collect_reachable_ip_addrs_from_command() -> Option<Vec<IpAddr>> {
 }
 
 fn run_command_stdout(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_hidden_process_creation_flags());
+    }
+
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hidden_process_creation_flags() -> u32 {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 }
 
 fn parse_linux_ip_addr_output(output: &str) -> Vec<IpAddr> {
