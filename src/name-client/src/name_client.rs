@@ -273,6 +273,24 @@ mod tests {
         }))
     }
 
+    #[test]
+    fn test_nameinfo_matches_record_type_for_caa() {
+        let mut info = NameInfo::new("web3.buckyos.ai");
+        assert!(NameClient::nameinfo_matches_record_type(Some(RecordType::CAA), &info));
+
+        info.caa.push("0 issue \"letsencrypt.org\"".to_string());
+        assert!(NameClient::nameinfo_matches_record_type(Some(RecordType::CAA), &info));
+
+        let empty = NameInfo::default();
+        assert!(!NameClient::nameinfo_matches_record_type(Some(RecordType::CAA), &empty));
+    }
+
+    #[test]
+    fn test_record_type_from_str_and_to_string_for_caa() {
+        assert_eq!(RecordType::from_str("CAA"), Some(RecordType::CAA));
+        assert_eq!(RecordType::CAA.to_string(), "CAA");
+    }
+
     #[derive(Clone, Copy)]
     enum MockErr {
         NotFound,
