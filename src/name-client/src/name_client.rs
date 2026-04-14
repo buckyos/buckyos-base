@@ -152,6 +152,7 @@ impl NameClient {
             None => true,
             Some(RecordType::A) => info.address.iter().any(|ip| ip.is_ipv4()),
             Some(RecordType::AAAA) => info.address.iter().any(|ip| ip.is_ipv6()),
+            Some(RecordType::CAA) => !info.caa.is_empty() || !info.name.is_empty(),
             Some(RecordType::CNAME) => info.cname.is_some(),
             Some(RecordType::TXT) => !info.txt.is_empty() || !info.did_documents.is_empty(),
             Some(RecordType::PTR) => !info.ptr_records.is_empty(),

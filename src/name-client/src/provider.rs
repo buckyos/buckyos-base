@@ -10,6 +10,7 @@ pub const DEFAULT_DID_DOC_TYPE: &str = "zone";
 pub enum RecordType {
     A,     // IPv4 address
     AAAA,  // IPv6 address
+    CAA,   // Certification Authority Authorization record
     CNAME, // Alias record
     TXT,   // Text record
     SRV,   // Service record
@@ -30,6 +31,7 @@ impl RecordType {
         match s.to_uppercase().as_str() {
             "A" => Some(RecordType::A),
             "AAAA" => Some(RecordType::AAAA),
+            "CAA" => Some(RecordType::CAA),
             "CNAME" => Some(RecordType::CNAME),
             "TXT" => Some(RecordType::TXT),
             "SRV" => Some(RecordType::SRV),
@@ -45,6 +47,7 @@ impl RecordType {
         match self {
             RecordType::A => "A",
             RecordType::AAAA => "AAAA",
+            RecordType::CAA => "CAA",
             RecordType::CNAME => "CNAME",
             RecordType::TXT => "TXT",
             RecordType::SRV => "SRV",
@@ -85,6 +88,9 @@ pub struct NameInfo {
     pub txt: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
+    pub caa: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub ptr_records: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
@@ -103,6 +109,7 @@ impl Default for NameInfo {
             address: Vec::new(),
             cname: None,
             txt: Vec::new(),
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: 0,
@@ -125,6 +132,7 @@ impl NameInfo {
             address: vec![address],
             cname: None,
             txt: Vec::new(),
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: 0,
@@ -139,6 +147,7 @@ impl NameInfo {
             address: address_vec,
             cname: None,
             txt: Vec::new(),
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: 0,
@@ -426,6 +435,7 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: other_txt,
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
@@ -507,6 +517,7 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: Vec::new(),
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents,
             iat: buckyos_get_unix_timestamp(),
@@ -576,6 +587,7 @@ mod tests {
                 format!("PKX={};", owner_x),
                 format!("DEV={};", device_jwt),
             ],
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
@@ -625,6 +637,7 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: vec!["some-txt=value".to_string()],
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
@@ -652,6 +665,7 @@ mod tests {
             address: Vec::new(),
             cname: None,
             txt: Vec::new(),
+            caa: Vec::new(),
             ptr_records: Vec::new(),
             did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),

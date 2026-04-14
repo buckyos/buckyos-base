@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use buckyos_kit::buckyos_get_unix_timestamp;
 use hickory_resolver::config::*;
+use hickory_resolver::proto::rr::{RData, RecordType as HickoryRecordType};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::TokioResolver;
@@ -111,6 +112,38 @@ impl NsProvider for DnsProvider {
                     address: Vec::new(),
                     cname: None,
                     txt: txt_vec,
+                    caa: Vec::new(),
+                    ptr_records: Vec::new(),
+                    did_documents: HashMap::new(),
+                    iat: buckyos_get_unix_timestamp(),
+                    ttl: Some(ttl),
+                };
+                return Ok(name_info);
+            }
+            RecordType::CAA => {
+                info!("dns query CAA: {}", name);
+                let response = resolver.lookup(name, HickoryRecordType::CAA).await;
+                if response.is_err() {
+                    let err = response.err().unwrap();
+                    warn!("lookup caa failed! {}", err);
+                    return Err(NSError::Failed(format!("lookup caa failed! {}", err)));
+                }
+
+                let response = response.unwrap();
+                let ttl = response.record_iter().next().map(|r| r.ttl()).unwrap_or(300);
+                let caa = response
+                    .iter()
+                    .filter_map(|rdata| match rdata {
+                        RData::CAA(caa) => Some(caa.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let name_info = NameInfo {
+                    name: name.to_string(),
+                    address: Vec::new(),
+                    cname: None,
+                    txt: Vec::new(),
+                    caa,
                     ptr_records: Vec::new(),
                     did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
@@ -143,6 +176,7 @@ impl NsProvider for DnsProvider {
                     address: addrs,
                     cname: None,
                     txt: Vec::new(),
+                    caa: Vec::new(),
                     ptr_records: Vec::new(),
                     did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
@@ -180,6 +214,7 @@ impl NsProvider for DnsProvider {
                     address: Vec::new(),
                     cname: None,
                     txt: Vec::new(),
+                    caa: Vec::new(),
                     ptr_records,
                     did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),

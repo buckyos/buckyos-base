@@ -306,6 +306,7 @@ impl NsProvider for LocalConfigDnsProvider {
                 address: Vec::new(),
                 cname: None,
                 txt: Vec::new(),
+                caa: Vec::new(),
                 ptr_records,
                 ttl: None,
                 did_documents: HashMap::new(),
@@ -359,6 +360,7 @@ txt = [
 "PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;",
 "DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;"
 ]
+caa = ["0 issue \"letsencrypt.org\""]
 
 ["*.example.com"]
 ttl = 300
@@ -437,6 +439,18 @@ ptr_records = ["node1.example.com", "node1-alt.example.com"]
             .unwrap();
         assert_eq!(result.name, "www.example.com");
         assert_eq!(result.ttl.unwrap(), 300);
+
+        let result = provider
+            .query("www.example.com", Some(RecordType::CAA), None)
+            .await
+            .unwrap();
+        assert_eq!(result.caa, vec!["0 issue \"letsencrypt.org\"".to_string()]);
+
+        let result = provider
+            .query("mail.example.com", Some(RecordType::CAA), None)
+            .await
+            .unwrap();
+        assert!(result.caa.is_empty());
 
         // Test wildcard domain match
         let result = provider
