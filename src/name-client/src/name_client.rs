@@ -154,6 +154,7 @@ impl NameClient {
             Some(RecordType::AAAA) => info.address.iter().any(|ip| ip.is_ipv6()),
             Some(RecordType::CAA) => !info.caa.is_empty() || !info.name.is_empty(),
             Some(RecordType::CNAME) => info.cname.is_some(),
+            Some(RecordType::HTTPS) => !info.name.is_empty(),
             Some(RecordType::TXT) => !info.txt.is_empty() || !info.did_documents.is_empty(),
             Some(RecordType::PTR) => !info.ptr_records.is_empty(),
             _ => false,
@@ -289,6 +290,27 @@ mod tests {
     fn test_record_type_from_str_and_to_string_for_caa() {
         assert_eq!(RecordType::from_str("CAA"), Some(RecordType::CAA));
         assert_eq!(RecordType::CAA.to_string(), "CAA");
+    }
+
+    #[test]
+    fn test_nameinfo_matches_record_type_for_https() {
+        let info = NameInfo::new("web3.buckyos.ai");
+        assert!(NameClient::nameinfo_matches_record_type(
+            Some(RecordType::HTTPS),
+            &info
+        ));
+
+        let empty = NameInfo::default();
+        assert!(!NameClient::nameinfo_matches_record_type(
+            Some(RecordType::HTTPS),
+            &empty
+        ));
+    }
+
+    #[test]
+    fn test_record_type_from_str_and_to_string_for_https() {
+        assert_eq!(RecordType::from_str("HTTPS"), Some(RecordType::HTTPS));
+        assert_eq!(RecordType::HTTPS.to_string(), "HTTPS");
     }
 
     #[derive(Clone, Copy)]

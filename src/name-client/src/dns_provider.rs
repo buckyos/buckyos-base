@@ -151,6 +151,11 @@ impl NsProvider for DnsProvider {
                 };
                 return Ok(name_info);
             }
+            RecordType::HTTPS => {
+                let mut name_info = NameInfo::new(name);
+                name_info.ttl = Some(300);
+                return Ok(name_info);
+            }
             RecordType::A | RecordType::AAAA => {
                 info!("dns query ip: {}", name);
                 let response = resolver.lookup_ip(name).await;

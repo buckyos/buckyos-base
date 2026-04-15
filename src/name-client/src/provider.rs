@@ -12,6 +12,7 @@ pub enum RecordType {
     AAAA,  // IPv6 address
     CAA,   // Certification Authority Authorization record
     CNAME, // Alias record
+    HTTPS, // HTTPS/SVCB service binding record
     TXT,   // Text record
     SRV,   // Service record
     MX,    // Mail exchange record
@@ -33,6 +34,7 @@ impl RecordType {
             "AAAA" => Some(RecordType::AAAA),
             "CAA" => Some(RecordType::CAA),
             "CNAME" => Some(RecordType::CNAME),
+            "HTTPS" => Some(RecordType::HTTPS),
             "TXT" => Some(RecordType::TXT),
             "SRV" => Some(RecordType::SRV),
             "MX" => Some(RecordType::MX),
@@ -49,6 +51,7 @@ impl RecordType {
             RecordType::AAAA => "AAAA",
             RecordType::CAA => "CAA",
             RecordType::CNAME => "CNAME",
+            RecordType::HTTPS => "HTTPS",
             RecordType::TXT => "TXT",
             RecordType::SRV => "SRV",
             RecordType::MX => "MX",
