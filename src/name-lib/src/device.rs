@@ -404,17 +404,20 @@ impl Deref for DeviceInfo {
 }
 
 impl DeviceInfo {
+    fn current_arch() -> String {
+        match std::env::consts::ARCH {
+            "x86_64" => "amd64".to_string(),
+            "aarch64" => "aarch64".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     pub fn from_device_doc(device_doc: &DeviceConfig) -> Self {
         let os_type = Self::get_os_type();
 
-        #[cfg(all(target_arch = "x86_64"))]
-        let arch = "amd64";
-        #[cfg(all(target_arch = "aarch64"))]
-        let arch = "aarch64";
-
         let result_info = DeviceInfo {
             device_doc: device_doc.clone(),
-            arch: arch.to_string(),
+            arch: Self::current_arch(),
             os: os_type.to_string(),
             update_time: buckyos_get_unix_timestamp(),
             state: None,
@@ -478,11 +481,6 @@ impl DeviceInfo {
         let ip = ood_string.ip.clone();
         let os_type = Self::get_os_type();
 
-        #[cfg(all(target_arch = "x86_64"))]
-        let arch = "amd64";
-        #[cfg(all(target_arch = "aarch64"))]
-        let arch = "aarch64";
-
         let mut config = DeviceConfig::new(device_name.as_str(), did.id.to_string());
         if ip.is_some() {
             config.ips.push(ip.unwrap());
@@ -493,7 +491,7 @@ impl DeviceInfo {
         DeviceInfo {
             device_doc: config,
             state: Some("Ready".to_string()),
-            arch: arch.to_string(),
+            arch: Self::current_arch(),
             os: os_type.to_string(),
             update_time: buckyos_get_unix_timestamp(),
             base_os_info: None,
