@@ -13,6 +13,9 @@ toml = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+dashmap = "6"
+bincode = "1"
+redb = "2"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

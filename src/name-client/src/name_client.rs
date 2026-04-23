@@ -1,5 +1,9 @@
 #![allow(unused)]
 
+use crate::addr_rtt_db::{
+    CleanupReport, Config as AddrRttDbConfig, ConnectionOutcome, PersistencePolicy, RankedAddress,
+    RttDatabase, SortPolicy,
+};
 use crate::dns_provider::DnsProvider;
 use crate::doc_cache::{CacheBackend, DIDDocumentCache};
 use crate::name_query::NameQuery;
@@ -12,17 +16,21 @@ use name_lib::*;
 
 use log::*;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub const DEFAULT_PROVIDER_TRUST_LEVEL: i32 = 100;
 pub const ROOT_TRUST_LEVEL: i32 = 0;
 pub const DNS_TRUST_LEVEL: i32 = 16;
 
+#[derive(Clone)]
 pub struct NameClientConfig {
     pub enable_cache: bool,
     pub local_cache_dir: Option<String>,
     pub cache_backend: CacheBackend,
+    pub rtt_db_config: AddrRttDbConfig,
 }
 
 impl Default for NameClientConfig {
@@ -31,6 +39,7 @@ impl Default for NameClientConfig {
             enable_cache: true,
             local_cache_dir: None,
             cache_backend: CacheBackend::Filesystem,
+            rtt_db_config: AddrRttDbConfig::default(),
         }
     }
 }
@@ -38,6 +47,7 @@ pub struct NameClient {
     name_query: NameQuery,
     config: NameClientConfig,
     doc_cache: DIDDocumentCache,
+    addr_rtt_db: Arc<RttDatabase>,
     nameinfo_cache: Option<std::sync::Arc<RwLock<HashMap<String, NameInfo>>>>,
 }
 
@@ -68,11 +78,55 @@ impl NameClient {
             _ => None,
         };
 
+        let addr_rtt_db = Arc::new(Self::build_rtt_db(
+            config.rtt_db_config.clone(),
+            config.local_cache_dir.as_deref(),
+        ));
+
         Self {
             name_query,
             config: config,
             doc_cache,
+            addr_rtt_db,
             nameinfo_cache,
+        }
+    }
+
+    fn build_rtt_db(config: AddrRttDbConfig, local_cache_dir: Option<&str>) -> RttDatabase {
+        match &config.persistence {
+            PersistencePolicy::Storage { path, .. } => RttDatabase::open(path, config.clone())
+                .unwrap_or_else(|e| {
+                    warn!("open addr-rtt-db failed ({}), fallback to in-memory db", e);
+                    RttDatabase::new(AddrRttDbConfig {
+                        persistence: PersistencePolicy::None,
+                        ..config
+                    })
+                }),
+            PersistencePolicy::None => {
+                if let Some(cache_dir) = local_cache_dir {
+                    let path = PathBuf::from(cache_dir).join("addr-rtt.redb");
+                    let storage_config = AddrRttDbConfig {
+                        persistence: PersistencePolicy::Storage {
+                            path,
+                            auto_flush_interval: None,
+                        },
+                        ..config.clone()
+                    };
+                    let storage_path = match &storage_config.persistence {
+                        PersistencePolicy::Storage { path, .. } => path.clone(),
+                        PersistencePolicy::None => unreachable!(),
+                    };
+                    RttDatabase::open(storage_path, storage_config).unwrap_or_else(|e| {
+                        warn!(
+                            "init addr-rtt-db at cache dir failed ({}), fallback to in-memory db",
+                            e
+                        );
+                        RttDatabase::new(config)
+                    })
+                } else {
+                    RttDatabase::new(config)
+                }
+            }
         }
     }
 
@@ -145,6 +199,91 @@ impl NameClient {
             .query(real_name.as_str(), record_type)
             .await?;
         return Ok(name_info);
+    }
+
+    pub async fn resolve_with_local_ip(
+        &self,
+        name: &str,
+        record_type: Option<RecordType>,
+        local_ip: IpAddr,
+        port: u16,
+        policy: Option<&SortPolicy>,
+    ) -> NSResult<NameInfo> {
+        let mut name_info = self.resolve(name, record_type).await?;
+        if name_info.address.len() <= 1 {
+            return Ok(name_info);
+        }
+
+        name_info.address = self.rank_ip_addrs(local_ip, &name_info.address, port, policy);
+        Ok(name_info)
+    }
+
+    pub fn rank_ip_addrs(
+        &self,
+        local_ip: IpAddr,
+        addresses: &[IpAddr],
+        port: u16,
+        policy: Option<&SortPolicy>,
+    ) -> Vec<IpAddr> {
+        let socket_addrs: Vec<_> = addresses
+            .iter()
+            .copied()
+            .map(|addr| SocketAddr::new(addr, port))
+            .collect();
+        self.rank_socket_addrs(local_ip, &socket_addrs, policy)
+            .into_iter()
+            .map(|item| item.addr.ip())
+            .collect()
+    }
+
+    pub fn rank_socket_addrs(
+        &self,
+        local_ip: IpAddr,
+        addresses: &[SocketAddr],
+        policy: Option<&SortPolicy>,
+    ) -> Vec<RankedAddress> {
+        let default_policy;
+        let policy = match policy {
+            Some(policy) => policy,
+            None => {
+                default_policy = SortPolicy::default();
+                &default_policy
+            }
+        };
+        self.addr_rtt_db.rank(local_ip, addresses, policy)
+    }
+
+    pub fn get_address_stats(
+        &self,
+        local_ip: IpAddr,
+        remote: SocketAddr,
+    ) -> Option<crate::AddressStats> {
+        self.addr_rtt_db.get_stats(local_ip, remote)
+    }
+
+    pub fn record_connection_outcome(
+        &self,
+        local_ip: IpAddr,
+        remote: SocketAddr,
+        outcome: ConnectionOutcome,
+    ) -> NSResult<()> {
+        self.addr_rtt_db
+            .record(local_ip, remote, outcome)
+            .map_err(|e| NSError::Failed(format!("record addr-rtt outcome failed: {}", e)))
+    }
+
+    pub fn flush_rtt_db(&self) -> NSResult<()> {
+        self.addr_rtt_db
+            .flush()
+            .map_err(|e| NSError::Failed(format!("flush addr-rtt-db failed: {}", e)))
+    }
+
+    pub fn cleanup_rtt_db(&self) -> CleanupReport {
+        self.addr_rtt_db.cleanup()
+    }
+
+    pub fn forget_local_rtt(&self, local_ip: IpAddr) -> usize {
+        self.addr_rtt_db.forget_local(local_ip)
     }
 
     fn nameinfo_matches_record_type(record_type: Option<RecordType>, info: &NameInfo) -> bool {
@@ -257,6 +396,7 @@ impl NameClient {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use crate::{init_name_lib_ex, resolve_did};
 
@@ -277,13 +417,22 @@ mod tests {
     #[test]
     fn test_nameinfo_matches_record_type_for_caa() {
         let mut info = NameInfo::new("web3.buckyos.ai");
-        assert!(NameClient::nameinfo_matches_record_type(Some(RecordType::CAA), &info));
+        assert!(NameClient::nameinfo_matches_record_type(
+            Some(RecordType::CAA),
+            &info
+        ));
 
         info.caa.push("0 issue \"letsencrypt.org\"".to_string());
-        assert!(NameClient::nameinfo_matches_record_type(Some(RecordType::CAA), &info));
+        assert!(NameClient::nameinfo_matches_record_type(
+            Some(RecordType::CAA),
+            &info
+        ));
 
         let empty = NameInfo::default();
-        assert!(!NameClient::nameinfo_matches_record_type(Some(RecordType::CAA), &empty));
+        assert!(!NameClient::nameinfo_matches_record_type(
+            Some(RecordType::CAA),
+            &empty
+        ));
     }
 
     #[test]
@@ -406,6 +555,7 @@ mod tests {
             enable_cache: true,
             local_cache_dir: Some(tmp.to_string_lossy().to_string()),
             cache_backend,
+            ..Default::default()
         };
         NameClient::new(cfg)
     }
@@ -470,6 +620,7 @@ mod tests {
             enable_cache: true,
             local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
             cache_backend: CacheBackend::Filesystem,
+            ..Default::default()
         });
 
         client
@@ -497,6 +648,7 @@ mod tests {
             enable_cache: true,
             local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
             cache_backend: CacheBackend::Filesystem,
+            ..Default::default()
         });
 
         client_high
@@ -511,6 +663,7 @@ mod tests {
             enable_cache: true,
             local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
             cache_backend: CacheBackend::Filesystem,
+            ..Default::default()
         });
 
         client_low_only
@@ -534,6 +687,7 @@ mod tests {
             enable_cache: true,
             local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
             cache_backend: CacheBackend::Filesystem,
+            ..Default::default()
         });
 
         client.doc_cache.insert(
@@ -562,6 +716,7 @@ mod tests {
                 enable_cache: true,
                 local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
                 cache_backend: CacheBackend::Filesystem,
+                ..Default::default()
             });
             client
                 .add_provider(Box::new(MockProvider::err(MockErr::NotFound)), Some(10))
@@ -588,6 +743,7 @@ mod tests {
             enable_cache: false,
             local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
             cache_backend: CacheBackend::Filesystem,
+            ..Default::default()
         });
         client
             .add_provider(Box::new(provider), Some(DEFAULT_PROVIDER_TRUST_LEVEL))
@@ -598,5 +754,85 @@ mod tests {
 
         let observed = called_name.lock().await.clone().unwrap();
         assert_eq!(observed, "example.com".to_string());
+    }
+
+    #[tokio::test]
+    async fn resolve_with_local_ip_reorders_addresses_by_rtt_history() {
+        struct AddressProvider;
+
+        #[async_trait]
+        impl NsProvider for AddressProvider {
+            fn get_id(&self) -> String {
+                "address-provider".to_string()
+            }
+
+            async fn query(
+                &self,
+                _name: &str,
+                _record_type: Option<RecordType>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<NameInfo> {
+                Ok(NameInfo::from_address_vec(
+                    "example.com",
+                    vec![
+                        "192.0.2.10".parse().unwrap(),
+                        "2001:db8::1".parse().unwrap(),
+                    ],
+                ))
+            }
+
+            async fn query_did(
+                &self,
+                _did: &DID,
+                _doc_type: Option<&str>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<EncodedDocument> {
+                Err(NSError::NotFound("not implemented".into()))
+            }
+        }
+
+        let local_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let ipv4_remote: SocketAddr = "192.0.2.10:443".parse().unwrap();
+        let ipv6_remote: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(AddressProvider),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        client
+            .record_connection_outcome(
+                local_ip,
+                ipv4_remote,
+                ConnectionOutcome::Success {
+                    rtt: Duration::from_millis(120),
+                    layer: crate::MeasurementLayer::Tcp,
+                },
+            )
+            .unwrap();
+        client
+            .record_connection_outcome(
+                local_ip,
+                ipv6_remote,
+                ConnectionOutcome::Success {
+                    rtt: Duration::from_millis(20),
+                    layer: crate::MeasurementLayer::Tcp,
+                },
+            )
+            .unwrap();
+
+        let resolved = client
+            .resolve_with_local_ip("example.com", Some(RecordType::A), local_ip, 443, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.address[0],
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
     }
 }

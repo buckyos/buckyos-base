@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod addr_rtt_db;
 mod bns_provider;
 mod dns_provider;
 mod doc_cache;
@@ -10,6 +11,7 @@ mod name_query;
 mod provider;
 mod utility;
 
+pub use addr_rtt_db::*;
 pub use bns_provider::*;
 pub use dns_provider::*;
 pub use doc_cache::*;
@@ -33,7 +35,7 @@ use log::*;
 use name_lib::*;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 #[macro_use]
 extern crate log;
@@ -132,6 +134,49 @@ pub async fn resolve(name: &str, record_type: Option<RecordType>) -> NSResult<Na
     }
     let client = client.unwrap();
     client.resolve(name, record_type).await
+}
+
+pub async fn resolve_with_local_ip(
+    name: &str,
+    record_type: Option<RecordType>,
+    local_ip: IpAddr,
+    port: u16,
+    policy: Option<&SortPolicy>,
+) -> NSResult<NameInfo> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not init yet".to_string()));
+    }
+    let client = client.unwrap();
+    client
+        .resolve_with_local_ip(name, record_type, local_ip, port, policy)
+        .await
+}
+
+pub fn rank_socket_addrs(
+    local_ip: IpAddr,
+    addresses: &[SocketAddr],
+    policy: Option<&SortPolicy>,
+) -> NSResult<Vec<RankedAddress>> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not init yet".to_string()));
+    }
+    let client = client.unwrap();
+    Ok(client.rank_socket_addrs(local_ip, addresses, policy))
+}
+
+pub fn record_connection_outcome(
+    local_ip: IpAddr,
+    remote: SocketAddr,
+    outcome: ConnectionOutcome,
+) -> NSResult<()> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not init yet".to_string()));
+    }
+    let client = client.unwrap();
+    client.record_connection_outcome(local_ip, remote, outcome)
 }
 
 pub async fn resolve_auth_key(did: &DID, kid: Option<&str>) -> NSResult<DecodingKey> {
@@ -268,10 +313,11 @@ mod tests {
 
         if GLOBAL_NAME_CLIENT.get().is_none() {
             let tmp = tempdir().unwrap().keep();
-            let mut client = NameClient::new(NameClientConfig {
+            let client = NameClient::new(NameClientConfig {
                 enable_cache: true,
                 local_cache_dir: Some(tmp.to_string_lossy().to_string()),
                 cache_backend: CacheBackend::Filesystem,
+                ..Default::default()
             });
             client
                 .add_provider(
