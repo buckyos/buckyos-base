@@ -114,12 +114,21 @@ pub async fn init_name_lib_ex(
 }
 
 pub async fn resolve_ip(name: &str) -> NSResult<IpAddr> {
-    let name_info = resolve(name, None).await?;
-    if name_info.address.is_empty() {
-        return Err(NSError::NotFound("A record not found".to_string()));
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not init yet".to_string()));
     }
-    let result_ip = name_info.address[0];
-    Ok(result_ip)
+    let client = client.unwrap();
+    client.resolve_ip(name).await
+}
+
+pub async fn resolve_ips(name: &str) -> NSResult<Vec<IpAddr>> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not init yet".to_string()));
+    }
+    let client = client.unwrap();
+    client.resolve_ips(name).await
 }
 
 fn get_name_client() -> Option<&'static NameClient> {

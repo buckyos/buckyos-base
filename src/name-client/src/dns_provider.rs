@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use buckyos_kit::buckyos_get_unix_timestamp;
 use hickory_resolver::config::*;
-use hickory_resolver::proto::rr::{RData, RecordType as HickoryRecordType};
 use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::rr::{RData, RecordType as HickoryRecordType};
 use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
@@ -121,7 +121,7 @@ impl NsProvider for DnsProvider {
                 return Ok(name_info);
             }
             RecordType::CAA => {
-                info!("dns query CAA: {}", name);
+                debug!("dns query CAA: {}", name);
                 let response = resolver.lookup(name, HickoryRecordType::CAA).await;
                 if response.is_err() {
                     let err = response.err().unwrap();
@@ -130,7 +130,11 @@ impl NsProvider for DnsProvider {
                 }
 
                 let response = response.unwrap();
-                let ttl = response.record_iter().next().map(|r| r.ttl()).unwrap_or(300);
+                let ttl = response
+                    .record_iter()
+                    .next()
+                    .map(|r| r.ttl())
+                    .unwrap_or(300);
                 let caa = response
                     .iter()
                     .filter_map(|rdata| match rdata {
@@ -157,7 +161,7 @@ impl NsProvider for DnsProvider {
                 return Ok(name_info);
             }
             RecordType::A | RecordType::AAAA => {
-                info!("dns query ip: {}", name);
+                debug!("dns query ip: {}", name);
                 let response = resolver.lookup_ip(name).await;
                 if response.is_err() {
                     return Err(NSError::Failed(format!(
@@ -190,7 +194,7 @@ impl NsProvider for DnsProvider {
                 return Ok(name_info);
             }
             RecordType::PTR => {
-                info!("dns query PTR: {}", name);
+                debug!("dns query PTR: {}", name);
 
                 let ip = IpAddr::from_str(name).map_err(|e| {
                     NSError::InvalidParam(format!(

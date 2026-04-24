@@ -1,8 +1,8 @@
 #![allow(unused)]
 
 use crate::addr_rtt_db::{
-    CleanupReport, Config as AddrRttDbConfig, ConnectionOutcome, PersistencePolicy, RankedAddress,
-    RttDatabase, SortPolicy,
+    AutoFlushHandle, CleanupReport, Config as AddrRttDbConfig, ConnectionOutcome,
+    PersistencePolicy, RankedAddress, RttDatabase, SortPolicy,
 };
 use crate::dns_provider::DnsProvider;
 use crate::doc_cache::{CacheBackend, DIDDocumentCache};
@@ -18,12 +18,13 @@ use log::*;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
 pub const DEFAULT_PROVIDER_TRUST_LEVEL: i32 = 100;
 pub const ROOT_TRUST_LEVEL: i32 = 0;
 pub const DNS_TRUST_LEVEL: i32 = 16;
+const MAX_CACHED_LOCAL_IPS: usize = 8;
 
 #[derive(Clone)]
 pub struct NameClientConfig {
@@ -48,6 +49,8 @@ pub struct NameClient {
     config: NameClientConfig,
     doc_cache: DIDDocumentCache,
     addr_rtt_db: Arc<RttDatabase>,
+    _addr_rtt_auto_flush: Option<AutoFlushHandle>,
+    cached_local_ips: StdRwLock<Vec<IpAddr>>,
     nameinfo_cache: Option<std::sync::Arc<RwLock<HashMap<String, NameInfo>>>>,
 }
 
@@ -82,12 +85,15 @@ impl NameClient {
             config.rtt_db_config.clone(),
             config.local_cache_dir.as_deref(),
         ));
+        let addr_rtt_auto_flush = addr_rtt_db.spawn_auto_flush();
 
         Self {
             name_query,
             config: config,
             doc_cache,
             addr_rtt_db,
+            _addr_rtt_auto_flush: addr_rtt_auto_flush,
+            cached_local_ips: StdRwLock::new(Vec::new()),
             nameinfo_cache,
         }
     }
@@ -201,6 +207,19 @@ impl NameClient {
         return Ok(name_info);
     }
 
+    pub async fn resolve_ip(&self, name: &str) -> NSResult<IpAddr> {
+        self.resolve_ips(name)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NSError::NotFound("A record not found".to_string()))
+    }
+
+    pub async fn resolve_ips(&self, name: &str) -> NSResult<Vec<IpAddr>> {
+        let name_info = self.resolve(name, None).await?;
+        self.sort_resolved_ips(&name_info.address)
+    }
+
     pub async fn resolve_with_local_ip(
         &self,
         name: &str,
@@ -209,6 +228,7 @@ impl NameClient {
         port: u16,
         policy: Option<&SortPolicy>,
     ) -> NSResult<NameInfo> {
+        self.remember_local_ip(local_ip);
         let mut name_info = self.resolve(name, record_type).await?;
         if name_info.address.len() <= 1 {
             return Ok(name_info);
@@ -267,6 +287,7 @@ impl NameClient {
         remote: SocketAddr,
         outcome: ConnectionOutcome,
     ) -> NSResult<()> {
+        self.remember_local_ip(local_ip);
         self.addr_rtt_db
             .record(local_ip, remote, outcome)
             .map_err(|e| NSError::Failed(format!("record addr-rtt outcome failed: {}", e)))
@@ -282,8 +303,49 @@ impl NameClient {
         self.addr_rtt_db.cleanup()
     }
 
+    pub fn cleanup_rtt_db_with_policy(&self, policy: &SortPolicy) -> CleanupReport {
+        self.addr_rtt_db.cleanup_with_policy(policy)
+    }
+
     pub fn forget_local_rtt(&self, local_ip: IpAddr) -> usize {
         self.addr_rtt_db.forget_local(local_ip)
+    }
+
+    fn sort_resolved_ips(&self, addresses: &[IpAddr]) -> NSResult<Vec<IpAddr>> {
+        if addresses.is_empty() {
+            return Err(NSError::NotFound("A record not found".to_string()));
+        }
+        if addresses.len() == 1 {
+            return Ok(addresses.to_vec());
+        }
+
+        let local_ips = self.cached_local_ips();
+        if local_ips.is_empty() {
+            return Ok(addresses.to_vec());
+        }
+
+        let policy = SortPolicy::default();
+        let ranked = self.addr_rtt_db.rank_ips(&local_ips, addresses, &policy);
+        Ok(ranked.into_iter().map(|item| item.ip).collect())
+    }
+
+    fn remember_local_ip(&self, local_ip: IpAddr) {
+        let Ok(mut cached) = self.cached_local_ips.write() else {
+            return;
+        };
+
+        if let Some(pos) = cached.iter().position(|ip| *ip == local_ip) {
+            cached.remove(pos);
+        }
+        cached.insert(0, local_ip);
+        cached.truncate(MAX_CACHED_LOCAL_IPS);
+    }
+
+    fn cached_local_ips(&self) -> Vec<IpAddr> {
+        self.cached_local_ips
+            .read()
+            .map(|cached| cached.clone())
+            .unwrap_or_default()
     }
 
     fn nameinfo_matches_record_type(record_type: Option<RecordType>, info: &NameInfo) -> bool {
@@ -833,6 +895,157 @@ mod tests {
         assert_eq!(
             resolved.address[0],
             "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_ip_uses_cached_local_ip_and_rtt_history() {
+        struct AddressProvider;
+
+        #[async_trait]
+        impl NsProvider for AddressProvider {
+            fn get_id(&self) -> String {
+                "address-provider".to_string()
+            }
+
+            async fn query(
+                &self,
+                _name: &str,
+                _record_type: Option<RecordType>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<NameInfo> {
+                Ok(NameInfo::from_address_vec(
+                    "example.com",
+                    vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()],
+                ))
+            }
+
+            async fn query_did(
+                &self,
+                _did: &DID,
+                _doc_type: Option<&str>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<EncodedDocument> {
+                Err(NSError::NotFound("not implemented".into()))
+            }
+        }
+
+        let local_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let slow_remote: SocketAddr = "192.0.2.10:443".parse().unwrap();
+        let fast_remote: SocketAddr = "192.0.2.20:8443".parse().unwrap();
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(AddressProvider),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        client
+            .record_connection_outcome(
+                local_ip,
+                slow_remote,
+                ConnectionOutcome::Success {
+                    rtt: Duration::from_millis(120),
+                    layer: crate::MeasurementLayer::Tcp,
+                },
+            )
+            .unwrap();
+        client
+            .record_connection_outcome(
+                local_ip,
+                fast_remote,
+                ConnectionOutcome::Success {
+                    rtt: Duration::from_millis(20),
+                    layer: crate::MeasurementLayer::Tcp,
+                },
+            )
+            .unwrap();
+
+        let resolved = client.resolve_ip("example.com").await.unwrap();
+        assert_eq!(resolved, "192.0.2.20".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_returns_ranked_ipv4_and_ipv6_addresses() {
+        struct AddressProvider;
+
+        #[async_trait]
+        impl NsProvider for AddressProvider {
+            fn get_id(&self) -> String {
+                "address-provider".to_string()
+            }
+
+            async fn query(
+                &self,
+                _name: &str,
+                _record_type: Option<RecordType>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<NameInfo> {
+                Ok(NameInfo::from_address_vec(
+                    "example.com",
+                    vec![
+                        "192.0.2.10".parse().unwrap(),
+                        "2001:db8::1".parse().unwrap(),
+                    ],
+                ))
+            }
+
+            async fn query_did(
+                &self,
+                _did: &DID,
+                _doc_type: Option<&str>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<EncodedDocument> {
+                Err(NSError::NotFound("not implemented".into()))
+            }
+        }
+
+        let local_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let ipv4_remote: SocketAddr = "192.0.2.10:443".parse().unwrap();
+        let ipv6_remote: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(AddressProvider),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        client
+            .record_connection_outcome(
+                local_ip,
+                ipv4_remote,
+                ConnectionOutcome::Success {
+                    rtt: Duration::from_millis(120),
+                    layer: crate::MeasurementLayer::Tcp,
+                },
+            )
+            .unwrap();
+        client
+            .record_connection_outcome(
+                local_ip,
+                ipv6_remote,
+                ConnectionOutcome::Success {
+                    rtt: Duration::from_millis(20),
+                    layer: crate::MeasurementLayer::Tcp,
+                },
+            )
+            .unwrap();
+
+        let resolved = client.resolve_ips("example.com").await.unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+            ]
         );
     }
 }

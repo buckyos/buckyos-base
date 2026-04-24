@@ -1,40 +1,57 @@
 use dashmap::DashMap;
+#[cfg(feature = "persistence")]
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
 pub type LocalIp = IpAddr;
 pub type RemoteAddr = SocketAddr;
 
+#[cfg(feature = "persistence")]
 const ADDRESS_STATS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("address_stats");
+#[cfg(feature = "persistence")]
 const METADATA_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata");
+#[cfg(feature = "persistence")]
 const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
-const SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "persistence")]
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_EWMA_ALPHA: f64 = 0.125;
 const DEFAULT_UNKNOWN_BASE_SCORE: f64 = 100.0;
 
 #[derive(Debug, Error)]
 pub enum AddrRttDbError {
+    #[cfg(feature = "persistence")]
     #[error("storage error: {0}")]
     Storage(#[from] redb::Error),
+    #[cfg(feature = "persistence")]
     #[error("storage transaction error: {0}")]
     Transaction(#[from] redb::TransactionError),
+    #[cfg(feature = "persistence")]
     #[error("storage table error: {0}")]
     Table(#[from] redb::TableError),
+    #[cfg(feature = "persistence")]
     #[error("storage commit error: {0}")]
     Commit(#[from] redb::CommitError),
+    #[cfg(feature = "persistence")]
     #[error("storage database error: {0}")]
     Database(#[from] redb::DatabaseError),
+    #[cfg(feature = "persistence")]
     #[error("storage access error: {0}")]
     StorageAccess(#[from] redb::StorageError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("encode error: {0}")]
     Encode(#[from] bincode::Error),
+    #[error("persistence feature is disabled")]
+    PersistenceDisabled,
 }
 
 pub type Result<T> = std::result::Result<T, AddrRttDbError>;
@@ -112,6 +129,15 @@ pub struct RankedAddress {
     pub rationale: SortRationale,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RankedIpAddress {
+    pub ip: IpAddr,
+    pub local: Option<LocalIp>,
+    pub score: f64,
+    pub stats: Option<AddressStats>,
+    pub rationale: SortRationale,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SortRationale {
     pub reasons: Vec<&'static str>,
@@ -182,7 +208,7 @@ pub enum UnknownStrategy {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedEntry {
+struct LegacyPersistedEntry {
     stats: AddressStats,
     consecutive_failure_score: f64,
 }
@@ -203,18 +229,19 @@ impl EntryState {
         }
     }
 
-    fn from_persisted(persisted: PersistedEntry, last_touched_tick: u64) -> Self {
+    fn from_stats(stats: AddressStats, last_touched_tick: u64) -> Self {
         Self {
-            stats: persisted.stats,
-            consecutive_failure_score: persisted.consecutive_failure_score,
+            consecutive_failure_score: failure_score_from_stats(&stats),
+            stats,
             last_touched_tick,
         }
     }
 
-    fn to_persisted(&self) -> PersistedEntry {
-        PersistedEntry {
-            stats: self.stats.clone(),
-            consecutive_failure_score: self.consecutive_failure_score,
+    fn from_legacy(persisted: LegacyPersistedEntry, last_touched_tick: u64) -> Self {
+        Self {
+            stats: persisted.stats,
+            consecutive_failure_score: persisted.consecutive_failure_score,
+            last_touched_tick,
         }
     }
 }
@@ -223,6 +250,31 @@ pub struct RttDatabase {
     config: Config,
     entries: DashMap<EntryKey, EntryState>,
     tick: AtomicU64,
+}
+
+pub struct AutoFlushHandle {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    done: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AutoFlushHandle {
+    pub fn is_finished(&self) -> bool {
+        self.done.load(AtomicOrdering::Acquire)
+    }
+}
+
+impl Drop for AutoFlushHandle {
+    fn drop(&mut self) {
+        let (lock, condvar) = &*self.stop;
+        if let Ok(mut stopped) = lock.lock() {
+            *stopped = true;
+            condvar.notify_one();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl RttDatabase {
@@ -256,13 +308,38 @@ impl RttDatabase {
         Ok(db)
     }
 
+    pub fn open_with_auto_flush(
+        path: impl AsRef<Path>,
+        config: Config,
+    ) -> Result<(Arc<Self>, Option<AutoFlushHandle>)> {
+        let db = Arc::new(Self::open(path, config)?);
+        let handle = db.spawn_auto_flush();
+        Ok((db, handle))
+    }
+
     pub fn record(
         &self,
         local: LocalIp,
         remote: RemoteAddr,
         outcome: ConnectionOutcome,
     ) -> Result<()> {
+        self.record_with_policy(local, remote, outcome, &SortPolicy::default())
+    }
+
+    pub fn record_with_policy(
+        &self,
+        local: LocalIp,
+        remote: RemoteAddr,
+        outcome: ConnectionOutcome,
+        policy: &SortPolicy,
+    ) -> Result<()> {
         if matches!(outcome, ConnectionOutcome::LocalError) {
+            metrics_record(outcome_kind_label(OutcomeKind::LocalError));
+            tracing::debug!(
+                ?local,
+                ?remote,
+                "addr-rtt-db ignored local connection error"
+            );
             return Ok(());
         }
 
@@ -288,7 +365,7 @@ impl RttDatabase {
 
                 match entry.stats.rtt_ewma {
                     Some(old_ewma) => {
-                        let alpha = DEFAULT_EWMA_ALPHA;
+                        let alpha = normalized_ewma_alpha(policy.ewma_alpha);
                         let new_ewma = duration_weighted_sum(sample, old_ewma, alpha);
                         let diff = abs_duration_diff(sample, old_ewma);
                         let old_var = entry
@@ -305,6 +382,14 @@ impl RttDatabase {
                     }
                 }
                 entry.consecutive_failure_score = 0.0;
+                metrics_record(outcome_kind_label(OutcomeKind::Success));
+                tracing::debug!(
+                    ?local,
+                    ?remote,
+                    rtt_ms = rtt.as_secs_f64() * 1000.0,
+                    ewma_alpha = normalized_ewma_alpha(policy.ewma_alpha),
+                    "addr-rtt-db recorded successful connection"
+                );
             }
             ConnectionOutcome::Timeout { .. } => {
                 entry.stats.samples += 1;
@@ -312,6 +397,7 @@ impl RttDatabase {
                 entry.stats.last_failure_time = Some(now);
                 entry.consecutive_failure_score += 1.0;
                 entry.stats.consecutive_failures = entry.consecutive_failure_score.ceil() as u32;
+                metrics_record(outcome_kind_label(OutcomeKind::Timeout));
             }
             ConnectionOutcome::Refused => {
                 entry.stats.samples += 1;
@@ -319,6 +405,7 @@ impl RttDatabase {
                 entry.stats.last_failure_time = Some(now);
                 entry.consecutive_failure_score += 0.5;
                 entry.stats.consecutive_failures = entry.consecutive_failure_score.ceil() as u32;
+                metrics_record(outcome_kind_label(OutcomeKind::Refused));
             }
             ConnectionOutcome::Unreachable => {
                 entry.stats.samples += 1;
@@ -326,12 +413,14 @@ impl RttDatabase {
                 entry.stats.last_failure_time = Some(now);
                 entry.consecutive_failure_score += 1.0;
                 entry.stats.consecutive_failures = entry.consecutive_failure_score.ceil() as u32;
+                metrics_record(outcome_kind_label(OutcomeKind::Unreachable));
             }
             ConnectionOutcome::LocalError => {}
         }
 
         drop(entry);
         self.enforce_limits(Some(local));
+        metrics_entries(self.entries.len());
         Ok(())
     }
 
@@ -392,6 +481,113 @@ impl RttDatabase {
                 .then_with(|| left_idx.cmp(right_idx))
         });
 
+        metrics_rank();
+        tracing::debug!(
+            ?local,
+            candidates = addresses.len(),
+            "addr-rtt-db ranked candidate addresses"
+        );
+
+        ranked.into_iter().map(|(_, item)| item).collect()
+    }
+
+    pub fn rank_ips(
+        &self,
+        local_ips: &[LocalIp],
+        addresses: &[IpAddr],
+        policy: &SortPolicy,
+    ) -> Vec<RankedIpAddress> {
+        let now = SystemTime::now();
+        let mut known_base_scores = Vec::new();
+        let mut candidate_states = Vec::with_capacity(addresses.len());
+        let mut touched_keys = Vec::new();
+
+        for ip in addresses {
+            let mut states = Vec::new();
+            for item in self.entries.iter() {
+                let key = item.key();
+                if key.remote.ip() == *ip && local_ips.contains(&key.local) {
+                    if let Some(rtt) = item.stats.rtt_ewma {
+                        known_base_scores.push(base_score_from_rtt(rtt));
+                    }
+                    touched_keys.push(key.clone());
+                    states.push((key.local, key.remote, item.value().clone()));
+                }
+            }
+            candidate_states.push(states);
+        }
+
+        for key in touched_keys {
+            if let Some(mut entry) = self.entries.get_mut(&key) {
+                entry.last_touched_tick = self.next_tick();
+            }
+        }
+
+        let unknown_base_score = unknown_base_score(&known_base_scores, &policy.unknown_strategy);
+        let mut ranked: Vec<(usize, RankedIpAddress)> = addresses
+            .iter()
+            .enumerate()
+            .map(|(index, ip)| {
+                let mut best = candidate_states[index]
+                    .iter()
+                    .map(|(local, remote, state)| {
+                        let (score, rationale, stats) = self.score_address(
+                            *remote,
+                            Some(state),
+                            now,
+                            policy,
+                            unknown_base_score,
+                        );
+                        RankedIpAddress {
+                            ip: *ip,
+                            local: Some(*local),
+                            score,
+                            stats,
+                            rationale,
+                        }
+                    })
+                    .max_by(|left, right| {
+                        left.score
+                            .partial_cmp(&right.score)
+                            .unwrap_or(Ordering::Equal)
+                    });
+
+                if best.is_none() {
+                    let (score, rationale, stats) = self.score_address(
+                        SocketAddr::new(*ip, 0),
+                        None,
+                        now,
+                        policy,
+                        unknown_base_score,
+                    );
+                    best = Some(RankedIpAddress {
+                        ip: *ip,
+                        local: None,
+                        score,
+                        stats,
+                        rationale,
+                    });
+                }
+
+                (index, best.unwrap())
+            })
+            .collect();
+
+        ranked.sort_by(|(left_idx, left), (right_idx, right)| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left_idx.cmp(right_idx))
+        });
+
+        metrics_rank();
+        tracing::debug!(
+            locals = local_ips.len(),
+            candidates = addresses.len(),
+            "addr-rtt-db ranked candidate IP addresses"
+        );
+
         ranked.into_iter().map(|(_, item)| item).collect()
     }
 
@@ -404,7 +600,11 @@ impl RttDatabase {
     }
 
     pub fn cleanup(&self) -> CleanupReport {
-        let ttl = SortPolicy::default().max_age.mul_f64(2.0);
+        self.cleanup_with_policy(&SortPolicy::default())
+    }
+
+    pub fn cleanup_with_policy(&self, policy: &SortPolicy) -> CleanupReport {
+        let ttl = policy.max_age.mul_f64(2.0);
         let now = SystemTime::now();
         let mut expired_keys = Vec::new();
 
@@ -422,10 +622,19 @@ impl RttDatabase {
             self.entries.remove(key);
         }
 
-        CleanupReport {
+        let report = CleanupReport {
             removed_expired: expired_keys.len(),
             removed_total: expired_keys.len(),
-        }
+        };
+        metrics_cleanup(report.removed_total);
+        metrics_entries(self.entries.len());
+        tracing::debug!(
+            removed_expired = report.removed_expired,
+            removed_total = report.removed_total,
+            ttl_secs = ttl.as_secs_f64(),
+            "addr-rtt-db cleanup completed"
+        );
+        report
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -574,18 +783,83 @@ impl RttDatabase {
         self.tick.fetch_add(1, AtomicOrdering::Relaxed)
     }
 
-    fn flush_to_disk(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(redb::StorageError::Io)?;
+    pub fn spawn_auto_flush(self: &Arc<Self>) -> Option<AutoFlushHandle> {
+        #[cfg(not(feature = "persistence"))]
+        {
+            return None;
         }
 
+        #[cfg(feature = "persistence")]
+        {
+            let interval = match &self.config.persistence {
+                PersistencePolicy::Storage {
+                    auto_flush_interval: Some(interval),
+                    ..
+                } => *interval,
+                _ => return None,
+            };
+            if interval.is_zero() {
+                return None;
+            }
+
+            let db = Arc::clone(self);
+            let stop = Arc::new((Mutex::new(false), Condvar::new()));
+            let done = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let thread_done = Arc::clone(&done);
+            let thread = thread::spawn(move || {
+                let (lock, condvar) = &*thread_stop;
+                loop {
+                    let stopped = match lock.lock() {
+                        Ok(stopped) => stopped,
+                        Err(_) => break,
+                    };
+                    let wait_result = condvar.wait_timeout(stopped, interval);
+                    let (stopped, timeout) = match wait_result {
+                        Ok(result) => result,
+                        Err(_) => break,
+                    };
+                    if *stopped {
+                        break;
+                    }
+                    drop(stopped);
+                    if timeout.timed_out() {
+                        match db.flush() {
+                            Ok(()) => {
+                                tracing::debug!("addr-rtt-db auto flush completed");
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "addr-rtt-db auto flush failed");
+                            }
+                        }
+                    }
+                }
+                thread_done.store(true, AtomicOrdering::Release);
+            });
+
+            Some(AutoFlushHandle {
+                stop,
+                done,
+                thread: Some(thread),
+            })
+        }
+    }
+
+    #[cfg(feature = "persistence")]
+    fn flush_to_disk(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let started = std::time::Instant::now();
         let db = Database::create(path)?;
         let write_txn = db.begin_write()?;
+        let _ = write_txn.delete_table(ADDRESS_STATS_TABLE)?;
         {
             let mut table = write_txn.open_table(ADDRESS_STATS_TABLE)?;
             for item in self.entries.iter() {
                 let key = bincode::serialize(item.key())?;
-                let value = bincode::serialize(&item.to_persisted())?;
+                let value = bincode::serialize(&item.stats)?;
                 table.insert(key.as_slice(), value.as_slice())?;
             }
         }
@@ -595,12 +869,24 @@ impl RttDatabase {
             metadata.insert(SCHEMA_VERSION_KEY, schema_bytes.as_slice())?;
         }
         write_txn.commit()?;
+        metrics_flush(started.elapsed());
+        tracing::debug!(
+            path = %path.display(),
+            entries = self.entries.len(),
+            "addr-rtt-db flushed to disk"
+        );
         Ok(())
     }
 
+    #[cfg(not(feature = "persistence"))]
+    fn flush_to_disk(&self, _path: &Path) -> Result<()> {
+        Err(AddrRttDbError::PersistenceDisabled)
+    }
+
+    #[cfg(feature = "persistence")]
     fn load_from_disk(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(redb::StorageError::Io)?;
+            std::fs::create_dir_all(parent)?;
         }
 
         let db = Database::create(path)?;
@@ -611,15 +897,25 @@ impl RttDatabase {
         for row in table.iter()? {
             let (key_guard, value_guard) = row?;
             let key: EntryKey = bincode::deserialize(key_guard.value())?;
-            let persisted: PersistedEntry = bincode::deserialize(value_guard.value())?;
             let tick = self.next_tick();
-            self.entries
-                .insert(key, EntryState::from_persisted(persisted, tick));
+            let state = deserialize_entry_state(value_guard.value(), tick)?;
+            self.entries.insert(key, state);
         }
 
+        tracing::debug!(
+            path = %path.display(),
+            entries = self.entries.len(),
+            "addr-rtt-db loaded from disk"
+        );
         Ok(())
     }
 
+    #[cfg(not(feature = "persistence"))]
+    fn load_from_disk(&self, _path: &Path) -> Result<()> {
+        Err(AddrRttDbError::PersistenceDisabled)
+    }
+
+    #[cfg(feature = "persistence")]
     fn ensure_storage_schema(&self, db: &Database) -> Result<()> {
         let write_txn = db.begin_write()?;
         {
@@ -689,6 +985,84 @@ impl RttDatabase {
             .map(|item| item.key().clone())
     }
 }
+
+fn normalized_ewma_alpha(alpha: f64) -> f64 {
+    if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_EWMA_ALPHA
+    }
+}
+
+fn failure_score_from_stats(stats: &AddressStats) -> f64 {
+    match stats.last_outcome {
+        Some(OutcomeKind::Refused) if stats.consecutive_failures > 0 => {
+            stats.consecutive_failures as f64 - 0.5
+        }
+        _ => stats.consecutive_failures as f64,
+    }
+}
+
+fn outcome_kind_label(outcome: OutcomeKind) -> &'static str {
+    match outcome {
+        OutcomeKind::Success => "success",
+        OutcomeKind::Timeout => "timeout",
+        OutcomeKind::Refused => "refused",
+        OutcomeKind::Unreachable => "unreachable",
+        OutcomeKind::LocalError => "local_error",
+    }
+}
+
+#[cfg(feature = "persistence")]
+fn deserialize_entry_state(bytes: &[u8], tick: u64) -> Result<EntryState> {
+    match bincode::deserialize::<AddressStats>(bytes) {
+        Ok(stats) => Ok(EntryState::from_stats(stats, tick)),
+        Err(stats_error) => match bincode::deserialize::<LegacyPersistedEntry>(bytes) {
+            Ok(legacy) => Ok(EntryState::from_legacy(legacy, tick)),
+            Err(_) => Err(stats_error.into()),
+        },
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn metrics_record(outcome: &'static str) {
+    metrics::counter!("addr_rtt_db.records_total", "outcome" => outcome).increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+fn metrics_record(_outcome: &'static str) {}
+
+#[cfg(feature = "metrics")]
+fn metrics_rank() {
+    metrics::counter!("addr_rtt_db.ranks_total").increment(1);
+}
+
+#[cfg(not(feature = "metrics"))]
+fn metrics_rank() {}
+
+#[cfg(feature = "metrics")]
+fn metrics_entries(entries: usize) {
+    metrics::gauge!("addr_rtt_db.entries_total").set(entries as f64);
+}
+
+#[cfg(not(feature = "metrics"))]
+fn metrics_entries(_entries: usize) {}
+
+#[cfg(feature = "metrics")]
+fn metrics_flush(duration: Duration) {
+    metrics::histogram!("addr_rtt_db.flush_duration_seconds").record(duration.as_secs_f64());
+}
+
+#[cfg(not(feature = "metrics"))]
+fn metrics_flush(_duration: Duration) {}
+
+#[cfg(feature = "metrics")]
+fn metrics_cleanup(removed: usize) {
+    metrics::counter!("addr_rtt_db.cleanup_evicted_total").increment(removed as u64);
+}
+
+#[cfg(not(feature = "metrics"))]
+fn metrics_cleanup(_removed: usize) {}
 
 fn clamp_sample_rtt(ewma: Option<Duration>, sample: Duration, factor: f64) -> Duration {
     if factor <= 0.0 {
@@ -799,6 +1173,41 @@ mod tests {
     }
 
     #[test]
+    fn record_with_policy_uses_custom_ewma_alpha() {
+        let db = RttDatabase::new(Config::default());
+        let local: IpAddr = "10.0.0.1".parse().unwrap();
+        let remote = test_addr("192.0.2.10", 443);
+        let policy = SortPolicy {
+            ewma_alpha: 0.5,
+            ..SortPolicy::default()
+        };
+
+        db.record_with_policy(
+            local,
+            remote,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(100),
+                layer: MeasurementLayer::Tcp,
+            },
+            &policy,
+        )
+        .unwrap();
+        db.record_with_policy(
+            local,
+            remote,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(200),
+                layer: MeasurementLayer::Tcp,
+            },
+            &policy,
+        )
+        .unwrap();
+
+        let stats = db.get_stats(local, remote).unwrap();
+        assert_eq!(stats.rtt_ewma, Some(Duration::from_millis(150)));
+    }
+
+    #[test]
     fn rank_penalizes_failures_and_keeps_local_isolated() {
         let db = RttDatabase::new(Config::default());
         let local_a: IpAddr = "10.0.0.1".parse().unwrap();
@@ -845,6 +1254,42 @@ mod tests {
     }
 
     #[test]
+    fn rank_ips_uses_history_across_ports_and_cached_locals() {
+        let db = RttDatabase::new(Config::default());
+        let local_a: IpAddr = "10.0.0.1".parse().unwrap();
+        let local_b: IpAddr = "10.0.0.2".parse().unwrap();
+        let slow = test_addr("192.0.2.10", 443);
+        let fast = test_addr("192.0.2.20", 8443);
+
+        db.record(
+            local_a,
+            slow,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(120),
+                layer: MeasurementLayer::Tcp,
+            },
+        )
+        .unwrap();
+        db.record(
+            local_b,
+            fast,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(20),
+                layer: MeasurementLayer::Tcp,
+            },
+        )
+        .unwrap();
+
+        let ranked = db.rank_ips(
+            &[local_a, local_b],
+            &[slow.ip(), fast.ip()],
+            &SortPolicy::default(),
+        );
+        assert_eq!(ranked[0].ip, fast.ip());
+        assert_eq!(ranked[0].local, Some(local_b));
+    }
+
+    #[test]
     fn cleanup_removes_expired_entries() {
         let db = RttDatabase::new(Config::default());
         let local: IpAddr = "10.0.0.1".parse().unwrap();
@@ -870,6 +1315,36 @@ mod tests {
         assert!(db.get_stats(local, remote).is_none());
     }
 
+    #[test]
+    fn cleanup_with_policy_uses_policy_max_age() {
+        let db = RttDatabase::new(Config::default());
+        let local: IpAddr = "10.0.0.1".parse().unwrap();
+        let remote = test_addr("192.0.2.10", 443);
+        let policy = SortPolicy {
+            max_age: Duration::from_secs(60),
+            ..SortPolicy::default()
+        };
+
+        db.record(
+            local,
+            remote,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(10),
+                layer: MeasurementLayer::Tcp,
+            },
+        )
+        .unwrap();
+
+        if let Some(mut entry) = db.entries.get_mut(&EntryKey { local, remote }) {
+            entry.stats.last_success_time = Some(SystemTime::now() - Duration::from_secs(121));
+        }
+
+        let report = db.cleanup_with_policy(&policy);
+        assert_eq!(report.removed_expired, 1);
+        assert!(db.get_stats(local, remote).is_none());
+    }
+
+    #[cfg(feature = "persistence")]
     #[test]
     fn flush_and_open_round_trip() {
         let dir = tempdir().unwrap();
@@ -901,6 +1376,108 @@ mod tests {
         assert_eq!(stats.success_count, 1);
         assert_eq!(stats.measurement_layer, MeasurementLayer::Tls);
         assert_eq!(stats.rtt_ewma, Some(Duration::from_millis(25)));
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn flush_removes_entries_deleted_from_memory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("addr-rtt.redb");
+        let local: IpAddr = "10.0.0.1".parse().unwrap();
+        let remote = test_addr("192.0.2.10", 443);
+        let config = Config {
+            persistence: PersistencePolicy::Storage {
+                path: path.clone(),
+                auto_flush_interval: None,
+            },
+            ..Config::default()
+        };
+
+        let db = RttDatabase::new(config.clone());
+        db.record(
+            local,
+            remote,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(25),
+                layer: MeasurementLayer::Tls,
+            },
+        )
+        .unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.forget_local(local), 1);
+        db.flush().unwrap();
+
+        let reopened = RttDatabase::open(path, config).unwrap();
+        assert!(reopened.get_stats(local, remote).is_none());
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn flush_persists_documented_address_stats_value() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("addr-rtt.redb");
+        let local: IpAddr = "10.0.0.1".parse().unwrap();
+        let remote = test_addr("192.0.2.10", 443);
+        let config = Config {
+            persistence: PersistencePolicy::Storage {
+                path: path.clone(),
+                auto_flush_interval: None,
+            },
+            ..Config::default()
+        };
+
+        let db = RttDatabase::new(config);
+        db.record(
+            local,
+            remote,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(25),
+                layer: MeasurementLayer::Tls,
+            },
+        )
+        .unwrap();
+        db.flush().unwrap();
+
+        let storage = Database::open(path).unwrap();
+        let read_txn = storage.begin_read().unwrap();
+        let table = read_txn.open_table(ADDRESS_STATS_TABLE).unwrap();
+        let key = bincode::serialize(&EntryKey { local, remote }).unwrap();
+        let value = table.get(key.as_slice()).unwrap().unwrap();
+        let stats: AddressStats = bincode::deserialize(value.value()).unwrap();
+        assert_eq!(stats.rtt_ewma, Some(Duration::from_millis(25)));
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn auto_flush_handle_periodically_flushes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("addr-rtt.redb");
+        let local: IpAddr = "10.0.0.1".parse().unwrap();
+        let remote = test_addr("192.0.2.10", 443);
+        let config = Config {
+            persistence: PersistencePolicy::Storage {
+                path: path.clone(),
+                auto_flush_interval: Some(Duration::from_millis(10)),
+            },
+            ..Config::default()
+        };
+
+        let db = Arc::new(RttDatabase::new(config.clone()));
+        let handle = db.spawn_auto_flush().unwrap();
+        db.record(
+            local,
+            remote,
+            ConnectionOutcome::Success {
+                rtt: Duration::from_millis(25),
+                layer: MeasurementLayer::Tls,
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        drop(handle);
+
+        let reopened = RttDatabase::open(path, config).unwrap();
+        assert_eq!(reopened.get_stats(local, remote).unwrap().success_count, 1);
     }
 
     #[test]
