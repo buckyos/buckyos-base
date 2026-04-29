@@ -281,7 +281,13 @@ p, su_bob,/config/users/bob/*,read|write,allow
             false
         );
         assert_eq!(
-            enforce("scheduler", Some("ood1"), "/config/system/scheduler/snapshot", "write").await,
+            enforce(
+                "scheduler",
+                Some("ood1"),
+                "/config/system/scheduler/snapshot",
+                "write"
+            )
+            .await,
             true
         );
         assert_eq!(
@@ -289,7 +295,13 @@ p, su_bob,/config/users/bob/*,read|write,allow
             true
         );
         assert_eq!(
-            enforce("jarvis", Some("bob"), "/config/services/task-manager/info", "read").await,
+            enforce(
+                "jarvis",
+                Some("bob"),
+                "/config/services/task-manager/info",
+                "read"
+            )
+            .await,
             true
         );
         assert_eq!(
@@ -390,7 +402,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
             .await,
             true
         );
-     
+
         assert_eq!(
             enforce(
                 "ood1",
@@ -446,7 +458,7 @@ p, su_bob,/config/users/bob/*,read|write,allow
             .await,
             true
         );
-      
+
         assert_eq!(
             enforce(
                 "root",
@@ -457,7 +469,6 @@ p, su_bob,/config/users/bob/*,read|write,allow
             .await,
             true
         );
-
 
         //can not read and write app2
         assert_eq!(

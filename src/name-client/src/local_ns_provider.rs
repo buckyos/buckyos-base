@@ -175,7 +175,6 @@ impl LocalConfigDnsProvider {
     //         address: Vec::new(),
     //         cname: None,
     //         txt: Vec::new(),
-    //         did_documents: HashMap::new(),
     //         iat: 0,
     //         ttl: Some(default_ttl),
     //     };
@@ -309,7 +308,6 @@ impl NsProvider for LocalConfigDnsProvider {
                 caa: Vec::new(),
                 ptr_records,
                 ttl: None,
-                did_documents: HashMap::new(),
                 iat: 0,
             });
         }
@@ -328,11 +326,10 @@ impl NsProvider for LocalConfigDnsProvider {
     ) -> NSResult<EncodedDocument> {
         let host_name = did.to_host_name();
         let name_info = self.get_name_info(&host_name)?;
-        let new_name_info = name_info.parse_txt_record_to_did_document()?;
         let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
-        let did_document = new_name_info.get_did_document(doc_type);
-        if did_document.is_some() {
-            return Ok(did_document.unwrap().clone());
+        let did_documents = name_info.parse_txt_record_to_did_documents()?;
+        if let Some(did_document) = did_documents.get(doc_type) {
+            return Ok(did_document.clone());
         }
         return Err(NSError::NotFound(format!(
             "DID Document not found: {}",

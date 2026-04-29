@@ -216,8 +216,32 @@ impl NameClient {
     }
 
     pub async fn resolve_ips(&self, name: &str) -> NSResult<Vec<IpAddr>> {
-        let name_info = self.resolve(name, None).await?;
-        self.sort_resolved_ips(&name_info.address)
+        if let Some(ips) = self.resolve_signed_device_document_ips(name).await? {
+            return self.sort_resolved_ips(&ips);
+        }
+
+        let mut merged_ips = Vec::new();
+        let mut first_error = None;
+
+        match self.resolve(name, None).await {
+            Ok(name_info) => Self::merge_unique_ips(&mut merged_ips, &name_info.address),
+            Err(err) => first_error = Some(err),
+        }
+
+        match self.resolve_device_info_ips(name).await {
+            Ok(device_info_ips) => Self::merge_unique_ips(&mut merged_ips, &device_info_ips),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+
+        if !merged_ips.is_empty() {
+            return self.sort_resolved_ips(&merged_ips);
+        }
+
+        Err(first_error.unwrap_or_else(|| NSError::NotFound("A record not found".to_string())))
     }
 
     pub async fn resolve_with_local_ip(
@@ -329,6 +353,71 @@ impl NameClient {
         Ok(ranked.into_iter().map(|item| item.ip).collect())
     }
 
+    async fn resolve_signed_device_document_ips(
+        &self,
+        name: &str,
+    ) -> NSResult<Option<Vec<IpAddr>>> {
+        let did = DID::from_str(name)?;
+        let doc = match self.resolve_did(&did, None).await {
+            Ok(doc) => doc,
+            Err(NSError::NotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        Self::extract_signed_device_document_ips(doc)
+    }
+
+    async fn resolve_device_info_ips(&self, name: &str) -> NSResult<Vec<IpAddr>> {
+        let did = DID::from_str(name)?;
+        let doc = self.resolve_did(&did, Some("info")).await?;
+        Self::extract_device_info_ips(doc)
+    }
+
+    fn extract_signed_device_document_ips(doc: EncodedDocument) -> NSResult<Option<Vec<IpAddr>>> {
+        if !doc.is_proof() {
+            return Ok(None);
+        }
+
+        let value = doc.to_json_value()?;
+        if value.get("device_type").is_none() {
+            return Ok(None);
+        }
+
+        let device_config = serde_json::from_value::<DeviceConfig>(value).map_err(|e| {
+            NSError::Failed(format!(
+                "parse device config from DID document failed: {}",
+                e
+            ))
+        })?;
+        if device_config.ips.is_empty() {
+            return Err(NSError::NotFound(
+                "device document does not contain ips".to_string(),
+            ));
+        }
+        Ok(Some(device_config.ips))
+    }
+
+    fn extract_device_info_ips(doc: EncodedDocument) -> NSResult<Vec<IpAddr>> {
+        let value = doc.to_json_value()?;
+        let device_info = serde_json::from_value::<DeviceInfo>(value).map_err(|e| {
+            NSError::Failed(format!("parse device info from DID document failed: {}", e))
+        })?;
+        let ips = device_info.merged_ips();
+        if ips.is_empty() {
+            return Err(NSError::NotFound(
+                "device info does not contain ips".to_string(),
+            ));
+        }
+        Ok(ips)
+    }
+
+    fn merge_unique_ips(ips: &mut Vec<IpAddr>, new_ips: &[IpAddr]) {
+        for ip in new_ips {
+            if !ips.contains(ip) {
+                ips.push(*ip);
+            }
+        }
+    }
+
     fn remember_local_ip(&self, local_ip: IpAddr) {
         let Ok(mut cached) = self.cached_local_ips.write() else {
             return;
@@ -356,7 +445,7 @@ impl NameClient {
             Some(RecordType::CAA) => !info.caa.is_empty() || !info.name.is_empty(),
             Some(RecordType::CNAME) => info.cname.is_some(),
             Some(RecordType::HTTPS) => !info.name.is_empty(),
-            Some(RecordType::TXT) => !info.txt.is_empty() || !info.did_documents.is_empty(),
+            Some(RecordType::TXT) => !info.txt.is_empty(),
             Some(RecordType::PTR) => !info.ptr_records.is_empty(),
             _ => false,
         }
@@ -465,6 +554,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use buckyos_kit::init_logging;
+    use jsonwebtoken::EncodingKey;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
@@ -1045,6 +1135,196 @@ mod tests {
             vec![
                 "2001:db8::1".parse::<IpAddr>().unwrap(),
                 "192.0.2.10".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_prefers_signed_device_document_over_unverified_ips() {
+        struct MixedProvider {
+            signed_doc: EncodedDocument,
+            info_doc: EncodedDocument,
+        }
+
+        #[async_trait]
+        impl NsProvider for MixedProvider {
+            fn get_id(&self) -> String {
+                "mixed-provider".to_string()
+            }
+
+            async fn query(
+                &self,
+                _name: &str,
+                _record_type: Option<RecordType>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<NameInfo> {
+                Ok(NameInfo::from_address_vec(
+                    "ood1.example",
+                    vec!["192.0.2.30".parse().unwrap()],
+                ))
+            }
+
+            async fn query_did(
+                &self,
+                _did: &DID,
+                doc_type: Option<&str>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<EncodedDocument> {
+                match doc_type {
+                    Some("info") => Ok(self.info_doc.clone()),
+                    None => Ok(self.signed_doc.clone()),
+                    _ => Err(NSError::NotFound("not implemented".into())),
+                }
+            }
+        }
+
+        let owner_private_key_pem = r#"
+        -----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
+        -----END PRIVATE KEY-----
+        "#;
+        let owner_private_key = EncodingKey::from_ed_pem(owner_private_key_pem.as_bytes()).unwrap();
+
+        let mut signed_device_config = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        signed_device_config.ips = vec!["192.0.2.10".parse().unwrap()];
+        let signed_doc = signed_device_config
+            .encode(Some(&owner_private_key))
+            .unwrap();
+
+        let mut info_config = signed_device_config.clone();
+        info_config.ips = vec!["192.0.2.20".parse().unwrap()];
+        let mut device_info = DeviceInfo::from_device_doc(&info_config);
+        device_info.all_ip = vec!["192.0.2.40".parse().unwrap()];
+        let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
+
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(MixedProvider {
+                    signed_doc,
+                    info_doc,
+                }),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(resolved, vec!["192.0.2.10".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_merges_nameinfo_and_device_info_ips() {
+        struct MergeProvider {
+            info_doc: EncodedDocument,
+        }
+
+        #[async_trait]
+        impl NsProvider for MergeProvider {
+            fn get_id(&self) -> String {
+                "merge-provider".to_string()
+            }
+
+            async fn query(
+                &self,
+                _name: &str,
+                _record_type: Option<RecordType>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<NameInfo> {
+                Ok(NameInfo::from_address_vec(
+                    "ood1.example",
+                    vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()],
+                ))
+            }
+
+            async fn query_did(
+                &self,
+                _did: &DID,
+                doc_type: Option<&str>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<EncodedDocument> {
+                match doc_type {
+                    Some("info") => Ok(self.info_doc.clone()),
+                    _ => Err(NSError::NotFound("not implemented".into())),
+                }
+            }
+        }
+
+        let mut device_config = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        device_config.ips = vec![
+            "192.0.2.20".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let mut device_info = DeviceInfo::from_device_doc(&device_config);
+        device_info.all_ip = vec!["192.0.2.30".parse().unwrap()];
+        let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
+
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(MergeProvider { info_doc }),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "192.0.2.20".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+                "192.0.2.30".parse::<IpAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_falls_back_to_device_info_ips() {
+        let mut device_config = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        device_config.ips = vec![
+            "192.0.2.10".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let mut device_info = DeviceInfo::from_device_doc(&device_config);
+        device_info.all_ip = vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()];
+        let doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
+
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(MockProvider::ok(doc)),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+                "192.0.2.20".parse::<IpAddr>().unwrap(),
             ]
         );
     }

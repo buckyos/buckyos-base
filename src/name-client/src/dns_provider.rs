@@ -114,7 +114,6 @@ impl NsProvider for DnsProvider {
                     txt: txt_vec,
                     caa: Vec::new(),
                     ptr_records: Vec::new(),
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
@@ -149,7 +148,6 @@ impl NsProvider for DnsProvider {
                     txt: Vec::new(),
                     caa,
                     ptr_records: Vec::new(),
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
@@ -187,7 +185,6 @@ impl NsProvider for DnsProvider {
                     txt: Vec::new(),
                     caa: Vec::new(),
                     ptr_records: Vec::new(),
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
@@ -225,7 +222,6 @@ impl NsProvider for DnsProvider {
                     txt: Vec::new(),
                     caa: Vec::new(),
                     ptr_records,
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
@@ -252,20 +248,18 @@ impl NsProvider for DnsProvider {
             .query(&did.to_host_name(), Some(RecordType::TXT), None)
             .await?;
 
-        //info!("NsProvicer will parse_txt_record_to_did_document... for {}",did.to_host_name());
+        //info!("NsProvicer will parse_txt_record_to_did_documents... for {}",did.to_host_name());
 
         //识别TXT记录中的特殊记录
-        let new_name_info = name_info.parse_txt_record_to_did_document()?;
-
         let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
-        let did_document = new_name_info.get_did_document(doc_type);
-        if did_document.is_some() {
+        let did_documents = name_info.parse_txt_record_to_did_documents()?;
+        if let Some(did_document) = did_documents.get(doc_type) {
             info!(
                 "NsProvider::query_did{}: DID Document found: {}",
                 did.to_host_name(),
                 doc_type
             );
-            return Ok(did_document.unwrap().clone());
+            return Ok(did_document.clone());
         }
         warn!(
             "NsProvider::query_did{}: DID Document not found: {}",

@@ -97,10 +97,6 @@ pub struct NameInfo {
     pub ptr_records: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl: Option<u32>,
-    /// key is the doc_type,used by query_did
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    #[serde(default)]
-    pub did_documents: HashMap<String, EncodedDocument>,
     #[serde(default)]
     pub iat: u64,
 }
@@ -114,7 +110,6 @@ impl Default for NameInfo {
             txt: Vec::new(),
             caa: Vec::new(),
             ptr_records: Vec::new(),
-            did_documents: HashMap::new(),
             iat: 0,
             ttl: None,
         }
@@ -137,7 +132,6 @@ impl NameInfo {
             txt: Vec::new(),
             caa: Vec::new(),
             ptr_records: Vec::new(),
-            did_documents: HashMap::new(),
             iat: 0,
             ttl: Some(ttl),
         }
@@ -152,55 +146,20 @@ impl NameInfo {
             txt: Vec::new(),
             caa: Vec::new(),
             ptr_records: Vec::new(),
-            did_documents: HashMap::new(),
             iat: 0,
             ttl: Some(ttl),
         }
     }
 
-    pub fn parse_did_document_to_txt_record(self: &NameInfo) -> NSResult<NameInfo> {
-        let mut new_name_info = self.clone();
-
-        let boot_jwt = self.get_did_document("boot");
-        if boot_jwt.is_some() {
-            let boot_jwt = boot_jwt.unwrap();
-            new_name_info
-                .txt
-                .push(format!("BOOT={};", boot_jwt.to_string()));
-        }
-
-        let owner_config = self.get_did_document("owner");
-        if owner_config.is_some() {
-            let owner_config = owner_config.unwrap();
-            let owner_config = OwnerConfig::decode(owner_config, None)?;
-            new_name_info.txt.push(format!(
-                "PKX={};",
-                get_x_from_jwk(&owner_config.get_default_key().unwrap())?
-            ));
-        }
-
-        for (obj_name, device_jwt) in self.did_documents.iter() {
-            if obj_name == "boot" || obj_name == "zone" || obj_name == "owner" {
-                continue;
-            }
-
-            new_name_info
-                .txt
-                .push(format!("DEV={};", device_jwt.to_string()));
-        }
-
-        new_name_info.did_documents.clear();
-        return Ok(new_name_info);
-    }
-
-    pub fn parse_txt_record_to_did_document(self: &NameInfo) -> NSResult<NameInfo> {
+    pub fn parse_txt_record_to_did_documents(
+        self: &NameInfo,
+    ) -> NSResult<HashMap<String, EncodedDocument>> {
         let host_name = self.name.clone();
         let mut did_documents = HashMap::new();
         let mut owner_x = None;
         let mut devices = Vec::new();
         let mut boot_jwt = None;
         let mut zone_config: Option<ZoneConfig> = None;
-        let mut new_txt_vec = Vec::new();
 
         for txt in self.txt.iter() {
             debug!("- TXT:{}", txt);
@@ -216,8 +175,6 @@ impl NameInfo {
             } else if txt.starts_with("DEV=") {
                 let dev_payload = txt.trim_start_matches("DEV=").trim_end_matches(";");
                 devices.push(dev_payload.to_string());
-            } else {
-                new_txt_vec.push(txt.to_string());
             }
         }
 
@@ -280,14 +237,9 @@ impl NameInfo {
                     EncodedDocument::JsonLd(zone_config_json),
                 );
             }
-
-            let mut new_name_info = self.clone();
-            new_name_info.did_documents = did_documents;
-            new_name_info.txt = new_txt_vec;
-            return Ok(new_name_info);
         }
 
-        return Ok(self.clone());
+        return Ok(did_documents);
     }
     // pub fn from_zone_config_str(
     //     name: &str,
@@ -311,22 +263,15 @@ impl NameInfo {
     //     }
 
     //     let zone_boot_config_doc = EncodedDocument::from_str(zone_config_jwt.to_string()).unwrap();
-    //     let mut did_documents = HashMap::new();
-    //     did_documents.insert("boot".to_string(), zone_boot_config_doc);
     //     Self {
     //         name: name.to_string(),
     //         address: vec![],
     //         cname: None,
     //         txt: Vec::new(),
-    //         did_documents: did_documents,
     //         iat: 0,
     //         ttl: Some(ttl),
     //     }
     // }
-
-    pub fn get_did_document(&self, doc_type: &str) -> Option<&EncodedDocument> {
-        self.did_documents.get(doc_type)
-    }
 }
 
 #[async_trait::async_trait]
@@ -411,225 +356,67 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_txt_record_to_did_document() {
+    fn test_parse_txt_record_to_did_documents() {
         // 准备测试数据
         let (private_key, _public_key, public_key_jwk, zone_boot_config) =
             create_test_zone_boot_config();
 
         // 编码 ZoneBootConfig 为 JWT
         let boot_jwt = zone_boot_config.encode(Some(&private_key)).unwrap();
-        let boot_jwt_str = boot_jwt.to_string();
 
         // 创建设备 JWT
         let device_jwt = create_test_device_mini_config(&private_key);
 
         // 获取 owner key 的 x 值
         let owner_x = get_x_from_jwk(&public_key_jwk).unwrap();
-
-        let other_txt = vec ![
-            "DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;".to_string(),
-            "BOOT=eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg;".to_string(),
-            "PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;".to_string(),
-        ];
 
         // 创建包含 TXT 记录的 NameInfo
         let name_info = NameInfo {
             name: "did:bns:testzone".to_string(),
             address: Vec::new(),
             cname: None,
-            txt: other_txt,
+            txt: vec![
+                format!("BOOT={};", boot_jwt.to_string()),
+                format!("PKX={};", owner_x),
+                format!("DEV={};", device_jwt),
+                "plain=value".to_string(),
+            ],
             caa: Vec::new(),
             ptr_records: Vec::new(),
-            did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
         };
 
         // 执行解析
-        let result = name_info.parse_txt_record_to_did_document();
+        let result = name_info.parse_txt_record_to_did_documents();
         assert!(
             result.is_ok(),
-            "parse_txt_record_to_did_document should succeed"
+            "parse_txt_record_to_did_documents should succeed"
         );
 
-        let parsed_info = result.unwrap();
+        let did_documents = result.unwrap();
 
         // 验证结果
         assert!(
-            parsed_info.did_documents.contains_key("boot"),
+            did_documents.contains_key("boot"),
             "should contain boot document"
         );
         assert!(
-            parsed_info.did_documents.contains_key("zone"),
+            did_documents.contains_key("zone"),
             "should contain zone document"
         );
         assert!(
-            parsed_info.did_documents.contains_key("sn"),
-            "should contain ood1 document"
+            did_documents.contains_key("device1"),
+            "should contain device document"
         );
 
-        let zone_boot_config = parsed_info.get_did_document("zone").unwrap();
+        let zone_boot_config = did_documents.get("zone").unwrap();
         let did_doc = parse_did_doc(zone_boot_config.clone()).unwrap();
         let auth_key = did_doc.get_auth_key(None).unwrap();
-        let auth_key_x = get_x_from_jwk(&auth_key.1).unwrap();
+        let _auth_key_x = get_x_from_jwk(&auth_key.1).unwrap();
         //assert_eq!(auth_key_x, owner_x);
 
-        println!("✓ test_parse_txt_record_to_did_document passed");
-    }
-
-    #[test]
-    fn test_parse_did_document_to_txt_record() {
-        // 准备测试数据
-        let (private_key, _public_key, public_key_jwk, mut zone_boot_config) =
-            create_test_zone_boot_config();
-
-        // 设置 owner_key
-        zone_boot_config.owner_key = Some(public_key_jwk.clone());
-        zone_boot_config.id = Some(DID::from_str("did:bns:testzone").unwrap());
-
-        let owner_config = OwnerConfig::new(
-            DID::from_str("did:bns:testzone").unwrap(),
-            "did:bns:testzone".to_string(),
-            "did:bns:testzone".to_string(),
-            public_key_jwk.clone(),
-        );
-        let owner_config_json = serde_json::to_value(&owner_config).unwrap();
-        // 编码为 JWT
-        let boot_jwt = zone_boot_config.encode(Some(&private_key)).unwrap();
-
-        // 创建设备 JWT
-        let device_jwt = create_test_device_mini_config(&private_key);
-
-        // 创建 zone 的 JsonLd 文档
-        let zone_config_value = serde_json::to_value(&zone_boot_config).unwrap();
-
-        // 创建包含 DID 文档的 NameInfo
-        let mut did_documents = HashMap::new();
-        did_documents.insert("boot".to_string(), boot_jwt.clone());
-        did_documents.insert(
-            "owner".to_string(),
-            EncodedDocument::JsonLd(owner_config_json),
-        );
-        did_documents.insert(
-            "device1".to_string(),
-            EncodedDocument::Jwt(device_jwt.clone()),
-        );
-
-        let name_info = NameInfo {
-            name: "did:bns:testzone".to_string(),
-            address: Vec::new(),
-            cname: None,
-            txt: Vec::new(),
-            caa: Vec::new(),
-            ptr_records: Vec::new(),
-            did_documents,
-            iat: buckyos_get_unix_timestamp(),
-            ttl: Some(3600),
-        };
-
-        // 执行转换
-        let result = name_info.parse_did_document_to_txt_record();
-        assert!(
-            result.is_ok(),
-            "parse_did_document_to_txt_record should succeed"
-        );
-
-        let parsed_info = result.unwrap();
-
-        // 验证结果
-        assert!(
-            parsed_info.txt.len() >= 3,
-            "should have at least 3 TXT records (BOOT, PKX, DEV)"
-        );
-        for txt in parsed_info.txt.iter() {
-            println!("TXT:{}", txt);
-        }
-
-        //验证包含必要的 TXT 记录
-        let has_boot = parsed_info.txt.iter().any(|txt| txt.starts_with("BOOT="));
-        let has_pkx = parsed_info.txt.iter().any(|txt| txt.starts_with("PKX="));
-        let has_dev = parsed_info.txt.iter().any(|txt| txt.starts_with("DEV="));
-
-        assert!(has_boot, "should have BOOT TXT record");
-        assert!(has_pkx, "should have PKX TXT record");
-        assert!(has_dev, "should have DEV TXT record");
-
-        // 验证 did_documents 已清空
-        assert_eq!(
-            parsed_info.did_documents.len(),
-            0,
-            "did_documents should be cleared"
-        );
-
-        println!("✓ test_parse_did_document_to_txt_record passed");
-    }
-
-    #[test]
-    fn test_txt_record_round_trip() {
-        // 准备测试数据
-        let (private_key, _public_key, public_key_jwk, zone_boot_config) =
-            create_test_zone_boot_config();
-
-        // 编码 ZoneBootConfig 为 JWT
-        let boot_jwt = zone_boot_config.encode(Some(&private_key)).unwrap();
-        let boot_jwt_str = boot_jwt.to_string();
-
-        // 创建设备 JWT
-        let device_jwt = create_test_device_mini_config(&private_key);
-
-        // 获取 owner key 的 x 值
-        let owner_x = get_x_from_jwk(&public_key_jwk).unwrap();
-
-        // 创建初始 NameInfo（TXT 记录格式）
-        let original_name_info = NameInfo {
-            name: "did:bns:testzone".to_string(),
-            address: Vec::new(),
-            cname: None,
-            txt: vec![
-                format!("BOOT={};", boot_jwt_str),
-                format!("PKX={};", owner_x),
-                format!("DEV={};", device_jwt),
-            ],
-            caa: Vec::new(),
-            ptr_records: Vec::new(),
-            did_documents: HashMap::new(),
-            iat: buckyos_get_unix_timestamp(),
-            ttl: Some(3600),
-        };
-
-        // 第一步：TXT -> DID Documents
-        let with_did_docs = original_name_info
-            .parse_txt_record_to_did_document()
-            .unwrap();
-        assert!(
-            with_did_docs.did_documents.len() >= 2,
-            "should have DID documents"
-        );
-        assert_eq!(
-            with_did_docs.txt.len(),
-            0,
-            "TXT records should be moved to did_documents"
-        );
-
-        // // 第二步：DID Documents -> TXT
-        let back_to_txt = with_did_docs.parse_did_document_to_txt_record().unwrap();
-        assert!(back_to_txt.txt.len() >= 3, "should have TXT records");
-        assert_eq!(
-            back_to_txt.did_documents.len(),
-            0,
-            "did_documents should be cleared"
-        );
-
-        // 验证往返后包含相同的记录类型
-        let has_boot = back_to_txt.txt.iter().any(|txt| txt.starts_with("BOOT="));
-        let has_pkx = back_to_txt.txt.iter().any(|txt| txt.starts_with("PKX="));
-        let has_dev = back_to_txt.txt.iter().any(|txt| txt.starts_with("DEV="));
-
-        assert!(has_boot, "round trip should preserve BOOT");
-        assert!(has_pkx, "round trip should preserve PKX");
-        assert!(has_dev, "round trip should preserve DEV");
-
-        println!("✓ test_txt_record_round_trip passed");
+        println!("✓ test_parse_txt_record_to_did_documents passed");
     }
 
     #[test]
@@ -642,49 +429,15 @@ mod tests {
             txt: vec!["some-txt=value".to_string()],
             caa: Vec::new(),
             ptr_records: Vec::new(),
-            did_documents: HashMap::new(),
             iat: buckyos_get_unix_timestamp(),
             ttl: Some(3600),
         };
 
-        let result = name_info.parse_txt_record_to_did_document().unwrap();
+        let result = name_info.parse_txt_record_to_did_documents().unwrap();
 
-        // 应该返回原始 NameInfo 的克隆
-        assert_eq!(
-            result.did_documents.len(),
-            0,
-            "should have no DID documents"
-        );
-        assert_eq!(result.txt.len(), 1, "should preserve original TXT");
+        assert_eq!(result.len(), 0, "should have no DID documents");
+        assert_eq!(name_info.txt.len(), 1, "should preserve original TXT");
 
         println!("✓ test_parse_txt_record_without_owner_key passed");
-    }
-
-    #[test]
-    fn test_parse_did_document_without_zone() {
-        // 测试没有 zone 文档的情况
-        let name_info = NameInfo {
-            name: "did:bns:testzone".to_string(),
-            address: Vec::new(),
-            cname: None,
-            txt: Vec::new(),
-            caa: Vec::new(),
-            ptr_records: Vec::new(),
-            did_documents: HashMap::new(),
-            iat: buckyos_get_unix_timestamp(),
-            ttl: Some(3600),
-        };
-
-        let result = name_info.clone();
-
-        // 应该返回原始的 NameInfo，只是 did_documents 被清空
-        assert_eq!(result.txt.len(), 0, "should have no TXT records");
-        assert_eq!(
-            result.did_documents.len(),
-            0,
-            "should have no DID documents"
-        );
-
-        println!("✓ test_parse_did_document_without_zone passed");
     }
 }

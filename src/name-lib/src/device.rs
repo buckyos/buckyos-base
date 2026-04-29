@@ -444,6 +444,17 @@ impl DeviceInfo {
         return result_info;
     }
 
+    pub fn merged_ips(&self) -> Vec<IpAddr> {
+        let mut ips = Vec::new();
+        for ip in &self.device_doc.ips {
+            push_unique_ip(&mut ips, *ip);
+        }
+        for ip in &self.all_ip {
+            push_unique_ip(&mut ips, *ip);
+        }
+        ips
+    }
+
     // //return (short_name,net_id,ip_addr)
     // pub fn get_net_info_from_ood_desc_string(
     //     ood_desc_string: &str,
@@ -1391,6 +1402,29 @@ mod tests {
         device_info.auto_fill_by_system_info().await.unwrap();
         let device_info_json = serde_json::to_string_pretty(&device_info).unwrap();
         println!("{}", device_info_json);
+    }
+
+    #[test]
+    fn test_device_info_merged_ips_prefers_device_config_ips() {
+        let mut device_config = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        device_config.ips = vec![
+            "192.0.2.10".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let mut device_info = DeviceInfo::from_device_doc(&device_config);
+        device_info.all_ip = vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()];
+
+        assert_eq!(
+            device_info.merged_ips(),
+            vec![
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "2001:db8::1".parse::<IpAddr>().unwrap(),
+                "192.0.2.20".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 
     #[test]
