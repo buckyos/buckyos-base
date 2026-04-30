@@ -571,37 +571,6 @@ impl ZoneConfig {
         return self.devices.get(device_name);
     }
 
-    pub fn select_same_subnet_ood(&self, device_info: &DeviceInfo) -> Option<String> {
-        let mut ood_list = self.oods.clone();
-        let mut rng = rand::rng();
-        ood_list.shuffle(&mut rng);
-
-        for ood in ood_list.iter() {
-            if ood.node_type.is_ood() {
-                if ood.net_id == device_info.net_id {
-                    return Some(ood.name.clone());
-                }
-            }
-        }
-
-        return None;
-    }
-
-    pub fn select_wan_ood(&self) -> Option<String> {
-        let mut ood_list = self.oods.clone();
-        let mut rng = rand::rng();
-        ood_list.shuffle(&mut rng);
-        for ood in self.oods.iter() {
-            if ood.node_type.is_ood() {
-                if ood.net_id.is_some() {
-                    if ood.net_id.as_ref().unwrap().starts_with("wan") {
-                        return Some(ood.name.clone());
-                    }
-                }
-            }
-        }
-        return None;
-    }
 
     pub fn get_sn_api_url(&self) -> Option<String> {
         if self.sn.is_some() {
