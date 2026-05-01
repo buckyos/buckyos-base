@@ -30,7 +30,7 @@ impl HttpsProvider {
     }
 
     /// Create with config json. Expected keys:
-    /// - resolver_host: required, resolver hostname.
+    /// - resolver_host: required, resolver hostname or http(s) base URL.
     /// - scheme: optional, defaults to https.
     pub fn new_with_config(config: Value) -> NSResult<Self> {
         let resolver_host = config
@@ -56,10 +56,19 @@ impl HttpsProvider {
         } else {
             did.to_string()
         };
-        format!(
-            "{}://{}/1.0/identifiers/{}",
-            self.scheme, self.resolver_host, target
-        )
+        let resolver_base = self.resolver_base_url();
+        format!("{}/1.0/identifiers/{}", resolver_base, target)
+    }
+
+    fn resolver_base_url(&self) -> String {
+        let resolver_host = self.resolver_host.trim().trim_end_matches('/');
+        let lower = resolver_host.to_ascii_lowercase();
+
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            resolver_host.to_string()
+        } else {
+            format!("{}://{}", self.scheme, resolver_host)
+        }
     }
 
     async fn parse_response(did: &DID, resp: reqwest::Response) -> NSResult<EncodedDocument> {
@@ -206,6 +215,28 @@ impl NsProvider for SmartProvider {
 mod tests {
     use super::*;
     use name_lib::DID;
+
+    #[test]
+    fn build_url_uses_http_base_url_directly() {
+        let provider = HttpsProvider::new("http://127.0.0.1:3200");
+        let did = DID::from_str("did:bns:example").unwrap();
+
+        assert_eq!(
+            provider.build_url(&did, Some("owner")),
+            "http://127.0.0.1:3200/1.0/identifiers/did:bns:example?type=owner"
+        );
+    }
+
+    #[test]
+    fn build_url_keeps_default_https_for_bare_host() {
+        let provider = HttpsProvider::new("127.0.0.1:3200");
+        let did = DID::from_str("did:bns:example").unwrap();
+
+        assert_eq!(
+            provider.build_url(&did, None),
+            "https://127.0.0.1:3200/1.0/identifiers/did:bns:example"
+        );
+    }
 
     #[tokio::test]
     async fn resolve_did_via_identity_foundation() {
