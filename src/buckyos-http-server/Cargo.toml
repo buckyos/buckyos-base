@@ -6,14 +6,23 @@ authors = ["BuckyOS DAO", "@waterflier"]
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+httpdate = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 log = { workspace = true }
+mime_guess = { workspace = true }
+percent-encoding = { workspace = true }
 serde_json = { workspace = true }
 sfo-result = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 buckyos-kit = { workspace = true }
 kRPC = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
