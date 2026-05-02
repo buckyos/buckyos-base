@@ -8,6 +8,7 @@ members = [
     "./buckyos-tracing",
     "./debug-lib",
     "./kRPC",
+    "./buckyos-http-server",
     "./rbac",
 ]
 
@@ -70,6 +71,10 @@ jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # HTTP clients and servers
 reqwest = { version = "0.12", default-features = false, features = ["json","rustls-tls-native-roots"] }
+http = "1.4"
+hyper = { version = "1.8", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
 
 # DNS
 hickory-resolver = { version = "0.25", features = ["tls-ring", "webpki-roots"] }
@@ -84,6 +89,7 @@ casbin = { version = "2.9", features = ["logging","explain"] }
 nvml-wrapper = "0.11"
 bip39 = "2.0"
 cfg-if = "1.0"
+sfo-result = "0.2"
 
 # Internal workspace dependencies
 buckyos-kit = { path = "./buckyos-kit" }
@@ -91,6 +97,7 @@ buckyos-tracing = { path = "./buckyos-tracing" }
 name-lib = { path = "./name-lib" }
 name-client = { path = "./name-client" }
 kRPC = { path = "./kRPC" }
+buckyos-http-server = { path = "./buckyos-http-server" }
 rbac = { path = "./rbac" }
 debug-lib = { path = "./debug-lib" }
 

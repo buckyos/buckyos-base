@@ -1,0 +1,19 @@
+[package]
+name = "buckyos-http-server"
+version.workspace = true
+edition = "2021"
+authors = ["BuckyOS DAO", "@waterflier"]
+
+[dependencies]
+async-trait = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+sfo-result = { workspace = true }
+tokio = { workspace = true }
+
+buckyos-kit = { workspace = true }
+kRPC = { workspace = true }
