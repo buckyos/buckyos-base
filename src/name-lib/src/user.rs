@@ -15,6 +15,13 @@ use crate::{
     EncodedDocument, NSError, NSResult, ServiceNode, VerificationMethodNode, DID,
 };
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct OwnerWallet {
+    #[serde(rename = "type")]
+    pub wallet_type: String,
+    pub address: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct OwnerConfig {
     #[serde(rename = "@context", default = "default_owner_context")]
@@ -51,6 +58,9 @@ pub struct OwnerConfig {
     pub meta: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_zone_did: Option<DID>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub wallets: HashMap<String, OwnerWallet>,
 }
 
 impl OwnerConfig {
@@ -126,6 +136,7 @@ impl OwnerConfig {
             mini_version_seq: None,
             valid_iat: None,
             meta: None,
+            wallets: HashMap::new(),
             extra_info: HashMap::new(),
             service: vec![],
         }
@@ -374,6 +385,50 @@ mod tests {
 
         assert_eq!(owner_config, decoded);
         assert_eq!(encoded, token2);
+    }
+
+    #[test]
+    fn owner_config_serializes_wallets_by_name() {
+        let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
+            {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }
+        ))
+        .unwrap();
+        let mut owner_config = OwnerConfig::new(
+            DID::new("bns", "lzc"),
+            "lzc".to_string(),
+            "zhicong liu".to_string(),
+            public_key_jwk,
+        );
+
+        owner_config.wallets.insert(
+            "main".to_string(),
+            OwnerWallet {
+                wallet_type: "eth".to_string(),
+                address: "0x1234".to_string(),
+            },
+        );
+
+        let json_value = serde_json::to_value(&owner_config).unwrap();
+        assert_eq!(
+            json_value["wallets"]["main"],
+            json!({
+                "type": "eth",
+                "address": "0x1234"
+            })
+        );
+
+        let decoded: OwnerConfig = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            decoded.wallets.get("main").unwrap(),
+            &OwnerWallet {
+                wallet_type: "eth".to_string(),
+                address: "0x1234".to_string(),
+            }
+        );
     }
 
     #[test]

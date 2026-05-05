@@ -12,7 +12,7 @@ pub use agent::*;
 pub use device::*;
 pub use did::*;
 use serde::{Deserialize, Serialize};
-pub use user::OwnerConfig;
+pub use user::{OwnerConfig, OwnerWallet};
 pub use utility::*;
 pub use zone::*;
 
