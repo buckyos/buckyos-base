@@ -179,20 +179,7 @@ impl DIDDocumentFsCache {
         trust_level: i32,
     ) -> bool {
         if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
-            let mut need_update = false;
-            if did.is_named_obj_id() {
-                need_update = false;
-            } else {
-                let new_iat = get_doc_iat(&doc);
-                let current_iat = get_doc_iat(&existing);
-                if trust_level < current_trust {
-                    need_update = true;
-                } else if trust_level == current_trust && new_iat > current_iat {
-                    need_update = true;
-                }
-            }
-
-            if need_update {
+            if should_update_cached_doc(&did, &existing, current_trust, &doc, trust_level) {
                 self.insert(did, doc_type, doc, exp, trust_level);
                 return true;
             }
@@ -430,15 +417,7 @@ impl DIDDocumentDBCache {
         trust_level: i32,
     ) -> bool {
         if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
-            let mut need_update = false;
-            let new_iat = get_doc_iat(&doc);
-            let current_iat = get_doc_iat(&existing);
-            if trust_level < current_trust {
-                need_update = true;
-            } else if trust_level == current_trust && new_iat > current_iat {
-                need_update = true;
-            }
-            if need_update {
+            if should_update_cached_doc(&did, &existing, current_trust, &doc, trust_level) {
                 self.insert(did, doc_type, doc, exp, trust_level);
                 return true;
             }
@@ -614,20 +593,7 @@ impl DIDDocumentMemCache {
         trust_level: i32,
     ) -> bool {
         if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
-            let mut need_update = false;
-            if did.is_named_obj_id() {
-                need_update = false;
-            } else {
-                let new_iat = get_doc_iat(&doc);
-                let current_iat = get_doc_iat(&existing);
-                if trust_level < current_trust {
-                    need_update = true;
-                } else if trust_level == current_trust && new_iat > current_iat {
-                    need_update = true;
-                }
-            }
-
-            if need_update {
+            if should_update_cached_doc(&did, &existing, current_trust, &doc, trust_level) {
                 self.insert(did, doc_type, doc, exp, trust_level);
                 return true;
             }
@@ -672,6 +638,41 @@ impl DIDDocumentMemCache {
 
 fn is_expired(exp_ts: u64) -> bool {
     exp_ts <= buckyos_get_unix_timestamp()
+}
+
+fn should_update_cached_doc(
+    did: &DID,
+    current_doc: &EncodedDocument,
+    current_trust: i32,
+    new_doc: &EncodedDocument,
+    new_trust: i32,
+) -> bool {
+    let current_version_seq = get_doc_version_seq(current_doc);
+    let new_version_seq = get_doc_version_seq(new_doc);
+
+    match (current_version_seq, new_version_seq) {
+        (Some(current), Some(new)) => {
+            return new > current || (new == current && new_trust < current_trust);
+        }
+        (Some(_), None) => return false,
+        (None, Some(_)) => return true,
+        (None, None) => {}
+    }
+
+    if did.is_named_obj_id() {
+        return false;
+    }
+
+    let new_iat = get_doc_iat(new_doc);
+    let current_iat = get_doc_iat(current_doc);
+    if new_trust < current_trust {
+        return true;
+    }
+    new_trust == current_trust && new_iat > current_iat
+}
+
+fn get_doc_version_seq(doc: &EncodedDocument) -> Option<u64> {
+    extract_timestamp(doc, "version_seq")
 }
 
 fn get_doc_iat(doc: &EncodedDocument) -> Option<u64> {
@@ -766,6 +767,14 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     fn build_owner_doc(iat: u64, marker: &str) -> EncodedDocument {
+        build_owner_doc_with_version(iat, Some(0), marker)
+    }
+
+    fn build_owner_doc_with_version(
+        iat: u64,
+        version_seq: Option<u64>,
+        marker: &str,
+    ) -> EncodedDocument {
         let mut owner_config = OwnerConfig::new(
             DID::new("bns", "tester"),
             format!("tester-{marker}"),
@@ -774,6 +783,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
         owner_config.iat = iat;
         owner_config.exp = iat + DEFAULT_EXPIRE_TIME;
+        owner_config.version_seq = version_seq;
         owner_config
             .extra_info
             .insert("marker".to_string(), json!(marker));
@@ -859,10 +869,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[test]
-    fn fs_update_only_writes_when_newer_iat_or_higher_trust() {
+    fn fs_update_prefers_version_seq_over_iat() {
         let (_tmp_dir, cache, did) = setup_fs_cache();
         let now = buckyos_get_unix_timestamp();
-        let doc_v1 = build_owner_doc(now, "jwt-v1");
+        let doc_v1 = build_owner_doc_with_version(now + 1_000, Some(1), "jwt-v1");
         let exp_v1 = doc_v1
             .clone()
             .to_json_value()
@@ -879,7 +889,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             DEFAULT_PROVIDER_TRUST_LEVEL
         ));
 
-        let doc_v2 = build_owner_doc(now + 1_000, "jwt-v2");
+        let doc_v2 = build_owner_doc_with_version(now, Some(2), "jwt-v2");
         let exp_v2 = doc_v2
             .clone()
             .to_json_value()
@@ -897,7 +907,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         ));
         assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
 
-        let older_doc = build_owner_doc(now + 500, "jwt-old");
+        let older_doc = build_owner_doc_with_version(now + 2_000, Some(1), "jwt-old");
         assert!(!cache.update(
             did.clone(),
             None,
@@ -943,6 +953,112 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         ));
 
         assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
+    }
+
+    #[test]
+    fn fs_versioned_cache_rejects_unversioned_doc() {
+        let (_tmp_dir, cache, did) = setup_fs_cache();
+        let now = buckyos_get_unix_timestamp();
+        let versioned_doc = EncodedDocument::JsonLd(json!({
+            "version_seq": 5,
+            "iat": now,
+            "exp": now + DEFAULT_EXPIRE_TIME,
+            "marker": "versioned"
+        }));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            versioned_doc.clone(),
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
+
+        let unversioned_doc = EncodedDocument::JsonLd(json!({
+            "iat": now + 10_000,
+            "exp": now + DEFAULT_EXPIRE_TIME + 10_000,
+            "marker": "unversioned"
+        }));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            unversioned_doc,
+            now + DEFAULT_EXPIRE_TIME + 10_000,
+            DEFAULT_PROVIDER_TRUST_LEVEL - 10
+        ));
+
+        assert_eq!(cache.get(&did, None).unwrap().0, versioned_doc);
+    }
+
+    #[test]
+    fn mem_version_seq_takes_over_named_obj_cache() {
+        let (cache, _) = setup_mem_cache();
+        let did = DID::from_str("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let doc_v1 = EncodedDocument::JsonLd(json!({
+            "version_seq": 1,
+            "iat": now,
+            "exp": now + DEFAULT_EXPIRE_TIME,
+            "marker": "v1"
+        }));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v1,
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
+
+        let doc_v2 = EncodedDocument::JsonLd(json!({
+            "version_seq": 2,
+            "iat": now + 10,
+            "exp": now + DEFAULT_EXPIRE_TIME + 10,
+            "marker": "v2"
+        }));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v2.clone(),
+            now + DEFAULT_EXPIRE_TIME + 10,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
+
+        assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
+    }
+
+    #[test]
+    fn db_version_seq_rejects_lower_sequence() -> Result<(), NSError> {
+        let (_tmp_dir, cache, did) = setup_db_cache();
+        let now = buckyos_get_unix_timestamp();
+        let doc_v2 = EncodedDocument::JsonLd(json!({
+            "version_seq": 2,
+            "iat": now,
+            "exp": now + DEFAULT_EXPIRE_TIME,
+            "marker": "v2"
+        }));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v2.clone(),
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL
+        ));
+
+        let doc_v1 = EncodedDocument::JsonLd(json!({
+            "version_seq": 1,
+            "iat": now + 10_000,
+            "exp": now + DEFAULT_EXPIRE_TIME + 10_000,
+            "marker": "v1"
+        }));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            doc_v1,
+            now + DEFAULT_EXPIRE_TIME + 10_000,
+            DEFAULT_PROVIDER_TRUST_LEVEL - 10
+        ));
+
+        assert_eq!(cache.get(&did, None).unwrap().0, doc_v2);
+        Ok(())
     }
 
     #[test]
