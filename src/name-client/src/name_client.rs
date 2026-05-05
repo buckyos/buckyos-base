@@ -451,14 +451,17 @@ impl NameClient {
         }
     }
 
-    fn is_doc_type_is_owner(&self, doc_type: Option<&str>) -> bool {
-        if doc_type.is_some() {
-            let doc_type = doc_type.unwrap();
-            if doc_type == "owner" {
-                return true;
-            }
+    fn validate_doc_replay_guard(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        doc: &EncodedDocument,
+    ) -> NSResult<()> {
+        if self.config.enable_cache {
+            self.doc_cache
+                .validate_owner_revocation(did, doc_type, doc)?;
         }
-        return false;
+        Ok(())
     }
 
     fn is_expired(&self, exp: u64) -> bool {
@@ -492,6 +495,19 @@ impl NameClient {
                     cached_trust_level = *trust_level;
                 }
             }
+            if let Some((doc, _, _)) = cached_result.as_ref() {
+                if let Err(err) = self.validate_doc_replay_guard(did, doc_type, doc) {
+                    info!(
+                        "cached did:{}#{} rejected by owner replay guard: {}",
+                        did.to_string(),
+                        doc_type.unwrap_or(""),
+                        err
+                    );
+                    self.doc_cache.delete(did.clone(), doc_type);
+                    cached_result = None;
+                    cached_trust_level = i32::MAX;
+                }
+            }
         }
 
         let reslove_result = self
@@ -507,6 +523,7 @@ impl NameClient {
                     doc_type.unwrap_or(""),
                     exp
                 );
+                self.validate_doc_replay_guard(did, doc_type, &did_doc)?;
                 if self.config.enable_cache {
                     self.doc_cache.update(
                         did.clone(),
@@ -554,9 +571,13 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use buckyos_kit::init_logging;
-    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    const TEST_OWNER_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
+-----END PRIVATE KEY-----"#;
 
     fn make_doc(iat: u64, exp: u64, marker: &str) -> EncodedDocument {
         EncodedDocument::JsonLd(serde_json::json!({
@@ -670,6 +691,39 @@ mod tests {
         }
     }
 
+    struct ReplayGuardProvider {
+        owner_doc: EncodedDocument,
+        fresh_doc: EncodedDocument,
+    }
+
+    #[async_trait]
+    impl NsProvider for ReplayGuardProvider {
+        fn get_id(&self) -> String {
+            "replay-guard-provider".to_string()
+        }
+
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Err(NSError::NotFound("not implemented".into()))
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            doc_type: Option<&str>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            if doc_type == Some("owner") {
+                return Ok(self.owner_doc.clone());
+            }
+            Ok(self.fresh_doc.clone())
+        }
+    }
+
     struct NameMockProvider {
         called_name: Arc<Mutex<Option<String>>>,
     }
@@ -719,6 +773,31 @@ mod tests {
         config
     }
 
+    fn test_owner_public_jwk() -> jsonwebtoken::jwk::Jwk {
+        serde_json::from_value(serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+        }))
+        .unwrap()
+    }
+
+    fn make_jwt_doc(version_seq: u64, iat: u64, marker: &str) -> EncodedDocument {
+        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        let jwt = encode(
+            &Header::new(Algorithm::EdDSA),
+            &serde_json::json!({
+                "version_seq": version_seq,
+                "iat": iat,
+                "exp": iat + DEFAULT_EXPIRE_TIME,
+                "marker": marker
+            }),
+            &private_key,
+        )
+        .unwrap();
+        EncodedDocument::Jwt(jwt)
+    }
+
     #[tokio::test]
     async fn prefer_higher_trust_provider_over_cached() {
         let mut client = client_with_temp_cache(CacheBackend::Filesystem);
@@ -759,6 +838,56 @@ mod tests {
 
         let resolved = client.resolve_did(&did, None).await.unwrap();
         assert_eq!(resolved, cached);
+    }
+
+    #[tokio::test]
+    async fn owner_replay_guard_rejects_cached_stale_jwt_and_resolves_again() {
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: true,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let old_doc = make_jwt_doc(1, 200, "old");
+        let fresh_doc = make_jwt_doc(2, 201, "fresh");
+        let now = buckyos_get_unix_timestamp();
+
+        let mut owner_config = OwnerConfig::new(
+            did.clone(),
+            "example".to_string(),
+            "example@example.com".to_string(),
+            test_owner_public_jwk(),
+        );
+        owner_config.mini_version_seq = Some(1);
+        owner_config.valid_iat = Some(200);
+        let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(owner_config).unwrap());
+
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            old_doc,
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+        client.doc_cache.insert(
+            did.clone(),
+            Some("owner"),
+            owner_doc.clone(),
+            now + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+        client
+            .add_provider(
+                Box::new(ReplayGuardProvider {
+                    owner_doc,
+                    fresh_doc: fresh_doc.clone(),
+                }),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        let resolved = client.resolve_did(&did, None).await.unwrap();
+        assert_eq!(resolved, fresh_doc);
     }
 
     #[tokio::test]

@@ -34,6 +34,12 @@ pub struct OwnerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub version_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub mini_version_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub valid_iat: Option<u64>,
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
 
@@ -117,6 +123,8 @@ impl OwnerConfig {
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 10,
             iat: buckyos_get_unix_timestamp(),
             version_seq: Some(0),
+            mini_version_seq: None,
+            valid_iat: None,
             meta: None,
             extra_info: HashMap::new(),
             service: vec![],
@@ -166,6 +174,55 @@ impl OwnerConfig {
             }
         }
         return None;
+    }
+
+    pub fn validate_jwt_revocation(&self, doc_type: &str, doc: &EncodedDocument) -> NSResult<()> {
+        if self.mini_version_seq.is_none() && self.valid_iat.is_none() {
+            return Ok(());
+        }
+
+        if !doc.is_proof() {
+            return Ok(());
+        }
+
+        let doc_value = doc.clone().to_json_value()?;
+        if let Some(mini_version_seq) = self.mini_version_seq {
+            let version_seq = doc_value
+                .get("version_seq")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    NSError::Failed(format!(
+                        "{} JWT missing version_seq required by owner revocation policy",
+                        doc_type
+                    ))
+                })?;
+            if version_seq <= mini_version_seq {
+                return Err(NSError::Failed(format!(
+                    "{} JWT version_seq {} is not greater than owner mini_version_seq {}",
+                    doc_type, version_seq, mini_version_seq
+                )));
+            }
+        }
+
+        if let Some(valid_iat) = self.valid_iat {
+            let iat = doc_value
+                .get("iat")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    NSError::Failed(format!(
+                        "{} JWT missing iat required by owner revocation policy",
+                        doc_type
+                    ))
+                })?;
+            if iat <= valid_iat {
+                return Err(NSError::Failed(format!(
+                    "{} JWT iat {} is not greater than owner valid_iat {}",
+                    doc_type, iat, valid_iat
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -346,6 +403,72 @@ mod tests {
 
         let err = owner_config.encode(Some(&private_key)).unwrap_err();
         assert!(matches!(err, NSError::Failed(_)));
+    }
+
+    #[test]
+    fn owner_config_replay_guard_rejects_stale_jwt() {
+        let private_key_pem = r#"
+        -----BEGIN PRIVATE KEY-----
+        MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
+        -----END PRIVATE KEY-----
+        "#;
+        let private_key = EncodingKey::from_ed_pem(private_key_pem.as_bytes()).unwrap();
+
+        let mut owner_config = OwnerConfig::new(
+            DID::new("bns", "lzc"),
+            "lzc".to_string(),
+            "zhicong liu".to_string(),
+            serde_json::from_value(json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }))
+            .unwrap(),
+        );
+        owner_config.mini_version_seq = Some(3);
+        owner_config.valid_iat = Some(100);
+
+        let fresh_jwt = encode(
+            &Header::new(Algorithm::EdDSA),
+            &json!({
+                "version_seq": 4,
+                "iat": 101,
+                "exp": 1000
+            }),
+            &private_key,
+        )
+        .unwrap();
+        owner_config
+            .validate_jwt_revocation("ZoneConfig", &EncodedDocument::Jwt(fresh_jwt))
+            .unwrap();
+
+        let stale_version_jwt = encode(
+            &Header::new(Algorithm::EdDSA),
+            &json!({
+                "version_seq": 3,
+                "iat": 101,
+                "exp": 1000
+            }),
+            &private_key,
+        )
+        .unwrap();
+        assert!(owner_config
+            .validate_jwt_revocation("ZoneConfig", &EncodedDocument::Jwt(stale_version_jwt))
+            .is_err());
+
+        let stale_iat_jwt = encode(
+            &Header::new(Algorithm::EdDSA),
+            &json!({
+                "version_seq": 4,
+                "iat": 100,
+                "exp": 1000
+            }),
+            &private_key,
+        )
+        .unwrap();
+        assert!(owner_config
+            .validate_jwt_revocation("ZoneConfig", &EncodedDocument::Jwt(stale_iat_jwt))
+            .is_err());
     }
 
     #[test]

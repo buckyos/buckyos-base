@@ -8,7 +8,7 @@ use buckyos_kit::{
     buckyos_get_unix_timestamp, get_buckyos_service_local_data_dir, get_buckyos_system_etc_dir,
 };
 use log::{debug, error, info, warn};
-use name_lib::{EncodedDocument, DEFAULT_EXPIRE_TIME, DID};
+use name_lib::{DIDDocumentTrait, EncodedDocument, OwnerConfig, DEFAULT_EXPIRE_TIME, DID};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +77,19 @@ impl DIDDocumentCache {
             Self::Fs(inner) => inner.update(did, doc_type, doc, exp, trust_level),
             Self::Db(inner) => inner.update(did, doc_type, doc, exp, trust_level),
             Self::Mem(inner) => inner.update(did, doc_type, doc, exp, trust_level),
+        }
+    }
+
+    pub fn validate_owner_revocation(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        doc: &EncodedDocument,
+    ) -> name_lib::NSResult<()> {
+        match self {
+            Self::Fs(inner) => inner.validate_owner_revocation(did, doc_type, doc),
+            Self::Db(inner) => inner.validate_owner_revocation(did, doc_type, doc),
+            Self::Mem(inner) => inner.validate_owner_revocation(did, doc_type, doc),
         }
     }
 
@@ -178,6 +191,13 @@ impl DIDDocumentFsCache {
         exp: u64,
         trust_level: i32,
     ) -> bool {
+        if self
+            .validate_owner_revocation(&did, doc_type, &doc)
+            .is_err()
+        {
+            return false;
+        }
+
         if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
             if should_update_cached_doc(&did, &existing, current_trust, &doc, trust_level) {
                 self.insert(did, doc_type, doc, exp, trust_level);
@@ -198,6 +218,13 @@ impl DIDDocumentFsCache {
         exp: u64,
         trust_level: i32,
     ) {
+        if self
+            .validate_owner_revocation(&did, doc_type, &doc)
+            .is_err()
+        {
+            return;
+        }
+
         self.save_to_disk(&did, doc_type, &doc);
         self.save_meta(
             &did,
@@ -208,6 +235,10 @@ impl DIDDocumentFsCache {
                 update_from_remote_time: Some(buckyos_get_unix_timestamp()),
             },
         );
+
+        if let Some(owner_config) = parse_owner_config_doc(doc_type, &doc) {
+            self.evict_revoked_docs(&did, doc_type, &owner_config);
+        }
     }
 
     pub fn delete(&self, did: DID, doc_type: Option<&str>) {
@@ -353,6 +384,70 @@ impl DIDDocumentFsCache {
             }
         }
     }
+
+    pub fn validate_owner_revocation(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        doc: &EncodedDocument,
+    ) -> name_lib::NSResult<()> {
+        if is_owner_doc(doc_type, doc) {
+            return Ok(());
+        }
+
+        if let Some(owner_config) = self.load_cached_owner_config(did) {
+            owner_config.validate_jwt_revocation(doc_type.unwrap_or_default(), doc)?;
+        }
+        Ok(())
+    }
+
+    fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
+        self.load_from_disk(did, Some("owner"))
+            .and_then(|(doc, _)| parse_owner_config_doc(Some("owner"), &doc))
+            .or_else(|| {
+                self.load_from_disk(did, None)
+                    .and_then(|(doc, _)| parse_owner_config_doc(None, &doc))
+            })
+    }
+
+    fn evict_revoked_docs(
+        &self,
+        did: &DID,
+        owner_doc_type: Option<&str>,
+        owner_config: &OwnerConfig,
+    ) {
+        let did_key = did.to_raw_host_name();
+        let entries = match fs::read_dir(&self.cache_dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!(
+                    "read did cache directory for revocation cleanup failed: {}",
+                    err
+                );
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Some(doc_type) = doc_type_from_cache_file_name(&did_key, &file_name) else {
+                continue;
+            };
+            if same_doc_type(doc_type.as_deref(), owner_doc_type) {
+                continue;
+            }
+
+            let Some((doc, _)) = self.load_from_disk(did, doc_type.as_deref()) else {
+                continue;
+            };
+            if owner_config
+                .validate_jwt_revocation(doc_type.as_deref().unwrap_or_default(), &doc)
+                .is_err()
+            {
+                self.delete(did.clone(), doc_type.as_deref());
+            }
+        }
+    }
 }
 
 // ------------------------ SQLite 实现 ------------------------
@@ -416,6 +511,13 @@ impl DIDDocumentDBCache {
         exp: u64,
         trust_level: i32,
     ) -> bool {
+        if self
+            .validate_owner_revocation(&did, doc_type, &doc)
+            .is_err()
+        {
+            return false;
+        }
+
         if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
             if should_update_cached_doc(&did, &existing, current_trust, &doc, trust_level) {
                 self.insert(did, doc_type, doc, exp, trust_level);
@@ -436,6 +538,13 @@ impl DIDDocumentDBCache {
         exp: u64,
         trust_level: i32,
     ) {
+        if self
+            .validate_owner_revocation(&did, doc_type, &doc)
+            .is_err()
+        {
+            return;
+        }
+
         let conn = match self.open_conn() {
             Ok(c) => c,
             Err(err) => {
@@ -457,6 +566,10 @@ impl DIDDocumentDBCache {
             ],
         ) {
             warn!("write did doc sqlite cache failed: {}", err);
+        }
+
+        if let Some(owner_config) = parse_owner_config_doc(doc_type, &doc) {
+            self.evict_revoked_docs(&did, doc_type, &owner_config);
         }
     }
 
@@ -519,6 +632,88 @@ impl DIDDocumentDBCache {
             name_lib::NSError::ReadLocalFileError(format!("migrate table failed: {}", e))
         })?;
         Ok(())
+    }
+
+    pub fn validate_owner_revocation(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        doc: &EncodedDocument,
+    ) -> name_lib::NSResult<()> {
+        if is_owner_doc(doc_type, doc) {
+            return Ok(());
+        }
+
+        if let Some(owner_config) = self.load_cached_owner_config(did) {
+            owner_config.validate_jwt_revocation(doc_type.unwrap_or_default(), doc)?;
+        }
+        Ok(())
+    }
+
+    fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
+        self.get(did, Some("owner"))
+            .and_then(|(doc, _, _)| parse_owner_config_doc(Some("owner"), &doc))
+            .or_else(|| {
+                self.get(did, None)
+                    .and_then(|(doc, _, _)| parse_owner_config_doc(None, &doc))
+            })
+    }
+
+    fn evict_revoked_docs(
+        &self,
+        did: &DID,
+        owner_doc_type: Option<&str>,
+        owner_config: &OwnerConfig,
+    ) {
+        let conn = match self.open_conn() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("open sqlite cache failed for revocation cleanup: {}", err);
+                return;
+            }
+        };
+
+        let mut stmt = match conn.prepare("SELECT doc_type, doc FROM did_docs WHERE did = ?1") {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                warn!("prepare sqlite revocation cleanup failed: {}", err);
+                return;
+            }
+        };
+
+        let rows = match stmt.query_map(params![did.to_raw_host_name()], |row| {
+            let doc_type: String = row.get(0)?;
+            let doc_str: String = row.get(1)?;
+            Ok((doc_type, doc_str))
+        }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!("query sqlite revocation cleanup failed: {}", err);
+                return;
+            }
+        };
+
+        let mut revoked_doc_types = Vec::new();
+        for row in rows.flatten() {
+            let doc_type = empty_doc_type_to_option(&row.0);
+            if same_doc_type(doc_type, owner_doc_type) {
+                continue;
+            }
+            let Ok(doc) = EncodedDocument::from_str(row.1) else {
+                continue;
+            };
+            if owner_config
+                .validate_jwt_revocation(doc_type.unwrap_or_default(), &doc)
+                .is_err()
+            {
+                revoked_doc_types.push(row.0);
+            }
+        }
+
+        drop(stmt);
+        for doc_type in revoked_doc_types {
+            self.delete(did.clone(), empty_doc_type_to_option(&doc_type));
+        }
     }
 }
 
@@ -592,6 +787,13 @@ impl DIDDocumentMemCache {
         exp: u64,
         trust_level: i32,
     ) -> bool {
+        if self
+            .validate_owner_revocation(&did, doc_type, &doc)
+            .is_err()
+        {
+            return false;
+        }
+
         if let Some((existing, _, current_trust)) = self.get(&did, doc_type) {
             if should_update_cached_doc(&did, &existing, current_trust, &doc, trust_level) {
                 self.insert(did, doc_type, doc, exp, trust_level);
@@ -612,6 +814,14 @@ impl DIDDocumentMemCache {
         exp: u64,
         trust_level: i32,
     ) {
+        if self
+            .validate_owner_revocation(&did, doc_type, &doc)
+            .is_err()
+        {
+            return;
+        }
+
+        let owner_config = parse_owner_config_doc(doc_type, &doc);
         let key = combine_key(&did, doc_type);
         if let Ok(mut guard) = self.entries.write() {
             guard.insert(
@@ -624,12 +834,65 @@ impl DIDDocumentMemCache {
                 },
             );
         }
+
+        if let Some(owner_config) = owner_config {
+            self.evict_revoked_docs(&did, doc_type, &owner_config);
+        }
     }
 
     pub fn delete(&self, did: DID, doc_type: Option<&str>) {
         let key = combine_key(&did, doc_type);
         if let Ok(mut guard) = self.entries.write() {
             guard.remove(&key);
+        }
+    }
+
+    pub fn validate_owner_revocation(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        doc: &EncodedDocument,
+    ) -> name_lib::NSResult<()> {
+        if is_owner_doc(doc_type, doc) {
+            return Ok(());
+        }
+
+        if let Some(owner_config) = self.load_cached_owner_config(did) {
+            owner_config.validate_jwt_revocation(doc_type.unwrap_or_default(), doc)?;
+        }
+        Ok(())
+    }
+
+    fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
+        self.get(did, Some("owner"))
+            .and_then(|(doc, _, _)| parse_owner_config_doc(Some("owner"), &doc))
+            .or_else(|| {
+                self.get(did, None)
+                    .and_then(|(doc, _, _)| parse_owner_config_doc(None, &doc))
+            })
+    }
+
+    fn evict_revoked_docs(
+        &self,
+        did: &DID,
+        owner_doc_type: Option<&str>,
+        owner_config: &OwnerConfig,
+    ) {
+        let did_key = did.to_raw_host_name();
+        if let Ok(mut guard) = self.entries.write() {
+            guard.retain(|key, entry| {
+                let doc_type = doc_type_from_cache_key(&did_key, key);
+                if doc_type.is_none() {
+                    return true;
+                }
+                let doc_type = doc_type.unwrap();
+                if same_doc_type(doc_type.as_deref(), owner_doc_type) {
+                    return true;
+                }
+                owner_config
+                    .validate_jwt_revocation(doc_type.as_deref().unwrap_or_default(), &entry.doc)
+                    .is_ok()
+            });
         }
     }
 }
@@ -704,13 +967,64 @@ fn combine_key(did: &DID, doc_type: Option<&str>) -> String {
     }
 }
 
+fn is_owner_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> bool {
+    doc_type == Some("owner")
+        || doc
+            .clone()
+            .to_json_value()
+            .map_or(false, |value| value.get("full_name").is_some())
+}
+
+fn parse_owner_config_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> Option<OwnerConfig> {
+    if !is_owner_doc(doc_type, doc) {
+        return None;
+    }
+    match OwnerConfig::decode(doc, None) {
+        Ok(owner_config) => Some(owner_config),
+        Err(err) => {
+            warn!("parse owner config from did-cache failed: {}", err);
+            None
+        }
+    }
+}
+
+fn same_doc_type(left: Option<&str>, right: Option<&str>) -> bool {
+    left.unwrap_or_default() == right.unwrap_or_default()
+}
+
+fn empty_doc_type_to_option(doc_type: &str) -> Option<&str> {
+    if doc_type.is_empty() {
+        None
+    } else {
+        Some(doc_type)
+    }
+}
+
+fn doc_type_from_cache_file_name(did_key: &str, file_name: &str) -> Option<Option<String>> {
+    let suffix = ".doc.json";
+    if !file_name.ends_with(suffix) {
+        return None;
+    }
+
+    let key = file_name.strip_suffix(suffix)?;
+    doc_type_from_cache_key(did_key, key)
+}
+
+fn doc_type_from_cache_key(did_key: &str, key: &str) -> Option<Option<String>> {
+    if key == did_key {
+        return Some(None);
+    }
+    key.strip_prefix(&format!("{}#", did_key))
+        .map(|doc_type| Some(doc_type.to_string()))
+}
+
 // ------------------------ 测试 ------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::DEFAULT_PROVIDER_TRUST_LEVEL;
-    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use name_lib::{DIDDocumentTrait, NSError, OwnerConfig, ZoneBootConfig, DEFAULT_EXPIRE_TIME};
     use rusqlite::{params, Connection};
     use serde_json::json;
@@ -790,6 +1104,108 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         owner_config.encode(Some(&owner_encoding_key())).unwrap()
     }
 
+    fn build_owner_doc_with_revocation(
+        did: &DID,
+        iat: u64,
+        mini_version_seq: Option<u64>,
+        valid_iat: Option<u64>,
+        marker: &str,
+    ) -> EncodedDocument {
+        let mut owner_config = OwnerConfig::new(
+            did.clone(),
+            format!("tester-{marker}"),
+            "Tester Example".to_string(),
+            owner_public_jwk(),
+        );
+        owner_config.iat = iat;
+        owner_config.exp = iat + DEFAULT_EXPIRE_TIME;
+        owner_config.version_seq = Some(1);
+        owner_config.mini_version_seq = mini_version_seq;
+        owner_config.valid_iat = valid_iat;
+        owner_config
+            .extra_info
+            .insert("marker".to_string(), json!(marker));
+        owner_config.encode(Some(&owner_encoding_key())).unwrap()
+    }
+
+    fn build_jwt_doc(version_seq: u64, iat: u64, marker: &str) -> EncodedDocument {
+        let jwt = encode(
+            &Header::new(Algorithm::EdDSA),
+            &json!({
+                "version_seq": version_seq,
+                "iat": iat,
+                "exp": iat + DEFAULT_EXPIRE_TIME,
+                "marker": marker
+            }),
+            &owner_encoding_key(),
+        )
+        .unwrap();
+        EncodedDocument::Jwt(jwt)
+    }
+
+    fn assert_owner_update_evicts_revoked_docs(cache: &DIDDocumentCache, did: &DID) {
+        let base_iat = buckyos_get_unix_timestamp();
+        let old_doc = build_jwt_doc(1, base_iat + 10, "old");
+        let fresh_doc = build_jwt_doc(2, base_iat + 11, "fresh");
+        cache.insert(
+            did.clone(),
+            None,
+            old_doc,
+            base_iat + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+        cache.insert(
+            did.clone(),
+            Some("info"),
+            fresh_doc.clone(),
+            base_iat + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        let owner_doc =
+            build_owner_doc_with_revocation(did, base_iat, Some(1), Some(base_iat + 10), "owner");
+        cache.insert(
+            did.clone(),
+            Some("owner"),
+            owner_doc,
+            base_iat + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        assert!(
+            cache.get(did, None).is_none(),
+            "stale default DID document should be evicted"
+        );
+        assert_eq!(cache.get(did, Some("info")).unwrap().0, fresh_doc);
+    }
+
+    fn assert_owner_policy_rejects_new_revoked_doc(cache: &DIDDocumentCache, did: &DID) {
+        let base_iat = buckyos_get_unix_timestamp();
+        let owner_doc =
+            build_owner_doc_with_revocation(did, base_iat, Some(1), Some(base_iat + 10), "owner");
+        cache.insert(
+            did.clone(),
+            Some("owner"),
+            owner_doc,
+            base_iat + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        let old_doc = build_jwt_doc(1, base_iat + 10, "old");
+        cache.insert(
+            did.clone(),
+            None,
+            old_doc,
+            base_iat + DEFAULT_EXPIRE_TIME,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        assert!(
+            cache.get(did, None).is_none(),
+            "revoked DID document should not be inserted"
+        );
+    }
+
     fn build_zone_doc(did: &DID, exp: u64, marker: &str) -> EncodedDocument {
         let mut extra_info = HashMap::new();
         extra_info.insert("marker".to_string(), json!(marker));
@@ -823,6 +1239,18 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let loaded = cache.get(&did, None).expect("doc should be available");
         assert_eq!(loaded.0, doc);
         assert_eq!(loaded.1, exp);
+    }
+
+    #[test]
+    fn fs_owner_update_evicts_revoked_docs() {
+        let (_tmp_dir, cache, did) = setup_fs_cache();
+        assert_owner_update_evicts_revoked_docs(&cache, &did);
+    }
+
+    #[test]
+    fn fs_owner_policy_rejects_new_revoked_doc() {
+        let (_tmp_dir, cache, did) = setup_fs_cache();
+        assert_owner_policy_rejects_new_revoked_doc(&cache, &did);
     }
 
     #[test]
@@ -1103,6 +1531,20 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[test]
+    fn db_owner_update_evicts_revoked_docs() -> Result<(), NSError> {
+        let (_tmp_dir, cache, did) = setup_db_cache();
+        assert_owner_update_evicts_revoked_docs(&cache, &did);
+        Ok(())
+    }
+
+    #[test]
+    fn db_owner_policy_rejects_new_revoked_doc() -> Result<(), NSError> {
+        let (_tmp_dir, cache, did) = setup_db_cache();
+        assert_owner_policy_rejects_new_revoked_doc(&cache, &did);
+        Ok(())
+    }
+
+    #[test]
     fn mem_roundtrip() {
         let (cache, did) = setup_mem_cache();
         let now = buckyos_get_unix_timestamp();
@@ -1117,6 +1559,18 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         ));
         let loaded = cache.get(&did, None).expect("doc should be available");
         assert_eq!(loaded.0, doc);
+    }
+
+    #[test]
+    fn mem_owner_update_evicts_revoked_docs() {
+        let (cache, did) = setup_mem_cache();
+        assert_owner_update_evicts_revoked_docs(&cache, &did);
+    }
+
+    #[test]
+    fn mem_owner_policy_rejects_new_revoked_doc() {
+        let (cache, did) = setup_mem_cache();
+        assert_owner_policy_rejects_new_revoked_doc(&cache, &did);
     }
 
     #[test]
