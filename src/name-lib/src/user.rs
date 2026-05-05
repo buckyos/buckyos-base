@@ -33,6 +33,10 @@ pub struct OwnerConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     assertion_method: Vec<String>,
+    #[serde(rename = "capabilityInvocation")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    capability_invocation: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     service: Vec<ServiceNode>,
@@ -51,6 +55,10 @@ pub struct OwnerConfig {
     pub extra_info: HashMap<String, serde_json::Value>,
 
     //--------------------------------
+    #[serde(rename = "keyScope", alias = "buckyos:scopes")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub key_scope: HashMap<String, Vec<String>>,
     pub name: String,
     pub full_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,6 +137,7 @@ impl OwnerConfig {
             verification_method: verification_method,
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
+            capability_invocation: vec!["#main_key".to_string()],
             default_zone_did: None,
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 10,
             iat: buckyos_get_unix_timestamp(),
@@ -137,6 +146,7 @@ impl OwnerConfig {
             valid_iat: None,
             meta: None,
             wallets: HashMap::new(),
+            key_scope: HashMap::new(),
             extra_info: HashMap::new(),
             service: vec![],
         }
@@ -279,6 +289,24 @@ impl DIDDocumentTrait for OwnerConfig {
     fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
         //return default zone's exchange key
         return None;
+    }
+
+    fn get_key_ids_by_scope(&self, scope: &str) -> Option<&[String]> {
+        self.key_scope.get(scope).map(Vec::as_slice)
+    }
+
+    fn has_key_scope(&self) -> bool {
+        !self.key_scope.is_empty()
+    }
+
+    fn get_standard_scope_key_ids(&self) -> Option<&[String]> {
+        if !self.capability_invocation.is_empty() {
+            Some(self.capability_invocation.as_slice())
+        } else if !self.authentication.is_empty() {
+            Some(self.authentication.as_slice())
+        } else {
+            None
+        }
     }
 
     fn get_iss(&self) -> Option<String> {
@@ -429,6 +457,102 @@ mod tests {
                 address: "0x1234".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn owner_config_serializes_key_scope_by_scope_name() {
+        let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
+            {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }
+        ))
+        .unwrap();
+        let mut owner_config = OwnerConfig::new(
+            DID::new("bns", "lzc"),
+            "lzc".to_string(),
+            "zhicong liu".to_string(),
+            public_key_jwk,
+        );
+
+        let empty_json_value = serde_json::to_value(&owner_config).unwrap();
+        assert!(empty_json_value.get("keyScope").is_none());
+        assert!(owner_config.is_key_allowed_in_scope(crate::key_scope::CONTENT_CREATE, "#main_key"));
+        assert_eq!(
+            owner_config
+                .get_key_by_scope(crate::key_scope::CONTENT_CREATE)
+                .map(|(key_id, _, _)| key_id),
+            Some("#main_key".to_string())
+        );
+
+        let main_key_id = format!("{}#main_key", owner_config.id.to_string());
+        owner_config.key_scope.insert(
+            crate::key_scope::MANUAL.to_string(),
+            vec![main_key_id.clone()],
+        );
+        assert!(
+            !owner_config.is_key_allowed_in_scope(crate::key_scope::CONTENT_CREATE, "#main_key")
+        );
+        assert!(owner_config
+            .get_key_by_scope(crate::key_scope::CONTENT_CREATE)
+            .is_none());
+
+        let json_value = serde_json::to_value(&owner_config).unwrap();
+        assert_eq!(
+            json_value["keyScope"][crate::key_scope::MANUAL],
+            json!([main_key_id])
+        );
+
+        let decoded: OwnerConfig = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            decoded.key_scope.get(crate::key_scope::MANUAL).unwrap(),
+            &vec![main_key_id.clone()]
+        );
+        assert!(decoded.is_key_allowed_in_scope(crate::key_scope::MANUAL, "#main_key"));
+        assert!(decoded.is_key_allowed_in_scope(crate::key_scope::MANUAL, &main_key_id));
+        assert_eq!(
+            decoded
+                .get_key_by_scope(crate::key_scope::MANUAL)
+                .map(|(key_id, _, _)| key_id),
+            Some(main_key_id)
+        );
+    }
+
+    #[test]
+    fn owner_config_accepts_buckyos_scopes_alias() {
+        let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
+            {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }
+        ))
+        .unwrap();
+        let owner_config = OwnerConfig::new(
+            DID::new("bns", "lzc"),
+            "lzc".to_string(),
+            "zhicong liu".to_string(),
+            public_key_jwk,
+        );
+        let mut json_value = serde_json::to_value(&owner_config).unwrap();
+        let json_object = json_value.as_object_mut().unwrap();
+        json_object.insert(
+            "buckyos:scopes".to_string(),
+            json!({
+                crate::key_scope::CONTENT_CREATE: ["did:bucky:lzc#identity-cold"]
+            }),
+        );
+
+        let decoded: OwnerConfig = serde_json::from_value(json_value).unwrap();
+        assert_eq!(
+            decoded
+                .key_scope
+                .get(crate::key_scope::CONTENT_CREATE)
+                .unwrap(),
+            &vec!["did:bucky:lzc#identity-cold".to_string()]
+        );
+        assert!(!decoded.extra_info.contains_key("buckyos:scopes"));
     }
 
     #[test]

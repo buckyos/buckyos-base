@@ -288,6 +288,88 @@ pub trait DIDDocumentTrait {
     //实现了该方法的did document 可以进行密钥交换（建立rtcp连接)
     fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
 
+    fn get_key_ids_by_scope(&self, _scope: &str) -> Option<&[String]> {
+        None
+    }
+
+    fn has_key_scope(&self) -> bool {
+        false
+    }
+
+    fn get_standard_scope_key_ids(&self) -> Option<&[String]> {
+        None
+    }
+
+    fn get_key_by_scope(&self, scope: &str) -> Option<(String, DecodingKey, Jwk)> {
+        if let Some(key_ids) = self.get_key_ids_by_scope(scope) {
+            return self.get_key_from_key_ids(key_ids);
+        }
+        if self.has_key_scope() {
+            return None;
+        }
+        self.get_standard_scope_key_ids()
+            .and_then(|key_ids| self.get_key_from_key_ids(key_ids))
+            .or_else(|| {
+                self.get_auth_key(None)
+                    .map(|(decoding_key, jwk)| ("".to_string(), decoding_key, jwk))
+            })
+    }
+
+    fn get_key_from_key_ids(&self, key_ids: &[String]) -> Option<(String, DecodingKey, Jwk)> {
+        for key_id in key_ids {
+            let local_key_id = self.normalize_key_id_for_local_lookup(key_id);
+            if let Some((decoding_key, jwk)) = self.get_auth_key(Some(&local_key_id)) {
+                return Some((key_id.clone(), decoding_key, jwk));
+            }
+        }
+        None
+    }
+
+    fn is_key_allowed_in_scope(&self, scope: &str, key_id: &str) -> bool {
+        if let Some(key_ids) = self.get_key_ids_by_scope(scope) {
+            return key_ids
+                .iter()
+                .any(|allowed_key_id| self.is_same_document_key_id(allowed_key_id, key_id));
+        }
+        if self.has_key_scope() {
+            return false;
+        }
+        self.get_standard_scope_key_ids()
+            .map(|key_ids| {
+                key_ids
+                    .iter()
+                    .any(|allowed_key_id| self.is_same_document_key_id(allowed_key_id, key_id))
+            })
+            .unwrap_or_else(|| {
+                let local_key_id = self.normalize_key_id_for_local_lookup(key_id);
+                self.get_auth_key(Some(&local_key_id)).is_some()
+            })
+    }
+
+    fn normalize_key_id_for_local_lookup(&self, key_id: &str) -> String {
+        let document_id = self.get_id().to_string();
+        if let Some(local_key_id) = key_id.strip_prefix(&document_id) {
+            if local_key_id.starts_with('#') {
+                return local_key_id.to_string();
+            }
+        }
+        key_id.to_string()
+    }
+
+    fn expand_local_key_id(&self, key_id: &str) -> String {
+        if key_id.starts_with('#') {
+            return format!("{}{}", self.get_id().to_string(), key_id);
+        }
+        key_id.to_string()
+    }
+
+    fn is_same_document_key_id(&self, left: &str, right: &str) -> bool {
+        left == right
+            || self.normalize_key_id_for_local_lookup(left)
+                == self.normalize_key_id_for_local_lookup(right)
+            || self.expand_local_key_id(left) == self.expand_local_key_id(right)
+    }
+
     fn get_iss(&self) -> Option<String>;
     fn get_exp(&self) -> Option<u64>;
     fn get_iat(&self) -> Option<u64>;

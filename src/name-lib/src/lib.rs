@@ -4,6 +4,7 @@
 mod agent;
 mod device;
 mod did;
+pub mod key_scope;
 mod user;
 mod utility;
 mod zone;

@@ -86,6 +86,10 @@ pub struct DeviceConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     assertion_method: Vec<String>,
+    #[serde(rename = "capabilityInvocation")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    capability_invocation: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     service: Vec<ServiceNode>,
@@ -98,6 +102,10 @@ pub struct DeviceConfig {
     pub extra_info: HashMap<String, serde_json::Value>,
 
     //--------------------------------
+    #[serde(rename = "keyScope", alias = "buckyos:scopes")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub key_scope: HashMap<String, Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_did: Option<DID>, // The zone did where the Device is located
     pub owner: DID, //owner did，原则上应该与zone的owner相同
@@ -164,6 +172,7 @@ impl DeviceConfig {
             }],
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
+            capability_invocation: vec!["#main_key".to_string()],
             service: vec![],
             support_container: true,
             zone_did: Some(zone_did.clone()),
@@ -173,6 +182,7 @@ impl DeviceConfig {
             iat: mini_config.exp - DEFAULT_EXPIRE_TIME,
             version_seq: Some(0),
             extra_info: HashMap::new(),
+            key_scope: HashMap::new(),
         }
     }
 
@@ -208,6 +218,7 @@ impl DeviceConfig {
             }],
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
+            capability_invocation: vec!["#main_key".to_string()],
             service: vec![],
             support_container: true,
             zone_did: None,
@@ -218,6 +229,7 @@ impl DeviceConfig {
             iat: buckyos_get_unix_timestamp() as u64,
             version_seq: Some(0),
             extra_info: HashMap::new(),
+            key_scope: HashMap::new(),
         }
     }
 
@@ -286,6 +298,24 @@ impl DIDDocumentTrait for DeviceConfig {
 
     fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
         return self.get_auth_key(kid);
+    }
+
+    fn get_key_ids_by_scope(&self, scope: &str) -> Option<&[String]> {
+        self.key_scope.get(scope).map(Vec::as_slice)
+    }
+
+    fn has_key_scope(&self) -> bool {
+        !self.key_scope.is_empty()
+    }
+
+    fn get_standard_scope_key_ids(&self) -> Option<&[String]> {
+        if !self.capability_invocation.is_empty() {
+            Some(self.capability_invocation.as_slice())
+        } else if !self.authentication.is_empty() {
+            Some(self.authentication.as_slice())
+        } else {
+            None
+        }
     }
 
     fn get_iss(&self) -> Option<String> {
