@@ -13,9 +13,9 @@ use thiserror::Error;
 
 use crate::zone::{default_device_context, ServiceNode, VerificationMethodNode};
 use crate::{
-    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk, DIDContext,
-    DIDDocumentTrait, EncodedDocument, NSError, NSResult, OODDescriptionString,
-    DEFAULT_EXPIRE_TIME, DID,
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, ensure_version_seq_for_jwt,
+    get_x_from_jwk, DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult,
+    OODDescriptionString, DEFAULT_EXPIRE_TIME, DID,
 };
 use nvml_wrapper::enum_wrappers::device::Clock;
 use nvml_wrapper::*;
@@ -91,6 +91,9 @@ pub struct DeviceConfig {
     service: Vec<ServiceNode>,
     pub exp: u64,
     pub iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub version_seq: Option<u64>,
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
 
@@ -168,6 +171,7 @@ impl DeviceConfig {
             capbilities: HashMap::new(),
             exp: mini_config.exp,
             iat: mini_config.exp - DEFAULT_EXPIRE_TIME,
+            version_seq: Some(0),
             extra_info: HashMap::new(),
         }
     }
@@ -212,6 +216,7 @@ impl DeviceConfig {
             capbilities: HashMap::new(),
             exp: buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME,
             iat: buckyos_get_unix_timestamp() as u64,
+            version_seq: Some(0),
             extra_info: HashMap::new(),
         }
     }
@@ -294,16 +299,21 @@ impl DIDDocumentTrait for DeviceConfig {
     fn get_iat(&self) -> Option<u64> {
         return Some(self.iat);
     }
+    fn get_version_seq(&self) -> Option<u64> {
+        return self.version_seq;
+    }
 
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument> {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
+        ensure_version_seq_for_jwt("DeviceConfig", self.version_seq)?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
-        let token = encode(&header, self, key)
-            .map_err(|error| NSError::Failed(format!("Failed to encode OwnerConfig :{}", error)))?;
+        let token = encode(&header, self, key).map_err(|error| {
+            NSError::Failed(format!("Failed to encode DeviceConfig :{}", error))
+        })?;
         return Ok(EncodedDocument::Jwt(token));
     }
     fn decode(doc: &EncodedDocument, key: Option<&DecodingKey>) -> NSResult<Self>
@@ -322,6 +332,7 @@ impl DIDDocumentTrait for DeviceConfig {
                     serde_json::from_value(json_result).map_err(|error| {
                         NSError::Failed(format!("Failed to decode device config:{}", error))
                     })?;
+                ensure_version_seq_for_jwt("DeviceConfig", result.version_seq)?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {

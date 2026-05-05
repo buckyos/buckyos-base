@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     create_jwt_by_x, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify,
-    default_owner_context, DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult,
-    ServiceNode, VerificationMethodNode, DID,
+    default_owner_context, ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait,
+    EncodedDocument, NSError, NSResult, ServiceNode, VerificationMethodNode, DID,
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -31,6 +31,9 @@ pub struct OwnerConfig {
     service: Vec<ServiceNode>,
     pub exp: u64,
     pub iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub version_seq: Option<u64>,
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
 
@@ -113,6 +116,7 @@ impl OwnerConfig {
             default_zone_did: None,
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 10,
             iat: buckyos_get_unix_timestamp(),
+            version_seq: Some(0),
             meta: None,
             extra_info: HashMap::new(),
             service: vec![],
@@ -218,11 +222,15 @@ impl DIDDocumentTrait for OwnerConfig {
     fn get_iat(&self) -> Option<u64> {
         return Some(self.iat);
     }
+    fn get_version_seq(&self) -> Option<u64> {
+        return self.version_seq;
+    }
 
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument> {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
+        ensure_version_seq_for_jwt("OwnerConfig", self.version_seq)?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
@@ -246,6 +254,7 @@ impl DIDDocumentTrait for OwnerConfig {
                 let result: OwnerConfig = serde_json::from_value(json_result).map_err(|error| {
                     NSError::Failed(format!("Failed to decode owner config:{}", error))
                 })?;
+                ensure_version_seq_for_jwt("OwnerConfig", result.version_seq)?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {
@@ -308,6 +317,35 @@ mod tests {
 
         assert_eq!(owner_config, decoded);
         assert_eq!(encoded, token2);
+    }
+
+    #[test]
+    fn owner_config_jwt_requires_version_seq() {
+        let private_key_pem = r#"
+        -----BEGIN PRIVATE KEY-----
+        MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
+        -----END PRIVATE KEY-----
+        "#;
+        let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
+            {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }
+        ))
+        .unwrap();
+        let private_key = EncodingKey::from_ed_pem(private_key_pem.as_bytes()).unwrap();
+        let mut owner_config = OwnerConfig::new(
+            DID::new("bns", "lzc"),
+            "lzc".to_string(),
+            "zhicong liu".to_string(),
+            public_key_jwk,
+        );
+
+        owner_config.version_seq = None;
+
+        let err = owner_config.encode(Some(&private_key)).unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
     }
 
     #[test]

@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, default_agent_context,
-    DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult, ServiceNode,
-    VerificationMethodNode, DID,
+    ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult,
+    ServiceNode, VerificationMethodNode, DID,
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -51,6 +51,9 @@ pub struct AgentDocument {
     service: Vec<ServiceNode>,
     pub exp: u64,
     pub iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub version_seq: Option<u64>,
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
 
@@ -89,6 +92,7 @@ impl AgentDocument {
             service: vec![],
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 10,
             iat: buckyos_get_unix_timestamp(),
+            version_seq: Some(0),
             extra_info: HashMap::new(),
             support_public_access: false,
             contact: AgentContactInfo::default(),
@@ -202,10 +206,15 @@ impl DIDDocumentTrait for AgentDocument {
         Some(self.iat)
     }
 
+    fn get_version_seq(&self) -> Option<u64> {
+        self.version_seq
+    }
+
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument> {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
+        ensure_version_seq_for_jwt("AgentDocument", self.version_seq)?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None;
@@ -230,6 +239,7 @@ impl DIDDocumentTrait for AgentDocument {
                     serde_json::from_value(json_result).map_err(|error| {
                         NSError::Failed(format!("Failed to decode agent doc:{}", error))
                     })?;
+                ensure_version_seq_for_jwt("AgentDocument", result.version_seq)?;
                 Ok(result)
             }
             EncodedDocument::JsonLd(json_value) => {

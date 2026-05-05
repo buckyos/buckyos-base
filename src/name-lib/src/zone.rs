@@ -25,7 +25,7 @@ use crate::{
     decode_json_from_jwt_with_default_pk, decode_json_from_jwt_with_pk,
     decode_jwt_claim_without_verify,
 };
-use crate::{DIDDocumentTrait, EncodedDocument};
+use crate::{ensure_version_seq_for_jwt, DIDDocumentTrait, EncodedDocument};
 use crate::{NSError, NSResult};
 
 // Helper function for serde skip_serializing_if
@@ -555,6 +555,9 @@ pub struct ZoneConfig {
     service: Vec<ServiceNode>,
     pub exp: u64,
     pub iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub version_seq: Option<u64>,
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
 
@@ -597,6 +600,7 @@ impl ZoneConfig {
             }],
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 10,
             iat: buckyos_get_unix_timestamp(),
+            version_seq: Some(0),
             extra_info: HashMap::new(),
             boot_jwt: "".to_string(),
             owner: owner_did,
@@ -644,6 +648,7 @@ impl ZoneConfig {
         self.sn = boot_config.sn.clone();
         self.exp = boot_config.exp;
         self.iat = self.exp - DEFAULT_EXPIRE_TIME;
+        self.version_seq = Some(0);
         if boot_config.owner.is_some() {
             self.owner = boot_config.owner.clone().unwrap();
         } else {
@@ -744,11 +749,15 @@ impl DIDDocumentTrait for ZoneConfig {
     fn get_iat(&self) -> Option<u64> {
         return Some(self.iat);
     }
+    fn get_version_seq(&self) -> Option<u64> {
+        return self.version_seq;
+    }
 
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument> {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
+        ensure_version_seq_for_jwt("ZoneConfig", self.version_seq)?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
@@ -772,6 +781,7 @@ impl DIDDocumentTrait for ZoneConfig {
                 let result: ZoneConfig = serde_json::from_value(json_result).map_err(|error| {
                     NSError::Failed(format!("Failed to decode zone config:{}", error))
                 })?;
+                ensure_version_seq_for_jwt("ZoneConfig", result.version_seq)?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {

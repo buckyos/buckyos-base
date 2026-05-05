@@ -291,6 +291,7 @@ pub trait DIDDocumentTrait {
     fn get_iss(&self) -> Option<String>;
     fn get_exp(&self) -> Option<u64>;
     fn get_iat(&self) -> Option<u64>;
+    fn get_version_seq(&self) -> Option<u64>;
 
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument>;
     fn decode(doc: &EncodedDocument, key: Option<&DecodingKey>) -> NSResult<Self>
@@ -308,7 +309,18 @@ pub trait DIDDocumentTrait {
 
 pub static KNOWN_WEB3_BRIDGE_CONFIG: OnceCell<HashMap<String, String>> = OnceCell::new();
 
+pub(crate) fn ensure_version_seq_for_jwt(doc_type: &str, version_seq: Option<u64>) -> NSResult<()> {
+    if version_seq.is_none() {
+        return Err(NSError::Failed(format!(
+            "{} version_seq is required when encoding as JWT",
+            doc_type
+        )));
+    }
+    Ok(())
+}
+
 pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>> {
+    let is_jwt = matches!(&doc, EncodedDocument::Jwt(_));
     let doc_value = doc.to_json_value()?;
     debug!(
         "parse_did_doc: doc_value: {}",
@@ -318,22 +330,34 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>
     if doc_value.get("full_name").is_some() {
         let owner_config = serde_json::from_value::<OwnerConfig>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse owner config failed: {}", e)))?;
+        if is_jwt {
+            ensure_version_seq_for_jwt("OwnerConfig", owner_config.get_version_seq())?;
+        }
         return Ok(Box::new(owner_config));
     }
     if doc_value.get("httpServicePorts").is_some() {
         let agent_document = serde_json::from_value::<AgentDocument>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse agent document failed: {}", e)))?;
+        if is_jwt {
+            ensure_version_seq_for_jwt("AgentDocument", agent_document.get_version_seq())?;
+        }
         return Ok(Box::new(agent_document));
     }
     if doc_value.get("device_type").is_some() {
         let device_config = serde_json::from_value::<DeviceConfig>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse device config failed: {}", e)))?;
+        if is_jwt {
+            ensure_version_seq_for_jwt("DeviceConfig", device_config.get_version_seq())?;
+        }
         return Ok(Box::new(device_config));
     }
 
     if doc_value.get("oods").is_some() {
         let zone_config = serde_json::from_value::<ZoneConfig>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse zone config failed: {}", e)))?;
+        if is_jwt {
+            ensure_version_seq_for_jwt("ZoneConfig", zone_config.get_version_seq())?;
+        }
         return Ok(Box::new(zone_config));
     }
 
