@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     create_jwt_by_x, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify,
-    default_context, DIDDocumentTrait, EncodedDocument, NSError, NSResult, ServiceNode,
-    VerificationMethodNode, DID,
+    default_owner_context, DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult,
+    ServiceNode, VerificationMethodNode, DID,
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct OwnerConfig {
-    #[serde(rename = "@context", default = "default_context")]
-    pub context: String,
+    #[serde(rename = "@context", default = "default_owner_context")]
+    pub context: DIDContext,
     pub id: DID,
     #[serde(rename = "verificationMethod")]
     verification_method: Vec<VerificationMethodNode>,
@@ -103,7 +103,7 @@ impl OwnerConfig {
         }];
 
         OwnerConfig {
-            context: default_context(),
+            context: default_owner_context(),
             id: id,
             name: name,
             full_name: full_name,

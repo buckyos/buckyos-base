@@ -11,9 +11,9 @@ use std::process::Command;
 use std::str::FromStr;
 use thiserror::Error;
 
-use crate::zone::{default_context, ServiceNode, VerificationMethodNode};
+use crate::zone::{default_device_context, ServiceNode, VerificationMethodNode};
 use crate::{
-    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk,
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, get_x_from_jwk, DIDContext,
     DIDDocumentTrait, EncodedDocument, NSError, NSResult, OODDescriptionString,
     DEFAULT_EXPIRE_TIME, DID,
 };
@@ -77,8 +77,8 @@ impl DeviceMiniConfig {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeviceConfig {
-    #[serde(rename = "@context", default = "default_context")]
-    pub context: String,
+    #[serde(rename = "@context", default = "default_device_context")]
+    pub context: DIDContext,
     pub id: DID,
     #[serde(rename = "verificationMethod")]
     verification_method: Vec<VerificationMethodNode>,
@@ -145,7 +145,7 @@ impl DeviceConfig {
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk).unwrap();
         DeviceConfig {
             device_mini_config_jwt: Some(mini_config_jwt.clone()),
-            context: default_context(),
+            context: default_device_context(),
             id: DID::from_str(&did).unwrap(),
             name: mini_config.name.clone(),
             device_type: "ood".to_string(),
@@ -188,7 +188,7 @@ impl DeviceConfig {
 
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk).unwrap();
         DeviceConfig {
-            context: default_context(),
+            context: default_device_context(),
             id: DID::from_str(&did).unwrap(),
             name: name.to_string(),
             device_type: "ood".to_string(),

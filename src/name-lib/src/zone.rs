@@ -17,6 +17,7 @@ use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 use log::*;
 use once_cell::sync::OnceCell;
 use rand::seq::SliceRandom;
+use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 
@@ -30,6 +31,78 @@ use crate::{NSError, NSResult};
 // Helper function for serde skip_serializing_if
 fn is_hashmap_empty<K, V>(map: &HashMap<K, V>) -> bool {
     map.is_empty()
+}
+
+pub const DID_CORE_CONTEXT: &str = "https://www.w3.org/ns/did/v1";
+pub const BUCKYOS_CONTEXT_BASE: &str = "https://buckyos.org/ns";
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DIDContext {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl DIDContext {
+    pub fn buckyos(doc_type: &str) -> Self {
+        DIDContext::Array(vec![
+            DID_CORE_CONTEXT.to_string(),
+            format!("{}/{}/v1", BUCKYOS_CONTEXT_BASE, doc_type),
+        ])
+    }
+
+    pub fn contains(&self, context: &str) -> bool {
+        match self {
+            DIDContext::String(value) => value == context,
+            DIDContext::Array(values) => values.iter().any(|value| value == context),
+        }
+    }
+}
+
+impl Serialize for DIDContext {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            DIDContext::String(value) => value.serialize(serializer),
+            DIDContext::Array(values) => values.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DIDContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ContextValue {
+            String(String),
+            Array(Vec<String>),
+        }
+
+        match ContextValue::deserialize(deserializer)? {
+            ContextValue::String(value) => {
+                if value != DID_CORE_CONTEXT {
+                    return Err(D::Error::custom(format!(
+                        "@context string must be {}",
+                        DID_CORE_CONTEXT
+                    )));
+                }
+                Ok(DIDContext::String(value))
+            }
+            ContextValue::Array(values) => {
+                if values.first().map(|value| value.as_str()) != Some(DID_CORE_CONTEXT) {
+                    return Err(D::Error::custom(format!(
+                        "@context array must start with {}",
+                        DID_CORE_CONTEXT
+                    )));
+                }
+                Ok(DIDContext::Array(values))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -53,8 +126,24 @@ pub(crate) struct ServiceNode {
     pub service_endpoint: String,
 }
 
-pub(crate) fn default_context() -> String {
-    "https://www.w3.org/ns/did/v1".to_string()
+pub(crate) fn default_context() -> DIDContext {
+    DIDContext::String(DID_CORE_CONTEXT.to_string())
+}
+
+pub(crate) fn default_owner_context() -> DIDContext {
+    DIDContext::buckyos("owner")
+}
+
+pub(crate) fn default_zone_context() -> DIDContext {
+    DIDContext::buckyos("zone")
+}
+
+pub(crate) fn default_device_context() -> DIDContext {
+    DIDContext::buckyos("device")
+}
+
+pub(crate) fn default_agent_context() -> DIDContext {
+    DIDContext::buckyos("agent")
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -451,8 +540,8 @@ pub struct VerifyHubInfo {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct ZoneConfig {
-    #[serde(rename = "@context", default = "default_context")]
-    pub context: String,
+    #[serde(rename = "@context", default = "default_zone_context")]
+    pub context: DIDContext,
     pub id: DID, //zone did
     #[serde(rename = "verificationMethod")]
     verification_method: Vec<VerificationMethodNode>,
@@ -491,7 +580,7 @@ impl ZoneConfig {
     pub fn new(id: DID, owner_did: DID, public_key: Jwk) -> Self {
         let id2 = id.clone();
         ZoneConfig {
-            context: default_context(),
+            context: default_zone_context(),
             id: id2,
             verification_method: vec![VerificationMethodNode {
                 key_type: "Ed25519VerificationKey2020".to_string(),
@@ -570,7 +659,6 @@ impl ZoneConfig {
     pub fn get_device_config(&self, device_name: &str) -> Option<&DeviceConfig> {
         return self.devices.get(device_name);
     }
-
 
     pub fn get_sn_api_url(&self) -> Option<String> {
         if self.sn.is_some() {
@@ -717,6 +805,78 @@ mod tests {
         hash::Hash,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn test_did_context_accepts_did_core_string_and_buckyos_array() {
+        let string_context: DIDContext =
+            serde_json::from_str(r#""https://www.w3.org/ns/did/v1""#).unwrap();
+        assert_eq!(
+            string_context,
+            DIDContext::String(DID_CORE_CONTEXT.to_string())
+        );
+
+        let array_context: DIDContext = serde_json::from_str(
+            r#"[
+                "https://www.w3.org/ns/did/v1",
+                "https://buckyos.org/ns/zone/v1"
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(array_context, DIDContext::buckyos("zone"));
+
+        let invalid_context: Result<DIDContext, _> = serde_json::from_str(
+            r#"[
+                "https://buckyos.org/ns/zone/v1",
+                "https://www.w3.org/ns/did/v1"
+            ]"#,
+        );
+        assert!(invalid_context.is_err());
+    }
+
+    #[test]
+    fn test_generated_docs_use_buckyos_context_arrays() {
+        let public_key_jwk: Jwk = serde_json::from_value(json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+        }))
+        .unwrap();
+
+        let owner = OwnerConfig::new(
+            DID::new("bns", "alice"),
+            "alice".to_string(),
+            "alice".to_string(),
+            public_key_jwk.clone(),
+        );
+        let agent = AgentDocument::new(
+            DID::new("bns", "agent.alice"),
+            DID::new("bns", "alice"),
+            public_key_jwk.clone(),
+        );
+        let device = DeviceConfig::new(
+            "ood1",
+            "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8".to_string(),
+        );
+        let zone = ZoneConfig::new(
+            DID::new("bns", "alice"),
+            DID::new("bns", "alice"),
+            public_key_jwk,
+        );
+
+        assert_eq!(owner.context, DIDContext::buckyos("owner"));
+        assert_eq!(agent.context, DIDContext::buckyos("agent"));
+        assert_eq!(device.context, DIDContext::buckyos("device"));
+        assert_eq!(zone.context, DIDContext::buckyos("zone"));
+
+        let zone_json = serde_json::to_value(&zone).unwrap();
+        assert_eq!(
+            zone_json["@context"],
+            json!([
+                "https://www.w3.org/ns/did/v1",
+                "https://buckyos.org/ns/zone/v1"
+            ])
+        );
+    }
 
     async fn create_test_zone_config(
         user_did: DID,

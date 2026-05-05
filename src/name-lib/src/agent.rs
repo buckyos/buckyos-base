@@ -8,8 +8,9 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, default_context,
-    DIDDocumentTrait, EncodedDocument, NSError, NSResult, ServiceNode, VerificationMethodNode, DID,
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, default_agent_context,
+    DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult, ServiceNode,
+    VerificationMethodNode, DID,
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -36,8 +37,8 @@ pub struct AgentHttpServicePorts {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct AgentDocument {
-    #[serde(rename = "@context", default = "default_context")]
-    pub context: String,
+    #[serde(rename = "@context", default = "default_agent_context")]
+    pub context: DIDContext,
     pub id: DID,
     #[serde(rename = "verificationMethod")]
     verification_method: Vec<VerificationMethodNode>,
@@ -80,7 +81,7 @@ impl AgentDocument {
         }];
 
         Self {
-            context: default_context(),
+            context: default_agent_context(),
             id,
             verification_method,
             authentication: vec!["#main_key".to_string()],
