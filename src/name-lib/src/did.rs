@@ -173,6 +173,21 @@ impl DID {
         format!("{}.{}.did", real_id, self.method)
     }
 
+    /// Returns `host/path` for DIDs that carry a sub-path (e.g. did:web with extra segments),
+    /// or just `host` when there is no path.
+    ///
+    /// Examples:
+    ///   did:web:example.com              → "example.com"
+    ///   did:web:example.com:user:alice   → "example.com/user/alice"
+    ///   did:bns:waterflier               → "waterflier.web3.buckyos.io"
+    pub fn to_host_uri(&self) -> String {
+        let hostname = self.to_host_name();
+        match self.get_path_from_id() {
+            Some(path) => format!("{}/{}", hostname, path),
+            None => hostname,
+        }
+    }
+
     fn from_host_name(host_name: &str) -> Option<Self> {
         if host_name.ends_with(".did") {
             let parts: Vec<&str> = host_name.split('.').collect();
@@ -476,6 +491,16 @@ mod tests {
         assert_eq!(host_name, "web3.buckyos.io");
         let path = did.get_path_from_id();
         assert_eq!(path, Some("users/bob".to_string()));
+        let uri = did.to_host_uri();
+        assert_eq!(uri, "web3.buckyos.io/users/bob");
+
+        let did = DID::from_str("did:web:example.com:user:alice").unwrap();
+        assert_eq!(did.to_host_name(), "example.com");
+        assert_eq!(did.get_path_from_id(), Some("user/alice".to_string()));
+        assert_eq!(did.to_host_uri(), "example.com/user/alice");
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        assert_eq!(did.to_host_uri(), "example.com");
 
         let did = DID::from_host_name("waterflier.web3.buckyos.io").unwrap();
         assert_eq!(did.method, "bns");
