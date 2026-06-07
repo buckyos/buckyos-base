@@ -32,6 +32,7 @@ base64 = { workspace = true }
 once_cell = { workspace = true }
 lazy_static = { workspace = true }
 cfg-if = { workspace = true }
+percent-encoding = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }

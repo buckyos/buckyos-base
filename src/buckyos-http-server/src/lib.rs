@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
+mod did_obj_server;
 mod dir_server;
 mod runner;
+#[cfg(test)]
+mod test_did_obj_server;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -14,6 +17,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
+pub use did_obj_server::*;
 pub use dir_server::*;
 pub use runner::*;
 

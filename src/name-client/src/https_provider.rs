@@ -8,6 +8,7 @@ use crate::{NameInfo, NsProvider, RecordType};
 use async_trait::async_trait;
 use log::info;
 use name_lib::{EncodedDocument, NSError, NSResult, DID};
+use percent_encoding::percent_decode_str;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::net::IpAddr;
@@ -153,13 +154,52 @@ impl NsProvider for HttpsProvider {
 //TODO:支持用任意协议连接zone
 pub struct SmartProvider {
     client: Client,
+    scheme: String,
 }
 
 impl SmartProvider {
     pub fn new() -> Self {
+        Self::new_with_scheme("https")
+    }
+
+    pub fn new_with_scheme(scheme: &str) -> Self {
         Self {
             client: Client::new(),
+            scheme: scheme.to_string(),
         }
+    }
+
+    fn build_url(&self, did: &DID, doc_type: Option<&str>) -> NSResult<String> {
+        let real_doc_type = doc_type.unwrap_or("did");
+        if did.method == "web" {
+            let mut parts = did.id.split(':');
+            let host = parts.next().ok_or_else(|| {
+                NSError::InvalidDID(format!("missing did:web host: {}", did.to_string()))
+            })?;
+            let host = percent_decode_str(host)
+                .decode_utf8()
+                .map_err(|e| NSError::InvalidDID(format!("invalid did:web host: {e}")))?;
+            let path = parts.collect::<Vec<_>>().join("/");
+
+            if path.is_empty() {
+                return Ok(format!(
+                    "{}://{}/.well-known/{}",
+                    self.scheme, host, real_doc_type
+                ));
+            }
+
+            return Ok(format!(
+                "{}://{}/{}/{}.json",
+                self.scheme, host, path, real_doc_type
+            ));
+        }
+
+        Ok(format!(
+            "{}://{}/{}.json",
+            self.scheme,
+            did.to_host_uri(),
+            real_doc_type
+        ))
     }
 }
 
@@ -186,19 +226,7 @@ impl NsProvider for SmartProvider {
         doc_type: Option<&str>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        let hostname = did.to_host_name();
-        let path = did.get_path_from_id();
-        let real_doc_type = doc_type.unwrap_or("did");
-        let url = if path.is_some() {
-            format!(
-                "https://{}/{}/{}.json",
-                hostname,
-                path.unwrap(),
-                real_doc_type
-            )
-        } else {
-            format!("https://{}/.well-known/{}", hostname, real_doc_type)
-        };
+        let url = self.build_url(did, doc_type)?;
 
         let resp = self
             .client
@@ -235,6 +263,17 @@ mod tests {
         assert_eq!(
             provider.build_url(&did, None),
             "https://127.0.0.1:3200/1.0/identifiers/did:bns:example"
+        );
+    }
+
+    #[test]
+    fn smart_provider_builds_did_object_url() {
+        let provider = SmartProvider::new_with_scheme("http");
+        let did = DID::from_str("did:web:127.0.0.1%3A3200:devices:cam01").unwrap();
+
+        assert_eq!(
+            provider.build_url(&did, None).unwrap(),
+            "http://127.0.0.1:3200/devices/cam01/did.json"
         );
     }
 

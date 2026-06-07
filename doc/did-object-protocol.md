@@ -166,6 +166,7 @@ BuckyOS 扩展字段 MUST 使用明确 namespace，例如 `x-buckyos:*`。
 ```text
 https://myhome.com/devices/cam01
 ```
+did是 did:web:myhome.com:devices:cam01
 
 Runtime 通过 DID Object Resolver 得到 DID Object Card。默认 Web-compatible resolution 是：
 
@@ -231,7 +232,7 @@ Object URL 是调用方引用 DID Object 的主 handle。它 SHOULD：
 - 可解析到 DID Object Card。
 - 对同一对象长期保持一致。
 - 在 DID Object Card 的 `alsoKnownAs` 中出现。
-- 在生产环境使用 HTTPS。
+- 尽量使用 HTTPS
 
 示例：
 

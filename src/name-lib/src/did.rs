@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::agent::AgentDocument;
+use crate::did_object_card::{DIDObjectCard, DID_OBJECT_SERVICE_TYPE};
 use crate::user::OwnerConfig;
 use crate::zone::{ZoneBootConfig, ZoneConfig};
 use crate::DeviceConfig;
@@ -456,6 +457,28 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>
             ensure_version_seq_for_jwt("ZoneConfig", zone_config.get_version_seq())?;
         }
         return Ok(Box::new(zone_config));
+    }
+
+    if doc_value
+        .get("service")
+        .and_then(Value::as_array)
+        .map(|services| {
+            services.iter().any(|service| {
+                service
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|service_type| service_type == DID_OBJECT_SERVICE_TYPE)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+    {
+        let did_object_card = serde_json::from_value::<DIDObjectCard>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse DID Object Card failed: {}", e)))?;
+        if is_jwt {
+            ensure_version_seq_for_jwt("DIDObjectCard", did_object_card.get_version_seq())?;
+        }
+        return Ok(Box::new(did_object_card));
     }
 
     Err(NSError::Failed("unknown did document".to_string()))
