@@ -9,6 +9,7 @@ use hyper::body::Bytes;
 use name_client::{CacheBackend, NameClient, NameClientConfig, SmartProvider};
 use name_lib::{DIDObjectCard, DID};
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::{
@@ -201,6 +202,100 @@ impl DIDObjectServer for CameraObjectServer {
     }
 }
 
+struct CameraFleetObjectServer {
+    fallback: CameraObjectServer,
+}
+
+impl CameraFleetObjectServer {
+    fn new() -> Self {
+        Self {
+            fallback: CameraObjectServer::new(),
+        }
+    }
+
+    fn camera_id(ctx: &DIDObjectRequestContext) -> DIDObjectServerResult<&str> {
+        ctx.object_params
+            .get("camera_id")
+            .map(String::as_str)
+            .ok_or_else(|| DIDObjectError::bad_request("missing camera_id in ObjURL"))
+    }
+}
+
+#[async_trait]
+impl DIDObjectServer for CameraFleetObjectServer {
+    fn object_card(&self) -> &DIDObjectCard {
+        self.fallback.object_card()
+    }
+
+    fn object_profile(&self) -> &Value {
+        self.fallback.object_profile()
+    }
+
+    async fn object_card_for(
+        &self,
+        ctx: DIDObjectRequestContext,
+    ) -> DIDObjectServerResult<DIDObjectCard> {
+        let camera_id = Self::camera_id(&ctx)?;
+        Ok(DIDObjectCard::new(
+            DID::new("web", &format!("myhome.com:devices:{camera_id}")),
+            ctx.object_url.clone(),
+            Some(DID::new("web", "myhome.com")),
+            format!("{}/profile.json", ctx.object_url.trim_end_matches('/')),
+            Some("web.camera"),
+        ))
+    }
+
+    async fn object_profile_for(
+        &self,
+        ctx: DIDObjectRequestContext,
+    ) -> DIDObjectServerResult<Value> {
+        let camera_id = Self::camera_id(&ctx)?;
+        let mut profile = self.fallback.object_profile().clone();
+        profile["id"] = json!(format!("{}/profile.json", ctx.object_url));
+        profile["title"] = json!(format!("Example Camera {camera_id}"));
+        Ok(profile)
+    }
+
+    async fn read_property(
+        &self,
+        name: &str,
+        ctx: DIDObjectRequestContext,
+    ) -> DIDObjectServerResult<Value> {
+        let camera_id = Self::camera_id(&ctx)?;
+        match name {
+            "brand" => Ok(json!(format!("AcmeCam/{camera_id}"))),
+            "battery" => Ok(json!({
+                "camera": camera_id,
+                "value": 87,
+                "unit": "percent",
+                "object_url": ctx.object_url
+            })),
+            _ => Err(DIDObjectError::not_found(format!(
+                "unknown property '{name}'"
+            ))),
+        }
+    }
+
+    async fn invoke_action(
+        &self,
+        request: DIDObjectActionRequest,
+        ctx: DIDObjectRequestContext,
+    ) -> DIDObjectServerResult<DIDObjectActionSuccess> {
+        let camera_id = Self::camera_id(&ctx)?;
+        match request.method.as_str() {
+            "query_clip" => Ok(DIDObjectActionSuccess::new(json!({
+                "camera": camera_id,
+                "object_url": ctx.object_url,
+                "mode": request.params.get("mode").and_then(Value::as_str)
+            }))),
+            _ => Err(DIDObjectError::not_found(format!(
+                "unknown action '{}'",
+                request.method
+            ))),
+        }
+    }
+}
+
 fn full_body(body: impl Into<Bytes>) -> http_body_util::combinators::BoxBody<Bytes, ServerError> {
     Full::new(body.into())
         .map_err(|never| match never {})
@@ -257,6 +352,27 @@ async fn wait_for_tcp(addr: SocketAddr) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("server did not start listening on {addr}");
+}
+
+async fn http_get(addr: SocketAddr, path: &str) -> String {
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        addr.port()
+    );
+    client.write_all(request.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    client.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn http_json_body<T: serde::de::DeserializeOwned>(response: &str) -> T {
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or(response);
+    serde_json::from_str(body).unwrap()
 }
 
 #[tokio::test]
@@ -355,4 +471,159 @@ async fn invokes_action_with_krpc_style_envelope() {
     assert_eq!(action_response["result"]["media_type"], "video");
     assert_eq!(action_response["result"]["seekable"], true);
     assert_eq!(action_response["meta"]["status"], "ok");
+}
+
+#[tokio::test]
+async fn default_obj_url_pattern_keeps_per_object_server_scoped() {
+    let server = example_http_server();
+
+    let response = server
+        .serve_request(
+            http::Request::builder()
+                .method("GET")
+                .uri("http://localhost/devices/cam02/props/battery")
+                .body(full_body(Bytes::new()))
+                .unwrap(),
+            StreamInfo::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn obj_url_pattern_routes_object_group_to_one_server() {
+    let server = Arc::new(
+        DIDObjectHttpServer::new("camera-fleet", Arc::new(CameraFleetObjectServer::new()))
+            .with_obj_url_pattern("/devices/{camera_id}"),
+    );
+
+    let response = server
+        .serve_request(
+            http::Request::builder()
+                .method("GET")
+                .uri("http://localhost/devices/cam02/props/battery")
+                .body(full_body(Bytes::new()))
+                .unwrap(),
+            StreamInfo::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let battery: Value = read_json_response(response).await;
+    assert_eq!(battery["camera"], "cam02");
+    assert_eq!(battery["object_url"], "http://localhost/devices/cam02");
+
+    let profile_response = server
+        .serve_request(
+            http::Request::builder()
+                .method("GET")
+                .uri("http://localhost/devices/cam03/profile.json")
+                .body(full_body(Bytes::new()))
+                .unwrap(),
+            StreamInfo::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(profile_response.status(), StatusCode::OK);
+    let profile: Value = read_json_response(profile_response).await;
+    assert_eq!(profile["title"], "Example Camera cam03");
+
+    let miss = server
+        .serve_request(
+            http::Request::builder()
+                .method("GET")
+                .uri("http://localhost/rooms/lab/props/battery")
+                .body(full_body(Bytes::new()))
+                .unwrap(),
+            StreamInfo::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn runner_routes_multiple_did_object_servers() {
+    let addr = random_loopback();
+    let runner = Runner::with_addr(addr);
+    let cam01_url = format!("http://127.0.0.1:{}/devices/cam01", addr.port());
+    let cam02_url = format!("http://127.0.0.1:{}/devices/cam02", addr.port());
+
+    runner
+        .add_http_server(
+            "/devices/cam01".to_string(),
+            example_http_server_with_object(
+                DID::new("web", &format!("127.0.0.1%3A{}:devices:cam01", addr.port())),
+                cam01_url.clone(),
+            ),
+        )
+        .unwrap();
+    runner
+        .add_http_server(
+            "/devices/cam02".to_string(),
+            example_http_server_with_object(
+                DID::new("web", &format!("127.0.0.1%3A{}:devices:cam02", addr.port())),
+                cam02_url.clone(),
+            ),
+        )
+        .unwrap();
+
+    let runner_task = tokio::spawn(async move { runner.run().await });
+    wait_for_tcp(addr).await;
+
+    let cam01_response = http_get(addr, "/devices/cam01/did.json").await;
+    assert!(cam01_response.contains("200 OK"), "{cam01_response}");
+    let cam01_card: DIDObjectCard = http_json_body(&cam01_response);
+    assert_eq!(cam01_card.service_endpoint().unwrap(), cam01_url);
+
+    let cam02_response = http_get(addr, "/devices/cam02/did.json").await;
+    assert!(cam02_response.contains("200 OK"), "{cam02_response}");
+    let cam02_card: DIDObjectCard = http_json_body(&cam02_response);
+    assert_eq!(cam02_card.service_endpoint().unwrap(), cam02_url);
+
+    let miss = http_get(addr, "/devices/cam03/did.json").await;
+    assert!(miss.contains("404 Not Found"), "{miss}");
+
+    runner_task.abort();
+}
+
+#[tokio::test]
+async fn runner_routes_object_group_to_one_did_object_server() {
+    let addr = random_loopback();
+    let runner = Runner::with_addr(addr);
+    let fleet_server = Arc::new(
+        DIDObjectHttpServer::new("camera-fleet", Arc::new(CameraFleetObjectServer::new()))
+            .with_obj_url_pattern("/devices/{camera_id}"),
+    );
+
+    runner
+        .add_http_server("/devices".to_string(), fleet_server)
+        .unwrap();
+
+    let runner_task = tokio::spawn(async move { runner.run().await });
+    wait_for_tcp(addr).await;
+
+    let battery_response = http_get(addr, "/devices/cam10/props/battery").await;
+    assert!(battery_response.contains("200 OK"), "{battery_response}");
+    let battery: Value = http_json_body(&battery_response);
+    assert_eq!(battery["camera"], "cam10");
+    assert_eq!(
+        battery["object_url"],
+        format!("http://127.0.0.1:{}/devices/cam10", addr.port())
+    );
+
+    let profile_response = http_get(addr, "/devices/cam11/profile.json").await;
+    assert!(profile_response.contains("200 OK"), "{profile_response}");
+    let profile: Value = http_json_body(&profile_response);
+    assert_eq!(profile["title"], "Example Camera cam11");
+
+    let miss = http_get(addr, "/rooms/lab/props/battery").await;
+    assert!(miss.contains("404 Not Found"), "{miss}");
+
+    runner_task.abort();
 }
