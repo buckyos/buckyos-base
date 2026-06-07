@@ -2,6 +2,7 @@
 
 mod addr_rtt_db;
 mod bns_provider;
+mod did_obj_client;
 mod dns_provider;
 mod doc_cache;
 mod https_provider;
@@ -13,6 +14,7 @@ mod utility;
 
 pub use addr_rtt_db::*;
 pub use bns_provider::*;
+pub use did_obj_client::*;
 pub use dns_provider::*;
 pub use doc_cache::*;
 pub use https_provider::*;

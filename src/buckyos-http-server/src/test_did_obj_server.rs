@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use http::StatusCode;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use name_client::{CacheBackend, NameClient, NameClientConfig, SmartProvider};
+use name_client::{CacheBackend, DIDObjectClient, NameClient, NameClientConfig, SmartProvider};
 use name_lib::{DIDObjectCard, DID};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -414,6 +414,39 @@ async fn serves_did_object_card_and_profile() {
         profile["properties"]["battery"]["forms"][0]["op"],
         "readproperty"
     );
+
+    let did_object_client = DIDObjectClient::new();
+    let resolved_object = did_object_client.resolve(&object_url).await.unwrap();
+    assert!(DIDObjectClient::card_declares_object_url(
+        &resolved_object.object_card,
+        &object_url
+    ));
+    assert!(DIDObjectClient::has_trait(
+        &resolved_object.object_profile,
+        "https://buckyos.org/traits/media-source@1"
+    ));
+    assert!(DIDObjectClient::has_property(
+        &resolved_object.object_profile,
+        "battery"
+    ));
+    assert!(DIDObjectClient::has_action(
+        &resolved_object.object_profile,
+        "query_clip"
+    ));
+
+    let battery = did_object_client
+        .read_property_from_resolved(&resolved_object, "battery")
+        .await
+        .unwrap();
+    assert_eq!(battery["value"], 87);
+    assert_eq!(battery["version"], "battery-v42");
+
+    let clip = did_object_client
+        .invoke_action_result(&object_url, "query_clip", json!({"mode": "clip"}))
+        .await
+        .unwrap();
+    assert_eq!(clip["media_type"], "video");
+    assert_eq!(clip["seekable"], true);
 
     runner_task.abort();
 }
