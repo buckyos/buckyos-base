@@ -66,7 +66,7 @@
 3. 客户端调用：
 
    ```text
-   discover_zone_document_from_host("zhicong.me")
+   resolve_zone_document_from_host("did:web:zhicong.me")
    ```
 
    流程如下：
@@ -107,7 +107,7 @@
 4. 验证 Semantic Path JWT：
 
    ```text
-   issuer 必须等于 verified_zone
+   issuer 必须等于 verified_zone (did:web:zhicong.me)
    kid 只能在 verified_zone 的 ZoneDocument 内选择公钥
    如果没有 kid，则使用 ZoneDocument 的默认语义路径签名 Key
    JWT payload 必须覆盖 host、path、object_id、iat、exp 等字段
@@ -131,7 +131,7 @@
 
 #### 攻击者替换 Owner 时的语义
 
-攻击者可以拦截 HTTP，并替换：
+攻击者可以拦截 HTTP/DNS请求，并替换：
 
 ```text
 zone-document-jwt
@@ -144,7 +144,7 @@ file bytes
 
 ```text
 verified_owner = did:bns:attacker
-verified_zone = attacker_zone
+verified_zone = did:web:zhicong.me
 ```
 
 这不会继承 `did:bns:zhicong` 的信用、支付归属或权限。也就是说，本模式保证的是：
@@ -159,7 +159,9 @@ verified_zone = attacker_zone
 zhicong.me 这个 Host 必然属于 did:bns:zhicong。
 ```
 
-因此，应用 UI 与业务逻辑必须展示和使用 `verified_owner` / `verified_zone` 作为信用主体，不能只显示“来自 zhicong.me”。如果业务确实需要 Host 身份可信，应切换到 Host-bound 模式。
+因此，应用 UI 与业务逻辑必须展示和使用 `verified_owner` / `verified_zone` 作为信用主体，不能只显示“来自 did:web:zhicong.me”。如果业务确实需要 Host 身份可信，应切换到 Host-bound 模式。
+
+> 和x509体系不同，身份信用应该基于 Owner，而不基于HTTP Host
 
 #### 客户私有获取内容：在乎被窃听
 
@@ -562,6 +564,8 @@ flowchart TD
 - `owner` / `zone-controller` 可以用于定位 OwnerDocument，但不能在验签前作为可信结论；
 - 验证通过后，内容信用绑定到 `verified_owner` / `verified_zone`；
 - 如果上层业务需要确认 Host 身份，则必须额外走 Host-bound 验证。
+- OwnerConfig 可以作为 Owner 侧的可信状态源，声明当前绑定的 Zone 信息，例如 `default_zone_did` 或后续扩展的 bound zone 列表。Resolver 在验证 ZoneDocument 签名后，还应确认 `verified_zone` 仍在 OwnerConfig 声明的绑定范围内，避免攻击者重放同一 Owner 过去签发、但已经不再被 Owner 认可的旧 ZoneDocument。
+- 如果 OwnerConfig 同时声明了 `mini_version_seq`、`valid_iat` 等吊销 / 新鲜度策略，ZoneDocument JWT 还必须满足这些下限。也就是说，OwnerConfig 的绑定关系校验不能替代 `exp`、版本号和吊销检查，但可以把“签名仍有效的旧 ZoneDocument”进一步限制在 Owner 当前认可的 Zone 集合内，从而缩小重放窗口。
 
 ### 5.4 通过 DNS TXT Record 获取
 

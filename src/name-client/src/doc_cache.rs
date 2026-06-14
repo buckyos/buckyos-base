@@ -416,7 +416,7 @@ impl DIDDocumentFsCache {
         owner_doc_type: Option<&str>,
         owner_config: &OwnerConfig,
     ) {
-        let did_key = did.to_raw_host_name();
+        let did_key = did_cache_key(did);
         let entries = match fs::read_dir(&self.cache_dir) {
             Ok(entries) => entries,
             Err(err) => {
@@ -557,7 +557,7 @@ impl DIDDocumentDBCache {
              ON CONFLICT(doc_key) DO UPDATE SET doc = excluded.doc, exp = excluded.exp, trust_level = excluded.trust_level, update_from_remote_time = excluded.update_from_remote_time",
             params![
                 combine_key(&did, doc_type),
-                did.to_raw_host_name(),
+                did_cache_key(&did),
                 doc_type.unwrap_or_default(),
                 doc.to_string(),
                 exp as i64,
@@ -681,7 +681,7 @@ impl DIDDocumentDBCache {
             }
         };
 
-        let rows = match stmt.query_map(params![did.to_raw_host_name()], |row| {
+        let rows = match stmt.query_map(params![did_cache_key(did)], |row| {
             let doc_type: String = row.get(0)?;
             let doc_str: String = row.get(1)?;
             Ok((doc_type, doc_str))
@@ -878,7 +878,7 @@ impl DIDDocumentMemCache {
         owner_doc_type: Option<&str>,
         owner_config: &OwnerConfig,
     ) {
-        let did_key = did.to_raw_host_name();
+        let did_key = did_cache_key(did);
         if let Ok(mut guard) = self.entries.write() {
             guard.retain(|key, entry| {
                 let doc_type = doc_type_from_cache_key(&did_key, key);
@@ -960,11 +960,16 @@ fn extract_timestamp(doc: &EncodedDocument, field: &str) -> Option<u64> {
 }
 
 fn combine_key(did: &DID, doc_type: Option<&str>) -> String {
+    let did_key = did_cache_key(did);
     if let Some(f) = doc_type {
-        format!("{}#{}", did.to_raw_host_name(), f)
+        format!("{}#{}", did_key, f)
     } else {
-        did.to_raw_host_name()
+        did_key
     }
+}
+
+fn did_cache_key(did: &DID) -> String {
+    did.to_filename()
 }
 
 fn is_owner_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> bool {
@@ -1063,13 +1068,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     fn doc_path(base: &tempfile::TempDir, did: &DID) -> PathBuf {
-        base.path()
-            .join(format!("{}.doc.json", did.to_raw_host_name()))
+        base.path().join(format!("{}.doc.json", did_cache_key(did)))
     }
 
     fn meta_path(base: &tempfile::TempDir, did: &DID) -> PathBuf {
         base.path()
-            .join(format!("{}.meta.json", did.to_raw_host_name()))
+            .join(format!("{}.meta.json", did_cache_key(did)))
     }
 
     fn owner_encoding_key() -> EncodingKey {
@@ -1221,6 +1225,33 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         EncodedDocument::JsonLd(serde_json::to_value(zone_boot_config).unwrap())
     }
 
+    fn assert_path_did_does_not_collide_with_host_did(cache: &DIDDocumentCache) {
+        let host_did = DID::from_str("did:web:example.com").unwrap();
+        let path_did = DID::from_str("did:web:example.com:abc:bcd").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let exp = now + DEFAULT_EXPIRE_TIME;
+        let host_doc = build_zone_doc(&host_did, exp, "host");
+        let path_doc = build_zone_doc(&path_did, exp, "path");
+
+        cache.insert(
+            host_did.clone(),
+            None,
+            host_doc.clone(),
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+        cache.insert(
+            path_did.clone(),
+            None,
+            path_doc.clone(),
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
+
+        assert_eq!(cache.get(&host_did, None).unwrap().0, host_doc);
+        assert_eq!(cache.get(&path_did, None).unwrap().0, path_doc);
+    }
+
     #[test]
     fn fs_insert_and_get_preserves_document() {
         let (tmp_dir, cache, did) = setup_fs_cache();
@@ -1239,6 +1270,16 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let loaded = cache.get(&did, None).expect("doc should be available");
         assert_eq!(loaded.0, doc);
         assert_eq!(loaded.1, exp);
+    }
+
+    #[test]
+    fn fs_cache_uses_filename_key_for_path_did() {
+        let (tmp_dir, cache, _) = setup_fs_cache();
+        assert_path_did_does_not_collide_with_host_did(&cache);
+
+        let path_did = DID::from_str("did:web:example.com:abc:bcd").unwrap();
+        assert_eq!(did_cache_key(&path_did), "example.com%2Fabc%2Fbcd");
+        assert!(doc_path(&tmp_dir, &path_did).exists());
     }
 
     #[test]
@@ -1531,6 +1572,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[test]
+    fn db_cache_uses_filename_key_for_path_did() -> Result<(), NSError> {
+        let (_tmp_dir, cache, _) = setup_db_cache();
+        assert_path_did_does_not_collide_with_host_did(&cache);
+        Ok(())
+    }
+
+    #[test]
     fn db_owner_update_evicts_revoked_docs() -> Result<(), NSError> {
         let (_tmp_dir, cache, did) = setup_db_cache();
         assert_owner_update_evicts_revoked_docs(&cache, &did);
@@ -1559,6 +1607,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         ));
         let loaded = cache.get(&did, None).expect("doc should be available");
         assert_eq!(loaded.0, doc);
+    }
+
+    #[test]
+    fn mem_cache_uses_filename_key_for_path_did() {
+        let (cache, _) = setup_mem_cache();
+        assert_path_did_does_not_collide_with_host_did(&cache);
     }
 
     #[test]
@@ -1633,7 +1687,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
             params![
                 combine_key(&did, None),
-                did.to_raw_host_name(),
+                did_cache_key(&did),
                 "",
                 doc.to_string(),
                 past_exp as i64,

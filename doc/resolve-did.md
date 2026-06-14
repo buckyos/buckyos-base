@@ -12,8 +12,8 @@
 
 ## 几个关键的provider与协议
 
-解析器0. 基于智能合约(BNS)的协议，协议上。是一个运行在current zone的http 解析器
-解析器1. 基于dns协议的did-doc解析器（目前主力)
+解析器0. 基于智能合约(BNS)的协议，实现上。是一个运行在current zone的http 解析器(内部会根据区块链状态构造可信索引)
+解析器1. 基于dns协议的did-doc解析器（目前主力)-> 只能解析ZoneConfig
 解析器2. 基于http的did-doc解析器，与0的协议基本相同，但更适合查询did:bns:$objname.$zonename 这种zone内的二级对象
 - "https://{provider}/1.0/identifiers/{did?type=doc_type}", 
 这种URL适合在有明确的provider的情况下查询任意did

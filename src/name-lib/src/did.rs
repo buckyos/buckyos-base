@@ -189,6 +189,34 @@ impl DID {
         }
     }
 
+    pub fn to_raw_host_uri(&self) -> String {
+        let raw_hostname = self.to_raw_host_name();
+        match self.get_path_from_id() {
+            Some(path) => format!("{}/{}", raw_hostname, path),
+            None => raw_hostname,
+        }
+    }
+
+    pub fn to_filename(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+        let raw_host_uri = self.to_raw_host_uri();
+        let mut filename = String::with_capacity(raw_host_uri.len());
+        for byte in raw_host_uri.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                    filename.push(byte as char);
+                }
+                _ => {
+                    filename.push('%');
+                    filename.push(HEX[(byte >> 4) as usize] as char);
+                    filename.push(HEX[(byte & 0x0f) as usize] as char);
+                }
+            }
+        }
+        filename
+    }
+
     fn from_host_name(host_name: &str) -> Option<Self> {
         if host_name.ends_with(".did") {
             let parts: Vec<&str> = host_name.split('.').collect();
@@ -583,6 +611,29 @@ mod tests {
         assert_eq!(did_str, "did:web:waterflier.buckyos.io");
         let host_name = did.to_host_name_by_bridge("web3.buckyos.io");
         assert_eq!(host_name, "waterflier.buckyos.io");
+    }
+
+    #[test]
+    fn test_did_to_filename() {
+        let did = DID::from_str("did:web:node1.example.com").unwrap();
+        assert_eq!(did.to_raw_host_uri(), "node1.example.com");
+        assert_eq!(did.to_filename(), "node1.example.com");
+
+        let did = DID::from_str("did:web:example.com:user:alice").unwrap();
+        assert_eq!(did.to_raw_host_uri(), "example.com/user/alice");
+        assert_eq!(did.to_filename(), "example.com%2Fuser%2Falice");
+
+        let did = DID::from_str("did:web:example.com%3A3000:user:alice").unwrap();
+        assert_eq!(did.to_raw_host_uri(), "example.com%3A3000/user/alice");
+        assert_eq!(did.to_filename(), "example.com%253A3000%2Fuser%2Falice");
+
+        let did = DID::new("web", "example.com:user:\u{00E9}");
+        assert_eq!(did.to_raw_host_uri(), "example.com/user/\u{00E9}");
+        assert_eq!(did.to_filename(), "example.com%2Fuser%2F%C3%A9");
+
+        let did = DID::from_str("did:bns:waterflier").unwrap();
+        assert_eq!(did.to_raw_host_uri(), "waterflier.bns.did");
+        assert_eq!(did.to_filename(), "waterflier.bns.did");
     }
 
     #[test]
