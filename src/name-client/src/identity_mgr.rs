@@ -797,9 +797,13 @@ fn did_input_to_raw_host_uri(did_or_hostname: &str) -> NSResult<String> {
         return Err(NSError::InvalidDID("empty did or hostname".to_string()));
     }
 
-    let did = DID::from_str(input)?;
-    let raw_host_uri = did.to_raw_host_uri();
-    Ok(normalize_wildcard_raw_host_uri(&raw_host_uri))
+    if DID::is_did(input) {
+        let did = DID::from_str(input)?;
+        let raw_host_uri = did.to_raw_host_uri();
+        Ok(normalize_wildcard_raw_host_uri(&raw_host_uri))
+    } else {
+        Ok(normalize_wildcard_raw_host_uri(input))
+    }
 }
 
 fn normalize_wildcard_raw_host_uri(raw_host_uri: &str) -> String {
@@ -1115,6 +1119,29 @@ mod tests {
             encode_filename("example.com%2Fuser"),
             "example.com%252Fuser"
         );
+    }
+
+    #[test]
+    fn hostname_input_uses_raw_hostname_without_did_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+
+        assert_eq!(
+            roots.raw_host_uri("example.com:3000").unwrap(),
+            "example.com:3000"
+        );
+        assert_eq!(
+            roots.dir_name("example.com:3000").unwrap(),
+            "example.com%3A3000"
+        );
+
+        let public_dir = roots.public_dir("example.com:3000").unwrap();
+        fs::create_dir_all(&public_dir).unwrap();
+        let matched = roots.find_identity_dir("example.com:3000").unwrap();
+        assert_eq!(matched.match_type, IdentityMatchType::Exact);
+        assert_eq!(matched.raw_host_uri, "example.com:3000");
+        assert_eq!(matched.dir_name, "example.com%3A3000");
+        assert_eq!(matched.public_dir, public_dir);
     }
 
     #[test]
