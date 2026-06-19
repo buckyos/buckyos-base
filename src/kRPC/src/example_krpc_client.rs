@@ -199,11 +199,6 @@ mod tests {
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             // Business logic here
-            if _ctx.is_rpc {
-                // let control_panel_client = get_runtime().get_control_panel_client();
-                // control_panel_client.set_context(_ctx);
-                // control_panel_client.delete_app_data(_userid, _appid).await?;
-            }
             Ok(())
         }
     }

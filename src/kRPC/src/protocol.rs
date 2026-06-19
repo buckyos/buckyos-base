@@ -246,22 +246,24 @@ impl<'de> Deserialize<'de> for RPCResponse {
 #[derive(Debug, PartialEq, Clone)]
 pub struct RPCContext {
     pub seq: u64,
+    pub schema: Option<String>,
     pub start_time: u64,
     pub token: Option<String>, //jwt session token
     pub trace_id: Option<String>,
-    pub from_ip: Option<IpAddr>,
-    pub is_rpc: bool,
+    pub from_ip: Option<IpAddr>,//filled by gateway,client never fill this
+    pub from_device: Option<String>,//filled by gateway,client never fill this
 }
 
 impl Default for RPCContext {
     fn default() -> Self {
         Self {
             seq: 0,
+            schema: None,
             start_time: 0,
             token: None,
             trace_id: None,
             from_ip: None,
-            is_rpc: false,
+            from_device: None,
         }
     }
 }
@@ -270,11 +272,12 @@ impl RPCContext {
     pub fn from_request(req: &RPCRequest, ip_from: IpAddr) -> Self {
         Self {
             seq: req.seq,
+            schema: None,
             start_time: buckyos_get_unix_timestamp(),
             token: req.token.clone(),
             trace_id: req.trace_id.clone(),
             from_ip: Some(ip_from),
-            is_rpc: true,
+            from_device: None,
         }
     }
 }
