@@ -10,6 +10,7 @@ mod identity_mgr;
 mod local_ns_provider;
 mod name_client;
 mod name_query;
+mod profile_resolver;
 mod provider;
 mod utility;
 
@@ -24,6 +25,7 @@ use jsonwebtoken::DecodingKey;
 pub use local_ns_provider::*;
 pub use name_client::*;
 pub use name_query::*;
+pub use profile_resolver::*;
 pub use provider::*;
 pub use utility::*;
 
@@ -246,6 +248,33 @@ pub async fn resolve_did(did: &DID, doc_type: Option<&str>) -> NSResult<EncodedD
     }
     let client = client.unwrap();
     client.resolve_did(did, doc_type).await
+}
+
+pub async fn resolve_owner_config(did: &DID) -> NSResult<OwnerConfig> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not found".to_string()));
+    }
+    client.unwrap().resolve_owner_config(did).await
+}
+
+pub async fn resolve_user_profile(
+    did: &DID,
+    opts: ProfileResolveOptions,
+) -> NSResult<MergedProfile> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not found".to_string()));
+    }
+    client.unwrap().resolve_user_profile(did, opts).await
+}
+
+pub async fn owner_is_bound_to_zone(did: &DID, zone_did: &DID) -> NSResult<bool> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not found".to_string()));
+    }
+    client.unwrap().owner_is_bound_to_zone(did, zone_did).await
 }
 
 pub async fn update_did_cache(

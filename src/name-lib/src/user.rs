@@ -64,8 +64,9 @@ pub struct OwnerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub meta: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_zone_did: Option<DID>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub binded_zone_list: Vec<DID>,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub wallets: HashMap<String, OwnerWallet>,
@@ -138,7 +139,7 @@ impl OwnerConfig {
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
             capability_invocation: vec!["#main_key".to_string()],
-            default_zone_did: None,
+            binded_zone_list: Vec::new(),
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 10,
             iat: buckyos_get_unix_timestamp(),
             version_seq: Some(0),
@@ -153,7 +154,13 @@ impl OwnerConfig {
     }
 
     pub fn set_default_zone_did(&mut self, default_zone_did: DID) {
-        self.default_zone_did = Some(default_zone_did.clone());
+        self.binded_zone_list
+            .retain(|zone_did| zone_did != &default_zone_did);
+        self.binded_zone_list.insert(0, default_zone_did.clone());
+
+        let last_doc_service_id = format!("{}#lastDoc", self.id.to_string());
+        self.service
+            .retain(|service| service.id != last_doc_service_id);
         self.service.push(ServiceNode {
             id: format!("{}#lastDoc", self.id.to_string()),
             service_type: "DIDDoc".to_string(),
@@ -185,7 +192,13 @@ impl OwnerConfig {
     }
 
     pub fn get_default_zone_did(&self) -> Option<DID> {
-        return self.default_zone_did.clone();
+        self.binded_zone_list.first().cloned()
+    }
+
+    pub fn is_bound_to_zone(&self, zone_did: &DID) -> bool {
+        self.binded_zone_list
+            .iter()
+            .any(|binded_zone_did| binded_zone_did == zone_did)
     }
 
     pub fn get_default_key(&self) -> Option<Jwk> {

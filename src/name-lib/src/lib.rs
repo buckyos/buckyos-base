@@ -8,6 +8,7 @@ mod did_object_card;
 pub mod key_scope;
 mod object_profile;
 mod user;
+mod user_profile;
 mod utility;
 mod zone;
 
@@ -18,6 +19,7 @@ pub use did_object_card::*;
 pub use object_profile::*;
 use serde::{Deserialize, Serialize};
 pub use user::{OwnerConfig, OwnerWallet};
+pub use user_profile::*;
 pub use utility::*;
 pub use zone::*;
 

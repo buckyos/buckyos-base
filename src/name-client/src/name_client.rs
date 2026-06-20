@@ -154,6 +154,12 @@ impl NameClient {
         Ok(())
     }
 
+    pub fn invalidate_did_cache(&self, did: DID, doc_type: Option<&str>) {
+        if self.config.enable_cache {
+            self.doc_cache.delete(did, doc_type);
+        }
+    }
+
     //only for test
     pub async fn add_nameinfo_cache(&self, name: &str, info: NameInfo) -> NSResult<()> {
         let cache = match &self.nameinfo_cache {
