@@ -81,6 +81,13 @@ impl RPCSessionToken {
         Ok((result_str, session_token))
     }
 
+    pub fn get_default_sudo_userid(user_id: &str) -> String {
+        match user_id {
+            "root" => "root".to_string(),
+            _ => "su_".to_string() + user_id,
+        }
+    }
+
     pub fn from_string(token: &str) -> Result<Self> {
         if token.trim().starts_with('{') {
             let mut result_token: RPCSessionToken = serde_json::from_str(token).map_err(|e| {
