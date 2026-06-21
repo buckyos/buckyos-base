@@ -8,6 +8,10 @@ use std::collections::hash_map::HashMap;
 
 const DEFAULT_SESSION_TOKEN_EXPIRE_TIME: u64 = 60 * 15;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum RPCSessionTokenType {
     Normal,
@@ -36,11 +40,12 @@ pub struct RPCSessionToken {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub appid: Option<String>,
+
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sudo: bool,
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
@@ -64,8 +69,8 @@ impl RPCSessionToken {
             exp: Some(timestamp + DEFAULT_SESSION_TOKEN_EXPIRE_TIME),
             iss: Some(user_id.to_string()),
             jti: None,
-            session: None,
             sub: Some(user_id.to_string()),
+            sudo: false,
             extra: HashMap::new(),
         };
         let result_str = session_token.generate_jwt(kid, private_key).map_err(|e| {
@@ -249,6 +254,19 @@ impl RPCSessionToken {
             }
         }
 
+        let sudo = decoded_json.get("sudo");
+        if let Some(sudo) = sudo {
+            if sudo.is_null() {
+                self.sudo = false;
+            } else {
+                self.sudo = sudo
+                    .as_bool()
+                    .ok_or(RPCErrors::InvalidToken("Invalid sudo".to_string()))?;
+            }
+        } else {
+            self.sudo = false;
+        }
+
         self.sub = Some(sub.to_string());
         Ok(())
     }
@@ -399,13 +417,15 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             exp: Some(1000),
             iss: Some("iss".to_string()),
             jti: Some("jti".to_string()),
-            session: Some(1000),
             sub: Some("sub".to_string()),
             appid: Some("appid".to_string()),
+            sudo: false,
             extra: HashMap::new(),
         };
         let serialized = serde_json::to_string(&session_token).unwrap();
         println!("serialized = {}", serialized);
+        let serialized_value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert!(serialized_value.get("sudo").is_none());
         let deserialized: RPCSessionToken = RPCSessionToken::from_string(&serialized).unwrap();
         assert_eq!(session_token, deserialized);
 
@@ -414,13 +434,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             "exp": 1000,
             "iss": "iss",
             "jti": "jti",
-            "session": 1000,
             "sub": "sub",
             "appid": "appid",
             "new_field": "new.value",
         });
         let new_session_token =
             serde_json::from_value::<RPCSessionToken>(session_token_with_extra).unwrap();
+        assert!(!new_session_token.sudo);
         assert_eq!(
             new_session_token
                 .extra
@@ -436,6 +456,15 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let new_serialized = format!("\n\n    {}   \n\n", serialized);
         let deserialized: RPCSessionToken = RPCSessionToken::from_string(&new_serialized).unwrap();
         assert_eq!(new_session_token, deserialized);
+
+        let mut sudo_session_token = session_token;
+        sudo_session_token.sudo = true;
+        let serialized = serde_json::to_string(&sudo_session_token).unwrap();
+        let serialized_value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            serialized_value.get("sudo").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -443,16 +472,16 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
 
         // Build the claims we expect to read back after verification.
-        let mut claims = RPCSessionToken {
+        let claims = RPCSessionToken {
             token_type: RPCSessionTokenType::Normal,
             token: None,
             aud: Some("test-aud".to_string()),
             exp: Some(now + 60),
             iss: Some("issuer-123".to_string()),
             jti: Some("nonce-1".to_string()),
-            session: None,
             sub: Some("user-123".to_string()),
             appid: Some("app-42".to_string()),
+            sudo: true,
             extra: HashMap::new(),
         };
 
@@ -467,9 +496,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             exp: None,
             iss: None,
             jti: None,
-            session: None,
             sub: None,
             appid: None,
+            sudo: false,
             extra: HashMap::new(),
         };
 
@@ -485,6 +514,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(token_to_verify.aud.as_deref(), Some("test-aud"));
         assert_eq!(token_to_verify.iss.as_deref(), Some("issuer-123"));
         assert_eq!(token_to_verify.jti.as_deref(), Some("nonce-1"));
+        assert!(token_to_verify.sudo);
         assert!(token_to_verify.exp.unwrap() >= now);
     }
 }

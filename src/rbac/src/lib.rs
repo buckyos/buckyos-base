@@ -90,6 +90,33 @@ g, cyfs-gateway, kernel
 lazy_static! {
     static ref SYS_ENFORCE: Arc<Mutex<Option<Enforcer>>> = { Arc::new(Mutex::new(None)) };
 }
+
+pub enum SudoMode {
+    None,
+    Sudo(String), //userid
+}
+
+fn enforce_subject(
+    enforcer: &Enforcer,
+    subject: &str,
+    res_path: &str,
+    op_name: &str,
+) -> Option<bool> {
+    match enforcer.enforce((subject, res_path, op_name)) {
+        Ok(res) => {
+            debug!(
+                "enforce {},{},{} result:{}",
+                subject, res_path, op_name, res
+            );
+            Some(res)
+        }
+        Err(err) => {
+            warn!("enforce error: {}", err);
+            None
+        }
+    }
+}
+
 pub async fn create_enforcer(
     model_str: Option<&str>,
     policy_str: Option<&str>,
@@ -123,7 +150,13 @@ pub async fn update_enforcer(policy_str: Option<&str>) -> Result<(), Box<dyn std
 }
 //use default RBAC config to enforce the access control
 //default acl config is stored in the memory,so it is not async function
-pub async fn enforce(userid: &str, appid: Option<&str>, res_path: &str, op_name: &str) -> bool {
+pub async fn enforce(
+    userid: &str,
+    appid: Option<&str>,
+    res_path: &str,
+    op_name: &str,
+    sudo: Option<SudoMode>,
+) -> bool {
     let enforcer = SYS_ENFORCE.lock().await;
     if enforcer.is_none() {
         error!("enforcer is not initialized");
@@ -136,31 +169,34 @@ pub async fn enforce(userid: &str, appid: Option<&str>, res_path: &str, op_name:
     //info!("roles for user {}: {:?}", userid, roles);
 
     let appid = appid.unwrap_or("kernel");
-    let res2 = enforcer.enforce((appid, res_path, op_name));
-    if res2.is_err() {
-        warn!("enforce error: {}", res2.err().unwrap());
+    let res2 = enforce_subject(enforcer, appid, res_path, op_name);
+    if res2.is_none() {
         return false;
     }
     let res2 = res2.unwrap();
 
     //println!("enforce {},{},{}, result:{}",appid, res_path, op_name,res2);
-    debug!(
-        "enforce {},{},{}, result:{}",
-        appid, res_path, op_name, res2
-    );
     if appid == "kernel" {
         return res2;
     }
 
-    let res = enforcer.enforce((userid, res_path, op_name));
-    if res.is_err() {
-        warn!("enforce error: {}", res.err().unwrap());
+    let res = enforce_subject(enforcer, userid, res_path, op_name);
+    if res.is_none() {
         return false;
     }
     let res = res.unwrap();
-    //println!("enforce {},{},{} result:{}",userid, res_path, op_name,res);
-    debug!("enforce {},{},{} result:{}", userid, res_path, op_name, res);
-    return res2 && res;
+    if res {
+        return res2;
+    }
+
+    let sudo_res = match sudo {
+        Some(SudoMode::Sudo(sudo_userid)) => {
+            enforce_subject(enforcer, &sudo_userid, res_path, op_name).unwrap_or(false)
+        }
+        _ => false,
+    };
+
+    return res2 && sudo_res;
 }
 
 //test
@@ -274,10 +310,24 @@ g, jarvis,app
 p, su_bob,/config/users/bob/*,read|write,allow
         "#;
         create_enforcer(None, Some(&policy_str)).await.unwrap();
-        let res = enforce("ood", Some("node-daemon"), "/config/boot/config", "read").await;
+        let res = enforce(
+            "ood",
+            Some("node-daemon"),
+            "/config/boot/config",
+            "read",
+            None,
+        )
+        .await;
         assert_eq!(res, true);
         assert_eq!(
-            enforce("ood1", Some("node-daemon"), "/config/boot/config", "write").await,
+            enforce(
+                "ood1",
+                Some("node-daemon"),
+                "/config/boot/config",
+                "write",
+                None
+            )
+            .await,
             false
         );
         assert_eq!(
@@ -285,13 +335,21 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "scheduler",
                 Some("ood1"),
                 "/config/system/scheduler/snapshot",
-                "write"
+                "write",
+                None,
             )
             .await,
             true
         );
         assert_eq!(
-            enforce("jarvis", Some("bob"), "/config/agents/jarvis/doc", "read").await,
+            enforce(
+                "jarvis",
+                Some("bob"),
+                "/config/agents/jarvis/doc",
+                "read",
+                None
+            )
+            .await,
             true
         );
         assert_eq!(
@@ -299,7 +357,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "jarvis",
                 Some("bob"),
                 "/config/services/task-manager/info",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
@@ -309,13 +368,21 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "ood1",
                 Some("verify-hub"),
                 "/config/system/verify-hub/key",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
         );
         assert_eq!(
-            enforce("root", Some("node-daemon"), "/config/boot/config", "write").await,
+            enforce(
+                "root",
+                Some("node-daemon"),
+                "/config/boot/config",
+                "write",
+                None
+            )
+            .await,
             true
         );
         assert_eq!(
@@ -323,7 +390,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "ood1",
                 Some("repo-service"),
                 "/config/services/repo-service/instance/ood1",
-                "write"
+                "write",
+                None,
             )
             .await,
             true
@@ -333,13 +401,21 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "ood1",
                 Some("smb-service"),
                 "/config/services/smb-service/latest_smb_items",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
         );
         assert_eq!(
-            enforce("ood1", Some("smb-service"), "/config/boot/config", "read").await,
+            enforce(
+                "ood1",
+                Some("smb-service"),
+                "/config/boot/config",
+                "read",
+                None
+            )
+            .await,
             true
         );
         assert_eq!(
@@ -347,7 +423,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "ood1",
                 Some("scheduler"),
                 "/config/users/alice/apps/app2/config",
-                "write"
+                "write",
+                None,
             )
             .await,
             true
@@ -357,7 +434,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "bob",
                 Some("node-daemon"),
                 "/config/users/alice/apps/app2",
-                "read"
+                "read",
+                None,
             )
             .await,
             false
@@ -367,7 +445,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "bob",
                 Some("app1"),
                 "/config/users/bob/apps/app1/settings",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
@@ -377,7 +456,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "bob",
                 Some("control-panel"),
                 "/config/users/bob/settings",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
@@ -387,17 +467,30 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "bob",
                 Some("control-panel"),
                 "/config/users/bob/settings",
-                "write"
+                "write",
+                None,
             )
             .await,
             false
         );
         assert_eq!(
             enforce(
+                "bob",
+                Some("control-panel"),
+                "/config/users/bob/settings",
+                "write",
+                Some(SudoMode::Sudo("su_bob".to_string())),
+            )
+            .await,
+            true
+        );
+        assert_eq!(
+            enforce(
                 "su_bob",
                 Some("control-panel"),
                 "/config/users/bob/settings",
-                "write"
+                "write",
+                None,
             )
             .await,
             true
@@ -408,13 +501,21 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "ood1",
                 Some("repo-service"),
                 "/config/services/verify-hub/info",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
         );
         assert_eq!(
-            enforce("ood1", Some("cyfs-gateway"), "/config/boot/config", "read").await,
+            enforce(
+                "ood1",
+                Some("cyfs-gateway"),
+                "/config/boot/config",
+                "read",
+                None
+            )
+            .await,
             true
         );
         //app1 can read and write config and info
@@ -423,7 +524,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "/config/users/alice/apps/app1/spec",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
@@ -433,7 +535,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "/config/users/alice/apps/app1/spec",
-                "write"
+                "write",
+                None,
             )
             .await,
             false
@@ -443,7 +546,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "/config/users/alice/apps/app1/info",
-                "read"
+                "read",
+                None,
             )
             .await,
             true
@@ -453,7 +557,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "/config/users/alice/apps/app1/info",
-                "write"
+                "write",
+                None,
             )
             .await,
             true
@@ -464,7 +569,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "root",
                 Some("app1"),
                 "/config/users/alice/apps/app1/settings",
-                "write"
+                "write",
+                None,
             )
             .await,
             true
@@ -476,7 +582,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "/config/users/alice/apps/app2/settings",
-                "write"
+                "write",
+                None,
             )
             .await,
             false
@@ -486,7 +593,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "/config/users/alice/apps/app2/info",
-                "read"
+                "read",
+                None,
             )
             .await,
             false
@@ -496,7 +604,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "dfs://users/alice/appdata/app2/readme.txt",
-                "write"
+                "write",
+                None,
             )
             .await,
             false
@@ -506,7 +615,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "dfs://users/alice/appdata/app2/readme.txt",
-                "read"
+                "read",
+                None,
             )
             .await,
             false
@@ -516,7 +626,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "dfs://users/alice/cache/app2/readme_cache.txt",
-                "write"
+                "write",
+                None,
             )
             .await,
             false
@@ -526,7 +637,8 @@ p, su_bob,/config/users/bob/*,read|write,allow
                 "alice",
                 Some("app1"),
                 "dfs://users/alice/cache/app2/readme_cache.txt",
-                "read"
+                "read",
+                None,
             )
             .await,
             false
