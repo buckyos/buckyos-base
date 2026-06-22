@@ -11,7 +11,124 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-pub const DEFAULT_MODEL: &str = r#"
+lazy_static! {
+    static ref SYS_ENFORCE: Arc<Mutex<Option<Enforcer>>> = { Arc::new(Mutex::new(None)) };
+}
+
+pub enum SudoMode {
+    None,
+    Sudo(String), //userid
+}
+
+fn enforce_subject(
+    enforcer: &Enforcer,
+    subject: &str,
+    res_path: &str,
+    op_name: &str,
+) -> Option<bool> {
+    match enforcer.enforce((subject, res_path, op_name)) {
+        Ok(res) => {
+            debug!(
+                "enforce {},{},{} result:{}",
+                subject, res_path, op_name, res
+            );
+            Some(res)
+        }
+        Err(err) => {
+            warn!("enforce error: {}", err);
+            None
+        }
+    }
+}
+
+pub async fn create_enforcer(
+    model_str: &str,
+    policy_str: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let m = DefaultModel::from_str(model_str).await?;
+    let mut e = Enforcer::new(m, MemoryAdapter::default()).await?;
+    for line in policy_str.lines() {
+        let line = line.trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            let rule: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
+            if rule[0] == "p" {
+                e.add_policy(rule[1..].to_vec()).await?;
+            } else if rule[0] == "g" {
+                e.add_grouping_policy(rule[1..].to_vec()).await?;
+            }
+        }
+    }
+
+    let mut enforcer = SYS_ENFORCE.lock().await;
+    *enforcer = Some(e);
+    Ok(())
+}
+
+pub async fn update_enforcer(
+    model_str: &str,
+    policy_str: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    return create_enforcer(model_str, policy_str).await;
+}
+// Use the configured RBAC enforcer to enforce access control.
+pub async fn enforce(
+    userid: &str,
+    appid: &str,
+    res_path: &str,
+    op_name: &str,
+    sudo: Option<SudoMode>,
+) -> bool {
+    let enforcer = SYS_ENFORCE.lock().await;
+    if enforcer.is_none() {
+        error!("enforcer is not initialized");
+        return false;
+    }
+    let enforcer = enforcer.as_ref().unwrap();
+
+    //let roles = enforcer.get_roles_for_user(userid,None);
+    //println!("roles for user {}: {:?}", userid, roles);
+    //info!("roles for user {}: {:?}", userid, roles);
+
+    let res2 = enforce_subject(enforcer, appid, res_path, op_name);
+    if res2.is_none() {
+        return false;
+    }
+    let res2 = res2.unwrap();
+    if !res2 {
+        return false;
+    }
+
+    let res = enforce_subject(enforcer, userid, res_path, op_name);
+    if res.is_none() {
+        return false;
+    }
+    let res = res.unwrap();
+    if !res {
+        let sudo_res = match sudo {
+            Some(SudoMode::Sudo(sudo_userid)) => {
+                enforce_subject(enforcer, &sudo_userid, res_path, op_name).unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !sudo_res {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+//test
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use casbin::{
+        rhai::ImmutableString, CoreApi, DefaultModel, Enforcer, Filter, MemoryAdapter, MgmtApi,
+    };
+    use std::collections::HashMap;
+    use tokio::test;
+
+    const TEST_MODEL: &str = r#"
 [request_definition]
 r = sub,obj,act
 
@@ -28,7 +145,7 @@ e = priority(p.eft) || deny
 m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.sub) || keyGet3(r.obj, p.obj, p.sub) =="") && keyMatch3(r.obj,p.obj)) && regexMatch(r.act, p.act)
 "#;
 
-pub const DEFAULT_POLICY: &str = r#"
+    const TEST_POLICY: &str = r#"
 p, kernel, /config/*, read|write,allow
 p, root, /config/*, read|write,allow
 
@@ -86,126 +203,6 @@ g, control-panel, kernel
 g, buckycli, kernel
 g, cyfs-gateway, kernel
 "#;
-
-lazy_static! {
-    static ref SYS_ENFORCE: Arc<Mutex<Option<Enforcer>>> = { Arc::new(Mutex::new(None)) };
-}
-
-pub enum SudoMode {
-    None,
-    Sudo(String), //userid
-}
-
-fn enforce_subject(
-    enforcer: &Enforcer,
-    subject: &str,
-    res_path: &str,
-    op_name: &str,
-) -> Option<bool> {
-    match enforcer.enforce((subject, res_path, op_name)) {
-        Ok(res) => {
-            debug!(
-                "enforce {},{},{} result:{}",
-                subject, res_path, op_name, res
-            );
-            Some(res)
-        }
-        Err(err) => {
-            warn!("enforce error: {}", err);
-            None
-        }
-    }
-}
-
-pub async fn create_enforcer(
-    model_str: Option<&str>,
-    policy_str: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let model_str = model_str.unwrap_or(DEFAULT_MODEL);
-    let policy_str = policy_str.unwrap_or(DEFAULT_POLICY);
-
-    let m = DefaultModel::from_str(model_str).await?;
-    let mut e = Enforcer::new(m, MemoryAdapter::default()).await?;
-    for line in policy_str.lines() {
-        let line = line.trim();
-        if !line.is_empty() && !line.starts_with('#') {
-            let rule: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
-            if rule[0] == "p" {
-                e.add_policy(rule[1..].to_vec()).await?;
-            } else if rule[0] == "g" {
-                e.add_grouping_policy(rule[1..].to_vec()).await?;
-            }
-        }
-    }
-
-    let mut enforcer = SYS_ENFORCE.lock().await;
-    *enforcer = Some(e);
-    Ok(())
-}
-
-pub async fn update_enforcer(policy_str: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let policy_str = policy_str.unwrap_or(DEFAULT_POLICY);
-    let model_str = DEFAULT_MODEL;
-    return create_enforcer(Some(model_str), Some(policy_str)).await;
-}
-//use default RBAC config to enforce the access control
-//default acl config is stored in the memory,so it is not async function
-pub async fn enforce(
-    userid: &str,
-    appid: &str,
-    res_path: &str,
-    op_name: &str,
-    sudo: Option<SudoMode>,
-) -> bool {
-    let enforcer = SYS_ENFORCE.lock().await;
-    if enforcer.is_none() {
-        error!("enforcer is not initialized");
-        return false;
-    }
-    let enforcer = enforcer.as_ref().unwrap();
-
-    //let roles = enforcer.get_roles_for_user(userid,None);
-    //println!("roles for user {}: {:?}", userid, roles);
-    //info!("roles for user {}: {:?}", userid, roles);
-
-    let res2 = enforce_subject(enforcer, appid, res_path, op_name);
-    if res2.is_none() {
-        return false;
-    }
-    let res2 = res2.unwrap();
-    if !res2 {
-        return false;
-    }
-
-    let res = enforce_subject(enforcer, userid, res_path, op_name);
-    if res.is_none() {
-        return false;
-    }
-    let res = res.unwrap();
-    if !res {
-        let sudo_res = match sudo {
-            Some(SudoMode::Sudo(sudo_userid)) => {
-                enforce_subject(enforcer, &sudo_userid, res_path, op_name).unwrap_or(false)
-            }
-            _ => false,
-        };
-        if !sudo_res {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-//test
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use casbin::{
-        rhai::ImmutableString, CoreApi, DefaultModel, Enforcer, Filter, MemoryAdapter, MgmtApi,
-    };
-    use std::collections::HashMap;
-    use tokio::test;
 
     #[test]
     async fn test_simple_enforce() -> Result<(), Box<dyn std::error::Error>> {
@@ -292,7 +289,7 @@ m = g(r.sub, p.sub) && keyMatch(r.obj, p.obj) && regexMatch(r.act, p.act)
     async fn test_enforce() {
         std::env::set_var("BUCKY_LOG", "debug");
         buckyos_kit::init_logging("test_rbac", false);
-        let mut policy_str = DEFAULT_POLICY.to_string();
+        let mut policy_str = TEST_POLICY.to_string();
         policy_str = policy_str
             + r#"
 g, sys-test, app
@@ -307,7 +304,7 @@ g, bob,user
 g, jarvis,app
 p, su_bob,/config/users/bob/*,read|write,allow
         "#;
-        create_enforcer(None, Some(&policy_str)).await.unwrap();
+        create_enforcer(TEST_MODEL, &policy_str).await.unwrap();
         let res = enforce("ood", "node-daemon", "/config/boot/config", "read", None).await;
         assert_eq!(res, true);
         assert_eq!(
