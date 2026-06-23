@@ -28,8 +28,8 @@
 
 **缺什么（核心 gap）：**
 - 没有 typed 便捷解析：`resolve_owner_config(did)` / `resolve_user_profile(did)`。
-- 没有 `UserType.md` 要求的 **双源合并协议**（current-zone + BNS，BNS 优先）。
-- 没有 **DID 形态感知的路由**（`did:bns:$user` vs `did:bns:$user.$zone`）。
+- 没有 `UserType.md` 要求的 **owner-config 与 profile 合并协议**（owner-config identity 字段覆盖 resolver 选中的 profile）。
+- 没有 **DID 形态感知的 owner-config 解析**（`did:bns:$user.$zone` 请求 profile 时，仍需用 `did:bns:$user` 取 owner-config 验签）。
 - 没有扁平的用户 profile 类型（`UserProfile`），现有 `ObjectProfile` 太重。
 - `OwnerConfig` 只有 `default_zone_did`，**没有 `binded_zone_list`** —— 本轮决策：加入 `binded_zone_list`，`default_zone_did` 改为派生自 `binded_zone_list[0]`（见 §6）。
 
@@ -42,17 +42,17 @@
 - `resolve_user_profile(did, opts) -> MergedProfile`：doc_type=`user`（对外公开 profile，**扁平 `UserProfile`，见决策2/§4**），含 §R2 合并。
 - 形态对齐现有 `DIDObjectClient`（可做成 `ProfileResolver` struct 或顶层 async fn）。
 
-### R2　双源合并（协议核心，UserType.md §通过 did 获取 profile）
-- **源 A：current-zone** —— 托管该用户的 zone 内 `users/{id}/profile`（doc_type=user）。
-- **源 B：BNS / 链上** —— DID 自带、不依赖任何 zone 的 profile。
-- **合并规则**：JSON 合并；同名字段 **以 BNS（源 B）为准**。
-- 结果需携带 **逐字段来源（provenance）**：标明每个字段来自 zone 还是 BNS —— 供 UI 区分「BNS 字段修改成本更高/有生效延迟」（PRD §8.4）。
-- 任一源缺失要可降级（只有 zone、或只有 BNS 都要能返回）。
+### R2　标准 Profile 解析 + OwnerConfig 合并（协议核心，UserType.md §通过 did 获取 profile）
+- **Profile 解析**：`resolve_user_profile` 不手动区分 BNS / 链上 profile 与 zone / 链下 profile，也不按字段合并多个 profile；它只通过标准 `resolve_did(did, doc_type=user)` 获取一个 profile 文档。具体返回链上还是链下结果，由 resolver / provider 的优先级管理决定。
+- **OwnerConfig 合并**：`resolve_user_profile` 必须先解析 owner-config（User Document），再用 owner-config 中的 identity 字段覆盖 resolver 选中的 profile。同名字段以 owner-config 为最高优先级；当前明确覆盖 `name / display_name / avatar / meta`，并允许 owner-config 的 `meta` 对象和扩展字段进入最终 profile。
+- **OwnerConfig meta overlay**：owner-config 的 `meta` 会保留到最终 `profile.meta`，同时其中的对象字段会作为 identity overlay 应用到 profile。字段名可以是顶层字段（如 `headline`），也可以是简单 JSON path / dot path（如 `$.links.github`）。对象覆盖采用递归合并，因此 `links` / `public_contacts` 使用 map，方便按 key 选择性覆盖。
+- 结果需携带 **逐字段来源（provenance）**：标明字段来自 owner-config 还是 resolver 选中的 profile —— 供 UI 区分「文档字段修改成本更高/有生效延迟」（PRD §8.4）。
+- profile 文档缺失时仍可用 owner-config 返回基础 identity；owner-config 本身解析失败必须报错。
 
-### R3　DID 形态感知路由（UserType.md）
-- `did:bns:$username`（一级，不带 zone）→ 先解析 owner-config，取 **`binded_zone_list[0]`** 作为 default zone（见决策1/§6），再到该 zone 取 zone-hosted profile。
-- `did:bns:$username.$zonename`（二级，显式 zone）→ 直接定位该 zone，省去 default-zone 解析。
-- 路由失败（`binded_zone_list` 为空 / zone 不可达）要有明确错误，而不是静默空 profile。
+### R3　DID 形态感知的 OwnerConfig 解析（UserType.md）
+- `did:bns:$username`（一级，不带 zone）→ owner-config DID 就是该 DID。
+- `did:bns:$username.$zonename`（二级，显式 zone）→ profile 仍按请求 DID 做标准 `resolve_did(did, doc_type=user)`；owner-config 则解析为 `did:bns:$username`，用于取得验签公钥和 identity 覆盖字段。
+- `binded_zone_list[0]` 只作为 owner-config 的 default-zone metadata 返回，不参与 profile 源选择。
 
 ### R4　doc_type 语义澄清（写进协议文档）
 - `doc_type = user`：用户**公开 profile**（头像/昵称/简介/公开可达）。
@@ -64,8 +64,8 @@
 - 验签失败 / 被吊销 → 拒绝返回，不能降级成「未验证 profile」。
 
 ### R6　缓存与新鲜度
-- 复用 `doc_cache`；定义 TTL 与刷新语义。BNS 源可能慢，需 stale-while-revalidate 类策略或显式 `force_refresh`。
-- 与 `kevent 是加速通道，不是真理来源` 一致：缓存是加速，权威源是 BNS/zone，调用方需能强制回源。
+- 复用 `doc_cache`；定义 TTL 与刷新语义。底层 provider 可能慢，需 stale-while-revalidate 类策略或显式 `force_refresh`。
+- 与 `kevent 是加速通道，不是真理来源` 一致：缓存是加速，权威源由 resolver/provider 链决定，调用方需能强制回源。
 
 ---
 
@@ -77,26 +77,36 @@
 // name-lib：新增扁平用户 profile（doc_type=user 的解码目标）
 pub struct UserProfile {
     pub did: DID,
+    #[serde(skip_serializing_if = "Option::is_none")] pub name: Option<String>,         // 稳定用户名
     #[serde(skip_serializing_if = "Option::is_none")] pub display_name: Option<String>, // 昵称/显示名
     #[serde(skip_serializing_if = "Option::is_none")] pub avatar: Option<String>,       // 头像 URL
+    #[serde(skip_serializing_if = "Option::is_none")] pub meta: Option<Value>,          // 通用 identity 扩展
     #[serde(skip_serializing_if = "Option::is_none")] pub headline: Option<String>,     // 一句话简介
     #[serde(skip_serializing_if = "Option::is_none")] pub bio: Option<String>,          // 详细简介/about
     #[serde(skip_serializing_if = "Option::is_none")] pub location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub organization: Option<String>, // 组织
     #[serde(skip_serializing_if = "Option::is_none")] pub title: Option<String>,        // 头衔
-    #[serde(skip_serializing_if = "Vec::is_empty")]   pub links: Vec<ProfileLink>,       // 主页/社交外链
-    #[serde(skip_serializing_if = "Vec::is_empty")]   pub public_contacts: Vec<ProfileContact>, // 公开可达方式
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub links: HashMap<String, ProfileLink>, // 主页/社交外链
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub public_contacts: HashMap<String, ProfileContact>, // 公开可达方式
     #[serde(flatten)]                                  pub extra: HashMap<String, Value>, // 前向扩展
 }
 pub struct ProfileLink    { pub label: String, pub url: String }
-pub struct ProfileContact { pub kind: String, pub value: String } // kind: email/telegram/...
+pub enum ProfileContactPlatform {
+    Email, Phone, Telegram, Matrix, Discord, Wechat, Whatsapp, Signal,
+    X, Github, Linkedin, Facebook, Instagram, Tiktok, Reddit, Mastodon, Bluesky,
+}
+pub struct ProfileContact {
+    pub platform: ProfileContactPlatform, // 强类型平台枚举，不提供 Other，避免任意扩展
+    pub account_id: String,               // 平台内可定位用户的 canonical id：uid/handle/email/E.164/Matrix ID 等
+    #[serde(skip_serializing_if = "Option::is_none")] pub display_id: Option<String>, // 可打开 profile page 的公开 handle/username
+    #[serde(skip_serializing_if = "Option::is_none")] pub tunnel_id: Option<DID>,     // 可选：平台 tunnel/gateway DID
+}
 
 // name-client：顶层 async fn 或 ProfileResolver
 pub async fn resolve_owner_config(did: &DID) -> NSResult<OwnerConfig>;
 
 pub struct ProfileResolveOptions {
     pub force_refresh: bool,
-    pub require_bns: bool,   // BNS 源缺失时是否报错
 }
 
 pub struct MergedProfile {
@@ -105,12 +115,31 @@ pub struct MergedProfile {
     pub field_sources: HashMap<String, ProfileSource>, // 逐字段来源（顶层字段名 → 来源）
     pub default_zone_did: Option<DID>,                 // = binded_zone_list[0]
 }
-pub enum ProfileSource { Zone, Bns }
+pub enum ProfileSource { Profile, OwnerConfig }
 
 pub async fn resolve_user_profile(
     did: &DID,
     opts: ProfileResolveOptions,
 ) -> NSResult<MergedProfile>;
+```
+
+`ProfileContact` 的目标是能定位到平台上的特定用户，并让调用方生成「打开 profile page / 添加好友」入口；不承载联系人关系、备注、分组等社交图信息。旧 `kind/value` 可以作为兼容输入读取，但新文档统一写 `platform/account_id`。例如：
+
+```json
+{
+  "public_contacts": {
+    "telegram": {
+      "platform": "telegram",
+      "account_id": "user:5397330802",
+      "display_id": "wacer2026",
+      "tunnel_id": "did:web:tg-tunnel.test.buckyos.io"
+    },
+    "matrix": {
+      "platform": "matrix",
+      "account_id": "@alice:example.com"
+    }
+  }
+}
 ```
 
 > 扁平 + `#[serde(flatten)] extra` 兼顾「字段少、好渲染」和「不锁死、可加字段」。`field_sources` 标到**顶层字段名**这一层即可（决策见 §7-Q2）。
@@ -119,7 +148,7 @@ pub async fn resolve_user_profile(
 
 ## 5. 边界（本协议**不**负责）
 
-- **写/编辑 profile**：属 zone-local 操作，留在 control_panel（`user.profile.set`），其中 BNS 字段的修改成本/确认走 control_panel UI。
+- **写/编辑 profile**：属 profile 发布链路，留在 control_panel（`user.profile.set`）；本协议只读取 resolver/provider 选中的 profile。
 - **联系人/好友关系图**：归 msg_center（`Contact` / `AccessGroupLevel`）。
 - **platform/account_id → DID 的发现**：msg_center 既有 `resolve_did`（同名但不同语义），不并入本协议。
 
@@ -143,7 +172,6 @@ pub async fn resolve_user_profile(
 - ~~Q1 用户 profile schema：WoT 还是扁平？~~ → **已定：扁平 `UserProfile`（LinkedIn 风格，§4）。**
 - ~~Q3 `binded_zone_list` 归属？~~ → **已定：进 `OwnerConfig`，`default_zone_did = binded_zone_list[0]`（§6）。**
 - **Q2 合并粒度**：顶层字段合并即可，还是支持 `extra` 内嵌套深合并？provenance 暂定标到顶层字段名一层 —— 待确认是否够用。
-- **Q4 BNS 源不可达降级**：返回 zone-only + 标记 `bns_unavailable`，还是直接报错？暂由 `require_bns` 开关控制，默认值待定。
 - **Q5 缓存**：TTL 默认值 / 是否接 kevent 主动失效。
 
 ---
@@ -154,6 +182,6 @@ pub async fn resolve_user_profile(
 2. **name-lib**：
    - `OwnerConfig` 增 `binded_zone_list`，`default_zone_did` 改派生 accessor + 老文档兼容回填（§6）。
    - 新增扁平 `UserProfile` / `ProfileLink` / `ProfileContact`（§4）。
-3. **name-client**：`resolve_owner_config` →（含双源合并的）`resolve_user_profile` → `owner_is_bound_to_zone`。
+3. **name-client**：`resolve_owner_config` →（含 owner-config/profile 合并的）`resolve_user_profile` → `owner_is_bound_to_zone`。
 4. **存量迁移**：扫所有写/读 `default_zone_did` 的点改走 `binded_zone_list`。
 5. **消费者接入**：control_panel TODO-6 `user.profile.get` 直接调本协议；TODO-3 invite.accept 调 `owner_is_bound_to_zone`。

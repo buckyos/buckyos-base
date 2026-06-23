@@ -15,14 +15,12 @@ pub const USER_PROFILE_DOC_TYPE: &str = "user";
 pub struct ProfileResolveOptions {
     #[serde(default)]
     pub force_refresh: bool,
-    #[serde(default)]
-    pub require_bns: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProfileSource {
-    Zone,
-    Bns,
+    Profile,
+    OwnerConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -32,16 +30,6 @@ pub struct MergedProfile {
     pub field_sources: HashMap<String, ProfileSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_zone_did: Option<DID>,
-}
-
-#[derive(Clone, Debug)]
-struct ProfileRoute {
-    requested_did: DID,
-    owner_did: DID,
-    bns_profile_did: DID,
-    zone_profile_did: Option<DID>,
-    default_zone_did: Option<DID>,
-    route_error: Option<String>,
 }
 
 impl NameClient {
@@ -66,55 +54,21 @@ impl NameClient {
         did: &DID,
         opts: ProfileResolveOptions,
     ) -> NSResult<MergedProfile> {
-        let route = self.resolve_profile_route(did, opts.force_refresh).await?;
+        let (owner_did, _) = split_bns_user_zone_did(did);
         let owner_config = self
-            .resolve_owner_config_with_options(&route.owner_did, opts.force_refresh)
+            .resolve_owner_config_with_options(&owner_did, opts.force_refresh)
             .await?;
-
-        let zone_profile = match route.zone_profile_did.as_ref() {
-            Some(zone_profile_did) => {
-                self.resolve_profile_source(
-                    zone_profile_did,
-                    &owner_config,
-                    opts.force_refresh,
-                    false,
-                )
-                .await?
-            }
-            None => None,
-        };
-
-        let bns_profile = self
-            .resolve_profile_source(
-                &route.bns_profile_did,
-                &owner_config,
-                opts.force_refresh,
-                opts.require_bns,
-            )
+        let profile = self
+            .resolve_profile_source(did, &owner_config, opts.force_refresh)
             .await?;
+        let profile_source = profile.as_ref().map(|_| ProfileSource::Profile);
 
-        if opts.require_bns && bns_profile.is_none() {
-            return Err(NSError::NotFound(format!(
-                "BNS user profile not found: {}",
-                route.bns_profile_did.to_string()
-            )));
-        }
-
-        if zone_profile.is_none() && bns_profile.is_none() {
-            if let Some(route_error) = route.route_error {
-                return Err(NSError::NotFound(route_error));
-            }
-            return Err(NSError::NotFound(format!(
-                "user profile not found: {}",
-                did.to_string()
-            )));
-        }
-
-        merge_profiles(
-            route.requested_did,
-            zone_profile,
-            bns_profile,
-            route.default_zone_did,
+        merge_profile_with_owner_config(
+            did.clone(),
+            profile,
+            profile_source,
+            &owner_config,
+            owner_config.get_default_zone_did(),
         )
     }
 
@@ -123,60 +77,11 @@ impl NameClient {
         Ok(owner_config.is_bound_to_zone(zone_did))
     }
 
-    async fn resolve_profile_route(
-        &self,
-        did: &DID,
-        force_refresh: bool,
-    ) -> NSResult<ProfileRoute> {
-        let (owner_did, explicit_zone_did) = split_bns_user_zone_did(did);
-        let bns_profile_did = owner_did.clone();
-        let mut default_zone_did = explicit_zone_did;
-        let mut route_error = None;
-
-        if default_zone_did.is_none() {
-            match self
-                .resolve_owner_config_with_options(&owner_did, force_refresh)
-                .await
-            {
-                Ok(owner_config) => {
-                    default_zone_did = owner_config.get_default_zone_did();
-                    if default_zone_did.is_none() {
-                        route_error = Some(format!(
-                            "{} owner-config binded_zone_list is empty",
-                            owner_did.to_string()
-                        ));
-                    }
-                }
-                Err(err) => {
-                    route_error = Some(format!(
-                        "resolve {} owner-config failed: {}",
-                        owner_did.to_string(),
-                        err
-                    ));
-                }
-            }
-        }
-
-        let zone_profile_did = default_zone_did
-            .as_ref()
-            .map(|zone_did| zone_hosted_user_did(&owner_did, zone_did));
-
-        Ok(ProfileRoute {
-            requested_did: did.clone(),
-            owner_did,
-            bns_profile_did,
-            zone_profile_did,
-            default_zone_did,
-            route_error,
-        })
-    }
-
     async fn resolve_profile_source(
         &self,
         profile_did: &DID,
         owner_config: &OwnerConfig,
         force_refresh: bool,
-        require_source: bool,
     ) -> NSResult<Option<UserProfile>> {
         if force_refresh {
             self.invalidate_did_cache(profile_did.clone(), Some(USER_PROFILE_DOC_TYPE));
@@ -188,12 +93,7 @@ impl NameClient {
         {
             Ok(profile_doc) => profile_doc,
             Err(NSError::Disabled(msg)) => return Err(NSError::Disabled(msg)),
-            Err(err) => {
-                if require_source {
-                    return Err(err);
-                }
-                return Ok(None);
-            }
+            Err(_) => return Ok(None),
         };
 
         let profile = decode_user_profile(owner_config, &profile_doc)?;
@@ -265,40 +165,21 @@ fn split_bns_user_zone_did(did: &DID) -> (DID, Option<DID>) {
     (did.clone(), None)
 }
 
-fn zone_hosted_user_did(owner_did: &DID, zone_did: &DID) -> DID {
-    let user_name = owner_did
-        .id
-        .split(':')
-        .next()
-        .unwrap_or(owner_did.id.as_str());
-    match zone_did.method.as_str() {
-        "bns" => DID::new("bns", &format!("{}.{}", user_name, zone_did.id)),
-        "web" => DID::new("web", &format!("{}:users:{}", zone_did.id, user_name)),
-        _ => DID::new(&zone_did.method, &format!("{}.{}", user_name, zone_did.id)),
-    }
-}
-
-fn merge_profiles(
+fn merge_profile_with_owner_config(
     requested_did: DID,
-    zone_profile: Option<UserProfile>,
-    bns_profile: Option<UserProfile>,
+    profile: Option<UserProfile>,
+    profile_source: Option<ProfileSource>,
+    owner_config: &OwnerConfig,
     default_zone_did: Option<DID>,
 ) -> NSResult<MergedProfile> {
     let mut merged = Map::new();
     let mut field_sources = HashMap::new();
 
-    merge_profile_source(
-        &mut merged,
-        &mut field_sources,
-        zone_profile,
-        ProfileSource::Zone,
-    )?;
-    merge_profile_source(
-        &mut merged,
-        &mut field_sources,
-        bns_profile,
-        ProfileSource::Bns,
-    )?;
+    if let Some(profile_source) = profile_source {
+        merge_profile_source(&mut merged, &mut field_sources, profile, profile_source)?;
+    }
+
+    merge_owner_config_identity(&mut merged, &mut field_sources, owner_config);
 
     merged.insert(
         "did".to_string(),
@@ -315,6 +196,132 @@ fn merge_profiles(
         field_sources,
         default_zone_did,
     })
+}
+
+fn merge_owner_config_identity(
+    merged: &mut Map<String, Value>,
+    field_sources: &mut HashMap<String, ProfileSource>,
+    owner_config: &OwnerConfig,
+) {
+    insert_owner_config_field(
+        merged,
+        field_sources,
+        "name",
+        Value::String(owner_config.name.clone()),
+    );
+    insert_owner_config_field(
+        merged,
+        field_sources,
+        "display_name",
+        Value::String(owner_config.display_name.clone()),
+    );
+    if let Some(avatar) = owner_config.avatar.as_ref() {
+        insert_owner_config_field(
+            merged,
+            field_sources,
+            "avatar",
+            Value::String(avatar.clone()),
+        );
+    }
+    if let Some(meta) = owner_config.meta.as_ref() {
+        insert_owner_config_field(merged, field_sources, "meta", meta.clone());
+        merge_owner_config_meta_overlay(merged, field_sources, meta);
+    }
+
+    for (field_name, field_value) in owner_config.extra_info.iter() {
+        if field_name == "did" || field_name == "id" || field_value.is_null() {
+            continue;
+        }
+        insert_owner_config_path(merged, field_sources, field_name, field_value.clone());
+    }
+}
+
+fn insert_owner_config_field(
+    merged: &mut Map<String, Value>,
+    field_sources: &mut HashMap<String, ProfileSource>,
+    field_name: &str,
+    field_value: Value,
+) {
+    if field_value.is_null() {
+        return;
+    }
+    merged.insert(field_name.to_string(), field_value);
+    field_sources.insert(field_name.to_string(), ProfileSource::OwnerConfig);
+}
+
+fn merge_owner_config_meta_overlay(
+    merged: &mut Map<String, Value>,
+    field_sources: &mut HashMap<String, ProfileSource>,
+    meta: &Value,
+) {
+    let Some(meta_object) = meta.as_object() else {
+        return;
+    };
+
+    for (field_path, field_value) in meta_object {
+        if field_path == "meta" || field_value.is_null() {
+            continue;
+        }
+        insert_owner_config_path(merged, field_sources, field_path, field_value.clone());
+    }
+}
+
+fn insert_owner_config_path(
+    merged: &mut Map<String, Value>,
+    field_sources: &mut HashMap<String, ProfileSource>,
+    field_path: &str,
+    field_value: Value,
+) {
+    let path = field_path.strip_prefix("$.").unwrap_or(field_path);
+    let parts: Vec<&str> = path.split('.').filter(|part| !part.is_empty()).collect();
+
+    let Some(first_part) = parts.first().copied() else {
+        return;
+    };
+    if first_part == "did" || first_part == "id" || field_value.is_null() {
+        return;
+    }
+
+    if parts.len() == 1 {
+        let target = merged.entry(first_part.to_string()).or_insert(Value::Null);
+        merge_json_value(target, field_value);
+    } else {
+        let target = merged
+            .entry(first_part.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        merge_json_path(target, &parts[1..], field_value);
+    }
+    field_sources.insert(first_part.to_string(), ProfileSource::OwnerConfig);
+}
+
+fn merge_json_path(target: &mut Value, path: &[&str], value: Value) {
+    if path.is_empty() {
+        merge_json_value(target, value);
+        return;
+    }
+
+    if !target.is_object() {
+        *target = Value::Object(Map::new());
+    }
+    let target_object = target.as_object_mut().unwrap();
+    let next = target_object
+        .entry(path[0].to_string())
+        .or_insert(Value::Null);
+    merge_json_path(next, &path[1..], value);
+}
+
+fn merge_json_value(target: &mut Value, value: Value) {
+    match (target, value) {
+        (Value::Object(target_object), Value::Object(value_object)) => {
+            for (key, value) in value_object {
+                let target_value = target_object.entry(key).or_insert(Value::Null);
+                merge_json_value(target_value, value);
+            }
+        }
+        (target, value) => {
+            *target = value;
+        }
+    }
 }
 
 fn merge_profile_source(
@@ -376,9 +383,27 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let mut owner_config = OwnerConfig::new(
             owner_did,
             "alice".to_string(),
-            "Alice".to_string(),
+            "Alice Document".to_string(),
             owner_public_jwk(),
         );
+        owner_config.avatar = Some("https://example.com/alice.png".to_string());
+        owner_config.meta = Some(json!({
+            "identity": "owner-config",
+            "headline": "from owner meta",
+            "links": {
+                "github": {
+                    "label": "GitHub",
+                    "url": "https://github.com/alice-owner"
+                }
+            },
+            "$.public_contacts.email": {
+                "platform": "email",
+                "account_id": "owner@example.com"
+            }
+        }));
+        owner_config
+            .extra_info
+            .insert("title".to_string(), json!("Owner Title"));
         if let Some(zone_did) = zone_did {
             owner_config.set_default_zone_did(zone_did);
         }
@@ -438,39 +463,60 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[tokio::test]
-    async fn resolve_user_profile_merges_zone_and_bns_with_bns_precedence() {
+    async fn resolve_user_profile_uses_standard_did_resolution_then_owner_config_overrides_identity_fields(
+    ) {
         let owner_did = DID::new("bns", "alice");
         let zone_did = DID::new("bns", "home");
-        let zone_profile_did = DID::new("bns", "alice.home");
 
-        let mut docs = HashMap::new();
-        docs.insert(
+        let mut high_priority_docs = HashMap::new();
+        high_priority_docs.insert(
             (owner_did.to_string(), OWNER_DOC_TYPE.to_string()),
             owner_doc(owner_did.clone(), Some(zone_did.clone())),
         );
-        docs.insert(
-            (
-                zone_profile_did.to_string(),
-                USER_PROFILE_DOC_TYPE.to_string(),
-            ),
-            profile_doc(
-                owner_did.clone(),
-                1,
-                json!({
-                    "display_name": "Alice Zone",
-                    "bio": "from zone",
-                    "location": "Zone City"
-                }),
-            ),
-        );
-        docs.insert(
+        high_priority_docs.insert(
             (owner_did.to_string(), USER_PROFILE_DOC_TYPE.to_string()),
             profile_doc(
                 owner_did.clone(),
                 2,
                 json!({
-                    "display_name": "Alice BNS",
-                    "headline": "from bns"
+                    "display_name": "Alice Profile",
+                    "avatar": "https://example.com/profile.png",
+                    "headline": "from selected profile",
+                    "title": "Profile Title",
+                    "links": {
+                        "blog": {
+                            "label": "Blog",
+                            "url": "https://blog.example.com/alice"
+                        },
+                        "github": {
+                            "label": "GitHub",
+                            "url": "https://github.com/alice-profile"
+                        }
+                    },
+                    "public_contacts": {
+                        "email": {
+                            "platform": "email",
+                            "account_id": "profile@example.com"
+                        },
+                        "matrix": {
+                            "platform": "matrix",
+                            "account_id": "@alice:example.com"
+                        }
+                    }
+                }),
+            ),
+        );
+
+        let mut low_priority_docs = HashMap::new();
+        low_priority_docs.insert(
+            (owner_did.to_string(), USER_PROFILE_DOC_TYPE.to_string()),
+            profile_doc(
+                owner_did.clone(),
+                1,
+                json!({
+                    "display_name": "Alice Low Priority",
+                    "bio": "from low priority profile",
+                    "location": "Low Priority City"
                 }),
             ),
         );
@@ -481,7 +527,20 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             ..Default::default()
         });
         client
-            .add_provider(Box::new(ProfileMockProvider { docs }), Some(10))
+            .add_provider(
+                Box::new(ProfileMockProvider {
+                    docs: low_priority_docs,
+                }),
+                Some(50),
+            )
+            .await;
+        client
+            .add_provider(
+                Box::new(ProfileMockProvider {
+                    docs: high_priority_docs,
+                }),
+                Some(10),
+            )
             .await;
 
         let merged = client
@@ -490,21 +549,90 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .unwrap();
 
         assert_eq!(merged.default_zone_did, Some(zone_did));
-        assert_eq!(merged.profile.display_name.as_deref(), Some("Alice BNS"));
-        assert_eq!(merged.profile.bio.as_deref(), Some("from zone"));
-        assert_eq!(merged.profile.headline.as_deref(), Some("from bns"));
+        assert_eq!(merged.profile.name.as_deref(), Some("alice"));
+        assert_eq!(
+            merged.profile.display_name.as_deref(),
+            Some("Alice Document")
+        );
+        assert_eq!(
+            merged.profile.avatar.as_deref(),
+            Some("https://example.com/alice.png")
+        );
+        assert_eq!(
+            merged
+                .profile
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("identity")),
+            Some(&json!("owner-config"))
+        );
+        assert_eq!(merged.profile.bio.as_deref(), None);
+        assert_eq!(merged.profile.location.as_deref(), None);
+        assert_eq!(merged.profile.headline.as_deref(), Some("from owner meta"));
+        assert_eq!(merged.profile.title.as_deref(), Some("Owner Title"));
+        assert_eq!(
+            merged.profile.extra.get("identity"),
+            Some(&json!("owner-config"))
+        );
+        assert_eq!(
+            merged
+                .profile
+                .links
+                .get("blog")
+                .map(|link| link.url.as_str()),
+            Some("https://blog.example.com/alice")
+        );
+        assert_eq!(
+            merged
+                .profile
+                .links
+                .get("github")
+                .map(|link| link.url.as_str()),
+            Some("https://github.com/alice-owner")
+        );
+        assert_eq!(
+            merged
+                .profile
+                .public_contacts
+                .get("email")
+                .map(|contact| contact.account_id.as_str()),
+            Some("owner@example.com")
+        );
+        assert_eq!(
+            merged
+                .profile
+                .public_contacts
+                .get("matrix")
+                .map(|contact| contact.account_id.as_str()),
+            Some("@alice:example.com")
+        );
         assert_eq!(
             merged.field_sources.get("display_name"),
-            Some(&ProfileSource::Bns)
+            Some(&ProfileSource::OwnerConfig)
         );
-        assert_eq!(merged.field_sources.get("bio"), Some(&ProfileSource::Zone));
+        assert_eq!(
+            merged.field_sources.get("avatar"),
+            Some(&ProfileSource::OwnerConfig)
+        );
+        assert_eq!(
+            merged.field_sources.get("headline"),
+            Some(&ProfileSource::OwnerConfig)
+        );
+        assert_eq!(
+            merged.field_sources.get("links"),
+            Some(&ProfileSource::OwnerConfig)
+        );
+        assert_eq!(
+            merged.field_sources.get("public_contacts"),
+            Some(&ProfileSource::OwnerConfig)
+        );
+        assert!(!merged.field_sources.contains_key("bio"));
     }
 
     #[tokio::test]
-    async fn explicit_bns_zone_did_skips_default_zone_lookup() {
+    async fn explicit_bns_zone_did_resolves_profile_for_requested_did_and_owner_doc_for_owner() {
         let requested_did = DID::new("bns", "alice.home");
         let owner_did = DID::new("bns", "alice");
-        let zone_profile_did = DID::new("bns", "alice.home");
 
         let mut docs = HashMap::new();
         docs.insert(
@@ -512,15 +640,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             owner_doc(owner_did.clone(), None),
         );
         docs.insert(
-            (
-                zone_profile_did.to_string(),
-                USER_PROFILE_DOC_TYPE.to_string(),
-            ),
+            (requested_did.to_string(), USER_PROFILE_DOC_TYPE.to_string()),
             profile_doc(
-                owner_did.clone(),
+                requested_did.clone(),
                 1,
                 json!({
-                    "display_name": "Alice In Home"
+                    "display_name": "Alice In Home",
+                    "location": "Home"
                 }),
             ),
         );
@@ -540,11 +666,62 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .unwrap();
 
         assert_eq!(merged.did, requested_did);
-        assert_eq!(merged.default_zone_did, Some(DID::new("bns", "home")));
+        assert_eq!(merged.default_zone_did, None);
         assert_eq!(merged.profile.did, DID::new("bns", "alice.home"));
         assert_eq!(
             merged.profile.display_name.as_deref(),
-            Some("Alice In Home")
+            Some("Alice Document")
+        );
+        assert_eq!(merged.profile.location.as_deref(), Some("Home"));
+        assert_eq!(
+            merged.field_sources.get("display_name"),
+            Some(&ProfileSource::OwnerConfig)
+        );
+        assert_eq!(
+            merged.field_sources.get("location"),
+            Some(&ProfileSource::Profile)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_user_profile_returns_owner_config_identity_without_profile_doc() {
+        let owner_did = DID::new("bns", "alice");
+
+        let mut docs = HashMap::new();
+        docs.insert(
+            (owner_did.to_string(), OWNER_DOC_TYPE.to_string()),
+            owner_doc(owner_did.clone(), None),
+        );
+
+        let client = NameClient::new(crate::NameClientConfig {
+            enable_cache: false,
+            cache_backend: crate::CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(Box::new(ProfileMockProvider { docs }), Some(10))
+            .await;
+
+        let merged = client
+            .resolve_user_profile(&owner_did, ProfileResolveOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(merged.did, owner_did);
+        assert_eq!(merged.default_zone_did, None);
+        assert_eq!(merged.profile.name.as_deref(), Some("alice"));
+        assert_eq!(
+            merged.profile.display_name.as_deref(),
+            Some("Alice Document")
+        );
+        assert_eq!(
+            merged.profile.avatar.as_deref(),
+            Some("https://example.com/alice.png")
+        );
+        assert_eq!(merged.profile.title.as_deref(), Some("Owner Title"));
+        assert_eq!(
+            merged.field_sources.get("display_name"),
+            Some(&ProfileSource::OwnerConfig)
         );
     }
 

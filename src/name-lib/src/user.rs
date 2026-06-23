@@ -60,7 +60,11 @@ pub struct OwnerConfig {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub key_scope: HashMap<String, Vec<String>>,
     pub name: String,
-    pub full_name: String,
+    #[serde(alias = "full_name", alias = "displayName")]
+    pub display_name: String, //display name
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>, //avatar url (http url or cyfs url) or object id
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub meta: Option<serde_json::Value>,
@@ -134,7 +138,7 @@ impl OwnerConfig {
             context: default_owner_context(),
             id: id,
             name: name,
-            full_name: full_name,
+            display_name: full_name,
             verification_method: verification_method,
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
@@ -145,6 +149,7 @@ impl OwnerConfig {
             version_seq: Some(0),
             mini_version_seq: None,
             valid_iat: None,
+            avatar: None,
             meta: None,
             wallets: HashMap::new(),
             key_scope: HashMap::new(),
@@ -673,7 +678,7 @@ mod tests {
         assert_eq!(cfg.id.method, "web");
         assert_eq!(cfg.id.id, "example.com");
         assert_eq!(cfg.name, "example.com");
-        assert_eq!(cfg.full_name, "example.com@did:web:example.com");
+        assert_eq!(cfg.display_name, "example.com@did:web:example.com");
     }
 
     #[test]
@@ -686,7 +691,7 @@ mod tests {
         assert_eq!(cfg.id.method, "bns");
         assert_eq!(cfg.id.id, "user1");
         assert_eq!(cfg.name, "user1");
-        assert_eq!(cfg.full_name, "user1@bridge.buckyos.org");
+        assert_eq!(cfg.display_name, "user1@bridge.buckyos.org");
     }
 
     #[test]

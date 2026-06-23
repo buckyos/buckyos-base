@@ -974,10 +974,13 @@ fn did_cache_key(did: &DID) -> String {
 
 fn is_owner_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> bool {
     doc_type == Some("owner")
-        || doc
-            .clone()
-            .to_json_value()
-            .map_or(false, |value| value.get("full_name").is_some())
+        || doc.clone().to_json_value().map_or(false, |value| {
+            value.get("verificationMethod").is_some()
+                && value.get("name").is_some()
+                && (value.get("display_name").is_some()
+                    || value.get("displayName").is_some()
+                    || value.get("full_name").is_some())
+        })
 }
 
 fn parse_owner_config_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> Option<OwnerConfig> {

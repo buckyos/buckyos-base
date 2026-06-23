@@ -453,7 +453,12 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>
         serde_json::to_string_pretty(&doc_value).unwrap()
     );
 
-    if doc_value.get("full_name").is_some() {
+    if doc_value.get("verificationMethod").is_some()
+        && doc_value.get("name").is_some()
+        && (doc_value.get("display_name").is_some()
+            || doc_value.get("displayName").is_some()
+            || doc_value.get("full_name").is_some())
+    {
         let owner_config = serde_json::from_value::<OwnerConfig>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse owner config failed: {}", e)))?;
         if is_jwt {
