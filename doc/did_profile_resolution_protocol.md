@@ -90,6 +90,33 @@ pub struct UserProfile {
     #[serde(skip_serializing_if = "HashMap::is_empty")] pub public_contacts: HashMap<String, ProfileContact>, // 公开可达方式
     #[serde(flatten)]                                  pub extra: HashMap<String, Value>, // 前向扩展
 }
+
+// 本地私有 profile：UserProfile 的超集，必须只用于本地/私有存储，
+// 不作为 doc_type=user 发布，也不进入链上 DID 文档。发布公开资料时由它派生 UserProfile。
+pub struct UserPrivateProfile {
+    pub did: DID,
+    // 与 UserProfile 相同的公开候选字段：name/display_name/avatar/meta/headline/...
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub links: HashMap<String, ProfileLink>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub public_contacts: HashMap<String, ProfileContact>,
+    #[serde(skip_serializing_if = "UserProfilePrivacy::is_empty")] pub privacy: UserProfilePrivacy,
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub private_contacts: HashMap<String, ProfileContact>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub private_meta: Option<Value>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub private_extra: HashMap<String, Value>,
+    #[serde(flatten)] pub extra: HashMap<String, Value>,
+}
+pub enum ProfileVisibility { Public, Private, Contacts, Zone, Custom }
+pub struct ProfilePrivacyRule {
+    pub visibility: ProfileVisibility,
+    #[serde(skip_serializing_if = "Vec::is_empty")] pub allow: Vec<DID>,
+    #[serde(skip_serializing_if = "Vec::is_empty")] pub deny: Vec<DID>,
+    #[serde(skip_serializing_if = "Vec::is_empty")] pub groups: Vec<String>,
+}
+pub struct UserProfilePrivacy {
+    #[serde(skip_serializing_if = "Option::is_none")] pub default_visibility: Option<ProfilePrivacyRule>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub fields: HashMap<String, ProfilePrivacyRule>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub links: HashMap<String, ProfilePrivacyRule>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")] pub contacts: HashMap<String, ProfilePrivacyRule>,
+}
 pub struct ProfileLink    { pub label: String, pub url: String }
 pub enum ProfileContactPlatform {
     Email, Phone, Telegram, Matrix, Discord, Wechat, Whatsapp, Signal,
