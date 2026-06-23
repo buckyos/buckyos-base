@@ -409,6 +409,15 @@ pub struct UserProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub birthday: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub bkg_image: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub links: HashMap<String, ProfileLink>,
@@ -476,6 +485,15 @@ pub struct UserPrivateProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub birthday: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub bkg_image: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub links: HashMap<String, ProfileLink>,
@@ -516,6 +534,9 @@ impl UserPrivateProfile {
             location: self.public_option("location", &self.location),
             organization: self.public_option("organization", &self.organization),
             title: self.public_option("title", &self.title),
+            birthday: self.public_option("birthday", &self.birthday),
+            tags: self.public_vec("tags", &self.tags),
+            bkg_image: self.public_option("bkg_image", &self.bkg_image),
             links: self
                 .links
                 .iter()
@@ -544,6 +565,14 @@ impl UserPrivateProfile {
             None
         }
     }
+
+    fn public_vec<T: Clone>(&self, field_name: &str, value: &[T]) -> Vec<T> {
+        if self.privacy.is_public_field(field_name) {
+            value.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl From<UserProfile> for UserPrivateProfile {
@@ -559,6 +588,9 @@ impl From<UserProfile> for UserPrivateProfile {
             location: profile.location,
             organization: profile.organization,
             title: profile.title,
+            birthday: profile.birthday,
+            tags: profile.tags,
+            bkg_image: profile.bkg_image,
             links: profile.links,
             public_contacts: profile.public_contacts,
             privacy: UserProfilePrivacy::default(),
@@ -664,6 +696,9 @@ mod tests {
             .fields
             .insert("bio".to_string(), ProfilePrivacyRule::private());
         privacy
+            .fields
+            .insert("birthday".to_string(), ProfilePrivacyRule::private());
+        privacy
             .links
             .insert("private_site".to_string(), ProfilePrivacyRule::private());
         privacy
@@ -681,6 +716,9 @@ mod tests {
             location: Some("Wonderland".to_string()),
             organization: None,
             title: None,
+            birthday: Some("1990-01-01".to_string()),
+            tags: vec!["builder".to_string(), "founder".to_string()],
+            bkg_image: Some("https://example.com/background.png".to_string()),
             links: HashMap::from([
                 (
                     "website".to_string(),
@@ -729,6 +767,15 @@ mod tests {
         assert_eq!(public_profile.did, DID::new("bns", "alice"));
         assert_eq!(public_profile.name.as_deref(), Some("alice"));
         assert_eq!(public_profile.bio, None);
+        assert_eq!(public_profile.birthday, None);
+        assert_eq!(
+            public_profile.tags,
+            vec!["builder".to_string(), "founder".to_string()]
+        );
+        assert_eq!(
+            public_profile.bkg_image.as_deref(),
+            Some("https://example.com/background.png")
+        );
         assert!(public_profile.links.contains_key("website"));
         assert!(!public_profile.links.contains_key("private_site"));
         assert!(public_profile.public_contacts.contains_key("email"));
@@ -758,6 +805,9 @@ mod tests {
             location: None,
             organization: None,
             title: None,
+            birthday: Some("1990-01-01".to_string()),
+            tags: vec!["builder".to_string()],
+            bkg_image: Some("https://example.com/background.png".to_string()),
             links: HashMap::from([(
                 "website".to_string(),
                 ProfileLink {
@@ -796,6 +846,9 @@ mod tests {
             location: None,
             organization: None,
             title: None,
+            birthday: Some("1990-01-01".to_string()),
+            tags: vec!["builder".to_string()],
+            bkg_image: Some("https://example.com/background.png".to_string()),
             links: HashMap::from([(
                 "website".to_string(),
                 ProfileLink {
@@ -821,6 +874,9 @@ mod tests {
         assert_eq!(public_profile.name.as_deref(), Some("alice"));
         assert_eq!(public_profile.display_name, None);
         assert_eq!(public_profile.headline, None);
+        assert_eq!(public_profile.birthday, None);
+        assert!(public_profile.tags.is_empty());
+        assert_eq!(public_profile.bkg_image, None);
         assert!(public_profile.links.is_empty());
         assert!(public_profile.public_contacts.contains_key("email"));
         assert!(!public_profile.extra.contains_key("pronouns"));

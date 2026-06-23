@@ -86,6 +86,9 @@ pub struct UserProfile {
     #[serde(skip_serializing_if = "Option::is_none")] pub location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] pub organization: Option<String>, // 组织
     #[serde(skip_serializing_if = "Option::is_none")] pub title: Option<String>,        // 头衔
+    #[serde(skip_serializing_if = "Option::is_none")] pub birthday: Option<String>,     // 生日
+    #[serde(skip_serializing_if = "Vec::is_empty")]    pub tags: Vec<String>,           // 标签
+    #[serde(skip_serializing_if = "Option::is_none")] pub bkg_image: Option<String>,    // 背景图 URL
     #[serde(skip_serializing_if = "HashMap::is_empty")] pub links: HashMap<String, ProfileLink>, // 主页/社交外链
     #[serde(skip_serializing_if = "HashMap::is_empty")] pub public_contacts: HashMap<String, ProfileContact>, // 公开可达方式
     #[serde(flatten)]                                  pub extra: HashMap<String, Value>, // 前向扩展
