@@ -360,6 +360,7 @@ mod tests {
     use async_trait::async_trait;
     use buckyos_kit::buckyos_get_unix_timestamp;
     use jsonwebtoken::{encode, jwk::Jwk, Algorithm, EncodingKey, Header};
+    use name_lib::{EmailContact, MatrixContact, ProfileContact};
     use serde_json::json;
 
     const TEST_OWNER_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
@@ -398,7 +399,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             },
             "$.public_contacts.email": {
                 "platform": "email",
-                "account_id": "owner@example.com"
+                "address": "owner@example.com"
             }
         }));
         owner_config
@@ -496,11 +497,11 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                     "public_contacts": {
                         "email": {
                             "platform": "email",
-                            "account_id": "profile@example.com"
+                            "address": "profile@example.com"
                         },
                         "matrix": {
                             "platform": "matrix",
-                            "account_id": "@alice:example.com"
+                            "user_id": "@alice:example.com"
                         }
                     }
                 }),
@@ -595,7 +596,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 .profile
                 .public_contacts
                 .get("email")
-                .map(|contact| contact.account_id.as_str()),
+                .and_then(|contact| match contact {
+                    ProfileContact::Email(EmailContact { address }) => Some(address.as_str()),
+                    _ => None,
+                }),
             Some("owner@example.com")
         );
         assert_eq!(
@@ -603,7 +607,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 .profile
                 .public_contacts
                 .get("matrix")
-                .map(|contact| contact.account_id.as_str()),
+                .and_then(|contact| match contact {
+                    ProfileContact::Matrix(MatrixContact { user_id }) => Some(user_id.as_str()),
+                    _ => None,
+                }),
             Some("@alice:example.com")
         );
         assert_eq!(

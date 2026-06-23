@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use jsonwebtoken::DecodingKey;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -15,41 +15,248 @@ pub struct ProfileLink {
     pub url: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProfileContactPlatform {
-    Email,
-    Phone,
-    Telegram,
-    Matrix,
-    Discord,
-    Wechat,
-    Whatsapp,
-    Signal,
-    X,
-    Github,
-    Linkedin,
-    Facebook,
-    Instagram,
-    Tiktok,
-    Reddit,
-    Mastodon,
-    Bluesky,
+#[derive(Clone, Serialize, Debug, PartialEq, Eq)]
+#[serde(tag = "platform", rename_all = "snake_case")]
+pub enum ProfileContact {
+    Email(EmailContact),
+    Phone(PhoneContact),
+    Telegram(TelegramContact),
+    Matrix(MatrixContact),
+    Discord(DiscordContact),
+    Wechat(WechatContact),
+    Whatsapp(WhatsappContact),
+    Signal(SignalContact),
+    X(XContact),
+    Github(GithubContact),
+    Linkedin(LinkedinContact),
+    Facebook(FacebookContact),
+    Instagram(InstagramContact),
+    Tiktok(TiktokContact),
+    Reddit(RedditContact),
+    Mastodon(MastodonContact),
+    Bluesky(BlueskyContact),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileContact {
-    #[serde(alias = "kind")]
-    pub platform: ProfileContactPlatform,
-    #[serde(alias = "value")]
-    pub account_id: String,
+pub struct EmailContact {
+    pub address: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PhoneContact {
+    pub e164: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramContact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub display_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixContact {
+    pub user_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscordContact {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub tunnel_id: Option<DID>,
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WechatContact {
+    pub wechat_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WhatsappContact {
+    pub phone_e164: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignalContact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub phone_e164: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XContact {
+    pub username: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GithubContact {
+    pub username: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkedinContact {
+    pub public_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FacebookContact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InstagramContact {
+    pub username: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TiktokContact {
+    pub username: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RedditContact {
+    pub username: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MastodonContact {
+    pub handle: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BlueskyContact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub handle: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ProfileContact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "platform", rename_all = "snake_case")]
+        enum ProfileContactDef {
+            Email(EmailContact),
+            Phone(PhoneContact),
+            Telegram(TelegramContact),
+            Matrix(MatrixContact),
+            Discord(DiscordContact),
+            Wechat(WechatContact),
+            Whatsapp(WhatsappContact),
+            Signal(SignalContact),
+            X(XContact),
+            Github(GithubContact),
+            Linkedin(LinkedinContact),
+            Facebook(FacebookContact),
+            Instagram(InstagramContact),
+            Tiktok(TiktokContact),
+            Reddit(RedditContact),
+            Mastodon(MastodonContact),
+            Bluesky(BlueskyContact),
+        }
+
+        let contact = match ProfileContactDef::deserialize(deserializer)? {
+            ProfileContactDef::Email(contact) => Self::Email(contact),
+            ProfileContactDef::Phone(contact) => Self::Phone(contact),
+            ProfileContactDef::Telegram(contact) => Self::Telegram(contact),
+            ProfileContactDef::Matrix(contact) => Self::Matrix(contact),
+            ProfileContactDef::Discord(contact) => Self::Discord(contact),
+            ProfileContactDef::Wechat(contact) => Self::Wechat(contact),
+            ProfileContactDef::Whatsapp(contact) => Self::Whatsapp(contact),
+            ProfileContactDef::Signal(contact) => Self::Signal(contact),
+            ProfileContactDef::X(contact) => Self::X(contact),
+            ProfileContactDef::Github(contact) => Self::Github(contact),
+            ProfileContactDef::Linkedin(contact) => Self::Linkedin(contact),
+            ProfileContactDef::Facebook(contact) => Self::Facebook(contact),
+            ProfileContactDef::Instagram(contact) => Self::Instagram(contact),
+            ProfileContactDef::Tiktok(contact) => Self::Tiktok(contact),
+            ProfileContactDef::Reddit(contact) => Self::Reddit(contact),
+            ProfileContactDef::Mastodon(contact) => Self::Mastodon(contact),
+            ProfileContactDef::Bluesky(contact) => Self::Bluesky(contact),
+        };
+        contact.validate().map_err(D::Error::custom)?;
+        Ok(contact)
+    }
+}
+
+impl ProfileContact {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Telegram(contact) => validate_at_least_one(
+                "telegram contact requires account_id or display_id",
+                [&contact.account_id, &contact.display_id],
+            ),
+            Self::Discord(contact) => validate_at_least_one(
+                "discord contact requires user_id or username",
+                [&contact.user_id, &contact.username],
+            ),
+            Self::Signal(contact) => validate_at_least_one(
+                "signal contact requires phone_e164 or username",
+                [&contact.phone_e164, &contact.username],
+            ),
+            Self::Facebook(contact) => validate_at_least_one(
+                "facebook contact requires profile_id or username",
+                [&contact.profile_id, &contact.username],
+            ),
+            Self::Bluesky(contact) => validate_at_least_one(
+                "bluesky contact requires did or handle",
+                [&contact.did, &contact.handle],
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn validate_at_least_one<const N: usize>(
+    error: &'static str,
+    values: [&Option<String>; N],
+) -> Result<(), &'static str> {
+    if values.iter().any(|value| {
+        value
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -381,31 +588,46 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn profile_contact_accepts_known_platforms_and_legacy_field_aliases() {
+    fn profile_contact_accepts_platform_specific_shapes() {
         let telegram: ProfileContact = serde_json::from_value(json!({
             "platform": "telegram",
             "account_id": "user:5397330802",
-            "display_id": "wacer2026",
-            "tunnel_id": "did:web:tg-tunnel.test.buckyos.io"
+            "display_id": "wacer2026"
         }))
         .unwrap();
 
-        assert_eq!(telegram.platform, ProfileContactPlatform::Telegram);
-        assert_eq!(telegram.account_id, "user:5397330802");
-        assert_eq!(telegram.display_id.as_deref(), Some("wacer2026"));
         assert_eq!(
-            telegram.tunnel_id.as_ref().map(DID::to_string).as_deref(),
-            Some("did:web:tg-tunnel.test.buckyos.io")
+            telegram,
+            ProfileContact::Telegram(TelegramContact {
+                account_id: Some("user:5397330802".to_string()),
+                display_id: Some("wacer2026".to_string()),
+            })
         );
 
-        let legacy_email: ProfileContact = serde_json::from_value(json!({
-            "kind": "email",
-            "value": "alice@example.com"
+        let email: ProfileContact = serde_json::from_value(json!({
+            "platform": "email",
+            "address": "alice@example.com"
         }))
         .unwrap();
+        assert_eq!(
+            email,
+            ProfileContact::Email(EmailContact {
+                address: "alice@example.com".to_string()
+            })
+        );
 
-        assert_eq!(legacy_email.platform, ProfileContactPlatform::Email);
-        assert_eq!(legacy_email.account_id, "alice@example.com");
+        let bluesky: ProfileContact = serde_json::from_value(json!({
+            "platform": "bluesky",
+            "handle": "alice.bsky.social"
+        }))
+        .unwrap();
+        assert_eq!(
+            bluesky,
+            ProfileContact::Bluesky(BlueskyContact {
+                did: None,
+                handle: Some("alice.bsky.social".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -419,7 +641,18 @@ mod tests {
         assert!(serde_json::from_value::<ProfileContact>(json!({
             "platform": "telegram",
             "account_id": "user:5397330802",
-            "custom_field": "not allowed"
+            "tunnel_id": "did:web:tg-tunnel.test.buckyos.io"
+        }))
+        .is_err());
+
+        assert!(serde_json::from_value::<ProfileContact>(json!({
+            "platform": "telegram"
+        }))
+        .is_err());
+
+        assert!(serde_json::from_value::<ProfileContact>(json!({
+            "platform": "matrix",
+            "account_id": "@alice:example.com"
         }))
         .is_err());
     }
@@ -467,32 +700,24 @@ mod tests {
             public_contacts: HashMap::from([
                 (
                     "email".to_string(),
-                    ProfileContact {
-                        platform: ProfileContactPlatform::Email,
-                        account_id: "alice@example.com".to_string(),
-                        display_id: None,
-                        tunnel_id: None,
-                    },
+                    ProfileContact::Email(EmailContact {
+                        address: "alice@example.com".to_string(),
+                    }),
                 ),
                 (
                     "telegram".to_string(),
-                    ProfileContact {
-                        platform: ProfileContactPlatform::Telegram,
-                        account_id: "user:5397330802".to_string(),
+                    ProfileContact::Telegram(TelegramContact {
+                        account_id: Some("user:5397330802".to_string()),
                         display_id: Some("alice".to_string()),
-                        tunnel_id: None,
-                    },
+                    }),
                 ),
             ]),
             privacy,
             private_contacts: HashMap::from([(
                 "phone".to_string(),
-                ProfileContact {
-                    platform: ProfileContactPlatform::Phone,
-                    account_id: "+15555550100".to_string(),
-                    display_id: None,
-                    tunnel_id: None,
-                },
+                ProfileContact::Phone(PhoneContact {
+                    e164: "+15555550100".to_string(),
+                }),
             )]),
             private_meta: Some(json!({ "birthday": "1990-01-01" })),
             private_extra: HashMap::from([("note".to_string(), json!("local only"))]),
@@ -580,12 +805,9 @@ mod tests {
             )]),
             public_contacts: HashMap::from([(
                 "email".to_string(),
-                ProfileContact {
-                    platform: ProfileContactPlatform::Email,
-                    account_id: "alice@example.com".to_string(),
-                    display_id: None,
-                    tunnel_id: None,
-                },
+                ProfileContact::Email(EmailContact {
+                    address: "alice@example.com".to_string(),
+                }),
             )]),
             privacy,
             private_contacts: HashMap::new(),

@@ -117,16 +117,26 @@ pub struct UserProfilePrivacy {
     #[serde(skip_serializing_if = "HashMap::is_empty")] pub links: HashMap<String, ProfilePrivacyRule>,
     #[serde(skip_serializing_if = "HashMap::is_empty")] pub contacts: HashMap<String, ProfilePrivacyRule>,
 }
-pub struct ProfileLink    { pub label: String, pub url: String }
-pub enum ProfileContactPlatform {
-    Email, Phone, Telegram, Matrix, Discord, Wechat, Whatsapp, Signal,
-    X, Github, Linkedin, Facebook, Instagram, Tiktok, Reddit, Mastodon, Bluesky,
-}
-pub struct ProfileContact {
-    pub platform: ProfileContactPlatform, // 强类型平台枚举，不提供 Other，避免任意扩展
-    pub account_id: String,               // 平台内可定位用户的 canonical id：uid/handle/email/E.164/Matrix ID 等
-    #[serde(skip_serializing_if = "Option::is_none")] pub display_id: Option<String>, // 可打开 profile page 的公开 handle/username
-    #[serde(skip_serializing_if = "Option::is_none")] pub tunnel_id: Option<DID>,     // 可选：平台 tunnel/gateway DID
+pub struct ProfileLink { pub label: String, pub url: String }
+#[serde(tag = "platform", rename_all = "snake_case")]
+pub enum ProfileContact {
+    Email(EmailContact),         // { platform: "email", address }
+    Phone(PhoneContact),         // { platform: "phone", e164 }
+    Telegram(TelegramContact),   // { platform: "telegram", account_id?, display_id? } 至少一个
+    Matrix(MatrixContact),       // { platform: "matrix", user_id }
+    Discord(DiscordContact),     // { platform: "discord", user_id?, username? } 至少一个
+    Wechat(WechatContact),       // { platform: "wechat", wechat_id }
+    Whatsapp(WhatsappContact),   // { platform: "whatsapp", phone_e164 }
+    Signal(SignalContact),       // { platform: "signal", phone_e164?, username? } 至少一个
+    X(XContact),                 // { platform: "x", username }
+    Github(GithubContact),       // { platform: "github", username }
+    Linkedin(LinkedinContact),   // { platform: "linkedin", public_id }
+    Facebook(FacebookContact),   // { platform: "facebook", profile_id?, username? } 至少一个
+    Instagram(InstagramContact), // { platform: "instagram", username }
+    Tiktok(TiktokContact),       // { platform: "tiktok", username }
+    Reddit(RedditContact),       // { platform: "reddit", username }
+    Mastodon(MastodonContact),   // { platform: "mastodon", handle }
+    Bluesky(BlueskyContact),     // { platform: "bluesky", did?, handle? } 至少一个
 }
 
 // name-client：顶层 async fn 或 ProfileResolver
@@ -150,7 +160,7 @@ pub async fn resolve_user_profile(
 ) -> NSResult<MergedProfile>;
 ```
 
-`ProfileContact` 的目标是能定位到平台上的特定用户，并让调用方生成「打开 profile page / 添加好友」入口；不承载联系人关系、备注、分组等社交图信息。旧 `kind/value` 可以作为兼容输入读取，但新文档统一写 `platform/account_id`。例如：
+`ProfileContact` 的目标是能定位到平台上的特定用户，并让调用方生成「打开 profile page / 添加好友」入口；不承载联系人关系、备注、分组等社交图信息。它不是统一的双 ID 结构，而是按平台绑定字段：Telegram 可以同时有用于加好友的 `account_id` 和用于打开 profile 的 `display_id`，Matrix 则只需要 `user_id`，Email 只需要 `address`。例如：
 
 ```json
 {
@@ -158,12 +168,15 @@ pub async fn resolve_user_profile(
     "telegram": {
       "platform": "telegram",
       "account_id": "user:5397330802",
-      "display_id": "wacer2026",
-      "tunnel_id": "did:web:tg-tunnel.test.buckyos.io"
+      "display_id": "wacer2026"
     },
     "matrix": {
       "platform": "matrix",
-      "account_id": "@alice:example.com"
+      "user_id": "@alice:example.com"
+    },
+    "github": {
+      "platform": "github",
+      "username": "alice"
     }
   }
 }
@@ -177,7 +190,7 @@ pub async fn resolve_user_profile(
 
 - **写/编辑 profile**：属 profile 发布链路，留在 control_panel（`user.profile.set`）；本协议只读取 resolver/provider 选中的 profile。
 - **联系人/好友关系图**：归 msg_center（`Contact` / `AccessGroupLevel`）。
-- **platform/account_id → DID 的发现**：msg_center 既有 `resolve_did`（同名但不同语义），不并入本协议。
+- **平台账号标识 → DID 的发现**：msg_center 既有 `resolve_did`（同名但不同语义），不并入本协议。
 
 ---
 
