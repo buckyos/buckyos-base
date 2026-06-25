@@ -223,8 +223,14 @@ impl NameInfo {
                         zone_config
                             .as_mut()
                             .unwrap()
+                            .mini_device_jwts
+                            .insert(device_config.name.clone(), device_jwt);
+                        zone_config
+                            .as_mut()
+                            .unwrap()
                             .devices
                             .insert(device_config.name.clone(), device_config);
+     
                     }
                 }
             }

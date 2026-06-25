@@ -80,7 +80,7 @@ impl NsProvider for DnsProvider {
         match record_type.unwrap_or(RecordType::A) {
             RecordType::TXT => {
                 //TODO: 这里似乎有崩溃bug，需要排查
-                info!("dns query TXT: {}", name);
+                debug!("dns query TXT: {}", name);
                 let response = resolver.txt_lookup(name).await;
                 if response.is_err() {
                     let err = response.err().unwrap();
@@ -100,7 +100,7 @@ impl NsProvider for DnsProvider {
                     txt_vec.push(txt);
                 }
 
-                info!("lookup txt success! {}", name);
+                debug!("lookup txt success! {}", name);
                 let ttl = response
                     .as_lookup()
                     .record_iter()
