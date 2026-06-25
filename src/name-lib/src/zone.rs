@@ -576,6 +576,9 @@ pub struct ZoneConfig {
     pub boot_jwt: String,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
+    pub mini_device_jwts: HashMap<String, String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
     pub devices: HashMap<String, DeviceConfig>,
     // Since all Gateways on Nodes are homogeneous, this may not need to be configured? The Gateway on whichever Node the DNS record resolves to is the ZoneGateway
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -615,6 +618,7 @@ impl ZoneConfig {
             boot_jwt: "".to_string(),
             owner: owner_did,
             hostname: id.to_host_name(),
+            mini_device_jwts: HashMap::new(),
             devices: HashMap::new(),
             oods: vec![],
             sn: None,
@@ -649,6 +653,23 @@ impl ZoneConfig {
             }
         }
         return None;
+    }
+
+    pub fn get_zone_gateway_ips(&self) -> Vec<IpAddr> {
+        self.oods
+            .iter()
+            .filter_map(|ood| {
+                if !ood.node_type.is_gateway() {
+                    return None;
+                }
+
+                let ip = ood.ip?;
+                match ood.net_id.as_deref() {
+                    None | Some("wan") => Some(ip),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     pub fn init_by_boot_config(&mut self, boot_config: &ZoneBootConfig, boot_jwt: &String) {
@@ -1154,6 +1175,37 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let auth_key_x = get_x_from_jwk(&auth_key.1).unwrap();
         let owner_x = get_x_from_jwk(&owner_jwk).unwrap();
         assert_eq!(auth_key_x, owner_x);
+    }
+
+    #[test]
+    fn test_get_zone_gateway_ips_returns_only_wan_gateway_fixed_ips() {
+        let owner_jwk: Jwk = serde_json::from_value(json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+        }))
+        .unwrap();
+
+        let mut zone = ZoneConfig::new(
+            DID::new("bns", "zone1"),
+            DID::new("bns", "alice"),
+            owner_jwk,
+        );
+        zone.oods = vec![
+            "ood1:198.51.100.1".parse().unwrap(),
+            "#gate1:203.0.113.10".parse().unwrap(),
+            "#gate2:10.0.0.2@lan".parse().unwrap(),
+            "#gate3@wan".parse().unwrap(),
+            "$ood-only:203.0.113.11".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            zone.get_zone_gateway_ips(),
+            vec![
+                "198.51.100.1".parse::<IpAddr>().unwrap(),
+                "203.0.113.10".parse::<IpAddr>().unwrap()
+            ]
+        );
     }
 
     #[test]
