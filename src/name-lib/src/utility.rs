@@ -19,9 +19,13 @@ use base64::{
     engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _,
 };
 use bip39::{Language, Mnemonic};
+use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+use bitcoin::key::Secp256k1;
+use bitcoin::Network;
 use hmac::{Hmac, Mac};
 use log::*;
 use sha2::Sha512;
+use sha3::{Digest, Keccak256};
 use sysinfo::{Components, Disks, Networks, System};
 
 #[derive(Error, Debug)]
@@ -239,6 +243,31 @@ const BUC_KEY_COIN: u32 = 0;
 
 type HmacSha512 = Hmac<Sha512>;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BuckyMnemonicKey {
+    pub private_key_pem: String,
+    pub public_jwk: serde_json::Value,
+    pub did: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvmMnemonicKey {
+    pub derivation_path: String,
+    /// Sensitive secp256k1 private key bytes encoded as 64 lowercase hex chars, without a 0x prefix.
+    pub private_key_hex: String,
+    /// 65-byte uncompressed public key encoded as lowercase hex, including the 0x04 prefix byte.
+    pub public_key_uncompressed_hex: String,
+    /// 33-byte compressed public key encoded as lowercase hex.
+    pub public_key_compressed_hex: String,
+    pub address: String,
+}
+
+fn seed_from_mnemonic(mnemonic: &str, passphrase: Option<&str>) -> NSResult<[u8; 64]> {
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, mnemonic)
+        .map_err(|e| NSError::InvalidParam(format!("Invalid mnemonic: {}", e)))?;
+    Ok(mnemonic.to_seed(passphrase.unwrap_or("")))
+}
+
 fn slip10_master_key(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
     let mut mac =
         HmacSha512::new_from_slice(b"ed25519 seed").expect("HMAC can take key of any size");
@@ -280,20 +309,11 @@ fn slip10_derive_ed25519(seed: &[u8], path: &[u32]) -> ([u8; 32], [u8; 32]) {
     (key, cc)
 }
 
-pub fn generate_ed25519_key_pair_from_mnemonic(
-    mnemonic: &str,
-    passphrase: Option<&str>,
-    index: u32,
-) -> NSResult<(String, serde_json::Value)> {
-    // Parse mnemonic -> seed (BIP39)
-    let mnemonic = Mnemonic::parse_in_normalized(Language::English, mnemonic)
-        .map_err(|e| NSError::InvalidParam(format!("Invalid mnemonic: {}", e)))?;
-    let seed = mnemonic.to_seed(passphrase.unwrap_or(""));
-
+fn derive_ed25519_key_pair_from_seed(seed: &[u8], index: u32) -> (String, serde_json::Value) {
     // Derive using SLIP-0010 Ed25519 on a custom purpose path to avoid coin conflicts.
     // Path: m/9777'/0'/{index}'
     let path = [BUC_KEY_PURPOSE, BUC_KEY_COIN, index];
-    let (sk32, _cc) = slip10_derive_ed25519(&seed, &path);
+    let (sk32, _cc) = slip10_derive_ed25519(seed, &path);
 
     // Build ed25519 signing key from 32-byte secret
     let signing_key = SigningKey::from_bytes(&sk32);
@@ -308,7 +328,90 @@ pub fn generate_ed25519_key_pair_from_mnemonic(
     // Prepare public key JWK consistent with existing utilities
     let public_key_jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
 
+    (private_key_pem, public_key_jwk)
+}
+
+pub fn derive_bucky_key_from_mnemonic(
+    mnemonic: &str,
+    passphrase: Option<&str>,
+    index: u32,
+) -> NSResult<BuckyMnemonicKey> {
+    let seed = seed_from_mnemonic(mnemonic, passphrase)?;
+    let (private_key_pem, public_jwk) = derive_ed25519_key_pair_from_seed(&seed, index);
+    let did = get_device_did_from_ed25519_jwk(&public_jwk)?;
+
+    Ok(BuckyMnemonicKey {
+        private_key_pem,
+        public_jwk,
+        did,
+    })
+}
+
+pub fn generate_ed25519_key_pair_from_mnemonic(
+    mnemonic: &str,
+    passphrase: Option<&str>,
+    index: u32,
+) -> NSResult<(String, serde_json::Value)> {
+    let derived = derive_bucky_key_from_mnemonic(mnemonic, passphrase, index)?;
+    let private_key_pem = derived.private_key_pem;
+    let public_key_jwk = derived.public_jwk;
     Ok((private_key_pem, public_key_jwk))
+}
+
+pub fn evm_derivation_path(index: u32) -> String {
+    format!("m/44'/60'/0'/0/{index}")
+}
+
+pub fn derive_evm_key_from_mnemonic(
+    mnemonic: &str,
+    passphrase: Option<&str>,
+    index: u32,
+) -> NSResult<EvmMnemonicKey> {
+    let seed = seed_from_mnemonic(mnemonic, passphrase)?;
+    let secp = Secp256k1::new();
+    let master_xprv = Xpriv::new_master(Network::Bitcoin, &seed)
+        .map_err(|e| NSError::Failed(format!("EVM master key derivation failed: {}", e)))?;
+    let path = evm_derivation_path(index);
+    let derivation_path: DerivationPath = path
+        .parse()
+        .map_err(|e| NSError::InvalidParam(format!("Invalid EVM derivation path: {}", e)))?;
+    let child_prv = master_xprv
+        .derive_priv(&secp, &derivation_path)
+        .map_err(|e| NSError::Failed(format!("EVM private key derivation failed: {}", e)))?;
+    let xpub = Xpub::from_priv(&secp, &child_prv);
+    let public_key = xpub.public_key;
+    let uncompressed = public_key.serialize_uncompressed();
+    let compressed = public_key.serialize();
+
+    // Ethereum address: Keccak-256 over the uncompressed public key without the 0x04 prefix,
+    // then take the last 20 bytes and apply EIP-55 checksum casing.
+    let hash = Keccak256::digest(&uncompressed[1..]);
+    let mut addr20 = [0u8; 20];
+    addr20.copy_from_slice(&hash[12..]);
+
+    Ok(EvmMnemonicKey {
+        derivation_path: path,
+        private_key_hex: hex::encode(child_prv.private_key.secret_bytes()),
+        public_key_uncompressed_hex: hex::encode(uncompressed),
+        public_key_compressed_hex: hex::encode(compressed),
+        address: to_eip55_address(&addr20),
+    })
+}
+
+pub fn to_eip55_address(addr20: &[u8; 20]) -> String {
+    let lower_hex = hex::encode(addr20);
+    let hash = Keccak256::digest(lower_hex.as_bytes());
+    let mut out = String::with_capacity(42);
+    out.push_str("0x");
+    for (i, ch) in lower_hex.chars().enumerate() {
+        let nibble = (hash[i / 2] >> (4 * (1 - (i % 2)))) & 0x0f;
+        if ch.is_ascii_hexdigit() && ch.is_ascii_lowercase() && nibble > 7 {
+            out.push(ch.to_ascii_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 // Generate a random private key and return the PKCS#8 encoded bytes
@@ -544,6 +647,78 @@ mod test {
         assert!(jwk.get("kty").unwrap() == "OKP");
         assert!(jwk.get("crv").unwrap() == "Ed25519");
         assert!(jwk.get("x").is_some());
+    }
+
+    #[test]
+    fn test_mnemonic_derivation_vectors() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let vectors = [
+            (
+                0u32,
+                "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIF4xu8hmb1YxptX7yh/UJuIXJ6yjmUdUkL8kwVfOTjzu\n-----END PRIVATE KEY-----\n",
+                "TFCczaH036J93MRNk0bMMy5zpAha29uNOO7WgcWnrWo",
+                "did:dev:TFCczaH036J93MRNk0bMMy5zpAha29uNOO7WgcWnrWo",
+                "m/44'/60'/0'/0/0",
+                "1ab42cc412b618bdea3a599e3c9bae199ebf030895b039e9db1e30dafb12b727",
+                "0237b0bb7a8288d38ed49a524b5dc98cff3eb5ca824c9f9dc0dfdb3d9cd600f299",
+                "0437b0bb7a8288d38ed49a524b5dc98cff3eb5ca824c9f9dc0dfdb3d9cd600f299a6179912b7451c09896c4098eca7ce6b2e58330672795e847c4d6af44e024230",
+                "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
+            ),
+            (
+                1u32,
+                "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJbxfiEsg4DzfDJyFvla6OaxgJkUhxw6CO7iOUdwB/11\n-----END PRIVATE KEY-----\n",
+                "QTDEn2PegzU07spmHCZaX-3vaDdX22U8kgBkK_IMTuE",
+                "did:dev:QTDEn2PegzU07spmHCZaX-3vaDdX22U8kgBkK_IMTuE",
+                "m/44'/60'/0'/0/1",
+                "9a983cb3d832fbde5ab49d692b7a8bf5b5d232479c99333d0fc8e1d21f1b55b6",
+                "039fd0991d0222b4e1339c1a1a5b5f6d9f6a96672a3247b638ee6156d9ea877a2f",
+                "049fd0991d0222b4e1339c1a1a5b5f6d9f6a96672a3247b638ee6156d9ea877a2f1735e3a9260940e4c2225c344a8cea6c7b6a6057d0eb90a9a875f446c131031d",
+                "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0",
+            ),
+        ];
+
+        for (
+            index,
+            expected_pem,
+            expected_public_x,
+            expected_did,
+            expected_path,
+            expected_private_key,
+            expected_compressed_public_key,
+            expected_uncompressed_public_key,
+            expected_address,
+        ) in vectors
+        {
+            let bucky = derive_bucky_key_from_mnemonic(mnemonic, None, index).unwrap();
+            assert_eq!(bucky.private_key_pem, expected_pem);
+            assert_eq!(
+                bucky.public_jwk,
+                serde_json::json!({
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": expected_public_x,
+                })
+            );
+            assert_eq!(bucky.did, expected_did);
+
+            let (legacy_pem, legacy_jwk) =
+                generate_ed25519_key_pair_from_mnemonic(mnemonic, None, index).unwrap();
+            assert_eq!(legacy_pem, bucky.private_key_pem);
+            assert_eq!(legacy_jwk, bucky.public_jwk);
+
+            let evm = derive_evm_key_from_mnemonic(mnemonic, None, index).unwrap();
+            assert_eq!(evm.derivation_path, expected_path);
+            assert_eq!(evm.private_key_hex, expected_private_key);
+            assert_eq!(
+                evm.public_key_compressed_hex,
+                expected_compressed_public_key
+            );
+            assert_eq!(
+                evm.public_key_uncompressed_hex,
+                expected_uncompressed_public_key
+            );
+            assert_eq!(evm.address, expected_address);
+        }
     }
 
     #[test]
