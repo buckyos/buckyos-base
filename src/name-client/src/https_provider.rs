@@ -169,8 +169,23 @@ impl SmartProvider {
         }
     }
 
+    fn doc_file_stem(doc_type: Option<&str>) -> NSResult<&str> {
+        let doc_type = doc_type.unwrap_or("did");
+        if doc_type.is_empty()
+            || !doc_type
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return Err(NSError::InvalidParam(format!(
+                "invalid DID document type: {}",
+                doc_type
+            )));
+        }
+        Ok(doc_type)
+    }
+
     fn build_url(&self, did: &DID, doc_type: Option<&str>) -> NSResult<String> {
-        let real_doc_type = doc_type.unwrap_or("did");
+        let real_doc_type = Self::doc_file_stem(doc_type)?;
         if did.method == "web" {
             let mut parts = did.id.split(':');
             let host = parts.next().ok_or_else(|| {
@@ -183,7 +198,7 @@ impl SmartProvider {
 
             if path.is_empty() {
                 return Ok(format!(
-                    "{}://{}/.well-known/{}",
+                    "{}://{}/.well-known/{}.json",
                     self.scheme, host, real_doc_type
                 ));
             }
@@ -275,6 +290,48 @@ mod tests {
             provider.build_url(&did, None).unwrap(),
             "http://127.0.0.1:3200/devices/cam01/did.json"
         );
+    }
+
+    #[test]
+    fn smart_provider_builds_root_did_web_url() {
+        let provider = SmartProvider::new_with_scheme("http");
+        let did = DID::from_str("did:web:example.com").unwrap();
+
+        assert_eq!(
+            provider.build_url(&did, None).unwrap(),
+            "http://example.com/.well-known/did.json"
+        );
+    }
+
+    #[test]
+    fn smart_provider_uses_doc_type_as_static_file_name() {
+        let provider = SmartProvider::new_with_scheme("http");
+        let root_did = DID::from_str("did:web:example.com").unwrap();
+        let path_did = DID::from_str("did:web:example.com:users:alice").unwrap();
+
+        assert_eq!(
+            provider.build_url(&root_did, Some("owner")).unwrap(),
+            "http://example.com/.well-known/owner.json"
+        );
+        assert_eq!(
+            provider.build_url(&path_did, Some("profile")).unwrap(),
+            "http://example.com/users/alice/profile.json"
+        );
+    }
+
+    #[test]
+    fn smart_provider_rejects_unsafe_doc_type() {
+        let provider = SmartProvider::new_with_scheme("http");
+        let did = DID::from_str("did:web:example.com").unwrap();
+
+        assert!(matches!(
+            provider.build_url(&did, Some("../owner")),
+            Err(NSError::InvalidParam(_))
+        ));
+        assert!(matches!(
+            provider.build_url(&did, Some("profile/v1")),
+            Err(NSError::InvalidParam(_))
+        ));
     }
 
     #[tokio::test]
