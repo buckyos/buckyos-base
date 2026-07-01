@@ -4,12 +4,16 @@
 向https://resolver.example.com/1.0/identifiers/did:example:1234#doc_type发送http GET请求，获取did文档
 */
 
-use crate::{NameInfo, NsProvider, RecordType};
+use crate::{
+    DocumentRef, DocumentStatus, NameInfo, NameStatus, NsProvider, OwnerSource, PublishedState,
+    RecordType,
+};
 use async_trait::async_trait;
 use log::info;
 use name_lib::{EncodedDocument, NSError, NSResult, DID};
 use percent_encoding::percent_decode_str;
 use reqwest::{Client, StatusCode};
+use serde::Deserialize;
 use serde_json::Value;
 use std::net::IpAddr;
 
@@ -114,12 +118,208 @@ impl HttpsProvider {
         EncodedDocument::from_str(body)
             .map_err(|e| NSError::Failed(format!("parse resolver response failed: {}", e)))
     }
+
+    /// 解析 `resolve_published_state` 的 HTTP 响应。协议见 `doc/http_did_resolver_api.md`：
+    /// method-agnostic，任何 did:method 的 HTTP resolver 只要按这份信封应答，都能走这里，
+    /// 状态机语义的复杂度在 resolver 那一侧，这里只是老老实实解析一个通用 JSON 信封。
+    ///
+    /// 拆成纯函数（接收已经读出来的 status/body，而不是 `reqwest::Response`）方便直接用字面量
+    /// 状态码和 JSON 字符串写单测，不需要真的发 HTTP 请求。
+    fn parse_published_state_body(
+        did: &DID,
+        doc_type: &str,
+        status: StatusCode,
+        body: &str,
+    ) -> NSResult<Option<PublishedState>> {
+        // doc/http_did_resolver_api.md 第 5 节：只有 200/404/410 是这份协议定义的合法状态码，
+        // 其它一律当作 transport error，绝不能被误判成 Missing/Revoked 之类的负状态。
+        if status != StatusCode::OK && status != StatusCode::NOT_FOUND && status != StatusCode::GONE
+        {
+            return Err(NSError::Failed(format!(
+                "resolver returned unexpected status {} for {}#{}: {}",
+                status,
+                did.to_string(),
+                doc_type,
+                body
+            )));
+        }
+
+        let response = match serde_json::from_str::<DidResolutionResponseWire>(body) {
+            Ok(response) => response,
+            Err(err) => {
+                // 裸 404（没有可解析的 body）视为"这个 resolver 对这个 (did, doc_type) 没有
+                // 意见"，不是负状态；200/410 缺了 body 说明响应本身有问题，是真错误。
+                if status == StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                return Err(NSError::Failed(format!(
+                    "malformed resolver response for {}#{}: {}",
+                    did.to_string(),
+                    doc_type,
+                    err
+                )));
+            }
+        };
+
+        Self::published_state_from_wire(did, doc_type, response)
+    }
+
+    fn published_state_from_wire(
+        did: &DID,
+        doc_type: &str,
+        response: DidResolutionResponseWire,
+    ) -> NSResult<Option<PublishedState>> {
+        let Some(metadata) = response.did_document_metadata else {
+            return Ok(None);
+        };
+        let Some(buckyos) = metadata.buckyos else {
+            return Ok(None);
+        };
+        let Some(status_str) = buckyos.document_status.as_deref() else {
+            // 没有 documentStatus：这个 resolver 明确表示对这个 (did, doc_type) 没有意见
+            // （NotApplicable），不是负状态。
+            return Ok(None);
+        };
+
+        let document_status = match status_str {
+            "active" => DocumentStatus::Active,
+            "expired" => DocumentStatus::Expired,
+            "missing" => DocumentStatus::Missing,
+            "revoked" => DocumentStatus::Revoked,
+            "tombstoned" => DocumentStatus::Tombstoned,
+            "migrated" => DocumentStatus::Migrated,
+            other => {
+                return Err(NSError::Failed(format!(
+                    "unknown documentStatus \"{}\" for {}#{}",
+                    other,
+                    did.to_string(),
+                    doc_type
+                )))
+            }
+        };
+
+        let name_status = match document_status {
+            DocumentStatus::Tombstoned => NameStatus::Tombstoned,
+            DocumentStatus::Missing => NameStatus::Missing,
+            DocumentStatus::Expired => NameStatus::Expired,
+            _ => NameStatus::Active,
+        };
+
+        let owner_source = match buckyos.owner_source.as_deref() {
+            Some("methodAuthority") => OwnerSource::MethodAuthority,
+            Some("documentClaim") => OwnerSource::DocumentClaim,
+            _ => OwnerSource::Unknown,
+        };
+
+        let effective_owner = parse_optional_did(buckyos.effective_owner.as_deref())?;
+        let migration_target = parse_optional_did(buckyos.migration_target.as_deref())?;
+        let canonical_id = parse_optional_did(metadata.canonical_id.as_deref())?;
+        let equivalent_ids = metadata
+            .equivalent_id
+            .iter()
+            .map(|id| DID::from_str(id))
+            .collect::<NSResult<Vec<_>>>()?;
+
+        let document_ref = response.did_document.map(|value| {
+            let document = match value {
+                Value::String(jwt) => EncodedDocument::Jwt(jwt),
+                other => EncodedDocument::JsonLd(other),
+            };
+            DocumentRef::inline(document)
+        });
+
+        let document_version = buckyos
+            .document_version
+            .or_else(|| metadata.version_id.as_deref().and_then(|v| v.parse().ok()));
+        let next_version = metadata
+            .next_version_id
+            .as_deref()
+            .and_then(|v| v.parse().ok());
+
+        Ok(Some(PublishedState {
+            did: did.clone(),
+            doc_type: buckyos.doc_type.unwrap_or_else(|| doc_type.to_string()),
+            name_status,
+            document_status,
+            document_ref,
+            document_version,
+            previous_version: buckyos.previous_version,
+            next_version,
+            effective_owner,
+            owner_source,
+            authority_root: buckyos.authority_root,
+            authority_seq: buckyos.authority_seq,
+            lineage_epoch: buckyos.lineage_epoch,
+            canonical_id,
+            equivalent_ids,
+            migration_target,
+        }))
+    }
+}
+
+fn parse_optional_did(value: Option<&str>) -> NSResult<Option<DID>> {
+    value.map(DID::from_str).transpose()
+}
+
+/// `doc/http_did_resolver_api.md` 第 3 节描述的响应信封，method-agnostic：任何 did:method 的
+/// HTTP resolver 都应该按这个形状应答。
+#[derive(Debug, Deserialize)]
+struct DidResolutionResponseWire {
+    #[serde(rename = "didDocument", default)]
+    did_document: Option<Value>,
+    #[serde(rename = "didDocumentMetadata", default)]
+    did_document_metadata: Option<DidDocumentMetadataWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DidDocumentMetadataWire {
+    #[serde(rename = "versionId", default)]
+    version_id: Option<String>,
+    #[serde(rename = "nextVersionId", default)]
+    next_version_id: Option<String>,
+    #[serde(rename = "canonicalId", default)]
+    canonical_id: Option<String>,
+    #[serde(rename = "equivalentId", default)]
+    equivalent_id: Vec<String>,
+    #[serde(default)]
+    buckyos: Option<BuckyosMetadataWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuckyosMetadataWire {
+    #[serde(rename = "docType", default)]
+    doc_type: Option<String>,
+    #[serde(rename = "documentStatus", default)]
+    document_status: Option<String>,
+    #[serde(rename = "documentVersion", default)]
+    document_version: Option<u64>,
+    #[serde(rename = "previousVersion", default)]
+    previous_version: Option<u64>,
+    #[serde(rename = "lineageEpoch", default)]
+    lineage_epoch: Option<u64>,
+    #[serde(rename = "authoritySeq", default)]
+    authority_seq: Option<u64>,
+    #[serde(rename = "effectiveOwner", default)]
+    effective_owner: Option<String>,
+    #[serde(rename = "ownerSource", default)]
+    owner_source: Option<String>,
+    #[serde(rename = "authorityRoot", default)]
+    authority_root: Option<String>,
+    #[serde(rename = "migrationTarget", default)]
+    migration_target: Option<String>,
 }
 
 #[async_trait]
 impl NsProvider for HttpsProvider {
     fn get_id(&self) -> String {
         format!("https-resolver:{}", self.resolver_host)
+    }
+
+    fn caps(&self) -> crate::ResolverCaps {
+        crate::ResolverCaps {
+            published_state: true,
+            ..crate::ResolverCaps::legacy_document()
+        }
     }
 
     async fn query(
@@ -148,6 +348,27 @@ impl NsProvider for HttpsProvider {
             .await
             .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
         HttpsProvider::parse_response(did, resp).await
+    }
+
+    async fn resolve_published_state(
+        &self,
+        did: &DID,
+        doc_type: &str,
+    ) -> NSResult<Option<PublishedState>> {
+        let url = self.build_url(did, Some(doc_type));
+        info!("https provider querying published state {}", url);
+        let resp = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| NSError::Failed(format!("read resolver response failed: {}", e)))?;
+        Self::parse_published_state_body(did, doc_type, status, &body)
     }
 }
 
@@ -258,6 +479,179 @@ impl NsProvider for SmartProvider {
 mod tests {
     use super::*;
     use name_lib::DID;
+
+    // ------------------------ resolve_published_state 信封解析 ------------------------
+    // 按 doc/http_did_resolver_api.md 的信封直接构造字面量 status/body 测试纯解析函数，
+    // 不需要真的发 HTTP 请求（也不需要像之前那样搭一套 mock transport trait）。
+
+    #[test]
+    fn active_state_maps_document_ref_and_owner() {
+        let did = DID::from_str("did:bns:waterflier").unwrap();
+        let body = serde_json::json!({
+            "didDocument": {"marker": "active"},
+            "didDocumentMetadata": {
+                "versionId": "3",
+                "buckyos": {
+                    "docType": "zone",
+                    "documentStatus": "active",
+                    "documentVersion": 3,
+                    "previousVersion": 2,
+                    "authoritySeq": 9,
+                    "lineageEpoch": 1,
+                    "effectiveOwner": "did:bns:waterflier-owner",
+                    "ownerSource": "methodAuthority",
+                    "authorityRoot": "0xroot"
+                }
+            }
+        })
+        .to_string();
+
+        let state = HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.document_status, DocumentStatus::Active);
+        assert_eq!(state.document_version, Some(3));
+        assert_eq!(
+            state.effective_owner,
+            Some(DID::new("bns", "waterflier-owner"))
+        );
+        assert_eq!(
+            state.document_ref.unwrap().inline_document.unwrap(),
+            EncodedDocument::JsonLd(serde_json::json!({"marker": "active"}))
+        );
+    }
+
+    #[test]
+    fn missing_revoked_tombstoned_and_migrated_map_to_terminal_states() {
+        let did = DID::from_str("did:bns:waterflier").unwrap();
+
+        let missing_body = serde_json::json!({
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "missing"}}
+        })
+        .to_string();
+        let missing = HttpsProvider::parse_published_state_body(
+            &did,
+            "zone",
+            StatusCode::NOT_FOUND,
+            &missing_body,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(missing.document_status, DocumentStatus::Missing);
+
+        let revoked_body = serde_json::json!({
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "revoked"}}
+        })
+        .to_string();
+        let revoked = HttpsProvider::parse_published_state_body(
+            &did,
+            "zone",
+            StatusCode::GONE,
+            &revoked_body,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(revoked.document_status, DocumentStatus::Revoked);
+
+        let tombstoned_body = serde_json::json!({
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "tombstoned"}}
+        })
+        .to_string();
+        let tombstoned = HttpsProvider::parse_published_state_body(
+            &did,
+            "zone",
+            StatusCode::GONE,
+            &tombstoned_body,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tombstoned.document_status, DocumentStatus::Tombstoned);
+
+        let migrated_body = serde_json::json!({
+            "didDocumentMetadata": {
+                "buckyos": {"documentStatus": "migrated", "migrationTarget": "did:bns:waterflier-v2"}
+            }
+        })
+        .to_string();
+        let migrated =
+            HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &migrated_body)
+                .unwrap()
+                .unwrap();
+        assert_eq!(migrated.document_status, DocumentStatus::Migrated);
+        assert_eq!(
+            migrated.migration_target,
+            Some(DID::new("bns", "waterflier-v2"))
+        );
+    }
+
+    #[test]
+    fn expired_state_maps_and_preserves_version() {
+        let did = DID::from_str("did:bns:waterflier").unwrap();
+        let body = serde_json::json!({
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "expired", "documentVersion": 5}}
+        })
+        .to_string();
+
+        let state = HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.document_status, DocumentStatus::Expired);
+        assert_eq!(state.document_version, Some(5));
+    }
+
+    #[test]
+    fn bare_404_without_buckyos_extension_is_not_applicable() {
+        // 第三方 did:web / did:key resolver（identity.foundation、uniresolver.io 等）根本不
+        // 知道这个扩展，普通的 404（甚至没有 JSON body）必须被当成"不适用"，而不是报错。
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let state =
+            HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::NOT_FOUND, "")
+                .unwrap();
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn response_without_buckyos_extension_is_not_applicable() {
+        // 200 但响应体里没有 buckyos 扩展块（比如一个不认识这份协议的普通 did:web host），
+        // 同样是"不适用"，不是错误、也不是负状态。
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let body = serde_json::json!({
+            "didDocument": {"id": "did:web:example.com"},
+            "didDocumentMetadata": {"deactivated": false}
+        })
+        .to_string();
+        let state =
+            HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &body).unwrap();
+        assert!(state.is_none());
+    }
+
+    // T3.2: transport 错误（5xx/超时/连接失败）必须原样冒泡成 Err，不能被误判成
+    // Missing/Revoked 之类的强负状态。
+    #[test]
+    fn unexpected_status_code_is_transport_error_not_negative_state() {
+        let did = DID::from_str("did:bns:waterflier").unwrap();
+        let err = HttpsProvider::parse_published_state_body(
+            &did,
+            "zone",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error",
+        )
+        .unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+    }
+
+    #[test]
+    fn malformed_json_on_200_is_transport_error() {
+        let did = DID::from_str("did:bns:waterflier").unwrap();
+        let err = HttpsProvider::parse_published_state_body(
+            &did,
+            "zone",
+            StatusCode::OK,
+            "not json at all",
+        )
+        .unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+    }
 
     #[test]
     fn build_url_uses_http_base_url_directly() {

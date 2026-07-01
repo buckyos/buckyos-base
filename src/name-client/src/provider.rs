@@ -574,7 +574,10 @@ impl Default for ResolvePolicy {
 }
 
 impl ResolvePolicy {
-    pub fn with_local_authority_override(mut self, store: Arc<LocalAuthorityOverrideStore>) -> Self {
+    pub fn with_local_authority_override(
+        mut self,
+        store: Arc<LocalAuthorityOverrideStore>,
+    ) -> Self {
         self.local_authority_override = Some(store);
         self
     }
@@ -1024,7 +1027,12 @@ pub trait NsProvider: 'static + Send + Sync {
     /// 该 (did, doc_type) 是否是 owner 递归的递归基：默认约定是
     /// `doc_type == "owner"`（设计文档第 6.4 节）。method 有自证根
     /// （例如 did:dev 用 DID 自身的 key）时可以覆盖。
-    fn is_owner_root(&self, _did: &DID, doc_type: &str, _published: Option<&PublishedState>) -> bool {
+    fn is_owner_root(
+        &self,
+        _did: &DID,
+        doc_type: &str,
+        _published: Option<&PublishedState>,
+    ) -> bool {
         doc_type == DOC_TYPE_OWNER
     }
 

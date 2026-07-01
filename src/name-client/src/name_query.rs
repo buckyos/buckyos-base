@@ -9,8 +9,8 @@ use tokio::sync::RwLock;
 
 use crate::{
     CacheStatus, DocumentBody, DocumentRef, DocumentStatus, EvidenceKind, NameInfo, NsProvider,
-    OwnerDocumentPolicy, PublishedState, RecordType, ResolvePolicy, ResolvedDocument,
-    ResolveWarning, DEFAULT_DID_DOC_TYPE, DOC_TYPE_OWNER,
+    OwnerDocumentPolicy, PublishedState, RecordType, ResolvePolicy, ResolveWarning,
+    ResolvedDocument, DEFAULT_DID_DOC_TYPE, DOC_TYPE_OWNER,
 };
 
 /// 候选文档在验证阶段被拒绝的原因。契约违规会被记录为 warning 并静默丢弃该候选，
@@ -396,7 +396,9 @@ impl NameQuery {
             match self.query_candidate_group(&group, did, doc_type).await {
                 Ok(bodies) => {
                     match self
-                        .verify_and_select_document(did, doc_type, &group, bodies, published, policy)
+                        .verify_and_select_document(
+                            did, doc_type, &group, bodies, published, policy,
+                        )
                         .await
                     {
                         Ok((body, warnings)) => {
@@ -622,8 +624,7 @@ impl NameQuery {
         }
 
         if is_owner_root {
-            self.verify_owner_root_candidate(did, body, published)
-                .await
+            self.verify_owner_root_candidate(did, body, published).await
         } else {
             self.verify_owned_candidate(did, doc_type, body, published, policy)
                 .await
@@ -738,22 +739,18 @@ impl NameQuery {
             .for_authority_lookup()
             .descend(&declared_owner, DOC_TYPE_OWNER)
             .map_err(CandidateRejection::Failed)?;
-        let owner_resolved = Box::pin(self.query_did_ex(
-            &declared_owner,
-            Some(DOC_TYPE_OWNER),
-            None,
-            next_policy,
-        ))
-        .await
-        .map_err(|err| {
-            CandidateRejection::Failed(NSError::Failed(format!(
-                "resolve owner {} for {}#{} failed: {}",
-                declared_owner.to_string(),
-                did.to_string(),
-                doc_type,
-                err
-            )))
-        })?;
+        let owner_resolved =
+            Box::pin(self.query_did_ex(&declared_owner, Some(DOC_TYPE_OWNER), None, next_policy))
+                .await
+                .map_err(|err| {
+                    CandidateRejection::Failed(NSError::Failed(format!(
+                        "resolve owner {} for {}#{} failed: {}",
+                        declared_owner.to_string(),
+                        did.to_string(),
+                        doc_type,
+                        err
+                    )))
+                })?;
 
         let owner_config = OwnerConfig::decode(&owner_resolved.document, None).map_err(|err| {
             CandidateRejection::Failed(NSError::Failed(format!(
@@ -803,15 +800,15 @@ impl NameQuery {
                 unreachable!("is_proof() only true for Jwt documents");
             };
             if decode_json_from_jwt_with_pk(jwt, &decoding_key).is_err() {
-                let verified_with_historical_key =
-                    owner_config.get_historical_keys().into_iter().any(
-                        |(_kid, jwk)| match DecodingKey::from_jwk(&jwk) {
-                            Ok(historical_key) => {
-                                decode_json_from_jwt_with_pk(jwt, &historical_key).is_ok()
-                            }
-                            Err(_) => false,
-                        },
-                    );
+                let verified_with_historical_key = owner_config
+                    .get_historical_keys()
+                    .into_iter()
+                    .any(|(_kid, jwk)| match DecodingKey::from_jwk(&jwk) {
+                        Ok(historical_key) => {
+                            decode_json_from_jwt_with_pk(jwt, &historical_key).is_ok()
+                        }
+                        Err(_) => false,
+                    });
                 if !verified_with_historical_key {
                     return Err(CandidateRejection::Failed(NSError::Failed(format!(
                         "{}#{} signature verification failed against owner {}",
@@ -1050,8 +1047,7 @@ mod tests {
         zone.iat = iat;
         zone.exp = iat + 3600 * 24 * 365;
         zone.version_seq = Some(1);
-        zone.extra_info
-            .insert("marker".to_string(), json!(marker));
+        zone.extra_info.insert("marker".to_string(), json!(marker));
         zone.encode(Some(key)).unwrap()
     }
 
@@ -1516,7 +1512,12 @@ mod tests {
         // owner 签名链完全无关，如果解析结果拿到它，说明错误地走了 unauthenticated 路径。
         let lenient_doc = make_doc(100, 200, "unauth-declared-no-verify");
         let owner_doc = build_owner_doc(&owner_did, None);
-        let zone_doc = build_zone_doc(&zone_did, &owner_did, ts(50), "verified-declared-needs-verify");
+        let zone_doc = build_zone_doc(
+            &zone_did,
+            &owner_did,
+            ts(50),
+            "verified-declared-needs-verify",
+        );
 
         q.add_provider(
             Box::new(MixedCapsProvider {
@@ -1605,11 +1606,8 @@ mod tests {
         .await;
         // 同一 trust level 下再注册一个只会返回未签名 JsonLd 的 self-signed candidate
         // provider，制造一个必然契约违规的候选。
-        q.add_provider(
-            Box::new(SelfSignedJsonLdProvider { doc: unsigned_doc }),
-            10,
-        )
-        .await;
+        q.add_provider(Box::new(SelfSignedJsonLdProvider { doc: unsigned_doc }), 10)
+            .await;
 
         let resolved = q
             .query_did_ex(&zone_did, Some("zone"), None, ResolvePolicy::default())
@@ -1620,10 +1618,7 @@ mod tests {
             .resolution_metadata
             .warnings
             .iter()
-            .any(|warning| matches!(
-                warning,
-                ResolveWarning::EvidenceContractViolation { .. }
-            )));
+            .any(|warning| matches!(warning, ResolveWarning::EvidenceContractViolation { .. })));
     }
 
     #[tokio::test]
@@ -1740,8 +1735,13 @@ mod tests {
             equivalent_ids: Vec::new(),
             migration_target: None,
         };
-        q.add_provider(Box::new(PublishedStateProvider { state: conflicting_state }), 0)
-            .await;
+        q.add_provider(
+            Box::new(PublishedStateProvider {
+                state: conflicting_state,
+            }),
+            0,
+        )
+        .await;
 
         let err = q
             .query_did_ex(&zone_did, Some("zone"), None, ResolvePolicy::default())
@@ -1773,10 +1773,19 @@ mod tests {
             equivalent_ids: Vec::new(),
             migration_target: None,
         };
-        q2.add_provider(Box::new(PublishedStateProvider { state: consistent_state }), 0)
-            .await;
         q2.add_provider(
-            Box::new(DidDocProvider::new("owner-x").with_doc(owner_x_did.clone(), "owner", owner_x_doc)),
+            Box::new(PublishedStateProvider {
+                state: consistent_state,
+            }),
+            0,
+        )
+        .await;
+        q2.add_provider(
+            Box::new(DidDocProvider::new("owner-x").with_doc(
+                owner_x_did.clone(),
+                "owner",
+                owner_x_doc,
+            )),
             10,
         )
         .await;

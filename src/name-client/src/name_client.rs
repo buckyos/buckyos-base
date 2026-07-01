@@ -9,8 +9,8 @@ use crate::doc_cache::{CacheBackend, DIDDocumentCache, UnauthenticatedInfoCache}
 use crate::name_query::NameQuery;
 use crate::provider::RecordType;
 use crate::{
-    CacheStatus, LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy,
-    ResolvedDocument, ResolveWarning, DEFAULT_DID_DOC_TYPE, DOC_TYPE_INFO,
+    CacheStatus, LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy, ResolveWarning,
+    ResolvedDocument, DEFAULT_DID_DOC_TYPE, DOC_TYPE_INFO,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
@@ -1061,9 +1061,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             _doc_type: Option<&str>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
-            let call = self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if call == 0 {
                 Ok(self.doc.clone())
             } else {

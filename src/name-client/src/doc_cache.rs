@@ -931,10 +931,24 @@ impl UnauthenticatedInfoCache {
         Some((entry.doc, entry.exp, entry.source_rank))
     }
 
-    pub fn insert(&self, did: &DID, doc_type: Option<&str>, doc: EncodedDocument, exp: u64, source_rank: i32) {
+    pub fn insert(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        doc: EncodedDocument,
+        exp: u64,
+        source_rank: i32,
+    ) {
         let key = combine_key(did, doc_type);
         if let Ok(mut entries) = self.entries.write() {
-            entries.insert(key, UnauthenticatedInfoEntry { doc, exp, source_rank });
+            entries.insert(
+                key,
+                UnauthenticatedInfoEntry {
+                    doc,
+                    exp,
+                    source_rank,
+                },
+            );
         }
     }
 }
