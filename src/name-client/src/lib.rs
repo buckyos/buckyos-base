@@ -41,6 +41,8 @@ extern crate log;
 pub static GLOBAL_BOOT_NAME_CLIENT: OnceCell<NameClient> = OnceCell::new();
 pub static GLOBAL_NAME_CLIENT: OnceCell<NameClient> = OnceCell::new();
 pub static IS_NAME_LIB_INITED: OnceCell<bool> = OnceCell::new();
+//串行化首次初始化，避免并发调用 init_name_lib_ex 时重复构建 NameClient
+static NAME_LIB_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn get_default_web3_bridge_config() -> HashMap<String, String> {
     let mut web3_bridge_config = HashMap::new();
@@ -64,6 +66,11 @@ pub async fn init_name_lib_ex(
     config: NameClientConfig,
 ) -> NSResult<()> {
     //init web3 bridge config
+    if IS_NAME_LIB_INITED.get().is_some() {
+        return Ok(());
+    }
+    let _init_guard = NAME_LIB_INIT_LOCK.lock().await;
+    //拿到锁后重新检查：可能已被先拿到锁的调用者（或直接设置 statics 的测试代码）初始化
     if IS_NAME_LIB_INITED.get().is_some() {
         return Ok(());
     }
@@ -104,10 +111,8 @@ pub async fn init_name_lib_ex(
             ));
         }
     }
-    let set_result = IS_NAME_LIB_INITED.set(true);
-    if set_result.is_err() {
-        panic!("Failed to set IS_NAME_LIB_INITED");
-    }
+    //set 失败说明已被其他路径置位，全局状态有效，与 GLOBAL_NAME_CLIENT.set 一样容忍
+    let _ = IS_NAME_LIB_INITED.set(true);
     Ok(())
 }
 
