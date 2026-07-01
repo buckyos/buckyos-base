@@ -250,8 +250,8 @@ pub struct RPCContext {
     pub start_time: u64,
     pub token: Option<String>, //jwt session token
     pub trace_id: Option<String>,
-    pub from_ip: Option<IpAddr>,//filled by gateway,client never fill this
-    pub from_device: Option<String>,//filled by gateway,client never fill this
+    pub from_ip: Option<IpAddr>, //filled by gateway,client never fill this
+    pub from_device: Option<String>, //filled by gateway,client never fill this
 }
 
 impl Default for RPCContext {

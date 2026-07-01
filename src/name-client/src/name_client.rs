@@ -247,7 +247,7 @@ impl NameClient {
     }
 
     pub async fn resolve_ips(&self, name: &str) -> NSResult<Vec<IpAddr>> {
-        if let Some(ips) = self.resolve_signed_device_document_ips(name).await? {
+        if let Some(ips) = self.resolve_device_document_ips(name).await? {
             return self.sort_resolved_ips(&ips);
         }
 
@@ -384,30 +384,23 @@ impl NameClient {
         Ok(ranked.into_iter().map(|item| item.ip).collect())
     }
 
-    async fn resolve_signed_device_document_ips(
-        &self,
-        name: &str,
-    ) -> NSResult<Option<Vec<IpAddr>>> {
+    async fn resolve_device_document_ips(&self, name: &str) -> NSResult<Option<Vec<IpAddr>>> {
         let did = DID::from_str(name)?;
         let doc = match self.resolve_did(&did, None).await {
             Ok(doc) => doc,
             Err(NSError::NotFound(_)) => return Ok(None),
             Err(err) => return Err(err),
         };
-        Self::extract_signed_device_document_ips(doc)
+        Self::extract_device_document_ips(doc)
     }
 
     async fn resolve_device_info_ips(&self, name: &str) -> NSResult<Vec<IpAddr>> {
         let did = DID::from_str(name)?;
-        let doc = self.resolve_did(&did, Some("info")).await?;
+        let doc = self.resolve_did(&did, Some(DOC_TYPE_INFO)).await?;
         Self::extract_device_info_ips(doc)
     }
 
-    fn extract_signed_device_document_ips(doc: EncodedDocument) -> NSResult<Option<Vec<IpAddr>>> {
-        if !doc.is_proof() {
-            return Ok(None);
-        }
-
+    fn extract_device_document_ips(doc: EncodedDocument) -> NSResult<Option<Vec<IpAddr>>> {
         let value = doc.to_json_value()?;
         if value.get("device_type").is_none() {
             return Ok(None);
@@ -419,12 +412,7 @@ impl NameClient {
                 e
             ))
         })?;
-        if device_config.ips.is_empty() {
-            return Err(NSError::NotFound(
-                "device document does not contain ips".to_string(),
-            ));
-        }
-        Ok(Some(device_config.ips))
+        Ok((!device_config.ips.is_empty()).then_some(device_config.ips))
     }
 
     fn extract_device_info_ips(doc: EncodedDocument) -> NSResult<Vec<IpAddr>> {
@@ -899,6 +887,43 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             Err(NSError::NotFound("not implemented".into()))
+        }
+    }
+
+    struct DeviceDocumentProvider {
+        device_doc: EncodedDocument,
+        owner_doc: EncodedDocument,
+        info_doc: EncodedDocument,
+        name_info: NameInfo,
+    }
+
+    #[async_trait]
+    impl NsProvider for DeviceDocumentProvider {
+        fn get_id(&self) -> String {
+            "device-document-provider".to_string()
+        }
+
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Ok(self.name_info.clone())
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            doc_type: Option<&str>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            match doc_type {
+                Some("info") => Ok(self.info_doc.clone()),
+                Some("owner") => Ok(self.owner_doc.clone()),
+                None => Ok(self.device_doc.clone()),
+                _ => Err(NSError::NotFound("not implemented".into())),
+            }
         }
     }
 
@@ -1657,6 +1682,117 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
         assert_eq!(resolved, vec!["192.0.2.10".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_uses_verified_jsonld_device_document_ips() {
+        let device_did = DID::from_str("did:web:ood1.example").unwrap();
+
+        let owner_config = OwnerConfig::new(
+            device_did.clone(),
+            "ood1-owner".to_string(),
+            "ood1-owner@test".to_string(),
+            test_owner_public_jwk(),
+        );
+        let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_config).unwrap());
+
+        let mut device_config = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        device_config.id = device_did.clone();
+        device_config.owner = device_did.clone();
+        device_config.ips = vec!["192.0.2.10".parse().unwrap()];
+        let device_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_config).unwrap());
+
+        let mut info_config = device_config.clone();
+        info_config.ips = vec!["192.0.2.20".parse().unwrap()];
+        let mut device_info = DeviceInfo::from_device_doc(&info_config);
+        device_info.all_ip = vec!["192.0.2.40".parse().unwrap()];
+        let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
+
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(DeviceDocumentProvider {
+                    device_doc,
+                    owner_doc,
+                    info_doc,
+                    name_info: NameInfo::from_address_vec(
+                        "ood1.example",
+                        vec!["192.0.2.30".parse().unwrap()],
+                    ),
+                }),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(resolved, vec!["192.0.2.10".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_falls_back_when_device_document_has_no_fixed_ips() {
+        let owner_private_key =
+            EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        let device_did = DID::from_str("did:web:ood1.example").unwrap();
+
+        let mut owner_config = OwnerConfig::new(
+            device_did.clone(),
+            "ood1-owner".to_string(),
+            "ood1-owner@test".to_string(),
+            test_owner_public_jwk(),
+        );
+        owner_config.version_seq = Some(0);
+        let owner_doc = owner_config.encode(Some(&owner_private_key)).unwrap();
+
+        let mut device_config = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        device_config.id = device_did.clone();
+        device_config.owner = device_did.clone();
+        let device_doc = device_config.encode(Some(&owner_private_key)).unwrap();
+
+        let mut info_config = device_config.clone();
+        info_config.ips = vec!["192.0.2.20".parse().unwrap()];
+        let mut device_info = DeviceInfo::from_device_doc(&info_config);
+        device_info.all_ip = vec!["192.0.2.30".parse().unwrap()];
+        let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
+
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(DeviceDocumentProvider {
+                    device_doc,
+                    owner_doc,
+                    info_doc,
+                    name_info: NameInfo::from_address_vec(
+                        "ood1.example",
+                        vec!["192.0.2.10".parse().unwrap()],
+                    ),
+                }),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                "192.0.2.10".parse::<IpAddr>().unwrap(),
+                "192.0.2.20".parse::<IpAddr>().unwrap(),
+                "192.0.2.30".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]
