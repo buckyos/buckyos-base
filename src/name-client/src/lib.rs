@@ -29,14 +29,6 @@ pub use profile_resolver::*;
 pub use provider::*;
 pub use utility::*;
 
-use cfg_if::cfg_if;
-cfg_if! {
-    if #[cfg(feature = "cloudflare")] {
-        mod cloudflare;
-        pub use cloudflare::*;
-    }
-}
-
 use log::*;
 use name_lib::*;
 use once_cell::sync::OnceCell;

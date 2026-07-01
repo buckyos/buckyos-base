@@ -95,7 +95,6 @@ backtrace = "0.3"
 casbin = { version = "2.9", features = ["logging","explain"] }
 nvml-wrapper = "0.11"
 bip39 = "2.0"
-cfg-if = "1.0"
 sfo-result = "0.2"
 
 # Internal workspace dependencies

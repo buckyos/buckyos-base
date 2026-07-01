@@ -1091,12 +1091,6 @@ pub trait NsProvider: 'static + Send + Sync {
     }
 }
 
-#[async_trait::async_trait]
-pub trait NsUpdateProvider: 'static + Send + Sync {
-    async fn update(&self, record_type: RecordType, record: NameInfo) -> NSResult<NameInfo>;
-    async fn delete(&self, name: &str, record_type: RecordType) -> NSResult<Option<NameInfo>>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

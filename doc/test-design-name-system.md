@@ -107,7 +107,6 @@ Legend: [x] Implemented, [ ] Planned
 - LocalNsProvider behavior [ ]
 - BnsProvider behavior [ ]
 - HttpsProvider and SmartProvider behavior [ ]
-- Cloudflare provider (feature gated) [ ]
 
 ## 5. Planned Test Design by Module
 
@@ -172,7 +171,6 @@ Legend: [x] Implemented, [ ] Planned
 - HttpsProvider: `.well-known` paths and doc_type resolution.
 - LocalNsProvider: local cache or file-based resolution behavior.
 - SmartProvider: provider selection and fallback behavior.
-- Cloudflare provider (feature `cloudflare`): CRUD operations if supported.
 
 ## 6. Test Types and Strategy
 - Unit tests: data structure correctness, parsing, encoding/decoding.
