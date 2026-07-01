@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::DEFAULT_DID_DOC_TYPE;
+use crate::DidDocType;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use buckyos_kit::get_buckyos_root_dir;
 use chrono::{DateTime, Utc};
@@ -84,10 +84,8 @@ impl FromStr for IdentityUsage {
 //- "https://{hostname}/.well-known/did.json","https://{hostname}/.well-known/doc-type.json"
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IdentityMaterial {
-    DidJson,
-    DidDocJson(String),  // string is doc_type
-    DidJDocJson(String), // compatibility alias for DidDocJson
-    DidDocJwt(String),   // string is doc_type
+    DidDocJson(Option<DidDocType>),
+    DidDocJwt(Option<DidDocType>),
     Cert,
     Chain,
     Fullchain,
@@ -104,11 +102,8 @@ impl IdentityMaterial {
     fn public_file_name(&self, usage: IdentityUsage) -> NSResult<String> {
         let stem = usage.as_str();
         match self {
-            Self::DidJson => Ok("did.json".to_string()),
             Self::DidDocJwt(doc_type) => did_document_file_name(doc_type, "jwt", "did_doc.jwt"),
-            Self::DidDocJson(doc_type) | Self::DidJDocJson(doc_type) => {
-                did_document_file_name(doc_type, "json", "did.json")
-            }
+            Self::DidDocJson(doc_type) => did_document_file_name(doc_type, "json", "did.json"),
             Self::Cert => Ok(format!("{stem}.cert.pem")),
             Self::Chain => Ok(format!("{stem}.chain.pem")),
             Self::Fullchain => Ok(format!("{stem}.fullchain.pem")),
@@ -138,9 +133,7 @@ impl IdentityMaterial {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::DidJson => "did-json",
             Self::DidDocJson(_) => "did-doc-json",
-            Self::DidJDocJson(_) => "did-doc-json",
             Self::DidDocJwt(_) => "did-doc-jwt",
             Self::Cert => "cert",
             Self::Chain => "chain",
@@ -789,16 +782,16 @@ fn ensure_x509_usage(usage: IdentityUsage) -> NSResult<()> {
 }
 
 fn did_document_file_name(
-    doc_type: &str,
+    doc_type: &Option<DidDocType>,
     extension: &str,
     default_file_name: &str,
 ) -> NSResult<String> {
+    let Some(doc_type) = doc_type else {
+        return Ok(default_file_name.to_string());
+    };
+    let doc_type = doc_type.as_str();
     validate_doc_type_file_stem(doc_type)?;
-    if doc_type == DEFAULT_DID_DOC_TYPE.as_str() {
-        Ok(default_file_name.to_string())
-    } else {
-        Ok(format!("{doc_type}.{extension}"))
-    }
+    Ok(format!("{doc_type}.{extension}"))
 }
 
 fn validate_doc_type_file_stem(doc_type: &str) -> NSResult<()> {
@@ -1141,7 +1134,7 @@ mod tests {
                 .public_file(
                     "node1.example.com",
                     IdentityUsage::Server,
-                    IdentityMaterial::DidJson,
+                    IdentityMaterial::DidDocJson(None),
                 )
                 .unwrap(),
             tmp.path().join("local/identity/node1.example.com/did.json")
@@ -1151,17 +1144,7 @@ mod tests {
                 .public_file(
                     "node1.example.com",
                     IdentityUsage::Server,
-                    IdentityMaterial::DidDocJson(crate::DEFAULT_DID_DOC_TYPE.to_string()),
-                )
-                .unwrap(),
-            tmp.path().join("local/identity/node1.example.com/did.json")
-        );
-        assert_eq!(
-            roots
-                .public_file(
-                    "node1.example.com",
-                    IdentityUsage::Server,
-                    IdentityMaterial::DidDocJwt(crate::DEFAULT_DID_DOC_TYPE.to_string()),
+                    IdentityMaterial::DidDocJwt(None),
                 )
                 .unwrap(),
             tmp.path()
@@ -1172,7 +1155,18 @@ mod tests {
                 .public_file(
                     "node1.example.com",
                     IdentityUsage::Server,
-                    IdentityMaterial::DidDocJson("owner".to_string()),
+                    IdentityMaterial::DidDocJson(Some(DidDocType::Zone)),
+                )
+                .unwrap(),
+            tmp.path()
+                .join("local/identity/node1.example.com/zone.json")
+        );
+        assert_eq!(
+            roots
+                .public_file(
+                    "node1.example.com",
+                    IdentityUsage::Server,
+                    IdentityMaterial::DidDocJson(Some(DidDocType::Owner)),
                 )
                 .unwrap(),
             tmp.path()
@@ -1183,7 +1177,7 @@ mod tests {
                 .public_file(
                     "node1.example.com",
                     IdentityUsage::Server,
-                    IdentityMaterial::DidDocJwt("profile".to_string()),
+                    IdentityMaterial::DidDocJwt(Some(DidDocType::custom("profile"))),
                 )
                 .unwrap(),
             tmp.path()
@@ -1200,7 +1194,7 @@ mod tests {
             roots.public_file(
                 "node1.example.com",
                 IdentityUsage::Server,
-                IdentityMaterial::DidDocJson("../owner".to_string()),
+                IdentityMaterial::DidDocJson(Some(DidDocType::custom("../owner"))),
             ),
             Err(NSError::InvalidParam(_))
         ));
@@ -1208,7 +1202,7 @@ mod tests {
             roots.public_file(
                 "node1.example.com",
                 IdentityUsage::Server,
-                IdentityMaterial::DidDocJwt("profile/v1".to_string()),
+                IdentityMaterial::DidDocJwt(Some(DidDocType::custom("profile/v1"))),
             ),
             Err(NSError::InvalidParam(_))
         ));
