@@ -325,7 +325,7 @@ impl EncodedDocument {
 }
 
 #[async_trait]
-pub trait DIDDocumentTrait {
+pub trait DIDDocumentTrait: Send + Sync {
     fn get_id(&self) -> DID;
     //key id is none means the default key
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
@@ -445,7 +445,7 @@ pub(crate) fn ensure_version_seq_for_jwt(doc_type: &str, version_seq: Option<u64
     Ok(())
 }
 
-pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait>> {
+pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait + Send + Sync>> {
     let is_jwt = matches!(&doc, EncodedDocument::Jwt(_));
     let doc_value = doc.to_json_value()?;
     debug!(
