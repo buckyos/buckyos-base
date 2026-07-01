@@ -407,7 +407,7 @@ impl Default for DidResolutionMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuckyOSDocumentMetadata {
     pub doc_type: String,
-    pub document_status: DocumentStatus,
+    pub document_status: Option<DocumentStatus>,
     pub document_version: Option<u64>,
     pub previous_version: Option<u64>,
     pub lineage_epoch: Option<u64>,
@@ -454,9 +454,7 @@ impl ResolvedDocument {
             .as_ref()
             .and_then(|value| value.get("version_seq").and_then(|ts| ts.as_u64()));
 
-        let document_status = published
-            .map(|state| state.document_status.clone())
-            .unwrap_or(DocumentStatus::Active);
+        let document_status = published.map(|state| state.document_status.clone());
         let document_version = published
             .and_then(|state| state.document_version)
             .or(version_seq);
@@ -488,7 +486,7 @@ impl ResolvedDocument {
             document_metadata: DidDocumentMetadata {
                 created,
                 updated,
-                deactivated: Some(document_status.is_terminal()),
+                deactivated: document_status.as_ref().map(DocumentStatus::is_terminal),
                 version_id: document_version.map(|version| version.to_string()),
                 next_version_id: next_version.map(|version| version.to_string()),
                 canonical_id: published.and_then(|state| state.canonical_id.clone()),
@@ -534,6 +532,24 @@ impl ResolvedDocument {
         };
         resolved.resolution_metadata.warnings.push(warning);
         resolved
+    }
+
+    pub fn from_unauthenticated_info(
+        document: EncodedDocument,
+        did: &DID,
+        doc_type: &str,
+        authority_rank: Option<i32>,
+        resolver_id: Option<String>,
+    ) -> Self {
+        Self::from_document(
+            document,
+            did,
+            doc_type,
+            authority_rank,
+            resolver_id,
+            EvidenceKind::UnauthenticatedInfo,
+            None,
+        )
     }
 
     pub fn with_warning(mut self, warning: ResolveWarning) -> Self {

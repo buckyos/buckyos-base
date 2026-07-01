@@ -295,6 +295,28 @@ pub async fn update_did_cache(
     client.update_did_cache(did, doc_type, doc)
 }
 
+pub async fn add_device_info_cache(did: DID, device_info: DeviceInfo) -> NSResult<()> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not found".to_string()));
+    }
+    let client = client.unwrap();
+    client.add_device_info_cache(did, device_info)
+}
+
+pub async fn add_device_info_cache_with_ttl(
+    did: DID,
+    device_info: DeviceInfo,
+    ttl_secs: u64,
+) -> NSResult<()> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not found".to_string()));
+    }
+    let client = client.unwrap();
+    client.add_device_info_cache_with_ttl(did, device_info, ttl_secs)
+}
+
 pub async fn add_nameinfo_cache(hostname: &str, info: NameInfo) -> NSResult<()> {
     let client = get_name_client();
     if client.is_none() {

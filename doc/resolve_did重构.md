@@ -104,7 +104,7 @@ struct DidDocumentMetadata {
 
 struct BuckyOSDocumentMetadata {
     doc_type: String,
-    document_status: DocumentStatus,
+    document_status: Option<DocumentStatus>,
     document_version: Option<u64>,
     previous_version: Option<u64>,
     lineage_epoch: Option<u64>,
@@ -125,6 +125,7 @@ struct BuckyOSDocumentMetadata {
 | `canonicalize_did` 失败 | `https://www.w3.org/ns/did#INVALID_DID` / `invalidDid` | 这是输入 DID 语法或 canonical form 错误。 |
 | body 格式或签名结构非法 | `https://www.w3.org/ns/did#INVALID_DID_DOCUMENT` | 包括解析出非 DID Document 或关键字段不满足约束。 |
 | `Tombstoned` / `Revoked` | `didDocumentMetadata.deactivated = true` 或 BuckyOS extension | 只有当状态表示整个 DID/name 被停用时才映射为 W3C `deactivated`；如果只是某个 `doc_type` 的终止状态，应放在 `buckyos.document_status`，避免污染 DID-level 语义。 |
+| `document_status = None` | 无 DID Resolution 标准状态；BuckyOS extension 明确置空 | 表示这个结果没有经过 `PublishedState / DocumentStatus` 状态机，典型场景是第 9 节 `resolve_unauthenticated_info`。调用方不能把它当作 `Active`；Info 消费方应改看 Info 自身字段，例如 `iat`、`ttl`、`source_rank`、`resolver_id` 和 `cache_status`。 |
 | `Migrated` / alias | `canonicalId` / `equivalentId` | 只有同一 DID method 内、由 method 规范保证逻辑等价时才能使用。跨 method 迁移或弱别名应使用 BuckyOS extension，或在 DID Document 中使用 `alsoKnownAs`。 |
 | `document_version` | `versionId` | W3C 要求 ASCII string，对外可把 `u64` 渲染成字符串。 |
 | `previous_version` | BuckyOS `previousVersionId` extension | W3C `nextVersionId` 表示“当前解析版本之后的下一版”，不是 previous；解析历史版本时，如果 Registry 能证明后一版，才填 `nextVersionId`。 |
@@ -728,6 +729,8 @@ async fn resolve_unauthenticated_info(
 
 `choose_best_unauthenticated_info` 可以按 Info 自身协议字段排序，例如 `iat / ttl / source_rank / content_hash`，但不能复用 `compare_published_body`，因为它不比较 Document 证据等级，也不表示 owner 授权。
 
+`ResolvedDocument::from_unauthenticated_info` 必须把 `document_metadata.buckyos.document_status` 填为 `None`，同时不要把 `didDocumentMetadata.deactivated` 强行写成 `false`。`None` 是对外契约的一部分：它表示调用方拿到的是未经过 Document 状态机的 Info 结果，不能按 `DocumentStatus::Active` 处理。
+
 验证根用一个枚举统一表达，递归基和递归步只是它的两个变体：
 
 ```rust
@@ -866,7 +869,7 @@ pub async fn resolve_did_ex(
 
 `resolve_did_ex` 是对外入口，内部直接调用第 9 节的递归函数 `resolve_did_document`。外部调用者不需要、也不应该单独解析 owner —— owner 解析是 `resolve_did_document` 在 `doc_type = "owner"` 时的递归层，由内部自动完成。
 
-`ResolvedDocument` 不应只是 `EncodedDocument` 的薄包装。它是第 1.4 节定义的三段式结果：`resolution_metadata` 记录解析过程、warning、cache/local override、resolver id、W3C error；`document` 是最终选中的文档；`document_metadata` 记录状态、version、deactivation、canonical/alias 和 BuckyOS 扩展 metadata。兼容 API `resolve_did` 会丢弃 metadata，因此只适合旧调用方和明确不关心解析 provenance 的场景。
+`ResolvedDocument` 不应只是 `EncodedDocument` 的薄包装。它是第 1.4 节定义的三段式结果：`resolution_metadata` 记录解析过程、warning、cache/local override、resolver id、W3C error；`document` 是最终选中的文档；`document_metadata` 记录状态、version、deactivation、canonical/alias 和 BuckyOS 扩展 metadata。`document_metadata.buckyos.document_status` 只有在结果确实来自 `PublishedState / DocumentStatus` 状态机时才是 `Some(..)`；免验证 Info 必须是 `None`。兼容 API `resolve_did` 会丢弃 metadata，因此只适合旧调用方和明确不关心解析 provenance 的场景。
 
 `ResolveError` 也应提供稳定的标准投影：
 

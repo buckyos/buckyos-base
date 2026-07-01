@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 pub const DEFAULT_PROVIDER_TRUST_LEVEL: i32 = 100;
 pub const ROOT_TRUST_LEVEL: i32 = 0;
 pub const DNS_TRUST_LEVEL: i32 = 16;
+pub const DEFAULT_DEVICE_INFO_CACHE_TTL_SECS: u64 = 3600 * 24 * 7;
 const MAX_CACHED_LOCAL_IPS: usize = 8;
 
 #[derive(Clone)]
@@ -176,6 +177,41 @@ impl NameClient {
             .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
         self.doc_cache
             .update(did, doc_type, doc, exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+        Ok(())
+    }
+
+    pub fn add_device_info_cache(&self, did: DID, device_info: DeviceInfo) -> NSResult<()> {
+        self.add_device_info_cache_with_ttl(did, device_info, DEFAULT_DEVICE_INFO_CACHE_TTL_SECS)
+    }
+
+    pub fn add_device_info_cache_with_ttl(
+        &self,
+        did: DID,
+        device_info: DeviceInfo,
+        ttl_secs: u64,
+    ) -> NSResult<()> {
+        if ttl_secs == 0 {
+            return Err(NSError::InvalidParam(
+                "device info cache ttl must be greater than zero".to_string(),
+            ));
+        }
+        let doc =
+            EncodedDocument::JsonLd(serde_json::to_value(&device_info).map_err(|e| {
+                NSError::Failed(format!("serialize device info cache failed: {}", e))
+            })?);
+        let seen_at = if device_info.update_time == 0 {
+            buckyos_get_unix_timestamp()
+        } else {
+            device_info.update_time
+        };
+        let exp = seen_at.saturating_add(ttl_secs);
+        self.unauthenticated_info_cache.insert(
+            &did,
+            Some(DOC_TYPE_INFO),
+            doc,
+            exp,
+            DEFAULT_PROVIDER_TRUST_LEVEL,
+        );
         Ok(())
     }
 
@@ -1118,8 +1154,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             )
             .await;
 
-        let first = client.resolve_did(&did, Some("info")).await.unwrap();
-        assert_eq!(first, doc);
+        let first = client
+            .resolve_did_ex(&did, Some("info"), ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(first.document, doc);
+        assert_eq!(first.document_metadata.buckyos.document_status, None);
+        assert_eq!(first.document_metadata.deactivated, None);
 
         // provider 从第二次调用起总是失败，只有 unauthenticated_info_cache 命中才能
         // 让这次解析成功。
@@ -1128,6 +1169,8 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .await
             .unwrap();
         assert_eq!(second.document, doc);
+        assert_eq!(second.document_metadata.buckyos.document_status, None);
+        assert_eq!(second.document_metadata.deactivated, None);
         assert_eq!(
             second.resolution_metadata.cache_status,
             Some(CacheStatus::UnauthenticatedInfoHit)
@@ -1903,5 +1946,51 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 "192.0.2.20".parse::<IpAddr>().unwrap(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_uses_cached_finder_device_info_after_discovery() {
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: true,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client
+            .add_provider(
+                Box::new(MockProvider::err(MockErr::NotFound)),
+                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+            )
+            .await;
+
+        let device_did = DID::from_str("did:web:ood1.example").unwrap();
+        let before_cache = client.resolve_ips("did:web:ood1.example").await;
+        assert!(matches!(before_cache, Err(NSError::NotFound(_))));
+
+        let endpoint_ip: IpAddr = "192.168.1.20".parse().unwrap();
+        let mut discovered_doc = DeviceConfig::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        discovered_doc.id = device_did.clone();
+        discovered_doc.zone_did = Some(DID::new("bns", "alice"));
+        discovered_doc.owner = DID::new("bns", "alice");
+        discovered_doc.ips.push(endpoint_ip);
+
+        let mut device_info = DeviceInfo::from_device_doc(&discovered_doc);
+        device_info.arch.clear();
+        device_info.os.clear();
+        device_info.update_time = buckyos_get_unix_timestamp();
+        device_info.all_ip.push(endpoint_ip);
+
+        client
+            .add_device_info_cache(device_did.clone(), device_info)
+            .unwrap();
+
+        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(resolved, vec![endpoint_ip]);
+        assert!(client
+            .doc_cache
+            .get(&device_did, Some(DOC_TYPE_INFO))
+            .is_none());
     }
 }

@@ -454,14 +454,12 @@ impl NameQuery {
                 .query_unauthenticated_group(&group, did, doc_type)
                 .await?;
             if let Some(body) = Self::choose_best_unauthenticated_body(bodies) {
-                return Ok(ResolvedDocument::from_document(
+                return Ok(ResolvedDocument::from_unauthenticated_info(
                     body.document,
                     did,
                     doc_type,
                     Some(level),
                     body.resolver_id,
-                    EvidenceKind::UnauthenticatedInfo,
-                    None,
                 )
                 .with_cache_status(CacheStatus::Miss));
             }
@@ -1457,6 +1455,8 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.document, info_doc);
         assert_eq!(resolved.document_metadata.buckyos.doc_type, "info");
+        assert_eq!(resolved.document_metadata.buckyos.document_status, None);
+        assert_eq!(resolved.document_metadata.deactivated, None);
         assert_eq!(resolved.resolution_metadata.authority_rank, Some(10));
     }
 
@@ -1795,6 +1795,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved.document, zone_doc_declares_x);
+        assert_eq!(
+            resolved.document_metadata.buckyos.document_status,
+            Some(DocumentStatus::Active)
+        );
+        assert_eq!(resolved.document_metadata.deactivated, Some(false));
     }
 
     #[tokio::test]
