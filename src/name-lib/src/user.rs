@@ -215,6 +215,16 @@ impl OwnerConfig {
         return None;
     }
 
+    /// 除默认 key（`#main_key`）之外的历史 key，供调用方在默认 key 验签失败时
+    /// 做 fallback 验证（例如刚发生过 key rotation，旧文档仍用旧 key 签名）。
+    pub fn get_historical_keys(&self) -> Vec<(String, Jwk)> {
+        self.verification_method
+            .iter()
+            .filter(|method| method.key_id != "#main_key")
+            .map(|method| (method.key_id.clone(), method.public_key.clone()))
+            .collect()
+    }
+
     pub fn validate_jwt_revocation(&self, doc_type: &str, doc: &EncodedDocument) -> NSResult<()> {
         if self.mini_version_seq.is_none() && self.valid_iat.is_none() {
             return Ok(());

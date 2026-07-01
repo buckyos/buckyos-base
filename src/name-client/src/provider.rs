@@ -3,7 +3,11 @@ use jsonwebtoken::DecodingKey;
 use name_lib::OwnerConfig;
 use name_lib::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, RwLock},
+};
 
 pub const DEFAULT_DID_DOC_TYPE: &str = "zone";
 
@@ -350,6 +354,12 @@ impl DidResolutionError {
                 "Invalid resolution options",
                 Some(detail.clone()),
             ),
+            NSError::OwnerConflict(detail) => Self::new(
+                "https://www.w3.org/ns/did#INVALID_DID_DOCUMENT",
+                "ownerConflict",
+                "Document owner conflicts with authority record",
+                Some(detail.clone()),
+            ),
             _ => Self::new(
                 "https://www.w3.org/ns/did#INTERNAL_ERROR",
                 "internalError",
@@ -517,10 +527,12 @@ impl ResolvedDocument {
         );
         resolved.resolution_metadata.cache_status = Some(cache_status);
         resolved.document_metadata.updated = Some(exp);
-        resolved
-            .resolution_metadata
-            .warnings
-            .push(ResolveWarning::CacheFallback);
+        let warning = if cache_status == CacheStatus::UnauthenticatedInfoHit {
+            ResolveWarning::UnauthenticatedInfoCache
+        } else {
+            ResolveWarning::CacheFallback
+        };
+        resolved.resolution_metadata.warnings.push(warning);
         resolved
     }
 
@@ -541,6 +553,10 @@ pub struct ResolvePolicy {
     pub allow_self_signed_when_missing: bool,
     pub allow_cache_when_authority_unavailable: bool,
     pub max_depth: usize,
+    /// 本地测试/运维显式注入的发布模拟（设计文档第 7.3 节），类似 hosts 文件。
+    /// 挂在 policy 上而不是单独传参，是为了让它随 `descend()`/`for_authority_lookup()`
+    /// 一起传播到 owner 递归里——owner 解析同样要能命中 override。
+    pub local_authority_override: Option<Arc<LocalAuthorityOverrideStore>>,
     visited: Vec<(DID, String)>,
 }
 
@@ -551,12 +567,18 @@ impl Default for ResolvePolicy {
             allow_self_signed_when_missing: false,
             allow_cache_when_authority_unavailable: true,
             max_depth: 8,
+            local_authority_override: None,
             visited: Vec::new(),
         }
     }
 }
 
 impl ResolvePolicy {
+    pub fn with_local_authority_override(mut self, store: Arc<LocalAuthorityOverrideStore>) -> Self {
+        self.local_authority_override = Some(store);
+        self
+    }
+
     pub fn for_authority_lookup(&self) -> Self {
         let mut policy = self.clone();
         policy.allow_self_signed_when_missing = false;
@@ -584,6 +606,129 @@ impl ResolvePolicy {
         let mut next = self.clone();
         next.visited.push((did.clone(), doc_type.to_string()));
         Ok(next)
+    }
+}
+
+/// 本地测试/运维显式注入的一条发布模拟记录（设计文档第 7.3 节）。
+#[derive(Debug, Clone)]
+struct LocalAuthorityOverrideEntry {
+    document: EncodedDocument,
+    /// 记录写入者声明的作用域（machine/zone/test-env/CI job），目前只用于日志和
+    /// 调试；不参与匹配逻辑。
+    #[allow(dead_code)]
+    scope: String,
+    /// `None` 表示不过期。
+    expires_at: Option<u64>,
+}
+
+/// hosts 文件式的本地 override 存储：只能被显式写入 API 写入，不参与普通
+/// `DIDDocumentCache` 的持久化/淘汰逻辑，默认不导出、不广播、不同步到普通 cache。
+#[derive(Debug, Default)]
+pub struct LocalAuthorityOverrideStore {
+    entries: RwLock<HashMap<(DID, String), LocalAuthorityOverrideEntry>>,
+}
+
+impl LocalAuthorityOverrideStore {
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// 只应由本地管理员、测试框架或显式运维命令调用。
+    pub fn set(
+        &self,
+        did: DID,
+        doc_type: &str,
+        document: EncodedDocument,
+        scope: impl Into<String>,
+        expires_at: Option<u64>,
+    ) {
+        let mut entries = self.entries.write().unwrap();
+        entries.insert(
+            (did, doc_type.to_string()),
+            LocalAuthorityOverrideEntry {
+                document,
+                scope: scope.into(),
+                expires_at,
+            },
+        );
+    }
+
+    pub fn clear(&self, did: &DID, doc_type: &str) {
+        let mut entries = self.entries.write().unwrap();
+        entries.remove(&(did.clone(), doc_type.to_string()));
+    }
+
+    pub fn get(&self, did: &DID, doc_type: &str) -> Option<EncodedDocument> {
+        let entries = self.entries.read().unwrap();
+        let entry = entries.get(&(did.clone(), doc_type.to_string()))?;
+        if let Some(expires_at) = entry.expires_at {
+            if expires_at <= buckyos_get_unix_timestamp() {
+                return None;
+            }
+        }
+        Some(entry.document.clone())
+    }
+}
+
+/// Owner 对可达性敏感 doc_type 的发布保护策略。设计文档第 12 节的落点，
+/// Phase 1-2 阶段先留空结构，具体规则在后续 Phase 落地。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReachabilityPolicy {}
+
+/// Owner Config 是验证策略源（设计文档第 6 节），不是调用方传入的 `ResolvePolicy`。
+/// 它来自递归解析出的 owner 文档本身，而不是调用方配置。
+#[derive(Debug, Clone, Default)]
+pub struct OwnerDocumentPolicy {
+    /// 一键否决此时间点（含）之前签发的所有文档，即使签名合法。
+    pub revoke_before_iat: Option<u64>,
+    /// 权威发布源返回 Missing 时，是否允许按 doc_type 进入自签名 fallback。
+    pub allow_self_signed_when_missing: HashMap<String, bool>,
+    /// 权威发布源不可达时，是否允许按 doc_type 使用已验证过的本地结果。
+    pub allow_cache_when_authority_unavailable: HashMap<String, bool>,
+    /// 可达性敏感 doc_type（zone/device/service 等）的发布保护策略。
+    pub reachability_sensitive: HashMap<String, ReachabilityPolicy>,
+}
+
+impl OwnerDocumentPolicy {
+    /// 从递归解析并验签得到的 owner 文档派生策略。目前只落地 `revoke_before_iat`
+    /// （复用 `OwnerConfig::valid_iat` 既有语义），其余字段是尚未被 owner 文档
+    /// 显式声明的扩展点，默认空 map 表示"由调用方 ResolvePolicy 兜底"。
+    pub fn from_owner_config(owner_config: &OwnerConfig) -> Self {
+        Self {
+            revoke_before_iat: owner_config.valid_iat,
+            allow_self_signed_when_missing: HashMap::new(),
+            allow_cache_when_authority_unavailable: HashMap::new(),
+            reachability_sensitive: HashMap::new(),
+        }
+    }
+}
+
+/// 递归解析得到的 owner 验证上下文：owner 的 DID、用于验签的 key，以及
+/// owner 自己声明的验证策略。
+#[derive(Debug, Clone)]
+pub struct OwnerContext {
+    pub owner_did: DID,
+    pub decoding_key: DecodingKey,
+    pub public_key: jsonwebtoken::jwk::Jwk,
+    pub policy: OwnerDocumentPolicy,
+}
+
+/// 验证根：owner 是递归基（`MethodAuthority`），普通文档递归到 owner 文档
+/// 拿到 `Owner(OwnerContext)`。参见设计文档第 1.1/9 节。
+#[derive(Debug, Clone)]
+pub enum VerificationRoot {
+    MethodAuthority,
+    Owner(OwnerContext),
+}
+
+impl VerificationRoot {
+    pub fn owner_document_policy(&self) -> OwnerDocumentPolicy {
+        match self {
+            VerificationRoot::MethodAuthority => OwnerDocumentPolicy::default(),
+            VerificationRoot::Owner(ctx) => ctx.policy.clone(),
+        }
     }
 }
 
@@ -874,6 +1019,13 @@ pub trait NsProvider: 'static + Send + Sync {
 
     fn requires_verification(&self, doc_type: &str) -> bool {
         doc_type != DOC_TYPE_INFO
+    }
+
+    /// 该 (did, doc_type) 是否是 owner 递归的递归基：默认约定是
+    /// `doc_type == "owner"`（设计文档第 6.4 节）。method 有自证根
+    /// （例如 did:dev 用 DID 自身的 key）时可以覆盖。
+    fn is_owner_root(&self, _did: &DID, doc_type: &str, _published: Option<&PublishedState>) -> bool {
+        doc_type == DOC_TYPE_OWNER
     }
 
     async fn query(

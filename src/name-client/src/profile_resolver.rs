@@ -440,6 +440,15 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             "profile-mock".to_string()
         }
 
+        // "user" 文档不是自声明 owner 字段的通用 Document 类型：它的归属由请求 DID
+        // 的命名结构（`split_bns_user_zone_did`）决定，而不是文档内容自身。它的真实性
+        // 由 `decode_user_profile` 用调用方已解析出的 owner key 单独验证，因此这里
+        // 声明成免验证，交给 resolve_profile_source 自己的验签逻辑处理，避免走进
+        // 通用递归验证管线（那条管线无法从文档内容推断出这个 owner 关系）。
+        fn requires_verification(&self, doc_type: &str) -> bool {
+            doc_type != USER_PROFILE_DOC_TYPE
+        }
+
         async fn query(
             &self,
             _name: &str,

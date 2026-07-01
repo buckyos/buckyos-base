@@ -7,7 +7,7 @@ use http::StatusCode;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use name_client::{CacheBackend, DIDObjectClient, NameClient, NameClientConfig, SmartProvider};
-use name_lib::{DIDObjectCard, DID};
+use name_lib::{DIDObjectCard, EncodedDocument, OwnerConfig, DID};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -328,6 +328,41 @@ async fn example_name_client() -> NameClient {
     client
         .add_provider(Box::new(SmartProvider::new_with_scheme("http")), Some(0))
         .await;
+
+    // 这些 fixture 里的 DIDObjectCard 都把 controller 设成 did:web:myhome.com，
+    // 但测试环境里并没有真的把 myhome.com 架起来。resolve_did 现在需要能递归解析到
+    // 这个 owner 才能验证 card，这里用 local_authority_override（hosts 文件式的
+    // 本地测试覆盖，见 resolve_did 重构文档第 7.3 节）模拟一个可解析的 owner 文档，
+    // card 本身仍然走真实的 HTTP 抓取路径。
+    let owner_json = json!({
+        "id": "did:web:myhome.com",
+        "verificationMethod": [{
+            "type": "Ed25519VerificationKey2020",
+            "id": "#main_key",
+            "controller": "did:web:myhome.com",
+            "publicKeyJwk": {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }
+        }],
+        "authentication": ["#main_key"],
+        "exp": 9_999_999_999u64,
+        "iat": 0,
+        "version_seq": 0,
+        "name": "myhome",
+        "display_name": "myhome@test",
+    });
+    let owner_config: OwnerConfig = serde_json::from_value(owner_json).unwrap();
+    let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_config).unwrap());
+    client.set_local_authority_override(
+        DID::new("web", "myhome.com"),
+        "owner",
+        owner_doc,
+        "test-fixture",
+        None,
+    );
+
     client
 }
 

@@ -897,6 +897,48 @@ impl DIDDocumentMemCache {
     }
 }
 
+// ------------------------ unauthenticated info cache ------------------------
+
+#[derive(Clone)]
+struct UnauthenticatedInfoEntry {
+    doc: EncodedDocument,
+    exp: u64,
+    source_rank: i32,
+}
+
+/// 设计文档第 7.4 节：只保存 `requires_verification(doc_type) == false` 的 Info 类
+/// 结果（例如 DeviceInfo、运行时地址）。它不参与 owner 验签，不受
+/// `Missing`/`revoke_before_iat` 等 Document 门禁间接门控，只按 `iat/ttl/source_rank`
+/// 判断可用性；不与 `DIDDocumentCache`（verified_cache 的角色）混在一起，也不参与
+/// 它的持久化/淘汰逻辑。
+pub struct UnauthenticatedInfoCache {
+    entries: RwLock<HashMap<String, UnauthenticatedInfoEntry>>,
+}
+
+impl UnauthenticatedInfoCache {
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
+        let key = combine_key(did, doc_type);
+        let entry = self.entries.read().ok()?.get(&key)?.clone();
+        if is_expired(entry.exp) {
+            return None;
+        }
+        Some((entry.doc, entry.exp, entry.source_rank))
+    }
+
+    pub fn insert(&self, did: &DID, doc_type: Option<&str>, doc: EncodedDocument, exp: u64, source_rank: i32) {
+        let key = combine_key(did, doc_type);
+        if let Ok(mut entries) = self.entries.write() {
+            entries.insert(key, UnauthenticatedInfoEntry { doc, exp, source_rank });
+        }
+    }
+}
+
 // ------------------------ 工具函数 ------------------------
 
 fn is_expired(exp_ts: u64) -> bool {

@@ -319,7 +319,10 @@ impl DIDDocumentTrait for DeviceConfig {
     }
 
     fn get_iss(&self) -> Option<String> {
-        return Some(self.owner.to_string());
+        if self.owner.is_valid() {
+            return Some(self.owner.to_string());
+        }
+        return None;
     }
 
     fn get_exp(&self) -> Option<u64> {

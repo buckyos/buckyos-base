@@ -56,6 +56,8 @@ pub enum NSError {
     InvalidParam(String),
     #[error("Invalid state: {0}")]
     InvalidState(String),
+    #[error("Owner conflict: {0}")]
+    OwnerConflict(String),
 }
 
 pub type NSResult<T> = Result<T, NSError>;

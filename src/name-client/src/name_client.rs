@@ -5,12 +5,12 @@ use crate::addr_rtt_db::{
     PersistencePolicy, RankedAddress, RttDatabase, SortPolicy,
 };
 use crate::dns_provider::DnsProvider;
-use crate::doc_cache::{CacheBackend, DIDDocumentCache};
+use crate::doc_cache::{CacheBackend, DIDDocumentCache, UnauthenticatedInfoCache};
 use crate::name_query::NameQuery;
 use crate::provider::RecordType;
 use crate::{
-    CacheStatus, NameInfo, NsProvider, ResolvePolicy, ResolvedDocument, DEFAULT_DID_DOC_TYPE,
-    DOC_TYPE_INFO,
+    CacheStatus, LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy,
+    ResolvedDocument, ResolveWarning, DEFAULT_DID_DOC_TYPE, DOC_TYPE_INFO,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
@@ -55,6 +55,8 @@ pub struct NameClient {
     _addr_rtt_auto_flush: Option<AutoFlushHandle>,
     cached_local_ips: StdRwLock<Vec<IpAddr>>,
     nameinfo_cache: Option<std::sync::Arc<RwLock<HashMap<String, NameInfo>>>>,
+    local_authority_overrides: Arc<LocalAuthorityOverrideStore>,
+    unauthenticated_info_cache: UnauthenticatedInfoCache,
 }
 
 impl NameClient {
@@ -98,7 +100,27 @@ impl NameClient {
             _addr_rtt_auto_flush: addr_rtt_auto_flush,
             cached_local_ips: StdRwLock::new(Vec::new()),
             nameinfo_cache,
+            local_authority_overrides: Arc::new(LocalAuthorityOverrideStore::new()),
+            unauthenticated_info_cache: UnauthenticatedInfoCache::new(),
         }
+    }
+
+    /// 写入本地测试/运维 override（设计文档第 7.3 节，类似 hosts 文件）。只应由本地
+    /// 管理员、测试框架或显式运维命令调用；不会进入普通 `doc_cache`，也不会被导出。
+    pub fn set_local_authority_override(
+        &self,
+        did: DID,
+        doc_type: &str,
+        document: EncodedDocument,
+        scope: impl Into<String>,
+        expires_at: Option<u64>,
+    ) {
+        self.local_authority_overrides
+            .set(did, doc_type, document, scope, expires_at);
+    }
+
+    pub fn clear_local_authority_override(&self, did: &DID, doc_type: &str) {
+        self.local_authority_overrides.clear(did, doc_type);
     }
 
     fn build_rtt_db(config: AddrRttDbConfig, local_cache_dir: Option<&str>) -> RttDatabase {
@@ -490,12 +512,19 @@ impl NameClient {
         doc_type: Option<&str>,
         policy: ResolvePolicy,
     ) -> NSResult<ResolvedDocument> {
+        let policy = policy.with_local_authority_override(self.local_authority_overrides.clone());
         let canonical_doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
         let is_unauthenticated_info = canonical_doc_type == DOC_TYPE_INFO;
         let mut cached_trust_level: i32 = i32::MAX;
         let mut cached_result: Option<(EncodedDocument, u64, i32)> = None;
         if self.config.enable_cache {
-            cached_result = self.doc_cache.get(did, doc_type);
+            // unauthenticated_info_cache 和 doc_cache（verified_cache 的角色）是两个
+            // 独立的存储：Info 类结果只按 iat/ttl 判断可用性，不做 owner replay guard。
+            cached_result = if is_unauthenticated_info {
+                self.unauthenticated_info_cache.get(did, doc_type)
+            } else {
+                self.doc_cache.get(did, doc_type)
+            };
             if let Some((_, exp, trust_level)) = cached_result.as_ref() {
                 if !self.is_expired(*exp) {
                     info!(
@@ -548,17 +577,34 @@ impl NameClient {
                     canonical_doc_type,
                     exp
                 );
-                if !is_unauthenticated_info {
+                // local_authority_override 命中的结果不受普通验证/缓存规则约束：
+                // 它不应该反过来污染普通 doc_cache（设计文档第 7.3 节第 3 条），
+                // 也不需要走 owner replay guard（override 本身就是最高优先级）。
+                let is_local_override = resolved
+                    .resolution_metadata
+                    .warnings
+                    .contains(&ResolveWarning::LocalAuthorityOverride);
+                if !is_unauthenticated_info && !is_local_override {
                     self.validate_doc_replay_guard(did, doc_type, &resolved.document)?;
                 }
-                if self.config.enable_cache && !is_unauthenticated_info {
-                    self.doc_cache.update(
-                        did.clone(),
-                        doc_type,
-                        resolved.document.clone(),
-                        exp,
-                        result_trust_level,
-                    );
+                if self.config.enable_cache {
+                    if is_unauthenticated_info {
+                        self.unauthenticated_info_cache.insert(
+                            did,
+                            doc_type,
+                            resolved.document.clone(),
+                            exp,
+                            result_trust_level,
+                        );
+                    } else if !is_local_override {
+                        self.doc_cache.update(
+                            did.clone(),
+                            doc_type,
+                            resolved.document.clone(),
+                            exp,
+                            result_trust_level,
+                        );
+                    }
                 }
                 resolved.resolution_metadata.cache_status = Some(if cached_result.is_some() {
                     CacheStatus::Refresh
@@ -642,6 +688,37 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         }))
     }
 
+    // 构造一个自持有（owner == 自己）的 zone 文档 + 对应 owner 文档，两者都用同一把
+    // 测试 key 签名，用来在需要真实 owner 验签的 resolve 路径测试里替代裸的 JsonLd
+    // 占位文档。
+    fn build_self_owned_zone_and_owner(
+        did: &DID,
+        iat: u64,
+        marker: &str,
+    ) -> (EncodedDocument, EncodedDocument) {
+        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        let jwk = test_owner_public_jwk();
+
+        let mut owner = OwnerConfig::new(
+            did.clone(),
+            "owner".to_string(),
+            "owner@test".to_string(),
+            jwk.clone(),
+        );
+        owner.version_seq = Some(0);
+        let owner_doc = owner.encode(Some(&private_key)).unwrap();
+
+        let mut zone = ZoneConfig::new(did.clone(), did.clone(), jwk);
+        zone.iat = iat;
+        zone.exp = iat + 3600 * 24 * 365;
+        zone.version_seq = Some(1);
+        zone.extra_info
+            .insert("marker".to_string(), serde_json::json!(marker));
+        let zone_doc = zone.encode(Some(&private_key)).unwrap();
+
+        (zone_doc, owner_doc)
+    }
+
     #[test]
     fn test_nameinfo_matches_record_type_for_caa() {
         let mut info = NameInfo::new("web3.buckyos.ai");
@@ -698,6 +775,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     struct MockProvider {
         doc: Option<EncodedDocument>,
+        owner_doc: Option<EncodedDocument>,
         err: Option<MockErr>,
     }
 
@@ -705,6 +783,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         fn ok(doc: EncodedDocument) -> Self {
             Self {
                 doc: Some(doc),
+                owner_doc: None,
                 err: None,
             }
         }
@@ -712,8 +791,16 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         fn err(err: MockErr) -> Self {
             Self {
                 doc: None,
+                owner_doc: None,
                 err: Some(err),
             }
+        }
+
+        // 让同一个 provider 也能在 doc_type == "owner" 时返回一份不同的文档，
+        // 用来搭建"文档 -> owner 递归验签"需要的最小可验证链路。
+        fn with_owner_doc(mut self, owner_doc: EncodedDocument) -> Self {
+            self.owner_doc = Some(owner_doc);
+            self
         }
     }
 
@@ -735,9 +822,14 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            doc_type: Option<&str>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
+            if doc_type == Some("owner") {
+                if let Some(owner_doc) = self.owner_doc.as_ref() {
+                    return Ok(owner_doc.clone());
+                }
+            }
             match self.err {
                 Some(MockErr::NotFound) => Err(NSError::NotFound("mock notfound".into())),
                 Some(MockErr::Disabled) => Err(NSError::Disabled("mock disabled".into())),
@@ -859,7 +951,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let did = DID::from_str("did:web:example.com").unwrap();
         let now = buckyos_get_unix_timestamp();
         let cached = make_doc(now, now + 1000, "cached");
-        let fresh = make_doc(now + 10, now + 2000, "fresh");
+        // "fresh" 走真正需要验证的 zone doc_type，必须是一份能通过 owner 递归验签的
+        // 真实文档；未验证签名的裸 JsonLd 现在会被拒绝，从而错误地退回到 cache。
+        let (fresh, owner_doc) = build_self_owned_zone_and_owner(&did, now + 10, "fresh");
 
         // 先写入低优先级缓存
         client
@@ -868,7 +962,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         // 高优先级 provider
         client
-            .add_provider(Box::new(MockProvider::ok(fresh.clone())), Some(10))
+            .add_provider(
+                Box::new(MockProvider::ok(fresh.clone()).with_owner_doc(owner_doc)),
+                Some(10),
+            )
             .await;
 
         let resolved = client.resolve_did(&did, None).await.unwrap();
@@ -896,6 +993,132 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[tokio::test]
+    async fn local_authority_override_wins_over_provider_and_skips_normal_cache() {
+        // T4.1: override 命中时优先级高于任何 provider 返回的结果，带
+        // LocalAuthorityOverride warning，且不会被写入普通 doc_cache。
+        let mut client = client_with_temp_cache(CacheBackend::Filesystem);
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let (provider_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "from-provider");
+        let override_doc = make_doc(now, now + 1000, "from-override");
+
+        client
+            .add_provider(
+                Box::new(MockProvider::ok(provider_doc.clone()).with_owner_doc(owner_doc)),
+                Some(0),
+            )
+            .await;
+        client.set_local_authority_override(
+            did.clone(),
+            "zone",
+            override_doc.clone(),
+            "test-env",
+            None,
+        );
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, override_doc);
+        assert!(resolved
+            .resolution_metadata
+            .warnings
+            .contains(&ResolveWarning::LocalAuthorityOverride));
+
+        // override 不应该泄漏进普通 doc_cache。
+        assert!(client.doc_cache.get(&did, None).is_none());
+
+        // 清除 override 后应该正常回落到 provider 的结果。
+        client.clear_local_authority_override(&did, "zone");
+        let resolved_after_clear = client.resolve_did(&did, None).await.unwrap();
+        assert_eq!(resolved_after_clear, provider_doc);
+    }
+
+    struct FlakyInfoProvider {
+        doc: EncodedDocument,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl NsProvider for FlakyInfoProvider {
+        fn get_id(&self) -> String {
+            "flaky-info".to_string()
+        }
+
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Err(NSError::NotFound("not implemented".into()))
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            _doc_type: Option<&str>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Ok(self.doc.clone())
+            } else {
+                Err(NSError::NotFound("provider gone".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_info_cache_serves_as_fallback_when_provider_goes_away() {
+        // T4.2: unauthenticated_info_cache 是独立于 doc_cache 的存储，Info 结果第一次
+        // 解析成功后应该被缓存下来；provider 之后失效时能从这个独立 cache 回落。
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: true,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        let did = DID::from_str("did:web:flaky.example").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let doc = make_doc(now, now + 1000, "flaky-info");
+
+        client
+            .add_provider(
+                Box::new(FlakyInfoProvider {
+                    doc: doc.clone(),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Some(10),
+            )
+            .await;
+
+        let first = client.resolve_did(&did, Some("info")).await.unwrap();
+        assert_eq!(first, doc);
+
+        // provider 从第二次调用起总是失败，只有 unauthenticated_info_cache 命中才能
+        // 让这次解析成功。
+        let second = client
+            .resolve_did_ex(&did, Some("info"), ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(second.document, doc);
+        assert_eq!(
+            second.resolution_metadata.cache_status,
+            Some(CacheStatus::UnauthenticatedInfoHit)
+        );
+        assert!(second
+            .resolution_metadata
+            .warnings
+            .contains(&ResolveWarning::UnauthenticatedInfoCache));
+
+        // 这个 cache 完全独立于普通 doc_cache（verified_cache 的角色）。
+        assert!(client.doc_cache.get(&did, Some("info")).is_none());
+    }
+
+    #[tokio::test]
     async fn owner_replay_guard_rejects_cached_stale_jwt_and_resolves_again() {
         let client = NameClient::new(NameClientConfig {
             enable_cache: true,
@@ -903,9 +1126,24 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             ..Default::default()
         });
         let did = DID::from_str("did:web:example.com").unwrap();
-        let old_doc = make_jwt_doc(1, 200, "old");
-        let fresh_doc = make_jwt_doc(2, 201, "fresh");
         let now = buckyos_get_unix_timestamp();
+        let owner_valid_iat = now + 200;
+        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+
+        // old/fresh 现在必须是真实可验证的 zone 文档（owner 递归 + 签名校验），
+        // 不能再用裸 JWT payload 占位——不然会在新验证路径里被当成
+        // "不可识别的文档" 直接拒绝，而不是走到 replay guard 这一层的判断。
+        let mut old_zone = ZoneConfig::new(did.clone(), did.clone(), test_owner_public_jwk());
+        old_zone.iat = now + 150;
+        old_zone.exp = old_zone.iat + DEFAULT_EXPIRE_TIME;
+        old_zone.version_seq = Some(1);
+        let old_doc = old_zone.encode(Some(&private_key)).unwrap();
+
+        let mut fresh_zone = ZoneConfig::new(did.clone(), did.clone(), test_owner_public_jwk());
+        fresh_zone.iat = now + 300;
+        fresh_zone.exp = fresh_zone.iat + DEFAULT_EXPIRE_TIME;
+        fresh_zone.version_seq = Some(2);
+        let fresh_doc = fresh_zone.encode(Some(&private_key)).unwrap();
 
         let mut owner_config = OwnerConfig::new(
             did.clone(),
@@ -913,9 +1151,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             "example@example.com".to_string(),
             test_owner_public_jwk(),
         );
+        owner_config.version_seq = Some(0);
         owner_config.mini_version_seq = Some(1);
-        owner_config.valid_iat = Some(200);
-        let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(owner_config).unwrap());
+        owner_config.valid_iat = Some(owner_valid_iat);
+        let owner_doc = owner_config.encode(Some(&private_key)).unwrap();
 
         client.doc_cache.insert(
             did.clone(),
@@ -978,7 +1217,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let tmp_dir = tempdir().unwrap().keep();
         let did = DID::from_str("did:web:example.com").unwrap();
         let now = buckyos_get_unix_timestamp();
-        let high_doc = make_doc(now, now + 2000, "high");
+        let (high_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "high");
 
         let mut client_high = NameClient::new(NameClientConfig {
             enable_cache: true,
@@ -988,7 +1227,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         });
 
         client_high
-            .add_provider(Box::new(MockProvider::ok(high_doc.clone())), Some(10))
+            .add_provider(
+                Box::new(MockProvider::ok(high_doc.clone()).with_owner_doc(owner_doc)),
+                Some(10),
+            )
             .await;
 
         let resolved_first = client_high.resolve_did(&did, None).await.unwrap();
@@ -1328,6 +1570,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         struct MixedProvider {
             signed_doc: EncodedDocument,
             info_doc: EncodedDocument,
+            owner_doc: EncodedDocument,
         }
 
         #[async_trait]
@@ -1356,6 +1599,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             ) -> NSResult<EncodedDocument> {
                 match doc_type {
                     Some("info") => Ok(self.info_doc.clone()),
+                    Some("owner") => Ok(self.owner_doc.clone()),
                     None => Ok(self.signed_doc.clone()),
                     _ => Err(NSError::NotFound("not implemented".into())),
                 }
@@ -1368,11 +1612,24 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         -----END PRIVATE KEY-----
         "#;
         let owner_private_key = EncodingKey::from_ed_pem(owner_private_key_pem.as_bytes()).unwrap();
+        let device_did = DID::from_str("did:web:ood1.example").unwrap();
+
+        // 设备文档必须能递归解析到一个真实可验证的 owner，这里让设备"自持有"，
+        // 用同一把 key 签发 owner 文档。
+        let mut owner_config = OwnerConfig::new(
+            device_did.clone(),
+            "ood1-owner".to_string(),
+            "ood1-owner@test".to_string(),
+            test_owner_public_jwk(),
+        );
+        owner_config.version_seq = Some(0);
+        let owner_doc = owner_config.encode(Some(&owner_private_key)).unwrap();
 
         let mut signed_device_config = DeviceConfig::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
+        signed_device_config.owner = device_did.clone();
         signed_device_config.ips = vec!["192.0.2.10".parse().unwrap()];
         let signed_doc = signed_device_config
             .encode(Some(&owner_private_key))
@@ -1394,6 +1651,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 Box::new(MixedProvider {
                     signed_doc,
                     info_doc,
+                    owner_doc,
                 }),
                 Some(DEFAULT_PROVIDER_TRUST_LEVEL),
             )
