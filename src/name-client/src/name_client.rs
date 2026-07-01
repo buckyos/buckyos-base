@@ -8,7 +8,10 @@ use crate::dns_provider::DnsProvider;
 use crate::doc_cache::{CacheBackend, DIDDocumentCache};
 use crate::name_query::NameQuery;
 use crate::provider::RecordType;
-use crate::{NameInfo, NsProvider};
+use crate::{
+    CacheStatus, NameInfo, NsProvider, ResolvePolicy, ResolvedDocument, DEFAULT_DID_DOC_TYPE,
+    DOC_TYPE_INFO,
+};
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
 use name_lib::DEFAULT_EXPIRE_TIME;
@@ -481,11 +484,14 @@ impl NameClient {
             .and_then(|value| value.get("exp").and_then(|ts| ts.as_u64()))
     }
 
-    pub async fn resolve_did(
+    pub async fn resolve_did_ex(
         &self,
         did: &DID,
         doc_type: Option<&str>,
-    ) -> NSResult<EncodedDocument> {
+        policy: ResolvePolicy,
+    ) -> NSResult<ResolvedDocument> {
+        let canonical_doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
+        let is_unauthenticated_info = canonical_doc_type == DOC_TYPE_INFO;
         let mut cached_trust_level: i32 = i32::MAX;
         let mut cached_result: Option<(EncodedDocument, u64, i32)> = None;
         if self.config.enable_cache {
@@ -501,45 +507,65 @@ impl NameClient {
                     cached_trust_level = *trust_level;
                 }
             }
-            if let Some((doc, _, _)) = cached_result.as_ref() {
-                if let Err(err) = self.validate_doc_replay_guard(did, doc_type, doc) {
-                    info!(
-                        "cached did:{}#{} rejected by owner replay guard: {}",
-                        did.to_string(),
-                        doc_type.unwrap_or(""),
-                        err
-                    );
-                    self.doc_cache.delete(did.clone(), doc_type);
-                    cached_result = None;
-                    cached_trust_level = i32::MAX;
+            if !is_unauthenticated_info {
+                if let Some((doc, _, _)) = cached_result.as_ref() {
+                    if let Err(err) = self.validate_doc_replay_guard(did, doc_type, doc) {
+                        info!(
+                            "cached did:{}#{} rejected by owner replay guard: {}",
+                            did.to_string(),
+                            doc_type.unwrap_or(""),
+                            err
+                        );
+                        self.doc_cache.delete(did.clone(), doc_type);
+                        cached_result = None;
+                        cached_trust_level = i32::MAX;
+                    }
                 }
             }
         }
 
+        let max_trust_level = if is_unauthenticated_info {
+            None
+        } else {
+            Some(cached_trust_level)
+        };
         let reslove_result = self
             .name_query
-            .query_did(did, doc_type, Some(cached_trust_level))
+            .query_did_ex(did, Some(canonical_doc_type), max_trust_level, policy)
             .await;
 
         match reslove_result {
-            Ok((did_doc, exp, result_trust_level)) => {
+            Ok(mut resolved) => {
+                let exp = Self::extract_exp(&resolved.document)
+                    .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
+                let result_trust_level = resolved
+                    .resolution_metadata
+                    .authority_rank
+                    .unwrap_or(DEFAULT_PROVIDER_TRUST_LEVEL);
                 info!(
                     "resolve did:{}#{} success, exp:{}",
                     did.to_string(),
-                    doc_type.unwrap_or(""),
+                    canonical_doc_type,
                     exp
                 );
-                self.validate_doc_replay_guard(did, doc_type, &did_doc)?;
-                if self.config.enable_cache {
+                if !is_unauthenticated_info {
+                    self.validate_doc_replay_guard(did, doc_type, &resolved.document)?;
+                }
+                if self.config.enable_cache && !is_unauthenticated_info {
                     self.doc_cache.update(
                         did.clone(),
                         doc_type,
-                        did_doc.clone(),
+                        resolved.document.clone(),
                         exp,
                         result_trust_level,
                     );
                 }
-                Ok(did_doc)
+                resolved.resolution_metadata.cache_status = Some(if cached_result.is_some() {
+                    CacheStatus::Refresh
+                } else {
+                    CacheStatus::Miss
+                });
+                Ok(resolved)
             }
             Err(result_error) => match result_error {
                 NSError::Disabled(msg) => {
@@ -550,19 +576,42 @@ impl NameClient {
                     Err(NSError::Disabled(msg))
                 }
                 _ => {
-                    if let Some((doc, exp, _)) = cached_result {
+                    if let Some((doc, exp, trust_level)) = cached_result {
                         info!(
                             "resolve did:{}#{} by cache success, exp:{}",
                             did.to_string(),
-                            doc_type.unwrap_or(""),
+                            canonical_doc_type,
                             exp
                         );
-                        return Ok(doc.clone());
+                        let cache_status = if is_unauthenticated_info {
+                            CacheStatus::UnauthenticatedInfoHit
+                        } else {
+                            CacheStatus::Fallback
+                        };
+                        return Ok(ResolvedDocument::from_cache(
+                            doc,
+                            did,
+                            canonical_doc_type,
+                            exp,
+                            trust_level,
+                            cache_status,
+                        ));
                     }
                     Err(result_error)
                 }
             },
         }
+    }
+
+    pub async fn resolve_did(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+    ) -> NSResult<EncodedDocument> {
+        Ok(self
+            .resolve_did_ex(did, doc_type, ResolvePolicy::default())
+            .await?
+            .document)
     }
 }
 

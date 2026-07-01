@@ -6,7 +6,7 @@
 
 */
 
-use crate::{HttpsProvider, NameInfo, NsProvider, RecordType};
+use crate::{HttpsProvider, MethodMatcher, NameInfo, NsProvider, RecordType, ResolverCaps};
 use async_trait::async_trait;
 use buckyos_kit::BuckyOSMachineConfig;
 use log::info;
@@ -66,6 +66,20 @@ impl BnsProvider {
 impl NsProvider for BnsProvider {
     fn get_id(&self) -> String {
         "bns-provider".to_string()
+    }
+
+    fn methods(&self) -> MethodMatcher {
+        MethodMatcher::exact(["bns", "dev"])
+    }
+
+    fn caps(&self) -> ResolverCaps {
+        ResolverCaps {
+            published_state: false,
+            document_body: true,
+            self_signed_candidate: true,
+            unauthenticated_info: true,
+            negative_state: true,
+        }
     }
 
     async fn query(

@@ -250,6 +250,19 @@ pub async fn resolve_did(did: &DID, doc_type: Option<&str>) -> NSResult<EncodedD
     client.resolve_did(did, doc_type).await
 }
 
+pub async fn resolve_did_ex(
+    did: &DID,
+    doc_type: Option<&str>,
+    policy: ResolvePolicy,
+) -> NSResult<ResolvedDocument> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not found".to_string()));
+    }
+    let client = client.unwrap();
+    client.resolve_did_ex(did, doc_type, policy).await
+}
+
 pub async fn resolve_owner_config(did: &DID) -> NSResult<OwnerConfig> {
     let client = get_name_client();
     if client.is_none() {

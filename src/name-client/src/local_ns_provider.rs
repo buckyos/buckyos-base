@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use crate::DEFAULT_DID_DOC_TYPE;
-use crate::{NSResult, NameInfo, NsProvider, RecordType};
+use crate::{MethodMatcher, NSResult, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 
 /* config file example (toml):
@@ -268,6 +268,10 @@ impl LocalConfigDnsProvider {
 impl NsProvider for LocalConfigDnsProvider {
     fn get_id(&self) -> String {
         "local dns-record-config provider".to_string()
+    }
+
+    fn methods(&self) -> MethodMatcher {
+        MethodMatcher::exact(["web"])
     }
 
     async fn query(

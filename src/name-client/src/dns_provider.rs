@@ -13,7 +13,7 @@ use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
-use crate::{NameInfo, NsProvider, RecordType, DEFAULT_DID_DOC_TYPE};
+use crate::{MethodMatcher, NameInfo, NsProvider, RecordType, DEFAULT_DID_DOC_TYPE};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -67,6 +67,10 @@ impl DnsProvider {
 impl NsProvider for DnsProvider {
     fn get_id(&self) -> String {
         return "dns provider".to_string();
+    }
+
+    fn methods(&self) -> MethodMatcher {
+        MethodMatcher::exact(["web"])
     }
 
     async fn query(

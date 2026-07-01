@@ -1,5 +1,5 @@
 use crate::utility::extract_root_domain;
-use crate::{NSError, NSResult, NameInfo, NsProvider, NsUpdateProvider, RecordType};
+use crate::{NSError, NSResult, NameInfo, NsProvider, NsUpdateProvider, RecordType, ResolverCaps};
 use name_lib::*;
 use reqwest::{
     header::{HeaderMap, HeaderValue},
@@ -240,6 +240,10 @@ impl NsUpdateProvider for CloudflareProvider {
 impl NsProvider for CloudflareProvider {
     fn get_id(&self) -> String {
         "cloudflare".to_string()
+    }
+
+    fn caps(&self) -> ResolverCaps {
+        ResolverCaps::dns_only()
     }
 
     async fn query(

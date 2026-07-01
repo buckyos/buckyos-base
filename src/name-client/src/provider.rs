@@ -1,3 +1,4 @@
+use buckyos_kit::buckyos_get_unix_timestamp;
 use jsonwebtoken::DecodingKey;
 use name_lib::OwnerConfig;
 use name_lib::*;
@@ -5,6 +6,586 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::IpAddr};
 
 pub const DEFAULT_DID_DOC_TYPE: &str = "zone";
+
+pub const DOC_TYPE_OWNER: &str = "owner";
+pub const DOC_TYPE_INFO: &str = "info";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MethodMatcher {
+    Exact(Vec<String>),
+    Any,
+}
+
+impl MethodMatcher {
+    pub fn exact(methods: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Exact(methods.into_iter().map(Into::into).collect())
+    }
+
+    pub fn matches(&self, method: &str) -> bool {
+        match self {
+            Self::Exact(methods) => methods.iter().any(|item| item == method),
+            Self::Any => true,
+        }
+    }
+
+    pub fn is_exact_match(&self, method: &str) -> bool {
+        match self {
+            Self::Exact(methods) => methods.iter().any(|item| item == method),
+            Self::Any => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolverCaps {
+    pub published_state: bool,
+    pub document_body: bool,
+    pub self_signed_candidate: bool,
+    pub unauthenticated_info: bool,
+    pub negative_state: bool,
+}
+
+impl ResolverCaps {
+    pub fn legacy_document() -> Self {
+        Self {
+            published_state: false,
+            document_body: true,
+            self_signed_candidate: true,
+            unauthenticated_info: true,
+            negative_state: true,
+        }
+    }
+
+    pub fn dns_only() -> Self {
+        Self {
+            published_state: false,
+            document_body: false,
+            self_signed_candidate: false,
+            unauthenticated_info: false,
+            negative_state: false,
+        }
+    }
+}
+
+impl Default for ResolverCaps {
+    fn default() -> Self {
+        Self::legacy_document()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvidenceKind {
+    PublishedState,
+    AnchoredDocumentBody,
+    SelfSignedCandidate,
+    UnauthenticatedInfo,
+    Negative,
+    NotFound,
+    TransportError,
+}
+
+impl EvidenceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EvidenceKind::PublishedState => "PublishedState",
+            EvidenceKind::AnchoredDocumentBody => "AnchoredDocumentBody",
+            EvidenceKind::SelfSignedCandidate => "SelfSignedCandidate",
+            EvidenceKind::UnauthenticatedInfo => "UnauthenticatedInfo",
+            EvidenceKind::Negative => "Negative",
+            EvidenceKind::NotFound => "NotFound",
+            EvidenceKind::TransportError => "TransportError",
+        }
+    }
+
+    pub fn rank(&self) -> u8 {
+        match self {
+            EvidenceKind::PublishedState => 0,
+            EvidenceKind::AnchoredDocumentBody => 1,
+            EvidenceKind::SelfSignedCandidate => 2,
+            EvidenceKind::UnauthenticatedInfo => 3,
+            EvidenceKind::Negative => 4,
+            EvidenceKind::NotFound => 5,
+            EvidenceKind::TransportError => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NameStatus {
+    Active,
+    Missing,
+    Expired,
+    Tombstoned,
+}
+
+impl Default for NameStatus {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocumentStatus {
+    Missing,
+    Active,
+    Revoked,
+    Expired,
+    Migrated,
+    Tombstoned,
+}
+
+impl Default for DocumentStatus {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+impl DocumentStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Revoked | Self::Tombstoned)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OwnerSource {
+    MethodAuthority,
+    DocumentClaim,
+    LocalOverride,
+    Unknown,
+}
+
+impl Default for OwnerSource {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentRef {
+    pub uri: Option<String>,
+    pub content_hash: Option<String>,
+    pub inline_document: Option<EncodedDocument>,
+}
+
+impl DocumentRef {
+    pub fn inline(document: EncodedDocument) -> Self {
+        Self {
+            uri: None,
+            content_hash: None,
+            inline_document: Some(document),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedState {
+    pub did: DID,
+    pub doc_type: String,
+    pub name_status: NameStatus,
+    pub document_status: DocumentStatus,
+    pub document_ref: Option<DocumentRef>,
+    pub document_version: Option<u64>,
+    pub previous_version: Option<u64>,
+    pub next_version: Option<u64>,
+    pub effective_owner: Option<DID>,
+    pub owner_source: OwnerSource,
+    pub authority_root: Option<String>,
+    pub authority_seq: Option<u64>,
+    pub lineage_epoch: Option<u64>,
+    pub canonical_id: Option<DID>,
+    pub equivalent_ids: Vec<DID>,
+    pub migration_target: Option<DID>,
+}
+
+impl PublishedState {
+    pub fn active(did: DID, doc_type: String, document: EncodedDocument) -> Self {
+        Self {
+            did,
+            doc_type,
+            name_status: NameStatus::Active,
+            document_status: DocumentStatus::Active,
+            document_ref: Some(DocumentRef::inline(document)),
+            document_version: None,
+            previous_version: None,
+            next_version: None,
+            effective_owner: None,
+            owner_source: OwnerSource::Unknown,
+            authority_root: None,
+            authority_seq: None,
+            lineage_epoch: None,
+            canonical_id: None,
+            equivalent_ids: Vec::new(),
+            migration_target: None,
+        }
+    }
+
+    pub fn missing(did: DID, doc_type: String) -> Self {
+        Self {
+            did,
+            doc_type,
+            name_status: NameStatus::Active,
+            document_status: DocumentStatus::Missing,
+            document_ref: None,
+            document_version: None,
+            previous_version: None,
+            next_version: None,
+            effective_owner: None,
+            owner_source: OwnerSource::Unknown,
+            authority_root: None,
+            authority_seq: None,
+            lineage_epoch: None,
+            canonical_id: None,
+            equivalent_ids: Vec::new(),
+            migration_target: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentBody {
+    pub document: EncodedDocument,
+    pub evidence_kind: EvidenceKind,
+    pub resolver_id: Option<String>,
+    pub retrieved: Option<u64>,
+}
+
+impl DocumentBody {
+    pub fn anchored(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+        Self {
+            document,
+            evidence_kind: EvidenceKind::AnchoredDocumentBody,
+            resolver_id,
+            retrieved: Some(buckyos_get_unix_timestamp()),
+        }
+    }
+
+    pub fn self_signed(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+        Self {
+            document,
+            evidence_kind: EvidenceKind::SelfSignedCandidate,
+            resolver_id,
+            retrieved: Some(buckyos_get_unix_timestamp()),
+        }
+    }
+
+    pub fn unauthenticated(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+        Self {
+            document,
+            evidence_kind: EvidenceKind::UnauthenticatedInfo,
+            resolver_id,
+            retrieved: Some(buckyos_get_unix_timestamp()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolveWarning {
+    LocalAuthorityOverride,
+    UnauthenticatedInfoCache,
+    EvidenceContractViolation {
+        evidence: String,
+        reason: String,
+    },
+    SignedByHistoricalKey,
+    KeyRotatedAfterIat,
+    PendingActivation {
+        pending_version: u64,
+        valid_from: u64,
+    },
+    LegacyResolverEvidence,
+    CacheFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheStatus {
+    Disabled,
+    Miss,
+    Hit,
+    Refresh,
+    Fallback,
+    UnauthenticatedInfoHit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DidResolutionError {
+    pub uri: String,
+    pub code: String,
+    pub title: String,
+    pub detail: Option<String>,
+}
+
+impl DidResolutionError {
+    pub fn new(uri: &str, code: &str, title: &str, detail: Option<String>) -> Self {
+        Self {
+            uri: uri.to_string(),
+            code: code.to_string(),
+            title: title.to_string(),
+            detail,
+        }
+    }
+
+    pub fn from_ns_error(err: &NSError) -> Self {
+        match err {
+            NSError::InvalidDID(detail) => Self::new(
+                "https://www.w3.org/ns/did#INVALID_DID",
+                "invalidDid",
+                "Invalid DID",
+                Some(detail.clone()),
+            ),
+            NSError::NotFound(detail) => Self::new(
+                "https://www.w3.org/ns/did#NOT_FOUND",
+                "notFound",
+                "DID document not found",
+                Some(detail.clone()),
+            ),
+            NSError::Disabled(detail) => Self::new(
+                "https://www.w3.org/ns/did#DEACTIVATED",
+                "deactivated",
+                "DID document deactivated",
+                Some(detail.clone()),
+            ),
+            NSError::InvalidParam(detail) => Self::new(
+                "https://www.w3.org/ns/did#INVALID_OPTIONS",
+                "invalidOptions",
+                "Invalid resolution options",
+                Some(detail.clone()),
+            ),
+            _ => Self::new(
+                "https://www.w3.org/ns/did#INTERNAL_ERROR",
+                "internalError",
+                "DID resolution failed",
+                Some(err.to_string()),
+            ),
+        }
+    }
+
+    pub fn method_not_supported(method: &str) -> Self {
+        Self::new(
+            "https://www.w3.org/ns/did#METHOD_NOT_SUPPORTED",
+            "methodNotSupported",
+            "DID method not supported",
+            Some(method.to_string()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DidResolutionMetadata {
+    pub content_type: Option<String>,
+    pub retrieved: Option<u64>,
+    pub resolver_id: Option<String>,
+    pub authority_rank: Option<i32>,
+    pub cache_status: Option<CacheStatus>,
+    pub warnings: Vec<ResolveWarning>,
+    pub error: Option<DidResolutionError>,
+}
+
+impl Default for DidResolutionMetadata {
+    fn default() -> Self {
+        Self {
+            content_type: None,
+            retrieved: None,
+            resolver_id: None,
+            authority_rank: None,
+            cache_status: None,
+            warnings: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuckyOSDocumentMetadata {
+    pub doc_type: String,
+    pub document_status: DocumentStatus,
+    pub document_version: Option<u64>,
+    pub previous_version: Option<u64>,
+    pub lineage_epoch: Option<u64>,
+    pub authority_seq: Option<u64>,
+    pub proof_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DidDocumentMetadata {
+    pub created: Option<u64>,
+    pub updated: Option<u64>,
+    pub deactivated: Option<bool>,
+    pub version_id: Option<String>,
+    pub next_version_id: Option<String>,
+    pub canonical_id: Option<DID>,
+    pub equivalent_ids: Vec<DID>,
+    #[serde(rename = "buckyos")]
+    pub buckyos: BuckyOSDocumentMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedDocument {
+    pub document: EncodedDocument,
+    pub resolution_metadata: DidResolutionMetadata,
+    pub document_metadata: DidDocumentMetadata,
+}
+
+impl ResolvedDocument {
+    pub fn from_document(
+        document: EncodedDocument,
+        _did: &DID,
+        doc_type: &str,
+        authority_rank: Option<i32>,
+        resolver_id: Option<String>,
+        evidence_kind: EvidenceKind,
+        published: Option<&PublishedState>,
+    ) -> Self {
+        let doc_value = document.clone().to_json_value().ok();
+        let created = doc_value
+            .as_ref()
+            .and_then(|value| value.get("iat").and_then(|ts| ts.as_u64()));
+        let updated = created;
+        let version_seq = doc_value
+            .as_ref()
+            .and_then(|value| value.get("version_seq").and_then(|ts| ts.as_u64()));
+
+        let document_status = published
+            .map(|state| state.document_status.clone())
+            .unwrap_or(DocumentStatus::Active);
+        let document_version = published
+            .and_then(|state| state.document_version)
+            .or(version_seq);
+        let previous_version = published.and_then(|state| state.previous_version);
+        let next_version = published.and_then(|state| state.next_version);
+
+        let content_type = match &document {
+            EncodedDocument::Jwt(_) => "application/did+jwt",
+            EncodedDocument::JsonLd(_) => "application/did+ld+json",
+        }
+        .to_string();
+
+        let mut warnings = Vec::new();
+        if evidence_kind == EvidenceKind::AnchoredDocumentBody && published.is_none() {
+            warnings.push(ResolveWarning::LegacyResolverEvidence);
+        }
+
+        Self {
+            document,
+            resolution_metadata: DidResolutionMetadata {
+                content_type: Some(content_type),
+                retrieved: Some(buckyos_get_unix_timestamp()),
+                resolver_id,
+                authority_rank,
+                cache_status: Some(CacheStatus::Miss),
+                warnings,
+                error: None,
+            },
+            document_metadata: DidDocumentMetadata {
+                created,
+                updated,
+                deactivated: Some(document_status.is_terminal()),
+                version_id: document_version.map(|version| version.to_string()),
+                next_version_id: next_version.map(|version| version.to_string()),
+                canonical_id: published.and_then(|state| state.canonical_id.clone()),
+                equivalent_ids: published
+                    .map(|state| state.equivalent_ids.clone())
+                    .unwrap_or_default(),
+                buckyos: BuckyOSDocumentMetadata {
+                    doc_type: doc_type.to_string(),
+                    document_status,
+                    document_version,
+                    previous_version,
+                    lineage_epoch: published.and_then(|state| state.lineage_epoch),
+                    authority_seq: published.and_then(|state| state.authority_seq),
+                    proof_root: published.and_then(|state| state.authority_root.clone()),
+                },
+            },
+        }
+    }
+
+    pub fn from_cache(
+        document: EncodedDocument,
+        did: &DID,
+        doc_type: &str,
+        exp: u64,
+        trust_level: i32,
+        cache_status: CacheStatus,
+    ) -> Self {
+        let mut resolved = Self::from_document(
+            document,
+            did,
+            doc_type,
+            Some(trust_level),
+            Some("did-cache".to_string()),
+            EvidenceKind::AnchoredDocumentBody,
+            None,
+        );
+        resolved.resolution_metadata.cache_status = Some(cache_status);
+        resolved.document_metadata.updated = Some(exp);
+        resolved
+            .resolution_metadata
+            .warnings
+            .push(ResolveWarning::CacheFallback);
+        resolved
+    }
+
+    pub fn with_warning(mut self, warning: ResolveWarning) -> Self {
+        self.resolution_metadata.warnings.push(warning);
+        self
+    }
+
+    pub fn with_cache_status(mut self, cache_status: CacheStatus) -> Self {
+        self.resolution_metadata.cache_status = Some(cache_status);
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvePolicy {
+    pub follow_migration: bool,
+    pub allow_self_signed_when_missing: bool,
+    pub allow_cache_when_authority_unavailable: bool,
+    pub max_depth: usize,
+    visited: Vec<(DID, String)>,
+}
+
+impl Default for ResolvePolicy {
+    fn default() -> Self {
+        Self {
+            follow_migration: true,
+            allow_self_signed_when_missing: false,
+            allow_cache_when_authority_unavailable: true,
+            max_depth: 8,
+            visited: Vec::new(),
+        }
+    }
+}
+
+impl ResolvePolicy {
+    pub fn for_authority_lookup(&self) -> Self {
+        let mut policy = self.clone();
+        policy.allow_self_signed_when_missing = false;
+        policy.allow_cache_when_authority_unavailable = false;
+        policy
+    }
+
+    pub fn descend(&self, did: &DID, doc_type: &str) -> NSResult<Self> {
+        if self.visited.len() >= self.max_depth {
+            return Err(NSError::InvalidState(format!(
+                "DID resolution recursion depth exceeded at {}#{}",
+                did.to_string(),
+                doc_type
+            )));
+        }
+        if self.visited.iter().any(|(visited_did, visited_doc_type)| {
+            visited_did == did && visited_doc_type == doc_type
+        }) {
+            return Err(NSError::InvalidState(format!(
+                "DID resolution recursion loop at {}#{}",
+                did.to_string(),
+                doc_type
+            )));
+        }
+        let mut next = self.clone();
+        next.visited.push((did.clone(), doc_type.to_string()));
+        Ok(next)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum RecordType {
@@ -230,7 +811,6 @@ impl NameInfo {
                             .unwrap()
                             .devices
                             .insert(device_config.name.clone(), device_config);
-     
                     }
                 }
             }
@@ -283,6 +863,19 @@ impl NameInfo {
 #[async_trait::async_trait]
 pub trait NsProvider: 'static + Send + Sync {
     fn get_id(&self) -> String;
+
+    fn methods(&self) -> MethodMatcher {
+        MethodMatcher::Any
+    }
+
+    fn caps(&self) -> ResolverCaps {
+        ResolverCaps::default()
+    }
+
+    fn requires_verification(&self, doc_type: &str) -> bool {
+        doc_type != DOC_TYPE_INFO
+    }
+
     async fn query(
         &self,
         name: &str,
@@ -295,6 +888,47 @@ pub trait NsProvider: 'static + Send + Sync {
         doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument>;
+
+    async fn resolve_published_state(
+        &self,
+        _did: &DID,
+        _doc_type: &str,
+    ) -> NSResult<Option<PublishedState>> {
+        Ok(None)
+    }
+
+    async fn fetch_document_body(&self, doc_ref: &DocumentRef) -> NSResult<Option<DocumentBody>> {
+        Ok(doc_ref
+            .inline_document
+            .as_ref()
+            .map(|doc| DocumentBody::anchored(doc.clone(), Some(self.get_id()))))
+    }
+
+    async fn query_self_signed_candidates(
+        &self,
+        did: &DID,
+        doc_type: &str,
+    ) -> NSResult<Vec<DocumentBody>> {
+        let legacy_doc_type = if doc_type == DEFAULT_DID_DOC_TYPE {
+            None
+        } else {
+            Some(doc_type)
+        };
+        let doc = self.query_did(did, legacy_doc_type, None).await?;
+        Ok(vec![DocumentBody::anchored(doc, Some(self.get_id()))])
+    }
+
+    async fn query_unauthenticated_info(
+        &self,
+        did: &DID,
+        doc_type: &str,
+    ) -> NSResult<Vec<DocumentBody>> {
+        let doc = self.query_did(did, Some(doc_type), None).await?;
+        Ok(vec![DocumentBody::unauthenticated(
+            doc,
+            Some(self.get_id()),
+        )])
+    }
 }
 
 #[async_trait::async_trait]
