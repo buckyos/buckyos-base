@@ -53,9 +53,87 @@ doc_type 解决两件事：
 - **Document**：需要签名、参与权威发布与验证的部分（owner / zone / device / service 等配置）。本文的状态机、权威源、缓存规则都是针对 Document 的。
 - **Info**：实时、易变的信息（如 DeviceInfo、运行时地址）。Info 通常**不需要签名**；链上一般**不存储** Info（个别组织可能选择存储）。
 
+实现上，这个边界必须由 `DidResolver::requires_verification(doc_type)` 显式落地：声明为免验证的 Info 类 `doc_type` 不进入 `PublishedState / DocumentStatus` 状态机，不触发 owner 递归，也不受 `Missing / Revoked / Tombstoned` 这类 Document 门禁约束。它仍然使用第 3 节的 method-scoped resolver 选择，避免 wildcard resolver 覆盖具体 DID method，但解析结果只能作为非权威实时信息使用。
+
 **IP 解析的演进目标**：随着 IPv6 普及、每个节点都能拥有公网固定 IP，Zone config / device document 里会直接带上固定 IP。那时 **resolve Document 就等同于 resolve IP**，不再需要独立的地址解析流程。（当前实现里地址提取的顺序和位置还不一定对，属于待校正项，也回应了 review 中提到的 “resolve-ip 流程是否纳入统一递归” 的问题。）
 
-**过渡期**：当节点位于 NAT 后、无公网 IP、或公网 IP 动态可变时，固定 IP 假设不成立。此时仍需依赖传统的 SN（Super Node）服务作为过渡，由 SN 承担动态地址的发现与中转。体系已为这条过渡路径留好位置——**SN 提供的是 Info 层（动态地址），而非 Document 层的权威**，因此 SN 返回的地址不改变 Document 的权威性（与第 11.4 节 SN 定位一致）。
+**过渡期**：当节点位于 NAT 后、无公网 IP、或公网 IP 动态可变时，固定 IP 假设不成立。此时仍需依赖传统的 SN（Super Node）服务作为过渡，由 SN / DNS 承担动态地址的发现与中转。因此 SN 返回的地址不改变 Document 的权威性。
+
+### 1.4 与 W3C DID Core / DID Resolution 的术语对齐
+
+本次重构是 breaking change，应尽量把对外名词对齐到 W3C DID Core 和 DID Resolution，方便未来和通用 DID 工具、DIF Universal Resolver、HTTP binding 互操作。但这里要保留一个边界：W3C DID Core 的默认模型是 `resolve(did, resolutionOptions) -> (didResolutionMetadata, didDocument, didDocumentMetadata)`，一个 DID 解析出一份 DID Document；BuckyOS 的核心模型是 `(did, doc_type)`，同一个名字下可以有多份平级、独立版本和独立撤销的文档。
+
+因此对齐策略是：
+
+1. **对外结果结构采用 W3C 三段式 metadata**。`resolve_did_ex` 返回的 `ResolvedDocument` 应显式拆成 `resolution_metadata`、`document`、`document_metadata` 三层。当前散落的 `warnings`、resolver 选择、cache 使用、authority 证明、transport 信息属于 `resolution_metadata`；document status、version、canonical/alias、deactivation、method proof 属于 `document_metadata`。
+2. **`doc_type` 是 BuckyOS 扩展语义**。默认 DID Document 可按 W3C `didDocument` 暴露；其它 `doc_type` 可以理解成 BuckyOS 的 resolution option（例如 `buckyos:docType`），或在 HTTP 互操作层映射成 DID URL dereferencing 返回的 resource。不要在文档里声称所有 `doc_type` 都是 W3C DID Core 意义上的同一份 DID Document。
+3. **method-scoped resolver 对齐 DID method resolver / driver 模型**。`MethodMatcher::Exact(["bns"])` 可以类比 DIF Universal Resolver 的 per-method driver 注册；W3C 规范要求 resolver 至少支持一个 DID method，但不规定本地 driver registry 形态。
+4. **错误与负状态优先使用 W3C error vocabulary**。内部仍可保留 `ResolveError` enum，但要能稳定投影到 W3C DID Resolution v0.3 的 error URI；兼容老 DID Core 1.0 文档时，可同时保留 camelCase alias。
+
+推荐的 typed result 形态：
+
+```rust
+struct ResolvedDocument {
+    document: EncodedDocument,
+    resolution_metadata: DidResolutionMetadata,
+    document_metadata: DidDocumentMetadata,
+}
+
+struct DidResolutionMetadata {
+    content_type: Option<String>,
+    retrieved: Option<u64>,
+    resolver_id: Option<String>,
+    authority_rank: Option<i32>,
+    cache_status: Option<CacheStatus>,
+    warnings: Vec<ResolveWarning>,
+    error: Option<DidResolutionError>,
+}
+
+struct DidDocumentMetadata {
+    created: Option<u64>,
+    updated: Option<u64>,
+    deactivated: Option<bool>,
+    version_id: Option<String>,
+    next_version_id: Option<String>,
+    canonical_id: Option<DID>,
+    equivalent_ids: Vec<DID>,
+
+    // BuckyOS 扩展字段，避免把 per-doc_type 状态误写成 DID-level 状态。
+    buckyos: BuckyOSDocumentMetadata,
+}
+
+struct BuckyOSDocumentMetadata {
+    doc_type: String,
+    document_status: DocumentStatus,
+    document_version: Option<u64>,
+    previous_version: Option<u64>,
+    lineage_epoch: Option<u64>,
+    authority_seq: Option<u64>,
+    proof_root: Option<Hash>,
+}
+```
+
+关键映射规则：
+
+| BuckyOS 概念 | W3C/DIF 对齐 | 注意事项 |
+| --- | --- | --- |
+| `resolve_did_ex` | DID Resolution `resolve()` result | 返回结构按 `didResolutionMetadata / didDocument / didDocumentMetadata` 三段式组织。 |
+| `MethodMatcher::Exact(["bns"])` | per DID method resolver / Universal Resolver driver | 这是工程注册模型，不是 W3C Core 数据模型的一部分。 |
+| `warnings` | `didResolutionMetadata` | 例如 `LocalAuthorityOverride`、`SignedByHistoricalKey`、`PendingActivation` 都是解析过程信息。 |
+| `Missing` | `https://www.w3.org/ns/did#NOT_FOUND` / `notFound` | 只能用于权威源确认不存在；transport error 不能伪装成 Missing。 |
+| `resolvers.is_empty()` | `https://www.w3.org/ns/did#METHOD_NOT_SUPPORTED` / `methodNotSupported` | 如果没有支持该 DID method 的 resolver，不应返回普通 NotFound。 |
+| `canonicalize_did` 失败 | `https://www.w3.org/ns/did#INVALID_DID` / `invalidDid` | 这是输入 DID 语法或 canonical form 错误。 |
+| body 格式或签名结构非法 | `https://www.w3.org/ns/did#INVALID_DID_DOCUMENT` | 包括解析出非 DID Document 或关键字段不满足约束。 |
+| `Tombstoned` / `Revoked` | `didDocumentMetadata.deactivated = true` 或 BuckyOS extension | 只有当状态表示整个 DID/name 被停用时才映射为 W3C `deactivated`；如果只是某个 `doc_type` 的终止状态，应放在 `buckyos.document_status`，避免污染 DID-level 语义。 |
+| `Migrated` / alias | `canonicalId` / `equivalentId` | 只有同一 DID method 内、由 method 规范保证逻辑等价时才能使用。跨 method 迁移或弱别名应使用 BuckyOS extension，或在 DID Document 中使用 `alsoKnownAs`。 |
+| `document_version` | `versionId` | W3C 要求 ASCII string，对外可把 `u64` 渲染成字符串。 |
+| `previous_version` | BuckyOS `previousVersionId` extension | W3C `nextVersionId` 表示“当前解析版本之后的下一版”，不是 previous；解析历史版本时，如果 Registry 能证明后一版，才填 `nextVersionId`。 |
+
+参考规范：
+
+- [W3C DID Resolution v0.3](https://www.w3.org/TR/did-resolution/)
+- [W3C DID Core 1.0](https://www.w3.org/TR/did-1.0/)
+- [DIF Universal Resolver](https://github.com/decentralized-identity/universal-resolver)
 
 ## 2. trust_level 语义
 
@@ -105,6 +183,7 @@ struct ResolverCaps {
     published_state: bool,      // 能返回发布状态，如 BNS ResolveResult
     document_body: bool,        // 能根据 DocumentRef 拉取文档原文
     self_signed_candidate: bool,// 能返回自签名候选文档
+    unauthenticated_info: bool, // 能返回不参与 owner 信任链的 Info 类内容
     negative_state: bool,       // 能表达 Revoked/Tombstoned/Missing
 }
 ```
@@ -130,11 +209,14 @@ enum ResolveEvidence {
     PublishedState(PublishedState),
     AnchoredDocumentBody(DocumentBody),
     SelfSignedCandidate(DocumentBody),
+    UnauthenticatedInfo(DocumentBody),
     Negative(NegativeState),
-    NotFound,
+    NotFound, // 只表示当前 resolver 未找到；权威 Missing 才能映射到 W3C NOT_FOUND。
     TransportError(ResolveTransportError),
 }
 ```
+
+`UnauthenticatedInfo` 用于 method resolver 显式声明为“不参与 owner 信任链”的 `doc_type`，典型例子是 DeviceInfo 或运行时地址信息。这类证据允许 body 使用 `EncodedDocument::JsonLd` 编码，不要求、也不会尝试 owner-key 验签；上层调用者（例如 `resolve_ips` 的地址合并逻辑）可以自行决定如何使用它，但这不改变该内容“不是权威 Document 来源”的性质。
 
 其中 BNS 的发布状态可以映射为：
 
@@ -148,7 +230,8 @@ struct PublishedState {
 
     document_ref: Option<DocumentRef>,
     document_version: u64,
-    previous_version: u64,
+    previous_version: Option<u64>,
+    next_version: Option<u64>,
 
     effective_owner: Principal,
     owner_source: OwnerSource,
@@ -158,6 +241,10 @@ struct PublishedState {
     effective_controller: Option<Principal>,
     lineage_epoch: u64,
     proof_root: Option<Hash>,
+
+    canonical_id: Option<DID>,
+    equivalent_ids: Vec<DID>,
+    migration_target: Option<DID>,
 }
 
 enum DocumentStatus {
@@ -173,6 +260,8 @@ enum DocumentStatus {
 `PublishedState` 需要能回答 `effective_owner_at(iat)`。对 BNS 这类 Registry，可以通过当前状态、历史版本或事件日志计算签发时刻的 owner；如果某个 method 无法提供历史 owner，只能退化为使用当前 owner 或拒绝需要历史一致性校验的文档。
 
 `Revoked` 和 `Tombstoned` 是强负状态。它们不是普通 `NotFound`，不能被 cache、SN 或自签名文档绕过。
+
+把 `PublishedState` 转成对外 `DidDocumentMetadata` 时要遵循第 1.4 节的边界：`document_version` 渲染为 W3C `versionId`，`next_version` 只有在确实知道后继版本时才渲染为 `nextVersionId`，`previous_version` 保留为 BuckyOS extension；`canonical_id / equivalent_ids` 只有在同 method 强等价时才填入 W3C `canonicalId / equivalentId`，否则保留在 BuckyOS metadata 或 `migration_target` 中。
 
 ## 5. 发布语义与权威源
 
@@ -255,7 +344,7 @@ struct OwnerDocumentPolicy {
 
 ## 7. Cache 规则
 
-cache 分三类：
+cache 分四类：
 
 ```rust
 struct DidCacheEntry {
@@ -264,6 +353,9 @@ struct DidCacheEntry {
 
     // 已验证过、可作为 fallback 的普通缓存。
     verified_cache: Vec<CachedVerifiedDocument>,
+
+    // 不参与 owner 验证链的实时 Info 缓存，只能服务免验证路径。
+    unauthenticated_info_cache: Vec<CachedUnauthenticatedInfo>,
 
     // 本地测试或运维显式注入的发布模拟。
     local_authority_override: Option<LocalAuthorityOverride>,
@@ -295,7 +387,7 @@ struct DidCacheEntry {
 
 ### 7.3 local_authority_override
 
-`local_authority_override` 用于测试和运维，类似传统系统的 `hosts` 文件。它是环境本地的发布模拟，不是协议传播路径。
+`local_authority_override` 用于测试和运维，类似传统系统的 `hosts` 文件。它是环境本地的 Document 发布模拟，不是协议传播路径，也不用于 Info 轻量路径；Info 的本地覆盖应表现为本地 info resolver 或 `unauthenticated_info_cache`。
 
 规则：
 
@@ -308,9 +400,20 @@ struct DidCacheEntry {
 
 通过这种方式，可以在上线前把新 Document 写入测试环境 cache，模拟“已经从权威源发布”的效果。测试通过后，再执行真正的链上或平台发布。
 
+### 7.4 unauthenticated_info_cache
+
+`unauthenticated_info_cache` 只保存 `requires_verification(doc_type) == false` 的 Info 类结果，例如 DeviceInfo 或运行时地址。它不参与 owner 验签，不得提升为 `verified_cache`，也不得用于 Document fallback。
+
+规则：
+
+1. 只按 Info 自身协议字段判断可用性，例如 `iat / ttl / source_rank`。
+2. 不能被 `PublishedState::Missing`、Owner Config fallback policy 或 `revoke_before_iat` 间接门控。
+3. 如果实时 resolver 可达，应优先使用实时返回；cache 只作为离线重连或短 TTL 加速手段。
+4. 返回 cache 命中时必须在 `resolution_metadata.warnings` 或 `cache_status` 中标明它是 unauthenticated info cache。
+
 ## 8. 文档选择规则
 
-正常环境的选择顺序：
+对需要验证的 Document，正常环境的选择顺序：
 
 ```text
 1. local_authority_override
@@ -327,13 +430,18 @@ struct DidCacheEntry {
 
 ```rust
 fn compare_published_body(a: &VerifiedDocument, b: &VerifiedDocument) -> Ordering {
-    cmp_optional_version_seq(a.version_seq, b.version_seq)
-        .then(cmp_optional_iat(a.iat, b.iat))
+    cmp_evidence_rank(a.evidence_kind, b.evidence_kind)
+        .then_with(|| cmp_optional_version_seq(a.version_seq, b.version_seq))
+        .then_with(|| cmp_optional_iat(a.iat, b.iat))
         .then_with(|| a.content_hash.cmp(&b.content_hash))
 }
 ```
 
+`cmp_evidence_rank` 必须优先于 `version_seq / iat`。同一个发布源内部，`AnchoredDocumentBody` 的真实性来自权威源的写入权限保证和 `content_hash` 锚定，`SelfSignedCandidate` 只能靠自身签名自证，因此排序应满足 `AnchoredDocumentBody > SelfSignedCandidate`。否则在“不同 resolver 对同一 `(did, doc_type)` 一个返回已锚定 body、一个返回自签名候选”的混合场景里，合并结果会被 `version_seq / iat` 打平后变成未定义。
+
 普通 self-signed fallback 也可以按同样规则在候选之间选择，但它不能覆盖已发布结果。
+
+免验证 Info 不使用本节的 Document 发布源排序和 `compare_published_body`，它走第 9 节 `resolve_unauthenticated_info` 的轻量选择规则。
 
 签名合法性的判断点是文档的 `iat`：
 
@@ -344,11 +452,13 @@ document.iat = T
   -> 再应用当前 Owner Config 的 revoke_before_iat / lineage / doc_type policy
 ```
 
-resolver 可以把 `SignedByHistoricalKey`、`KeyRotatedAfterIat` 等信息放进 `warnings`，供上层 UI 或业务策略决定是否提示或拒绝。
+resolver 可以把 `SignedByHistoricalKey`、`KeyRotatedAfterIat` 等信息放进 `resolution_metadata.warnings`，供上层 UI 或业务策略决定是否提示或拒绝。
 
 ## 9. 核心伪代码
 
-整个流程只有一条路径。owner 和普通文档共用它，区别只在第 1 步「确定验证根」的那个分叉：owner 走递归基（method authority），其它 doc_type 走递归步（递归解析 owner 文档）。除此之外，从查发布状态到选最优文档完全一致。
+对需要验证的 Document，整个流程只有一条路径。owner 和普通文档共用它，区别只在第 1 步「确定验证根」的那个分叉：owner 走递归基（method authority），其它 doc_type 走递归步（递归解析 owner 文档）。除此之外，从查发布状态到选最优文档完全一致。
+
+声明为免验证的 Info 类 `doc_type` 是这条 Document 流程的前置分流：它不属于第 1.3 节定义的状态机范围，必须在查询 `PublishedState` 之前跳到轻量路径。
 
 ```rust
 async fn resolve_did_document(
@@ -360,18 +470,36 @@ async fn resolve_did_document(
     let doc_type = canonicalize_doc_type(doc_type)?;
     let cache_entry = cache.load(&did, &doc_type);
 
-    // 0. 本地测试/运维覆盖，语义类似 hosts 文件。对 owner 同样适用。
+    let resolvers = resolver_registry.match_method(&did.method);
+    if resolvers.is_empty() {
+        return Err(ResolveError::MethodNotSupported {
+            method: did.method.clone(),
+        });
+    }
+    let method_resolver = method_resolver(&did.method);
+    let needs_verification = method_resolver.requires_verification(&doc_type);
+
+    if !needs_verification {
+        // Info 类内容不属于 Document 状态机范围：不查 PublishedState，
+        // 不要求 owner 递归，不受 Missing/Revoked/Tombstoned 门禁约束。
+        // 仍然使用 method-scoped resolver 选择，只是跳过验证/权威链。
+        return resolve_unauthenticated_info(
+            &did,
+            &doc_type,
+            &resolvers,
+            &cache_entry,
+            &policy,
+        ).await;
+    }
+
+    // 0. 本地测试/运维覆盖，语义类似 hosts 文件。只对 Document 路径生效，对 owner 同样适用。
     if let Some(local) = cache_entry.local_authority_override {
         let resolved = verify_local_authority_override(&did, &doc_type, local).await?;
         return Ok(resolved.with_warning(ResolveWarning::LocalAuthorityOverride));
     }
 
-    let resolvers = resolver_registry.match_method(&did.method);
-    if resolvers.is_empty() {
-        return resolve_from_verified_cache_or_error(&did, &doc_type);
-    }
-
-    // 1. 查询最高等级的发布源。发布源返回的是状态，而不是普通候选。
+    // 1. 以下只对需要验证的 doc_type 执行。
+    // 查询最高等级的发布源。发布源返回的是状态，而不是普通候选。
     let published = resolve_published_state(
         &did,
         &doc_type,
@@ -410,9 +538,36 @@ async fn resolve_did_document(
                 ).await;
 
                 let mut verified = Vec::new();
+                let mut warnings = Vec::new();
                 for body in bodies {
                     if hash(&body.bytes) != doc_ref.content_hash {
                         continue;
+                    }
+
+                    match body.evidence_kind() {
+                        EvidenceKind::AnchoredDocumentBody => {
+                            // 已被 PublishedState.document_ref.content_hash 锚定，写入权限由权威源保证。
+                            // 签名校验是否强制由 policy 决定；JsonLd / Jwt 均可作为合法编码。
+                        }
+                        EvidenceKind::SelfSignedCandidate => {
+                            // self-signed 语义上必须能验证，即 doc.is_proof() == true。
+                            // JsonLd 结构上不可能携带签名，属于证据契约违规。
+                            if !body.doc.is_proof() {
+                                warnings.push(ResolveWarning::EvidenceContractViolation {
+                                    evidence: "SelfSignedCandidate",
+                                    reason: "unsigned JsonLd body",
+                                });
+                                continue;
+                            }
+                        }
+                        EvidenceKind::UnauthenticatedInfo => {
+                            warnings.push(ResolveWarning::EvidenceContractViolation {
+                                evidence: "UnauthenticatedInfo",
+                                reason: "doc_type requires verification",
+                            });
+                            continue;
+                        }
+                        _ => {}
                     }
 
                     // 唯一的分叉点在这里：确定“用什么验证这份具体文档”。
@@ -446,7 +601,8 @@ async fn resolve_did_document(
                     .ok_or(ResolveError::PublishedBodyNotFound(state.clone()))?;
 
                 cache.store_published_document(&did, &doc_type, &state, &best);
-                return Ok(ResolvedDocument::from_verified(did, doc_type, best, Some(state)));
+                return Ok(ResolvedDocument::from_verified(did, doc_type, best, Some(state))
+                    .with_warnings(warnings));
             }
 
             DocumentStatus::Missing => {
@@ -511,6 +667,66 @@ async fn resolve_did_document(
     Ok(ResolvedDocument::from_verified(did, doc_type, best, None))
 }
 ```
+
+免验证 Info 的轻量路径只处理 `UnauthenticatedInfo` 证据。它不读取 `PublishedState`，不进入 `DocumentStatus::Missing` 分支，不调用 `resolve_fallback_policy_from_published_owner`，也不使用第 7.2 节的 `verified_cache` 池：
+
+```rust
+async fn resolve_unauthenticated_info(
+    did: &DID,
+    doc_type: &str,
+    resolvers: &[ResolverRegistration],
+    cache_entry: &DidCacheEntry,
+    policy: &ResolvePolicy,
+) -> Result<ResolvedDocument, ResolveError> {
+    let mut warnings = Vec::new();
+
+    for group in group_by_trust_level(resolvers) {
+        let info_resolvers = group
+            .iter()
+            .filter(|r| r.caps.unauthenticated_info)
+            .collect::<Vec<_>>();
+
+        if info_resolvers.is_empty() {
+            continue;
+        }
+
+        let results = query_unauthenticated_info_group_concurrently(
+            info_resolvers,
+            did,
+            doc_type,
+        ).await;
+
+        let mut group_candidates = Vec::new();
+        for body in results.bodies {
+            if body.evidence_kind() != EvidenceKind::UnauthenticatedInfo {
+                warnings.push(ResolveWarning::EvidenceContractViolation {
+                    evidence: body.evidence_kind().as_str(),
+                    reason: "unauthenticated info path only accepts UnauthenticatedInfo",
+                });
+                continue;
+            }
+            group_candidates.push(UnauthenticatedDocument::from_body(body));
+        }
+
+        if let Some(best) = choose_best_unauthenticated_info(group_candidates, policy) {
+            return Ok(ResolvedDocument::from_unauthenticated_info(did, doc_type, best)
+                .with_warnings(warnings));
+        }
+    }
+
+    if let Some(cached) = cache_entry.usable_unauthenticated_info(doc_type, policy) {
+        return Ok(ResolvedDocument::from_unauthenticated_info(did, doc_type, cached)
+            .with_warning(ResolveWarning::UnauthenticatedInfoCache));
+    }
+
+    Err(ResolveError::InfoNotFound {
+        did: did.clone(),
+        doc_type: doc_type.to_string(),
+    })
+}
+```
+
+`choose_best_unauthenticated_info` 可以按 Info 自身协议字段排序，例如 `iat / ttl / source_rank / content_hash`，但不能复用 `compare_published_body`，因为它不比较 Document 证据等级，也不表示 owner 授权。
 
 验证根用一个枚举统一表达，递归基和递归步只是它的两个变体：
 
@@ -650,6 +866,18 @@ pub async fn resolve_did_ex(
 
 `resolve_did_ex` 是对外入口，内部直接调用第 9 节的递归函数 `resolve_did_document`。外部调用者不需要、也不应该单独解析 owner —— owner 解析是 `resolve_did_document` 在 `doc_type = "owner"` 时的递归层，由内部自动完成。
 
+`ResolvedDocument` 不应只是 `EncodedDocument` 的薄包装。它是第 1.4 节定义的三段式结果：`resolution_metadata` 记录解析过程、warning、cache/local override、resolver id、W3C error；`document` 是最终选中的文档；`document_metadata` 记录状态、version、deactivation、canonical/alias 和 BuckyOS 扩展 metadata。兼容 API `resolve_did` 会丢弃 metadata，因此只适合旧调用方和明确不关心解析 provenance 的场景。
+
+`ResolveError` 也应提供稳定的标准投影：
+
+```rust
+impl ResolveError {
+    fn to_did_resolution_error(&self) -> DidResolutionError { /* W3C error URI + title/detail */ }
+}
+```
+
+这样内部可以继续用有业务语义的 enum，例如 `TerminalDocumentState`、`OwnerConflict`、`AuthorityUnavailable`；对外 HTTP binding 或跨语言 SDK 则输出 W3C DID Resolution 的 `didResolutionMetadata.error`。
+
 `ResolvePolicy` 需要承载递归所需的两点：
 
 ```rust
@@ -697,8 +925,20 @@ trait DidResolver {
         did: &DID,
         doc_type: &str,
     ) -> NSResult<Vec<DocumentBody>>;
+
+    async fn query_unauthenticated_info(
+        &self,
+        did: &DID,
+        doc_type: &str,
+    ) -> NSResult<Vec<DocumentBody>>;
+
+    // 声明某个 doc_type 是否需要走 owner 验证链，默认 true。
+    // Info 类 doc_type（如 "info"）的 resolver 应返回 false。
+    fn requires_verification(&self, doc_type: &str) -> bool { true }
 }
 ```
+
+`requires_verification(doc_type)` 是 resolver 与 `doc_type` 的显式契约。解析器不能通过 `EncodedDocument` 编码形态或验证失败来反推“是否需要签名”：声明为免验证的 `doc_type` 进入 `query_unauthenticated_info` / `UnauthenticatedInfo` 轻量路径；未声明免验证的 `doc_type` 即使 body 是 `JsonLd`，也仍按需要验证的 Document 处理，验证失败就是失败。
 
 ### 11.3 BNS provider 的定位
 
@@ -863,12 +1103,5 @@ fn select_reachability_document(
 8. 回滚流程依赖已经被新文档配置影响的机器本身。
 9. 从普通传播路径获取 Owner Config，再用它决定后续文档验证策略。在递归模型里，等价于解析 `doc_type = "owner"` 时没有用 `policy.for_authority_lookup()` 收紧、放任 self-signed / gossip fallback 进入递归基。
 10. 把 owner 解析实现成一条独立于 `resolve_did_document` 的特殊流程。owner 只是递归基，不应该有自己的取文档、验签、选优逻辑。
-
-## 14. 待定问题
-
-1. `did:dev` 是否存在 method authority，还是完全 self-certifying。
-2. `did:web` 的 canonical endpoint 是否视为 `MethodAuthority = 0`，以及它的 tombstone/revoke 如何表达。
-3. BNS `Missing` 是否总是允许 self-signed fallback，还是只对特定 doc_type 允许。
-4. owner key 获取失败时，是否允许返回只有 hash anchor 但未完成 owner claim 校验的文档。
-5. `version_seq` 和 `iat` 在所有 BuckyOS DID Document 中是否应提升为统一字段。
-6. 发布源是否需要为可达性敏感文档增加显式 `Pending` 状态，还是复用 `Active + validFrom` 表达延迟激活。
+11. 把“验证失败”和“证据契约违规”混为一谈：`SelfSignedCandidate` 携带结构上不可验证的 `JsonLd` body，应作为契约违规直接丢弃并记录 warning，不能被误判为该 resolver 没有候选（`NotFound`），也不能悄悄进入 `compare_published_body` 参与排序。
+12. 让声明为免验证的 `doc_type`（如 Info）落到第 9 节默认的递归验证路径里。必须通过 `requires_verification(doc_type)` 在查询 `PublishedState` 之前显式豁免，不能先走 `Missing / Expired / owner fallback policy / verified_cache` 再靠验证失败静默退化；后者会让“这个 `doc_type` 本来就不需要验证”和“这个 `doc_type` 应该验证但验证失败了”在结果上无法区分。
