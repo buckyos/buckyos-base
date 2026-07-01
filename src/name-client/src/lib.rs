@@ -233,7 +233,7 @@ pub async fn resolve_ed25519_exchange_key(remote_did: &DID) -> NSResult<[u8; 32]
     return Err(NSError::NotFound("Invalid did document".to_string()));
 }
 
-pub async fn resolve_did(did: &DID, doc_type: Option<&str>) -> NSResult<EncodedDocument> {
+pub async fn resolve_did(did: &DID, doc_type: Option<DidDocType>) -> NSResult<EncodedDocument> {
     let client = get_name_client();
     if client.is_none() {
         return Err(NSError::NotFound("Name client not found".to_string()));
@@ -244,7 +244,7 @@ pub async fn resolve_did(did: &DID, doc_type: Option<&str>) -> NSResult<EncodedD
 
 pub async fn resolve_did_ex(
     did: &DID,
-    doc_type: Option<&str>,
+    doc_type: Option<DidDocType>,
     policy: ResolvePolicy,
 ) -> NSResult<ResolvedDocument> {
     let client = get_name_client();
@@ -284,7 +284,7 @@ pub async fn owner_is_bound_to_zone(did: &DID, zone_did: &DID) -> NSResult<bool>
 
 pub async fn update_did_cache(
     did: DID,
-    doc_type: Option<&str>,
+    doc_type: Option<DidDocType>,
     doc: EncodedDocument,
 ) -> NSResult<()> {
     let client = get_name_client();
@@ -361,7 +361,7 @@ mod tests {
         async fn query_did(
             &self,
             did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             if did.to_string() == self.name {

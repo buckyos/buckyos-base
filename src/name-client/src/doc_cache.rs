@@ -12,7 +12,7 @@ use name_lib::{DIDDocumentTrait, EncodedDocument, OwnerConfig, DEFAULT_EXPIRE_TI
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::ROOT_TRUST_LEVEL;
+use crate::{DidDocType, ROOT_TRUST_LEVEL};
 
 /// 支持两种存储后端的 DID 文档缓存：文件系统和 SQLite。
 /// 通过 `CacheBackend` 选择实现，默认推荐 SQLite 以避免大量小文件。
@@ -57,62 +57,66 @@ impl DIDDocumentCache {
         DIDDocumentFsCache::default_dir()
     }
 
-    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
+    pub fn get(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+    ) -> Option<(EncodedDocument, u64, i32)> {
         match self {
-            Self::Fs(inner) => inner.get(did, doc_type),
-            Self::Db(inner) => inner.get(did, doc_type),
-            Self::Mem(inner) => inner.get(did, doc_type),
+            Self::Fs(inner) => inner.get(did, doc_type.as_ref()),
+            Self::Db(inner) => inner.get(did, doc_type.as_ref()),
+            Self::Mem(inner) => inner.get(did, doc_type.as_ref()),
         }
     }
 
     pub fn update(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
     ) -> bool {
         match self {
-            Self::Fs(inner) => inner.update(did, doc_type, doc, exp, trust_level),
-            Self::Db(inner) => inner.update(did, doc_type, doc, exp, trust_level),
-            Self::Mem(inner) => inner.update(did, doc_type, doc, exp, trust_level),
+            Self::Fs(inner) => inner.update(did, doc_type.as_ref(), doc, exp, trust_level),
+            Self::Db(inner) => inner.update(did, doc_type.as_ref(), doc, exp, trust_level),
+            Self::Mem(inner) => inner.update(did, doc_type.as_ref(), doc, exp, trust_level),
         }
     }
 
     pub fn validate_owner_revocation(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         doc: &EncodedDocument,
     ) -> name_lib::NSResult<()> {
         match self {
-            Self::Fs(inner) => inner.validate_owner_revocation(did, doc_type, doc),
-            Self::Db(inner) => inner.validate_owner_revocation(did, doc_type, doc),
-            Self::Mem(inner) => inner.validate_owner_revocation(did, doc_type, doc),
+            Self::Fs(inner) => inner.validate_owner_revocation(did, doc_type.as_ref(), doc),
+            Self::Db(inner) => inner.validate_owner_revocation(did, doc_type.as_ref(), doc),
+            Self::Mem(inner) => inner.validate_owner_revocation(did, doc_type.as_ref(), doc),
         }
     }
 
     pub fn insert(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
     ) {
         match self {
-            Self::Fs(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
-            Self::Db(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
-            Self::Mem(inner) => inner.insert(did, doc_type, doc, exp, trust_level),
+            Self::Fs(inner) => inner.insert(did, doc_type.as_ref(), doc, exp, trust_level),
+            Self::Db(inner) => inner.insert(did, doc_type.as_ref(), doc, exp, trust_level),
+            Self::Mem(inner) => inner.insert(did, doc_type.as_ref(), doc, exp, trust_level),
         }
     }
 
-    pub fn delete(&self, did: DID, doc_type: Option<&str>) {
+    pub fn delete(&self, did: DID, doc_type: Option<DidDocType>) {
         match self {
-            Self::Fs(inner) => inner.delete(did, doc_type),
-            Self::Db(inner) => inner.delete(did, doc_type),
-            Self::Mem(inner) => inner.delete(did, doc_type),
+            Self::Fs(inner) => inner.delete(did, doc_type.as_ref()),
+            Self::Db(inner) => inner.delete(did, doc_type.as_ref()),
+            Self::Mem(inner) => inner.delete(did, doc_type.as_ref()),
         }
     }
 }
@@ -158,7 +162,11 @@ impl DIDDocumentFsCache {
         get_buckyos_system_etc_dir().join("did_docs")
     }
 
-    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
+    pub fn get(
+        &self,
+        did: &DID,
+        doc_type: Option<&DidDocType>,
+    ) -> Option<(EncodedDocument, u64, i32)> {
         let (doc, meta_fallback) = self.load_from_disk(did, doc_type)?;
         //默认的过期时间，使用磁盘文件的修改时间 + DEFAULT_EXPIRE_TIME
         let meta = self.load_meta(did, doc_type).unwrap_or(meta_fallback);
@@ -176,7 +184,7 @@ impl DIDDocumentFsCache {
                 debug!(
                     "doc cache {}#{} expired but kept because never fetched from remote",
                     did.to_string(),
-                    doc_type.unwrap_or_default()
+                    doc_type_str(doc_type)
                 );
             }
         }
@@ -186,7 +194,7 @@ impl DIDDocumentFsCache {
     pub fn update(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
@@ -213,7 +221,7 @@ impl DIDDocumentFsCache {
     pub fn insert(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
@@ -241,7 +249,7 @@ impl DIDDocumentFsCache {
         }
     }
 
-    pub fn delete(&self, did: DID, doc_type: Option<&str>) {
+    pub fn delete(&self, did: DID, doc_type: Option<&DidDocType>) {
         self.delete_local_file(&did, doc_type);
         self.delete_meta(&did, doc_type);
     }
@@ -249,7 +257,7 @@ impl DIDDocumentFsCache {
     fn load_from_disk(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
     ) -> Option<(EncodedDocument, CacheMeta)> {
         let file_path = self
             .cache_dir
@@ -295,7 +303,7 @@ impl DIDDocumentFsCache {
         }
     }
 
-    fn save_to_disk(&self, did: &DID, doc_type: Option<&str>, doc: &EncodedDocument) {
+    fn save_to_disk(&self, did: &DID, doc_type: Option<&DidDocType>, doc: &EncodedDocument) {
         let file_path = self
             .cache_dir
             .join(format!("{}.doc.json", combine_key(did, doc_type)));
@@ -310,12 +318,12 @@ impl DIDDocumentFsCache {
         }
     }
 
-    fn meta_path(&self, did: &DID, doc_type: Option<&str>) -> PathBuf {
+    fn meta_path(&self, did: &DID, doc_type: Option<&DidDocType>) -> PathBuf {
         self.cache_dir
             .join(format!("{}.meta.json", combine_key(did, doc_type)))
     }
 
-    fn save_meta(&self, did: &DID, doc_type: Option<&str>, meta: CacheMeta) {
+    fn save_meta(&self, did: &DID, doc_type: Option<&DidDocType>, meta: CacheMeta) {
         let meta_path = self.meta_path(did, doc_type);
         if let Ok(content) = serde_json::to_string(&meta) {
             if let Err(err) = fs::write(&meta_path, content) {
@@ -328,7 +336,7 @@ impl DIDDocumentFsCache {
         }
     }
 
-    fn load_meta(&self, did: &DID, doc_type: Option<&str>) -> Option<CacheMeta> {
+    fn load_meta(&self, did: &DID, doc_type: Option<&DidDocType>) -> Option<CacheMeta> {
         let meta_path = self.meta_path(did, doc_type);
         match fs::read_to_string(&meta_path) {
             Ok(content) => match serde_json::from_str::<CacheMeta>(&content) {
@@ -355,7 +363,7 @@ impl DIDDocumentFsCache {
         }
     }
 
-    fn delete_meta(&self, did: &DID, doc_type: Option<&str>) {
+    fn delete_meta(&self, did: &DID, doc_type: Option<&DidDocType>) {
         let meta_path = self.meta_path(did, doc_type);
         match fs::remove_file(&meta_path) {
             Ok(_) => debug!("removed did doc meta: {}", meta_path.display()),
@@ -371,7 +379,7 @@ impl DIDDocumentFsCache {
         }
     }
 
-    fn delete_local_file(&self, did: &DID, doc_type: Option<&str>) {
+    fn delete_local_file(&self, did: &DID, doc_type: Option<&DidDocType>) {
         let file_path = self
             .cache_dir
             .join(format!("{}.doc.json", combine_key(did, doc_type)));
@@ -388,7 +396,7 @@ impl DIDDocumentFsCache {
     pub fn validate_owner_revocation(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: &EncodedDocument,
     ) -> name_lib::NSResult<()> {
         if is_owner_doc(doc_type, doc) {
@@ -396,14 +404,14 @@ impl DIDDocumentFsCache {
         }
 
         if let Some(owner_config) = self.load_cached_owner_config(did) {
-            owner_config.validate_jwt_revocation(doc_type.unwrap_or_default(), doc)?;
+            owner_config.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
         }
         Ok(())
     }
 
     fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
-        self.load_from_disk(did, Some("owner"))
-            .and_then(|(doc, _)| parse_owner_config_doc(Some("owner"), &doc))
+        self.load_from_disk(did, Some(&DidDocType::Owner))
+            .and_then(|(doc, _)| parse_owner_config_doc(Some(&DidDocType::Owner), &doc))
             .or_else(|| {
                 self.load_from_disk(did, None)
                     .and_then(|(doc, _)| parse_owner_config_doc(None, &doc))
@@ -413,7 +421,7 @@ impl DIDDocumentFsCache {
     fn evict_revoked_docs(
         &self,
         did: &DID,
-        owner_doc_type: Option<&str>,
+        owner_doc_type: Option<&DidDocType>,
         owner_config: &OwnerConfig,
     ) {
         let did_key = did_cache_key(did);
@@ -433,18 +441,18 @@ impl DIDDocumentFsCache {
             let Some(doc_type) = doc_type_from_cache_file_name(&did_key, &file_name) else {
                 continue;
             };
-            if same_doc_type(doc_type.as_deref(), owner_doc_type) {
+            if same_doc_type(doc_type.as_ref(), owner_doc_type) {
                 continue;
             }
 
-            let Some((doc, _)) = self.load_from_disk(did, doc_type.as_deref()) else {
+            let Some((doc, _)) = self.load_from_disk(did, doc_type.as_ref()) else {
                 continue;
             };
             if owner_config
-                .validate_jwt_revocation(doc_type.as_deref().unwrap_or_default(), &doc)
+                .validate_jwt_revocation(doc_type_str(doc_type.as_ref()), &doc)
                 .is_err()
             {
-                self.delete(did.clone(), doc_type.as_deref());
+                self.delete(did.clone(), doc_type.as_ref());
             }
         }
     }
@@ -464,7 +472,11 @@ impl DIDDocumentDBCache {
         Ok(cache)
     }
 
-    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
+    pub fn get(
+        &self,
+        did: &DID,
+        doc_type: Option<&DidDocType>,
+    ) -> Option<(EncodedDocument, u64, i32)> {
         let conn = self.open_conn().ok()?;
         let mut stmt = conn
             .prepare(
@@ -496,7 +508,7 @@ impl DIDDocumentDBCache {
                 debug!(
                     "db doc cache {}#{} expired but kept because never fetched from remote",
                     did.to_string(),
-                    doc_type.unwrap_or_default()
+                    doc_type_str(doc_type)
                 );
             }
         }
@@ -506,7 +518,7 @@ impl DIDDocumentDBCache {
     pub fn update(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
@@ -533,7 +545,7 @@ impl DIDDocumentDBCache {
     pub fn insert(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
@@ -558,7 +570,7 @@ impl DIDDocumentDBCache {
             params![
                 combine_key(&did, doc_type),
                 did_cache_key(&did),
-                doc_type.unwrap_or_default(),
+                doc_type_str(doc_type),
                 doc.to_string(),
                 exp as i64,
                 trust_level,
@@ -573,7 +585,7 @@ impl DIDDocumentDBCache {
         }
     }
 
-    pub fn delete(&self, did: DID, doc_type: Option<&str>) {
+    pub fn delete(&self, did: DID, doc_type: Option<&DidDocType>) {
         let conn = match self.open_conn() {
             Ok(c) => c,
             Err(err) => {
@@ -637,7 +649,7 @@ impl DIDDocumentDBCache {
     pub fn validate_owner_revocation(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: &EncodedDocument,
     ) -> name_lib::NSResult<()> {
         if is_owner_doc(doc_type, doc) {
@@ -645,14 +657,14 @@ impl DIDDocumentDBCache {
         }
 
         if let Some(owner_config) = self.load_cached_owner_config(did) {
-            owner_config.validate_jwt_revocation(doc_type.unwrap_or_default(), doc)?;
+            owner_config.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
         }
         Ok(())
     }
 
     fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
-        self.get(did, Some("owner"))
-            .and_then(|(doc, _, _)| parse_owner_config_doc(Some("owner"), &doc))
+        self.get(did, Some(&DidDocType::Owner))
+            .and_then(|(doc, _, _)| parse_owner_config_doc(Some(&DidDocType::Owner), &doc))
             .or_else(|| {
                 self.get(did, None)
                     .and_then(|(doc, _, _)| parse_owner_config_doc(None, &doc))
@@ -662,7 +674,7 @@ impl DIDDocumentDBCache {
     fn evict_revoked_docs(
         &self,
         did: &DID,
-        owner_doc_type: Option<&str>,
+        owner_doc_type: Option<&DidDocType>,
         owner_config: &OwnerConfig,
     ) {
         let conn = match self.open_conn() {
@@ -696,14 +708,14 @@ impl DIDDocumentDBCache {
         let mut revoked_doc_types = Vec::new();
         for row in rows.flatten() {
             let doc_type = empty_doc_type_to_option(&row.0);
-            if same_doc_type(doc_type, owner_doc_type) {
+            if same_doc_type(doc_type.as_ref(), owner_doc_type) {
                 continue;
             }
             let Ok(doc) = EncodedDocument::from_str(row.1) else {
                 continue;
             };
             if owner_config
-                .validate_jwt_revocation(doc_type.unwrap_or_default(), &doc)
+                .validate_jwt_revocation(doc_type_str(doc_type.as_ref()), &doc)
                 .is_err()
             {
                 revoked_doc_types.push(row.0);
@@ -712,7 +724,8 @@ impl DIDDocumentDBCache {
 
         drop(stmt);
         for doc_type in revoked_doc_types {
-            self.delete(did.clone(), empty_doc_type_to_option(&doc_type));
+            let doc_type = empty_doc_type_to_option(&doc_type);
+            self.delete(did.clone(), doc_type.as_ref());
         }
     }
 }
@@ -758,7 +771,11 @@ impl DIDDocumentMemCache {
         }
     }
 
-    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
+    pub fn get(
+        &self,
+        did: &DID,
+        doc_type: Option<&DidDocType>,
+    ) -> Option<(EncodedDocument, u64, i32)> {
         let key = combine_key(did, doc_type);
         let entry = match self.entries.read() {
             Ok(guard) => guard.get(&key).cloned(),
@@ -772,7 +789,7 @@ impl DIDDocumentMemCache {
                 debug!(
                     "mem doc cache {}#{} expired but kept because never fetched from remote",
                     did.to_string(),
-                    doc_type.unwrap_or_default()
+                    doc_type_str(doc_type)
                 );
             }
         }
@@ -782,7 +799,7 @@ impl DIDDocumentMemCache {
     pub fn update(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
@@ -809,7 +826,7 @@ impl DIDDocumentMemCache {
     pub fn insert(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         trust_level: i32,
@@ -840,7 +857,7 @@ impl DIDDocumentMemCache {
         }
     }
 
-    pub fn delete(&self, did: DID, doc_type: Option<&str>) {
+    pub fn delete(&self, did: DID, doc_type: Option<&DidDocType>) {
         let key = combine_key(&did, doc_type);
         if let Ok(mut guard) = self.entries.write() {
             guard.remove(&key);
@@ -850,7 +867,7 @@ impl DIDDocumentMemCache {
     pub fn validate_owner_revocation(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<&DidDocType>,
         doc: &EncodedDocument,
     ) -> name_lib::NSResult<()> {
         if is_owner_doc(doc_type, doc) {
@@ -858,14 +875,14 @@ impl DIDDocumentMemCache {
         }
 
         if let Some(owner_config) = self.load_cached_owner_config(did) {
-            owner_config.validate_jwt_revocation(doc_type.unwrap_or_default(), doc)?;
+            owner_config.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
         }
         Ok(())
     }
 
     fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
-        self.get(did, Some("owner"))
-            .and_then(|(doc, _, _)| parse_owner_config_doc(Some("owner"), &doc))
+        self.get(did, Some(&DidDocType::Owner))
+            .and_then(|(doc, _, _)| parse_owner_config_doc(Some(&DidDocType::Owner), &doc))
             .or_else(|| {
                 self.get(did, None)
                     .and_then(|(doc, _, _)| parse_owner_config_doc(None, &doc))
@@ -875,7 +892,7 @@ impl DIDDocumentMemCache {
     fn evict_revoked_docs(
         &self,
         did: &DID,
-        owner_doc_type: Option<&str>,
+        owner_doc_type: Option<&DidDocType>,
         owner_config: &OwnerConfig,
     ) {
         let did_key = did_cache_key(did);
@@ -886,11 +903,11 @@ impl DIDDocumentMemCache {
                     return true;
                 }
                 let doc_type = doc_type.unwrap();
-                if same_doc_type(doc_type.as_deref(), owner_doc_type) {
+                if same_doc_type(doc_type.as_ref(), owner_doc_type) {
                     return true;
                 }
                 owner_config
-                    .validate_jwt_revocation(doc_type.as_deref().unwrap_or_default(), &entry.doc)
+                    .validate_jwt_revocation(doc_type_str(doc_type.as_ref()), &entry.doc)
                     .is_ok()
             });
         }
@@ -922,8 +939,12 @@ impl UnauthenticatedInfoCache {
         }
     }
 
-    pub fn get(&self, did: &DID, doc_type: Option<&str>) -> Option<(EncodedDocument, u64, i32)> {
-        let key = combine_key(did, doc_type);
+    pub fn get(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+    ) -> Option<(EncodedDocument, u64, i32)> {
+        let key = combine_key(did, doc_type.as_ref());
         let entry = self.entries.read().ok()?.get(&key)?.clone();
         if is_expired(entry.exp) {
             return None;
@@ -934,12 +955,12 @@ impl UnauthenticatedInfoCache {
     pub fn insert(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         doc: EncodedDocument,
         exp: u64,
         source_rank: i32,
     ) {
-        let key = combine_key(did, doc_type);
+        let key = combine_key(did, doc_type.as_ref());
         if let Ok(mut entries) = self.entries.write() {
             entries.insert(
                 key,
@@ -1015,21 +1036,25 @@ fn extract_timestamp(doc: &EncodedDocument, field: &str) -> Option<u64> {
         .and_then(|value| value.get(field).and_then(|ts| ts.as_u64()))
 }
 
-fn combine_key(did: &DID, doc_type: Option<&str>) -> String {
+fn combine_key(did: &DID, doc_type: Option<&DidDocType>) -> String {
     let did_key = did_cache_key(did);
     if let Some(f) = doc_type {
-        format!("{}#{}", did_key, f)
+        format!("{}#{}", did_key, f.as_str())
     } else {
         did_key
     }
+}
+
+fn doc_type_str(doc_type: Option<&DidDocType>) -> &str {
+    doc_type.map(DidDocType::as_str).unwrap_or_default()
 }
 
 fn did_cache_key(did: &DID) -> String {
     did.to_filename()
 }
 
-fn is_owner_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> bool {
-    doc_type == Some("owner")
+fn is_owner_doc(doc_type: Option<&DidDocType>, doc: &EncodedDocument) -> bool {
+    doc_type == Some(&DidDocType::Owner)
         || doc.clone().to_json_value().map_or(false, |value| {
             value.get("verificationMethod").is_some()
                 && value.get("name").is_some()
@@ -1039,7 +1064,10 @@ fn is_owner_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> bool {
         })
 }
 
-fn parse_owner_config_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> Option<OwnerConfig> {
+fn parse_owner_config_doc(
+    doc_type: Option<&DidDocType>,
+    doc: &EncodedDocument,
+) -> Option<OwnerConfig> {
     if !is_owner_doc(doc_type, doc) {
         return None;
     }
@@ -1052,19 +1080,19 @@ fn parse_owner_config_doc(doc_type: Option<&str>, doc: &EncodedDocument) -> Opti
     }
 }
 
-fn same_doc_type(left: Option<&str>, right: Option<&str>) -> bool {
-    left.unwrap_or_default() == right.unwrap_or_default()
+fn same_doc_type(left: Option<&DidDocType>, right: Option<&DidDocType>) -> bool {
+    doc_type_str(left) == doc_type_str(right)
 }
 
-fn empty_doc_type_to_option(doc_type: &str) -> Option<&str> {
+fn empty_doc_type_to_option(doc_type: &str) -> Option<DidDocType> {
     if doc_type.is_empty() {
         None
     } else {
-        Some(doc_type)
+        Some(DidDocType::from(doc_type))
     }
 }
 
-fn doc_type_from_cache_file_name(did_key: &str, file_name: &str) -> Option<Option<String>> {
+fn doc_type_from_cache_file_name(did_key: &str, file_name: &str) -> Option<Option<DidDocType>> {
     let suffix = ".doc.json";
     if !file_name.ends_with(suffix) {
         return None;
@@ -1074,12 +1102,12 @@ fn doc_type_from_cache_file_name(did_key: &str, file_name: &str) -> Option<Optio
     doc_type_from_cache_key(did_key, key)
 }
 
-fn doc_type_from_cache_key(did_key: &str, key: &str) -> Option<Option<String>> {
+fn doc_type_from_cache_key(did_key: &str, key: &str) -> Option<Option<DidDocType>> {
     if key == did_key {
         return Some(None);
     }
     key.strip_prefix(&format!("{}#", did_key))
-        .map(|doc_type| Some(doc_type.to_string()))
+        .map(|doc_type| Some(DidDocType::from(doc_type)))
 }
 
 // ------------------------ 测试 ------------------------
@@ -1219,7 +1247,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
         cache.insert(
             did.clone(),
-            Some("info"),
+            Some(DidDocType::Info),
             fresh_doc.clone(),
             base_iat + DEFAULT_EXPIRE_TIME,
             DEFAULT_PROVIDER_TRUST_LEVEL,
@@ -1229,7 +1257,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             build_owner_doc_with_revocation(did, base_iat, Some(1), Some(base_iat + 10), "owner");
         cache.insert(
             did.clone(),
-            Some("owner"),
+            Some(DidDocType::Owner),
             owner_doc,
             base_iat + DEFAULT_EXPIRE_TIME,
             DEFAULT_PROVIDER_TRUST_LEVEL,
@@ -1239,7 +1267,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             cache.get(did, None).is_none(),
             "stale default DID document should be evicted"
         );
-        assert_eq!(cache.get(did, Some("info")).unwrap().0, fresh_doc);
+        assert_eq!(cache.get(did, Some(DidDocType::Info)).unwrap().0, fresh_doc);
     }
 
     fn assert_owner_policy_rejects_new_revoked_doc(cache: &DIDDocumentCache, did: &DID) {
@@ -1248,7 +1276,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             build_owner_doc_with_revocation(did, base_iat, Some(1), Some(base_iat + 10), "owner");
         cache.insert(
             did.clone(),
-            Some("owner"),
+            Some(DidDocType::Owner),
             owner_doc,
             base_iat + DEFAULT_EXPIRE_TIME,
             DEFAULT_PROVIDER_TRUST_LEVEL,

@@ -5,8 +5,8 @@
 */
 
 use crate::{
-    DocumentRef, DocumentStatus, NameInfo, NameStatus, NsProvider, OwnerSource, PublishedState,
-    RecordType,
+    DidDocType, DocumentRef, DocumentStatus, NameInfo, NameStatus, NsProvider, OwnerSource,
+    PublishedState, RecordType,
 };
 use async_trait::async_trait;
 use log::info;
@@ -54,10 +54,10 @@ impl HttpsProvider {
         })
     }
 
-    fn build_url(&self, did: &DID, doc_type: Option<&str>) -> String {
+    fn build_url(&self, did: &DID, doc_type: Option<&DidDocType>) -> String {
         // Encode doc_type as %23doc_type so the resolver can receive it.
-        let target = if doc_type.is_some() {
-            format!("{}?type={}", did.to_string(), doc_type.unwrap())
+        let target = if let Some(doc_type) = doc_type {
+            format!("{}?type={}", did.to_string(), doc_type.as_str())
         } else {
             did.to_string()
         };
@@ -127,7 +127,7 @@ impl HttpsProvider {
     /// 状态码和 JSON 字符串写单测，不需要真的发 HTTP 请求。
     fn parse_published_state_body(
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         status: StatusCode,
         body: &str,
     ) -> NSResult<Option<PublishedState>> {
@@ -166,7 +166,7 @@ impl HttpsProvider {
 
     fn published_state_from_wire(
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         response: DidResolutionResponseWire,
     ) -> NSResult<Option<PublishedState>> {
         let Some(metadata) = response.did_document_metadata else {
@@ -336,10 +336,10 @@ impl NsProvider for HttpsProvider {
     async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        let url = self.build_url(did, doc_type);
+        let url = self.build_url(did, doc_type.as_ref());
         info!("https provider querying {}", url);
         let resp = self
             .client
@@ -353,7 +353,7 @@ impl NsProvider for HttpsProvider {
     async fn resolve_published_state(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
     ) -> NSResult<Option<PublishedState>> {
         let url = self.build_url(did, Some(doc_type));
         info!("https provider querying published state {}", url);
@@ -390,8 +390,8 @@ impl SmartProvider {
         }
     }
 
-    fn doc_file_stem(doc_type: Option<&str>) -> NSResult<&str> {
-        let doc_type = doc_type.unwrap_or("did");
+    fn doc_file_stem(doc_type: Option<&DidDocType>) -> NSResult<&str> {
+        let doc_type = doc_type.map(DidDocType::as_str).unwrap_or("did");
         if doc_type.is_empty()
             || !doc_type
                 .chars()
@@ -405,7 +405,7 @@ impl SmartProvider {
         Ok(doc_type)
     }
 
-    fn build_url(&self, did: &DID, doc_type: Option<&str>) -> NSResult<String> {
+    fn build_url(&self, did: &DID, doc_type: Option<&DidDocType>) -> NSResult<String> {
         let real_doc_type = Self::doc_file_stem(doc_type)?;
         if did.method == "web" {
             let mut parts = did.id.split(':');
@@ -459,10 +459,10 @@ impl NsProvider for SmartProvider {
     async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        let url = self.build_url(did, doc_type)?;
+        let url = self.build_url(did, doc_type.as_ref())?;
 
         let resp = self
             .client
@@ -506,9 +506,14 @@ mod tests {
         })
         .to_string();
 
-        let state = HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &body)
-            .unwrap()
-            .unwrap();
+        let state = HttpsProvider::parse_published_state_body(
+            &did,
+            &DidDocType::Zone,
+            StatusCode::OK,
+            &body,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(state.document_status, DocumentStatus::Active);
         assert_eq!(state.document_version, Some(3));
         assert_eq!(
@@ -531,7 +536,7 @@ mod tests {
         .to_string();
         let missing = HttpsProvider::parse_published_state_body(
             &did,
-            "zone",
+            &DidDocType::Zone,
             StatusCode::NOT_FOUND,
             &missing_body,
         )
@@ -545,7 +550,7 @@ mod tests {
         .to_string();
         let revoked = HttpsProvider::parse_published_state_body(
             &did,
-            "zone",
+            &DidDocType::Zone,
             StatusCode::GONE,
             &revoked_body,
         )
@@ -559,7 +564,7 @@ mod tests {
         .to_string();
         let tombstoned = HttpsProvider::parse_published_state_body(
             &did,
-            "zone",
+            &DidDocType::Zone,
             StatusCode::GONE,
             &tombstoned_body,
         )
@@ -573,10 +578,14 @@ mod tests {
             }
         })
         .to_string();
-        let migrated =
-            HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &migrated_body)
-                .unwrap()
-                .unwrap();
+        let migrated = HttpsProvider::parse_published_state_body(
+            &did,
+            &DidDocType::Zone,
+            StatusCode::OK,
+            &migrated_body,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(migrated.document_status, DocumentStatus::Migrated);
         assert_eq!(
             migrated.migration_target,
@@ -592,9 +601,14 @@ mod tests {
         })
         .to_string();
 
-        let state = HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &body)
-            .unwrap()
-            .unwrap();
+        let state = HttpsProvider::parse_published_state_body(
+            &did,
+            &DidDocType::Zone,
+            StatusCode::OK,
+            &body,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(state.document_status, DocumentStatus::Expired);
         assert_eq!(state.document_version, Some(5));
     }
@@ -604,9 +618,13 @@ mod tests {
         // 第三方 did:web / did:key resolver（identity.foundation、uniresolver.io 等）根本不
         // 知道这个扩展，普通的 404（甚至没有 JSON body）必须被当成"不适用"，而不是报错。
         let did = DID::from_str("did:web:example.com").unwrap();
-        let state =
-            HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::NOT_FOUND, "")
-                .unwrap();
+        let state = HttpsProvider::parse_published_state_body(
+            &did,
+            &DidDocType::Zone,
+            StatusCode::NOT_FOUND,
+            "",
+        )
+        .unwrap();
         assert!(state.is_none());
     }
 
@@ -620,8 +638,13 @@ mod tests {
             "didDocumentMetadata": {"deactivated": false}
         })
         .to_string();
-        let state =
-            HttpsProvider::parse_published_state_body(&did, "zone", StatusCode::OK, &body).unwrap();
+        let state = HttpsProvider::parse_published_state_body(
+            &did,
+            &DidDocType::Zone,
+            StatusCode::OK,
+            &body,
+        )
+        .unwrap();
         assert!(state.is_none());
     }
 
@@ -632,7 +655,7 @@ mod tests {
         let did = DID::from_str("did:bns:waterflier").unwrap();
         let err = HttpsProvider::parse_published_state_body(
             &did,
-            "zone",
+            &DidDocType::Zone,
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal error",
         )
@@ -645,7 +668,7 @@ mod tests {
         let did = DID::from_str("did:bns:waterflier").unwrap();
         let err = HttpsProvider::parse_published_state_body(
             &did,
-            "zone",
+            &DidDocType::Zone,
             StatusCode::OK,
             "not json at all",
         )
@@ -659,7 +682,7 @@ mod tests {
         let did = DID::from_str("did:bns:example").unwrap();
 
         assert_eq!(
-            provider.build_url(&did, Some("owner")),
+            provider.build_url(&did, Some(&DidDocType::Owner)),
             "http://127.0.0.1:3200/1.0/identifiers/did:bns:example?type=owner"
         );
     }
@@ -704,11 +727,15 @@ mod tests {
         let path_did = DID::from_str("did:web:example.com:users:alice").unwrap();
 
         assert_eq!(
-            provider.build_url(&root_did, Some("owner")).unwrap(),
+            provider
+                .build_url(&root_did, Some(&DidDocType::Owner))
+                .unwrap(),
             "http://example.com/.well-known/owner.json"
         );
         assert_eq!(
-            provider.build_url(&path_did, Some("profile")).unwrap(),
+            provider
+                .build_url(&path_did, Some(&DidDocType::custom("profile")))
+                .unwrap(),
             "http://example.com/users/alice/profile.json"
         );
     }
@@ -719,11 +746,11 @@ mod tests {
         let did = DID::from_str("did:web:example.com").unwrap();
 
         assert!(matches!(
-            provider.build_url(&did, Some("../owner")),
+            provider.build_url(&did, Some(&DidDocType::custom("../owner"))),
             Err(NSError::InvalidParam(_))
         ));
         assert!(matches!(
-            provider.build_url(&did, Some("profile/v1")),
+            provider.build_url(&did, Some(&DidDocType::custom("profile/v1"))),
             Err(NSError::InvalidParam(_))
         ));
     }

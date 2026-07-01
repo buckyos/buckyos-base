@@ -13,7 +13,7 @@ use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
-use crate::{MethodMatcher, NameInfo, NsProvider, RecordType, DEFAULT_DID_DOC_TYPE};
+use crate::{DidDocType, MethodMatcher, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -243,7 +243,7 @@ impl NsProvider for DnsProvider {
     async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         info!("NsProvider query did: {} ...", did.to_host_name());
@@ -255,9 +255,9 @@ impl NsProvider for DnsProvider {
         //info!("NsProvicer will parse_txt_record_to_did_documents... for {}",did.to_host_name());
 
         //识别TXT记录中的特殊记录
-        let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
+        let doc_type = doc_type.unwrap_or_default();
         let did_documents = name_info.parse_txt_record_to_did_documents()?;
-        if let Some(did_document) = did_documents.get(doc_type) {
+        if let Some(did_document) = did_documents.get(doc_type.as_str()) {
             info!(
                 "NsProvider::query_did{}: DID Document found: {}",
                 did.to_host_name(),
@@ -331,7 +331,7 @@ mod tests {
         let result = dns_provider
             .query_did(
                 &DID::from_str("did:web:test.buckyos.io").unwrap(),
-                Some("boot"),
+                Some(DidDocType::Boot),
                 None,
             )
             .await;
@@ -343,7 +343,7 @@ mod tests {
         let result = dns_provider
             .query_did(
                 &DID::from_str("did:web:test.buckyos.io").unwrap(),
-                Some("owner"),
+                Some(DidDocType::Owner),
                 None,
             )
             .await;

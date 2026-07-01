@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::DEFAULT_DID_DOC_TYPE;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use buckyos_kit::get_buckyos_root_dir;
 use chrono::{DateTime, Utc};
@@ -79,9 +80,14 @@ impl FromStr for IdentityUsage {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+//这种URL适合在有明确的provider的情况下查询任意did
+//- "https://{hostname}/.well-known/did.json","https://{hostname}/.well-known/doc-type.json"
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IdentityMaterial {
     DidJson,
+    DidDocJson(String),  // string is doc_type
+    DidJDocJson(String), // compatibility alias for DidDocJson
+    DidDocJwt(String),   // string is doc_type
     Cert,
     Chain,
     Fullchain,
@@ -95,10 +101,14 @@ pub enum IdentityMaterial {
 }
 
 impl IdentityMaterial {
-    fn public_file_name(self, usage: IdentityUsage) -> NSResult<String> {
+    fn public_file_name(&self, usage: IdentityUsage) -> NSResult<String> {
         let stem = usage.as_str();
         match self {
             Self::DidJson => Ok("did.json".to_string()),
+            Self::DidDocJwt(doc_type) => did_document_file_name(doc_type, "jwt", "did_doc.jwt"),
+            Self::DidDocJson(doc_type) | Self::DidJDocJson(doc_type) => {
+                did_document_file_name(doc_type, "json", "did.json")
+            }
             Self::Cert => Ok(format!("{stem}.cert.pem")),
             Self::Chain => Ok(format!("{stem}.chain.pem")),
             Self::Fullchain => Ok(format!("{stem}.fullchain.pem")),
@@ -114,7 +124,7 @@ impl IdentityMaterial {
         }
     }
 
-    fn security_file_name(self, usage: IdentityUsage) -> NSResult<String> {
+    fn security_file_name(&self, usage: IdentityUsage) -> NSResult<String> {
         let stem = usage.as_str();
         match self {
             Self::PrivateKey => Ok(format!("{stem}.private.pem")),
@@ -126,9 +136,12 @@ impl IdentityMaterial {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::DidJson => "did-json",
+            Self::DidDocJson(_) => "did-doc-json",
+            Self::DidJDocJson(_) => "did-doc-json",
+            Self::DidDocJwt(_) => "did-doc-jwt",
             Self::Cert => "cert",
             Self::Chain => "chain",
             Self::Fullchain => "fullchain",
@@ -775,6 +788,32 @@ fn ensure_x509_usage(usage: IdentityUsage) -> NSResult<()> {
     }
 }
 
+fn did_document_file_name(
+    doc_type: &str,
+    extension: &str,
+    default_file_name: &str,
+) -> NSResult<String> {
+    validate_doc_type_file_stem(doc_type)?;
+    if doc_type == DEFAULT_DID_DOC_TYPE.as_str() {
+        Ok(default_file_name.to_string())
+    } else {
+        Ok(format!("{doc_type}.{extension}"))
+    }
+}
+
+fn validate_doc_type_file_stem(doc_type: &str) -> NSResult<()> {
+    if doc_type.is_empty()
+        || !doc_type
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(NSError::InvalidParam(format!(
+            "invalid DID document type: {doc_type}"
+        )));
+    }
+    Ok(())
+}
+
 fn is_filename_keep_byte(byte: u8) -> bool {
     matches!(
         byte,
@@ -1090,6 +1129,89 @@ mod tests {
             tmp.path()
                 .join("security/node1.example.com/server.private.pem")
         );
+    }
+
+    #[test]
+    fn did_document_material_uses_well_known_style_doc_type_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+
+        assert_eq!(
+            roots
+                .public_file(
+                    "node1.example.com",
+                    IdentityUsage::Server,
+                    IdentityMaterial::DidJson,
+                )
+                .unwrap(),
+            tmp.path().join("local/identity/node1.example.com/did.json")
+        );
+        assert_eq!(
+            roots
+                .public_file(
+                    "node1.example.com",
+                    IdentityUsage::Server,
+                    IdentityMaterial::DidDocJson(crate::DEFAULT_DID_DOC_TYPE.to_string()),
+                )
+                .unwrap(),
+            tmp.path().join("local/identity/node1.example.com/did.json")
+        );
+        assert_eq!(
+            roots
+                .public_file(
+                    "node1.example.com",
+                    IdentityUsage::Server,
+                    IdentityMaterial::DidDocJwt(crate::DEFAULT_DID_DOC_TYPE.to_string()),
+                )
+                .unwrap(),
+            tmp.path()
+                .join("local/identity/node1.example.com/did_doc.jwt")
+        );
+        assert_eq!(
+            roots
+                .public_file(
+                    "node1.example.com",
+                    IdentityUsage::Server,
+                    IdentityMaterial::DidDocJson("owner".to_string()),
+                )
+                .unwrap(),
+            tmp.path()
+                .join("local/identity/node1.example.com/owner.json")
+        );
+        assert_eq!(
+            roots
+                .public_file(
+                    "node1.example.com",
+                    IdentityUsage::Server,
+                    IdentityMaterial::DidDocJwt("profile".to_string()),
+                )
+                .unwrap(),
+            tmp.path()
+                .join("local/identity/node1.example.com/profile.jwt")
+        );
+    }
+
+    #[test]
+    fn did_document_material_rejects_unsafe_doc_type_file_stems() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+
+        assert!(matches!(
+            roots.public_file(
+                "node1.example.com",
+                IdentityUsage::Server,
+                IdentityMaterial::DidDocJson("../owner".to_string()),
+            ),
+            Err(NSError::InvalidParam(_))
+        ));
+        assert!(matches!(
+            roots.public_file(
+                "node1.example.com",
+                IdentityUsage::Server,
+                IdentityMaterial::DidDocJwt("profile/v1".to_string()),
+            ),
+            Err(NSError::InvalidParam(_))
+        ));
     }
 
     #[test]

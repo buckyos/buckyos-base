@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::{
-    CacheStatus, DocumentBody, DocumentRef, DocumentStatus, EvidenceKind, NameInfo, NsProvider,
-    OwnerDocumentPolicy, PublishedState, RecordType, ResolvePolicy, ResolveWarning,
-    ResolvedDocument, DEFAULT_DID_DOC_TYPE, DOC_TYPE_OWNER,
+    CacheStatus, DidDocType, DocumentBody, DocumentRef, DocumentStatus, EvidenceKind, NameInfo,
+    NsProvider, OwnerDocumentPolicy, PublishedState, RecordType, ResolvePolicy, ResolveWarning,
+    ResolvedDocument,
 };
 
 /// 候选文档在验证阶段被拒绝的原因。契约违规会被记录为 warning 并静默丢弃该候选，
@@ -71,7 +71,7 @@ impl NameQuery {
     pub async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         max_trust_level: Option<i32>,
     ) -> NSResult<(EncodedDocument, u64, i32)> {
         let resolved = self
@@ -89,7 +89,7 @@ impl NameQuery {
     pub async fn query_did_ex(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         max_trust_level: Option<i32>,
         policy: ResolvePolicy,
     ) -> NSResult<ResolvedDocument> {
@@ -101,7 +101,7 @@ impl NameQuery {
             )));
         }
 
-        let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
+        let doc_type = doc_type.unwrap_or_default();
         let allowed_max_trust = max_trust_level.unwrap_or(i32::MAX);
         let matched = providers
             .iter()
@@ -139,11 +139,11 @@ impl NameQuery {
         // unauthenticated 路径，造成本该验证的 Document 绕过 owner 验签。
         let needs_verification = matched
             .iter()
-            .any(|(provider, _)| provider.requires_verification(doc_type));
+            .any(|(provider, _)| provider.requires_verification(&doc_type));
 
         if !needs_verification {
             return self
-                .resolve_unauthenticated_info(did, doc_type, &matched, &policy)
+                .resolve_unauthenticated_info(did, &doc_type, &matched, &policy)
                 .await;
         }
 
@@ -151,11 +151,11 @@ impl NameQuery {
         // 生效（不用于 Info 轻量路径），在查 PublishedState 之前生效，owner 递归
         // 复用同一个 policy 时同样会命中。
         if let Some(store) = policy.local_authority_override.as_ref() {
-            if let Some(document) = store.get(did, doc_type) {
+            if let Some(document) = store.get(did, &doc_type) {
                 return Ok(ResolvedDocument::from_document(
                     document,
                     did,
-                    doc_type,
+                    &doc_type,
                     None,
                     Some("local-authority-override".to_string()),
                     EvidenceKind::AnchoredDocumentBody,
@@ -166,13 +166,13 @@ impl NameQuery {
         }
 
         if let Some(resolved) = self
-            .resolve_from_published_state(did, doc_type, &matched, &policy)
+            .resolve_from_published_state(did, &doc_type, &matched, &policy)
             .await?
         {
             return Ok(resolved);
         }
 
-        self.resolve_from_document_candidates(did, doc_type, &matched, None, &policy)
+        self.resolve_from_document_candidates(did, &doc_type, &matched, None, &policy)
             .await
     }
 
@@ -188,7 +188,7 @@ impl NameQuery {
     async fn resolve_from_published_state(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         providers: &[(&Box<dyn NsProvider>, i32)],
         policy: &ResolvePolicy,
     ) -> NSResult<Option<ResolvedDocument>> {
@@ -232,7 +232,7 @@ impl NameQuery {
                             let next_policy = policy.descend(&target, doc_type)?;
                             let resolved = Box::pin(self.query_did_ex(
                                 &target,
-                                Some(doc_type),
+                                Some(doc_type.clone()),
                                 None,
                                 next_policy,
                             ))
@@ -305,7 +305,7 @@ impl NameQuery {
         &self,
         providers: &[(&Box<dyn NsProvider>, i32)],
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
     ) -> NSResult<Vec<PublishedState>> {
         use futures::future::join_all;
 
@@ -370,7 +370,7 @@ impl NameQuery {
     async fn resolve_from_document_candidates(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         providers: &[(&Box<dyn NsProvider>, i32)],
         published: Option<&PublishedState>,
         policy: &ResolvePolicy,
@@ -430,7 +430,7 @@ impl NameQuery {
     async fn resolve_unauthenticated_info(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         providers: &[(&Box<dyn NsProvider>, i32)],
         _policy: &ResolvePolicy,
     ) -> NSResult<ResolvedDocument> {
@@ -476,7 +476,7 @@ impl NameQuery {
         &self,
         providers: &[(&Box<dyn NsProvider>, i32)],
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
     ) -> NSResult<Vec<DocumentBody>> {
         use futures::future::join_all;
 
@@ -501,7 +501,7 @@ impl NameQuery {
         &self,
         providers: &[(&Box<dyn NsProvider>, i32)],
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
     ) -> NSResult<Vec<DocumentBody>> {
         use futures::future::join_all;
 
@@ -550,7 +550,7 @@ impl NameQuery {
     async fn verify_and_select_document(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         providers: &[(&Box<dyn NsProvider>, i32)],
         bodies: Vec<DocumentBody>,
         published: Option<&PublishedState>,
@@ -596,7 +596,7 @@ impl NameQuery {
     async fn verify_document_candidate(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         body: &DocumentBody,
         is_owner_root: bool,
         published: Option<&PublishedState>,
@@ -685,7 +685,7 @@ impl NameQuery {
     async fn verify_owned_candidate(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         body: &DocumentBody,
         published: Option<&PublishedState>,
         policy: &ResolvePolicy,
@@ -735,20 +735,24 @@ impl NameQuery {
         // 并用 descend() 做环路/深度检查。
         let next_policy = policy
             .for_authority_lookup()
-            .descend(&declared_owner, DOC_TYPE_OWNER)
+            .descend(&declared_owner, &DidDocType::Owner)
             .map_err(CandidateRejection::Failed)?;
-        let owner_resolved =
-            Box::pin(self.query_did_ex(&declared_owner, Some(DOC_TYPE_OWNER), None, next_policy))
-                .await
-                .map_err(|err| {
-                    CandidateRejection::Failed(NSError::Failed(format!(
-                        "resolve owner {} for {}#{} failed: {}",
-                        declared_owner.to_string(),
-                        did.to_string(),
-                        doc_type,
-                        err
-                    )))
-                })?;
+        let owner_resolved = Box::pin(self.query_did_ex(
+            &declared_owner,
+            Some(DidDocType::Owner),
+            None,
+            next_policy,
+        ))
+        .await
+        .map_err(|err| {
+            CandidateRejection::Failed(NSError::Failed(format!(
+                "resolve owner {} for {}#{} failed: {}",
+                declared_owner.to_string(),
+                did.to_string(),
+                doc_type,
+                err
+            )))
+        })?;
 
         let owner_config = OwnerConfig::decode(&owner_resolved.document, None).map_err(|err| {
             CandidateRejection::Failed(NSError::Failed(format!(
@@ -865,7 +869,7 @@ impl NameQuery {
         &self,
         providers: &[&Box<dyn NsProvider>],
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
     ) -> Result<Option<(EncodedDocument, u64)>, NSError> {
         if providers.is_empty() {
             return Ok(None);
@@ -876,7 +880,7 @@ impl NameQuery {
         // 收集所有的 futures（不立即 await，保持并发）
         let futures: Vec<_> = providers
             .iter()
-            .map(|provider| provider.query_did(did, doc_type, None))
+            .map(|provider| provider.query_did(did, doc_type.clone(), None))
             .collect();
 
         // 并发等待所有 futures 完成
@@ -938,9 +942,7 @@ impl NameQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        DocumentBody, MethodMatcher, NameStatus, OwnerSource, ResolverCaps, DOC_TYPE_INFO,
-    };
+    use crate::{DocumentBody, MethodMatcher, NameStatus, OwnerSource, ResolverCaps};
     use async_trait::async_trait;
     use jsonwebtoken::{jwk::Jwk, EncodingKey};
     use name_lib::NSError;
@@ -1109,16 +1111,16 @@ mod tests {
         fn is_owner_root(
             &self,
             _did: &DID,
-            doc_type: &str,
+            doc_type: &DidDocType,
             _published: Option<&PublishedState>,
         ) -> bool {
             self.is_owner_root_override
-                .unwrap_or(doc_type == DOC_TYPE_OWNER)
+                .unwrap_or(doc_type == &DidDocType::Owner)
         }
 
-        fn requires_verification(&self, doc_type: &str) -> bool {
+        fn requires_verification(&self, doc_type: &DidDocType) -> bool {
             self.requires_verification_override
-                .unwrap_or(doc_type != DOC_TYPE_INFO)
+                .unwrap_or(doc_type != &DidDocType::Info)
         }
 
         async fn query(
@@ -1133,13 +1135,13 @@ mod tests {
         async fn query_did(
             &self,
             did: &DID,
-            doc_type: Option<&str>,
+            doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
-            let wanted = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
+            let wanted = doc_type.unwrap_or_default();
             self.docs
                 .iter()
-                .find(|(d, t, _)| d == did && t == wanted)
+                .find(|(d, t, _)| d == did && t == wanted.as_str())
                 .map(|(_, _, doc)| doc.clone())
                 .ok_or_else(|| NSError::NotFound("no matching doc".into()))
         }
@@ -1178,7 +1180,7 @@ mod tests {
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             Err(NSError::NotFound("published-state only".into()))
@@ -1187,11 +1189,11 @@ mod tests {
         async fn resolve_published_state(
             &self,
             did: &DID,
-            doc_type: &str,
+            doc_type: &DidDocType,
         ) -> NSResult<Option<PublishedState>> {
             // 只对自己配置的 (did, doc_type) 生效，避免在递归解析其它 (did, doc_type)
             // 时（例如递归解析 owner 文档）被这个 mock 错误地"抢答"。
-            if did == &self.state.did && doc_type == self.state.doc_type {
+            if did == &self.state.did && doc_type.as_str() == self.state.doc_type {
                 Ok(Some(self.state.clone()))
             } else {
                 Ok(None)
@@ -1265,7 +1267,7 @@ mod tests {
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             Ok(self.doc.clone())
@@ -1304,7 +1306,7 @@ mod tests {
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             Ok(self.doc.clone())
@@ -1313,7 +1315,7 @@ mod tests {
         async fn query_self_signed_candidates(
             &self,
             _did: &DID,
-            _doc_type: &str,
+            _doc_type: &DidDocType,
         ) -> NSResult<Vec<DocumentBody>> {
             Ok(vec![DocumentBody::self_signed(
                 self.doc.clone(),
@@ -1340,7 +1342,7 @@ mod tests {
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             if let Some(err) = self.err {
@@ -1371,7 +1373,10 @@ mod tests {
         q.add_provider(Box::new(MockProvider::ok("p2", doc_new.clone())), 10)
             .await;
 
-        let (doc, exp, trust) = q.query_did(&did, Some("info"), None).await.unwrap();
+        let (doc, exp, trust) = q
+            .query_did(&did, Some(DidDocType::Info), None)
+            .await
+            .unwrap();
         assert_eq!(doc, doc_new);
         assert_eq!(exp, 300);
         assert_eq!(trust, 10);
@@ -1397,7 +1402,10 @@ mod tests {
         )
         .await;
 
-        let (doc, exp, trust) = q.query_did(&did, Some("info"), None).await.unwrap();
+        let (doc, exp, trust) = q
+            .query_did(&did, Some(DidDocType::Info), None)
+            .await
+            .unwrap();
         assert_eq!(doc, doc_high_priority);
         assert_eq!(exp, 20);
         assert_eq!(trust, 5);
@@ -1430,7 +1438,10 @@ mod tests {
         )
         .await;
 
-        let (doc, exp, trust) = q.query_did(&did, Some("info"), None).await.unwrap();
+        let (doc, exp, trust) = q
+            .query_did(&did, Some(DidDocType::Info), None)
+            .await
+            .unwrap();
         assert_eq!(doc, bns_doc);
         assert_eq!(exp, 200);
         assert_eq!(trust, 50);
@@ -1450,7 +1461,7 @@ mod tests {
             .await;
 
         let resolved = q
-            .query_did_ex(&did, Some("info"), None, ResolvePolicy::default())
+            .query_did_ex(&did, Some(DidDocType::Info), None, ResolvePolicy::default())
             .await
             .unwrap();
         assert_eq!(resolved.document, info_doc);
@@ -1477,7 +1488,7 @@ mod tests {
             self.caps
         }
 
-        fn requires_verification(&self, _doc_type: &str) -> bool {
+        fn requires_verification(&self, _doc_type: &DidDocType) -> bool {
             self.requires_verification
         }
 
@@ -1493,7 +1504,7 @@ mod tests {
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             Ok(self.doc.clone())
@@ -1548,7 +1559,12 @@ mod tests {
         .await;
 
         let resolved = q
-            .query_did_ex(&zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, zone_doc);
@@ -1576,7 +1592,12 @@ mod tests {
         .await;
 
         let resolved = q
-            .query_did_ex(&zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, zone_doc);
@@ -1610,7 +1631,12 @@ mod tests {
             .await;
 
         let resolved = q
-            .query_did_ex(&zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, zone_doc);
@@ -1653,13 +1679,23 @@ mod tests {
         .await;
 
         let resolved = q
-            .query_did_ex(&good_zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &good_zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, good_zone_doc);
 
         let err = q
-            .query_did_ex(&bad_zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &bad_zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
@@ -1696,7 +1732,12 @@ mod tests {
         .await;
 
         let resolved = q
-            .query_did_ex(&zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, zone_doc);
@@ -1744,7 +1785,12 @@ mod tests {
         .await;
 
         let err = q
-            .query_did_ex(&zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, NSError::OwnerConflict(_)));
@@ -1791,7 +1837,12 @@ mod tests {
         .await;
 
         let resolved = q2
-            .query_did_ex(&zone_did2, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &zone_did2,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, zone_doc_declares_x);
@@ -1827,13 +1878,23 @@ mod tests {
         .await;
 
         let err = q
-            .query_did_ex(&old_zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &old_zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("revoke_before_iat"));
 
         let resolved = q
-            .query_did_ex(&new_zone_did, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &new_zone_did,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, new_zone_doc);
@@ -1854,7 +1915,7 @@ mod tests {
         fn is_owner_root(
             &self,
             _did: &DID,
-            _doc_type: &str,
+            _doc_type: &DidDocType,
             _published: Option<&PublishedState>,
         ) -> bool {
             false
@@ -1872,13 +1933,13 @@ mod tests {
         async fn query_did(
             &self,
             did: &DID,
-            doc_type: Option<&str>,
+            doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
-            let wanted = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
+            let wanted = doc_type.unwrap_or_default();
             self.docs
                 .iter()
-                .find(|(d, t, _)| d == did && t == wanted)
+                .find(|(d, t, _)| d == did && t == wanted.as_str())
                 .map(|(_, _, doc)| doc.clone())
                 .ok_or_else(|| NSError::NotFound("no matching doc".into()))
         }
@@ -1907,7 +1968,12 @@ mod tests {
         .await;
 
         let result = q
-            .query_did_ex(&did_a, Some("owner"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &did_a,
+                Some(DidDocType::Owner),
+                None,
+                ResolvePolicy::default(),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -1963,7 +2029,12 @@ mod tests {
         .await;
 
         let resolved = q
-            .query_did_ex(&did_old, Some("zone"), None, ResolvePolicy::default())
+            .query_did_ex(
+                &did_old,
+                Some(DidDocType::Zone),
+                None,
+                ResolvePolicy::default(),
+            )
             .await
             .unwrap();
         assert_eq!(resolved.document, new_doc);
@@ -1988,7 +2059,7 @@ mod tests {
         let mut policy = ResolvePolicy::default();
         policy.follow_migration = false;
         let err = q
-            .query_did_ex(&did_old, Some("zone"), None, policy)
+            .query_did_ex(&did_old, Some(DidDocType::Zone), None, policy)
             .await
             .unwrap_err();
         assert!(matches!(err, NSError::Disabled(_)));
@@ -2025,11 +2096,14 @@ mod tests {
         .await;
 
         // 限制最大 trust_level = 10，应当直接 NotFound，而不会落到低优先级
-        let result = q.query_did(&did, Some("info"), Some(10)).await;
+        let result = q.query_did(&did, Some(DidDocType::Info), Some(10)).await;
         assert!(result.is_err());
 
         // 不限制时应当拿到低优先级结果
-        let (doc, exp, trust) = q.query_did(&did, Some("info"), None).await.unwrap();
+        let (doc, exp, trust) = q
+            .query_did(&did, Some(DidDocType::Info), None)
+            .await
+            .unwrap();
         assert_eq!(doc, doc_lower_priority);
         assert_eq!(exp, 100);
         assert_eq!(trust, 50);

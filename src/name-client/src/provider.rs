@@ -9,10 +9,108 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-pub const DEFAULT_DID_DOC_TYPE: &str = "zone";
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DidDocType {
+    Zone,
+    Owner,
+    Info,
+    Boot,
+    User,
+    Device,
+    DidObject,
+    Custom(String),
+}
 
-pub const DOC_TYPE_OWNER: &str = "owner";
-pub const DOC_TYPE_INFO: &str = "info";
+impl DidDocType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Zone => "zone",
+            Self::Owner => "owner",
+            Self::Info => "info",
+            Self::Boot => "boot",
+            Self::User => "user",
+            Self::Device => "device",
+            Self::DidObject => "did-object",
+            Self::Custom(doc_type) => doc_type.as_str(),
+        }
+    }
+
+    pub fn custom(doc_type: impl Into<String>) -> Self {
+        Self::from(doc_type.into())
+    }
+}
+
+impl Default for DidDocType {
+    fn default() -> Self {
+        Self::Zone
+    }
+}
+
+impl std::fmt::Display for DidDocType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for DidDocType {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for DidDocType {
+    fn from(value: &str) -> Self {
+        match value {
+            "zone" => Self::Zone,
+            "owner" => Self::Owner,
+            "info" => Self::Info,
+            "boot" => Self::Boot,
+            "user" => Self::User,
+            "device" => Self::Device,
+            "did-object" => Self::DidObject,
+            _ => Self::Custom(value.to_string()),
+        }
+    }
+}
+
+impl From<String> for DidDocType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "zone" => Self::Zone,
+            "owner" => Self::Owner,
+            "info" => Self::Info,
+            "boot" => Self::Boot,
+            "user" => Self::User,
+            "device" => Self::Device,
+            "did-object" => Self::DidObject,
+            _ => Self::Custom(value),
+        }
+    }
+}
+
+impl Serialize for DidDocType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DidDocType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from(value))
+    }
+}
+
+pub const DEFAULT_DID_DOC_TYPE: DidDocType = DidDocType::Zone;
+
+pub const DOC_TYPE_OWNER: DidDocType = DidDocType::Owner;
+pub const DOC_TYPE_INFO: DidDocType = DidDocType::Info;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MethodMatcher {
@@ -439,7 +537,7 @@ impl ResolvedDocument {
     pub fn from_document(
         document: EncodedDocument,
         _did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         authority_rank: Option<i32>,
         resolver_id: Option<String>,
         evidence_kind: EvidenceKind,
@@ -509,7 +607,7 @@ impl ResolvedDocument {
     pub fn from_cache(
         document: EncodedDocument,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         exp: u64,
         trust_level: i32,
         cache_status: CacheStatus,
@@ -537,7 +635,7 @@ impl ResolvedDocument {
     pub fn from_unauthenticated_info(
         document: EncodedDocument,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         authority_rank: Option<i32>,
         resolver_id: Option<String>,
     ) -> Self {
@@ -573,7 +671,7 @@ pub struct ResolvePolicy {
     /// 挂在 policy 上而不是单独传参，是为了让它随 `descend()`/`for_authority_lookup()`
     /// 一起传播到 owner 递归里——owner 解析同样要能命中 override。
     pub local_authority_override: Option<Arc<LocalAuthorityOverrideStore>>,
-    visited: Vec<(DID, String)>,
+    visited: Vec<(DID, DidDocType)>,
 }
 
 impl Default for ResolvePolicy {
@@ -605,7 +703,7 @@ impl ResolvePolicy {
         policy
     }
 
-    pub fn descend(&self, did: &DID, doc_type: &str) -> NSResult<Self> {
+    pub fn descend(&self, did: &DID, doc_type: &DidDocType) -> NSResult<Self> {
         if self.visited.len() >= self.max_depth {
             return Err(NSError::InvalidState(format!(
                 "DID resolution recursion depth exceeded at {}#{}",
@@ -623,7 +721,7 @@ impl ResolvePolicy {
             )));
         }
         let mut next = self.clone();
-        next.visited.push((did.clone(), doc_type.to_string()));
+        next.visited.push((did.clone(), doc_type.clone()));
         Ok(next)
     }
 }
@@ -658,7 +756,7 @@ impl LocalAuthorityOverrideStore {
     pub fn set(
         &self,
         did: DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         document: EncodedDocument,
         scope: impl Into<String>,
         expires_at: Option<u64>,
@@ -674,12 +772,12 @@ impl LocalAuthorityOverrideStore {
         );
     }
 
-    pub fn clear(&self, did: &DID, doc_type: &str) {
+    pub fn clear(&self, did: &DID, doc_type: &DidDocType) {
         let mut entries = self.entries.write().unwrap();
         entries.remove(&(did.clone(), doc_type.to_string()));
     }
 
-    pub fn get(&self, did: &DID, doc_type: &str) -> Option<EncodedDocument> {
+    pub fn get(&self, did: &DID, doc_type: &DidDocType) -> Option<EncodedDocument> {
         let entries = self.entries.read().unwrap();
         let entry = entries.get(&(did.clone(), doc_type.to_string()))?;
         if let Some(expires_at) = entry.expires_at {
@@ -1036,8 +1134,8 @@ pub trait NsProvider: 'static + Send + Sync {
         ResolverCaps::default()
     }
 
-    fn requires_verification(&self, doc_type: &str) -> bool {
-        doc_type != DOC_TYPE_INFO
+    fn requires_verification(&self, doc_type: &DidDocType) -> bool {
+        doc_type != &DidDocType::Info
     }
 
     /// 该 (did, doc_type) 是否是 owner 递归的递归基：默认约定是
@@ -1046,10 +1144,10 @@ pub trait NsProvider: 'static + Send + Sync {
     fn is_owner_root(
         &self,
         _did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
         _published: Option<&PublishedState>,
     ) -> bool {
-        doc_type == DOC_TYPE_OWNER
+        doc_type == &DidDocType::Owner
     }
 
     async fn query(
@@ -1061,14 +1159,14 @@ pub trait NsProvider: 'static + Send + Sync {
     async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument>;
 
     async fn resolve_published_state(
         &self,
         _did: &DID,
-        _doc_type: &str,
+        _doc_type: &DidDocType,
     ) -> NSResult<Option<PublishedState>> {
         Ok(None)
     }
@@ -1083,12 +1181,12 @@ pub trait NsProvider: 'static + Send + Sync {
     async fn query_self_signed_candidates(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
     ) -> NSResult<Vec<DocumentBody>> {
-        let legacy_doc_type = if doc_type == DEFAULT_DID_DOC_TYPE {
+        let legacy_doc_type = if doc_type == &DidDocType::Zone {
             None
         } else {
-            Some(doc_type)
+            Some(doc_type.clone())
         };
         let doc = self.query_did(did, legacy_doc_type, None).await?;
         Ok(vec![DocumentBody::anchored(doc, Some(self.get_id()))])
@@ -1097,9 +1195,9 @@ pub trait NsProvider: 'static + Send + Sync {
     async fn query_unauthenticated_info(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
     ) -> NSResult<Vec<DocumentBody>> {
-        let doc = self.query_did(did, Some(doc_type), None).await?;
+        let doc = self.query_did(did, Some(doc_type.clone()), None).await?;
         Ok(vec![DocumentBody::unauthenticated(
             doc,
             Some(self.get_id()),

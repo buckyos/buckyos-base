@@ -9,8 +9,8 @@ use crate::doc_cache::{CacheBackend, DIDDocumentCache, UnauthenticatedInfoCache}
 use crate::name_query::NameQuery;
 use crate::provider::RecordType;
 use crate::{
-    CacheStatus, LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy, ResolveWarning,
-    ResolvedDocument, DEFAULT_DID_DOC_TYPE, DOC_TYPE_INFO,
+    CacheStatus, DidDocType, LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy,
+    ResolveWarning, ResolvedDocument,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
@@ -111,17 +111,17 @@ impl NameClient {
     pub fn set_local_authority_override(
         &self,
         did: DID,
-        doc_type: &str,
+        doc_type: DidDocType,
         document: EncodedDocument,
         scope: impl Into<String>,
         expires_at: Option<u64>,
     ) {
         self.local_authority_overrides
-            .set(did, doc_type, document, scope, expires_at);
+            .set(did, &doc_type, document, scope, expires_at);
     }
 
-    pub fn clear_local_authority_override(&self, did: &DID, doc_type: &str) {
-        self.local_authority_overrides.clear(did, doc_type);
+    pub fn clear_local_authority_override(&self, did: &DID, doc_type: DidDocType) {
+        self.local_authority_overrides.clear(did, &doc_type);
     }
 
     fn build_rtt_db(config: AddrRttDbConfig, local_cache_dir: Option<&str>) -> RttDatabase {
@@ -170,7 +170,7 @@ impl NameClient {
     pub fn update_did_cache(
         &self,
         did: DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         doc: EncodedDocument,
     ) -> NSResult<()> {
         let exp = Self::extract_exp(&doc)
@@ -207,7 +207,7 @@ impl NameClient {
         let exp = seen_at.saturating_add(ttl_secs);
         self.unauthenticated_info_cache.insert(
             &did,
-            Some(DOC_TYPE_INFO),
+            Some(DidDocType::Info),
             doc,
             exp,
             DEFAULT_PROVIDER_TRUST_LEVEL,
@@ -215,7 +215,7 @@ impl NameClient {
         Ok(())
     }
 
-    pub fn invalidate_did_cache(&self, did: DID, doc_type: Option<&str>) {
+    pub fn invalidate_did_cache(&self, did: DID, doc_type: Option<DidDocType>) {
         if self.config.enable_cache {
             self.doc_cache.delete(did, doc_type);
         }
@@ -432,7 +432,7 @@ impl NameClient {
 
     async fn resolve_device_info_ips(&self, name: &str) -> NSResult<Vec<IpAddr>> {
         let did = DID::from_str(name)?;
-        let doc = self.resolve_did(&did, Some(DOC_TYPE_INFO)).await?;
+        let doc = self.resolve_did(&did, Some(DidDocType::Info)).await?;
         Self::extract_device_info_ips(doc)
     }
 
@@ -509,7 +509,7 @@ impl NameClient {
     fn validate_doc_replay_guard(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         doc: &EncodedDocument,
     ) -> NSResult<()> {
         if self.config.enable_cache {
@@ -533,28 +533,33 @@ impl NameClient {
     pub async fn resolve_did_ex(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         policy: ResolvePolicy,
     ) -> NSResult<ResolvedDocument> {
         let policy = policy.with_local_authority_override(self.local_authority_overrides.clone());
-        let canonical_doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
-        let is_unauthenticated_info = canonical_doc_type == DOC_TYPE_INFO;
+        let cache_doc_type = doc_type.clone();
+        let canonical_doc_type = doc_type.unwrap_or_default();
+        let is_unauthenticated_info = canonical_doc_type == DidDocType::Info;
         let mut cached_trust_level: i32 = i32::MAX;
         let mut cached_result: Option<(EncodedDocument, u64, i32)> = None;
         if self.config.enable_cache {
             // unauthenticated_info_cache 和 doc_cache（verified_cache 的角色）是两个
             // 独立的存储：Info 类结果只按 iat/ttl 判断可用性，不做 owner replay guard。
             cached_result = if is_unauthenticated_info {
-                self.unauthenticated_info_cache.get(did, doc_type)
+                self.unauthenticated_info_cache
+                    .get(did, cache_doc_type.clone())
             } else {
-                self.doc_cache.get(did, doc_type)
+                self.doc_cache.get(did, cache_doc_type.clone())
             };
             if let Some((_, exp, trust_level)) = cached_result.as_ref() {
                 if !self.is_expired(*exp) {
                     info!(
                         "cached did:{}#{} is not expired, trust_level set to: {}",
                         did.to_string(),
-                        doc_type.unwrap_or(""),
+                        cache_doc_type
+                            .as_ref()
+                            .map(DidDocType::as_str)
+                            .unwrap_or(""),
                         trust_level
                     );
                     cached_trust_level = *trust_level;
@@ -562,14 +567,19 @@ impl NameClient {
             }
             if !is_unauthenticated_info {
                 if let Some((doc, _, _)) = cached_result.as_ref() {
-                    if let Err(err) = self.validate_doc_replay_guard(did, doc_type, doc) {
+                    if let Err(err) =
+                        self.validate_doc_replay_guard(did, cache_doc_type.clone(), doc)
+                    {
                         info!(
                             "cached did:{}#{} rejected by owner replay guard: {}",
                             did.to_string(),
-                            doc_type.unwrap_or(""),
+                            cache_doc_type
+                                .as_ref()
+                                .map(DidDocType::as_str)
+                                .unwrap_or(""),
                             err
                         );
-                        self.doc_cache.delete(did.clone(), doc_type);
+                        self.doc_cache.delete(did.clone(), cache_doc_type.clone());
                         cached_result = None;
                         cached_trust_level = i32::MAX;
                     }
@@ -584,7 +594,12 @@ impl NameClient {
         };
         let reslove_result = self
             .name_query
-            .query_did_ex(did, Some(canonical_doc_type), max_trust_level, policy)
+            .query_did_ex(
+                did,
+                Some(canonical_doc_type.clone()),
+                max_trust_level,
+                policy,
+            )
             .await;
 
         match reslove_result {
@@ -609,13 +624,17 @@ impl NameClient {
                     .warnings
                     .contains(&ResolveWarning::LocalAuthorityOverride);
                 if !is_unauthenticated_info && !is_local_override {
-                    self.validate_doc_replay_guard(did, doc_type, &resolved.document)?;
+                    self.validate_doc_replay_guard(
+                        did,
+                        cache_doc_type.clone(),
+                        &resolved.document,
+                    )?;
                 }
                 if self.config.enable_cache {
                     if is_unauthenticated_info {
                         self.unauthenticated_info_cache.insert(
                             did,
-                            doc_type,
+                            cache_doc_type.clone(),
                             resolved.document.clone(),
                             exp,
                             result_trust_level,
@@ -623,7 +642,7 @@ impl NameClient {
                     } else if !is_local_override {
                         self.doc_cache.update(
                             did.clone(),
-                            doc_type,
+                            cache_doc_type.clone(),
                             resolved.document.clone(),
                             exp,
                             result_trust_level,
@@ -641,7 +660,7 @@ impl NameClient {
                 NSError::Disabled(msg) => {
                     info!("{}'s doc disabled, delete cache", did.to_string());
                     if self.config.enable_cache {
-                        self.doc_cache.delete(did.clone(), doc_type);
+                        self.doc_cache.delete(did.clone(), cache_doc_type);
                     }
                     Err(NSError::Disabled(msg))
                 }
@@ -661,7 +680,7 @@ impl NameClient {
                         return Ok(ResolvedDocument::from_cache(
                             doc,
                             did,
-                            canonical_doc_type,
+                            &canonical_doc_type,
                             exp,
                             trust_level,
                             cache_status,
@@ -676,7 +695,7 @@ impl NameClient {
     pub async fn resolve_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
     ) -> NSResult<EncodedDocument> {
         Ok(self
             .resolve_did_ex(did, doc_type, ResolvePolicy::default())
@@ -846,10 +865,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         async fn query_did(
             &self,
             _did: &DID,
-            doc_type: Option<&str>,
+            doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
-            if doc_type == Some("owner") {
+            if doc_type == Some(DidDocType::Owner) {
                 if let Some(owner_doc) = self.owner_doc.as_ref() {
                     return Ok(owner_doc.clone());
                 }
@@ -885,10 +904,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         async fn query_did(
             &self,
             _did: &DID,
-            doc_type: Option<&str>,
+            doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
-            if doc_type == Some("owner") {
+            if doc_type == Some(DidDocType::Owner) {
                 return Ok(self.owner_doc.clone());
             }
             Ok(self.fresh_doc.clone())
@@ -919,7 +938,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             Err(NSError::NotFound("not implemented".into()))
@@ -951,12 +970,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         async fn query_did(
             &self,
             _did: &DID,
-            doc_type: Option<&str>,
+            doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             match doc_type {
-                Some("info") => Ok(self.info_doc.clone()),
-                Some("owner") => Ok(self.owner_doc.clone()),
+                Some(DidDocType::Info) => Ok(self.info_doc.clone()),
+                Some(DidDocType::Owner) => Ok(self.owner_doc.clone()),
                 None => Ok(self.device_doc.clone()),
                 _ => Err(NSError::NotFound("not implemented".into())),
             }
@@ -1071,7 +1090,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .await;
         client.set_local_authority_override(
             did.clone(),
-            "zone",
+            DidDocType::Zone,
             override_doc.clone(),
             "test-env",
             None,
@@ -1091,7 +1110,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert!(client.doc_cache.get(&did, None).is_none());
 
         // 清除 override 后应该正常回落到 provider 的结果。
-        client.clear_local_authority_override(&did, "zone");
+        client.clear_local_authority_override(&did, DidDocType::Zone);
         let resolved_after_clear = client.resolve_did(&did, None).await.unwrap();
         assert_eq!(resolved_after_clear, provider_doc);
     }
@@ -1119,7 +1138,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         async fn query_did(
             &self,
             _did: &DID,
-            _doc_type: Option<&str>,
+            _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1155,7 +1174,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .await;
 
         let first = client
-            .resolve_did_ex(&did, Some("info"), ResolvePolicy::default())
+            .resolve_did_ex(&did, Some(DidDocType::Info), ResolvePolicy::default())
             .await
             .unwrap();
         assert_eq!(first.document, doc);
@@ -1165,7 +1184,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         // provider 从第二次调用起总是失败，只有 unauthenticated_info_cache 命中才能
         // 让这次解析成功。
         let second = client
-            .resolve_did_ex(&did, Some("info"), ResolvePolicy::default())
+            .resolve_did_ex(&did, Some(DidDocType::Info), ResolvePolicy::default())
             .await
             .unwrap();
         assert_eq!(second.document, doc);
@@ -1181,7 +1200,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .contains(&ResolveWarning::UnauthenticatedInfoCache));
 
         // 这个 cache 完全独立于普通 doc_cache（verified_cache 的角色）。
-        assert!(client.doc_cache.get(&did, Some("info")).is_none());
+        assert!(client.doc_cache.get(&did, Some(DidDocType::Info)).is_none());
     }
 
     #[tokio::test]
@@ -1231,7 +1250,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
         client.doc_cache.insert(
             did.clone(),
-            Some("owner"),
+            Some(DidDocType::Owner),
             owner_doc.clone(),
             now + DEFAULT_EXPIRE_TIME,
             DEFAULT_PROVIDER_TRUST_LEVEL,
@@ -1428,7 +1447,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             async fn query_did(
                 &self,
                 _did: &DID,
-                _doc_type: Option<&str>,
+                _doc_type: Option<DidDocType>,
                 _from_ip: Option<std::net::IpAddr>,
             ) -> NSResult<EncodedDocument> {
                 Err(NSError::NotFound("not implemented".into()))
@@ -1505,7 +1524,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             async fn query_did(
                 &self,
                 _did: &DID,
-                _doc_type: Option<&str>,
+                _doc_type: Option<DidDocType>,
                 _from_ip: Option<std::net::IpAddr>,
             ) -> NSResult<EncodedDocument> {
                 Err(NSError::NotFound("not implemented".into()))
@@ -1579,7 +1598,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             async fn query_did(
                 &self,
                 _did: &DID,
-                _doc_type: Option<&str>,
+                _doc_type: Option<DidDocType>,
                 _from_ip: Option<std::net::IpAddr>,
             ) -> NSResult<EncodedDocument> {
                 Err(NSError::NotFound("not implemented".into()))
@@ -1660,12 +1679,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             async fn query_did(
                 &self,
                 _did: &DID,
-                doc_type: Option<&str>,
+                doc_type: Option<DidDocType>,
                 _from_ip: Option<std::net::IpAddr>,
             ) -> NSResult<EncodedDocument> {
                 match doc_type {
-                    Some("info") => Ok(self.info_doc.clone()),
-                    Some("owner") => Ok(self.owner_doc.clone()),
+                    Some(DidDocType::Info) => Ok(self.info_doc.clone()),
+                    Some(DidDocType::Owner) => Ok(self.owner_doc.clone()),
                     None => Ok(self.signed_doc.clone()),
                     _ => Err(NSError::NotFound("not implemented".into())),
                 }
@@ -1865,11 +1884,11 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             async fn query_did(
                 &self,
                 _did: &DID,
-                doc_type: Option<&str>,
+                doc_type: Option<DidDocType>,
                 _from_ip: Option<std::net::IpAddr>,
             ) -> NSResult<EncodedDocument> {
                 match doc_type {
-                    Some("info") => Ok(self.info_doc.clone()),
+                    Some(DidDocType::Info) => Ok(self.info_doc.clone()),
                     _ => Err(NSError::NotFound("not implemented".into())),
                 }
             }
@@ -1990,7 +2009,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(resolved, vec![endpoint_ip]);
         assert!(client
             .doc_cache
-            .get(&device_did, Some(DOC_TYPE_INFO))
+            .get(&device_did, Some(DidDocType::Info))
             .is_none());
     }
 }

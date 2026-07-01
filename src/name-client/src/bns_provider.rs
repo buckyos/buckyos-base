@@ -12,7 +12,8 @@
 */
 
 use crate::{
-    HttpsProvider, MethodMatcher, NameInfo, NsProvider, PublishedState, RecordType, ResolverCaps,
+    DidDocType, HttpsProvider, MethodMatcher, NameInfo, NsProvider, PublishedState, RecordType,
+    ResolverCaps,
 };
 use async_trait::async_trait;
 use buckyos_kit::BuckyOSMachineConfig;
@@ -103,7 +104,7 @@ impl NsProvider for BnsProvider {
     async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         if did.method != "bns" && did.method != "dev" {
@@ -123,7 +124,7 @@ impl NsProvider for BnsProvider {
     async fn resolve_published_state(
         &self,
         did: &DID,
-        doc_type: &str,
+        doc_type: &DidDocType,
     ) -> NSResult<Option<PublishedState>> {
         if did.method != "bns" && did.method != "dev" {
             return Ok(None);
@@ -152,7 +153,7 @@ mod tests {
         let provider = BnsProvider::new().unwrap();
         let did = DID::from_str("did:web:example.com").unwrap();
         let state = provider
-            .resolve_published_state(&did, "zone")
+            .resolve_published_state(&did, &DidDocType::Zone)
             .await
             .unwrap();
         assert!(state.is_none());

@@ -6,10 +6,10 @@ use name_lib::{OwnerConfig, UserProfile, DID};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::NameClient;
+use crate::{DidDocType, NameClient};
 
-pub const OWNER_DOC_TYPE: &str = "owner";
-pub const USER_PROFILE_DOC_TYPE: &str = "user";
+pub const OWNER_DOC_TYPE: DidDocType = DidDocType::Owner;
+pub const USER_PROFILE_DOC_TYPE: DidDocType = DidDocType::User;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProfileResolveOptions {
@@ -136,7 +136,7 @@ fn decode_user_profile(
     owner_config: &OwnerConfig,
     profile_doc: &EncodedDocument,
 ) -> NSResult<UserProfile> {
-    owner_config.validate_jwt_revocation(USER_PROFILE_DOC_TYPE, profile_doc)?;
+    owner_config.validate_jwt_revocation(USER_PROFILE_DOC_TYPE.as_str(), profile_doc)?;
 
     if !profile_doc.is_proof() {
         return UserProfile::decode(profile_doc, None);
@@ -445,8 +445,8 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         // 由 `decode_user_profile` 用调用方已解析出的 owner key 单独验证，因此这里
         // 声明成免验证，交给 resolve_profile_source 自己的验签逻辑处理，避免走进
         // 通用递归验证管线（那条管线无法从文档内容推断出这个 owner 关系）。
-        fn requires_verification(&self, doc_type: &str) -> bool {
-            doc_type != USER_PROFILE_DOC_TYPE
+        fn requires_verification(&self, doc_type: &DidDocType) -> bool {
+            doc_type != &DidDocType::User
         }
 
         async fn query(
@@ -461,10 +461,17 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         async fn query_did(
             &self,
             did: &DID,
-            doc_type: Option<&str>,
+            doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
-            let key = (did.to_string(), doc_type.unwrap_or_default().to_string());
+            let key = (
+                did.to_string(),
+                doc_type
+                    .as_ref()
+                    .map(DidDocType::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
             self.docs
                 .get(&key)
                 .cloned()

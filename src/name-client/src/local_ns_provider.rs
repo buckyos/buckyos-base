@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::DEFAULT_DID_DOC_TYPE;
-use crate::{MethodMatcher, NSResult, NameInfo, NsProvider, RecordType};
+use crate::{DidDocType, MethodMatcher, NSResult, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 
 /* config file example (toml):
@@ -325,14 +324,14 @@ impl NsProvider for LocalConfigDnsProvider {
     async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         let host_name = did.to_host_name();
         let name_info = self.get_name_info(&host_name)?;
-        let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
+        let doc_type = doc_type.unwrap_or_default();
         let did_documents = name_info.parse_txt_record_to_did_documents()?;
-        if let Some(did_document) = did_documents.get(doc_type) {
+        if let Some(did_document) = did_documents.get(doc_type.as_str()) {
             return Ok(did_document.clone());
         }
         return Err(NSError::NotFound(format!(
@@ -428,7 +427,11 @@ ptr_records = ["node1.example.com", "node1-alt.example.com"]
 
         let _boot_config = ZoneBootConfig::decode(&result, None).unwrap();
         let result = provider
-            .query_did(&DID::new("web", "www.example.com"), Some("boot"), None)
+            .query_did(
+                &DID::new("web", "www.example.com"),
+                Some(DidDocType::Boot),
+                None,
+            )
             .await
             .unwrap();
         let boot_jwt = result.to_string();
