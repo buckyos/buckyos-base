@@ -34,7 +34,7 @@ provider 的返回值只分两档：
 - Missing → 自签名候选是正路（典型场景：新设备还没上链），"已发布"缓存反而与权威答复矛盾；
 - unknown → 已验证缓存是正路，此时若接受自签名候选，等于"谁能断你的网，谁就能给你塞文档"——所以权威源没回答时，候选没有"已验证"的资格，最多按策略点③以明确打标的结果露面（默认拒绝）。
 
-### 2.2 provider 是内核模型：一个权威渠道 + 少数补充源
+### 2.2 resolver-provider 是内核模型：一个权威渠道 + 少数补充源
 
 provider 不是应用可扩展的组件——这套机制用来扩展 DID method，不是让 App 注册自己的 provider。由此：
 
@@ -72,7 +72,7 @@ verify(result, doc_hash, expected_owner, owner_doc) =
 expected_owner 必须来自候选文档**之外**，来源只有两个，按优先级：
 
 1. **权威源的 owner 绑定**（2.2 节的第二类回答）：给定名字回答 owner 是谁，可以不带文档本体。owner 变更和委托只能在这里发布生效；
-2. **名字结构的确定性约束**（method 定义的默认值）：二级名字天然自带 owner 假设——`did:bns:app1.alice` 的 expected_owner 就是 `did:bns:alice`，`app1.alice` 不能自称归 mallory 所有。（自证 DID 的 owner 平凡地等于名字自身，但它们只有 owner 一种 doc_type，这条默认值实际用不上——第 6 节。）
+2. **名字结构的确定性约束**（method 定义的默认值）：二级名字天然自带 owner 假设——`did:bns:app1.alice` 的 expected_owner 就是 `did:bns:alice`，`app1.alice` 不能自称归 mallory 所有。（key 类 DID 不作为 resolve_did 的入参——第 6 节，不存在给它们推 expected_owner 的问题。）
 
 拿到之后只做一个检查：`doc.owner == expected_owner`，不一致直接作废——这是强攻击信号，值得打警告。
 
@@ -84,7 +84,7 @@ expected_owner 必须来自候选文档**之外**，来源只有两个，按优�
 
 > **owner 文档只有权威 provider 会返回，且 need_proof = false。**
 
-所以 owner 解析不需要独立分支：它走同一个主循环，第二层递归天然不会发生。owner document 的可信度来自"发布动作 + 可认证的权威信道"，而不是签名。要不要给 owner document 签名是可选项，判据是**传播路径**：只要它需要走不可信路径（push、中继、跨节点共享），签名就是它离开权威信道的唯一通行证。did:key / did:dev 是特例——权威就是 DID 自带的自证 key：owner 文档不需要发布、从名字即可直接构造，天然自签；而且它们**只有** owner 这一种 doc_type——key 类 DID 是解析的终点，不是入口（第 6 节）。
+所以 owner 解析不需要独立分支：它走同一个主循环，第二层递归天然不会发生。owner document 的可信度来自"发布动作 + 可认证的权威信道"，而不是签名。要不要给 owner document 签名是可选项，判据是**传播路径**：只要它需要走不可信路径（push、中继、跨节点共享），签名就是它离开权威信道的唯一通行证。这条链上不会出现 did:key / did:dev——key 类 DID 根本不是 resolve_did 的合法入参（第 6 节）。owner 链终止在一级名字的 owner 文档上：公钥就写在里面，没有更深一层要解析的东西。
 
 ## 3. 主循环：一条路径 + 四个策略点
 
@@ -102,15 +102,14 @@ def resolve_did(did, doc_type):
 
     # ---- 1. 查询：一个权威渠道 + 少数补充源，first-win ----
     # 每个 method 至多一个权威发布渠道，永远第一；status / doc_hash / owner 绑定只可能来自它。
-    # 生成式 method（did:key / did:dev）没有发布渠道：权威退化为“从名字构造 owner 文档”，
-    # 除 owner 外不承载任何 doc_type——key 是解析的终点，不是入口（第 6 节）。
+    # key 类 DID（did:key / did:dev）不会出现在这里——它们不是合法入参（第 6 节）。
     authority, supplements = get_authority(did.method), get_supplements(did.method)
 
     # expected_owner 先取名字结构的默认值（2.4 节）：
     # did:bns:app1.alice → did:bns:alice；
     # 一级名字（did:bns:alice）从结构推不出 → None，绑定只能等权威源回答
     doc_hash, expected_owner = None, structural_owner(did)
-    authority_unknown = False  # 权威渠道存在却没回答？没有权威渠道的 method 永远 False
+    authority_unknown = False  # 权威渠道存在却没回答？
 
     for provider in ([authority] if authority else []) + supplements:
         result = provider.resolve(did, doc_type)
@@ -273,13 +272,13 @@ def did_cache_update(did, doc_type, incoming):
 | --- | --- | --- |
 | did:bns（合约） | 完整状态 + 已发布版本集合 + owner 绑定（含变更/委托） | 完整流程：状态门禁 + hash 锚定 + owner 一致性 + 历史校验 |
 | did:web 类（canonical endpoint） | 只有“当前内容”与当前 owner 绑定，无历史、无强负状态 | 只有 Missing / Active 两态；历史校验退化为“用当前 owner 或拒绝” |
-| did:key / did:dev（生成式） | 无发布渠道，权威 = 自证 key（owner ≡ 名字自身） | 只有 owner 文档（从名字直接构造、need_proof = false）；不承载内容 doc_type |
+| did:key / did:dev（生成式） | ——不是解析入口 | 永远不作为 resolve_did 的入参；key 只出现在文档内容与内部标识里（见下） |
 
-主循环对"没有发布状态的 method"是**自动退化**的，不需要加分支：三个状态门禁只在权威源真的返回状态时才触发。但代价要诚实写出来：**没有发布状态 ⇒ 没有吊销能力**。生成式 DID 的 key 泄露后无处声明作废——这是选 method 时的权衡，也是 BNS 作为 BuckyOS 核心三件套之一存在的理由。
+主循环对"没有发布状态的 method"是**自动退化**的，不需要加分支：三个状态门禁只在权威源真的返回状态时才触发。但代价要诚实写出来：**没有发布状态 ⇒ 没有吊销能力**。裸公钥泄露后无处声明作废——所以对外身份必须用有权威源的逻辑名字，这也是 BNS 作为 BuckyOS 核心三件套之一存在的理由。
 
-**key 类 DID 是解析的终点，不是入口。** 名字系统对生成式 DID 的定位要说透：解析的本质目的是**通过一个逻辑名字得到一把当前可信的公钥，从而放心地与对方通信**——反过来，你手里已经有的公钥，通常正是解析某个名字的结果。did:key / did:dev 的名字就是公钥本身，没有什么可解析的：系统不设计"did:dev → 内容文档"的关系。它们只有两个用途：给验证当递归基（2.5 节），以及在系统内部充当唯一性标识——逻辑身份（用户、设备）支持 key 轮转，本地环境锚定公钥即可感知轮转，轮转的事实记录在逻辑名字的文档里，不在 key 上。
+**key 类 DID 不是解析入口——resolve_did 根本不接受它们。** 解析的本质目的是**通过一个逻辑名字得到一把当前可信的公钥，从而放心地与对方通信**；反过来，你手里已经有的公钥，通常正是解析某个名字的结果。did:key / did:dev 的名字就是公钥本身，把它传进 resolve_did 没有意义——结果只能是你已经知道的东西，实现可以直接拒绝这种入参。key 在系统里的角色是：作为文档**内容**里的 key 材料出现，以及在系统内部充当唯一性标识——逻辑身份（用户、设备）支持 key 轮转，本地环境锚定公钥即可感知轮转，轮转的事实记录在逻辑名字的文档里，不在 key 上。
 
-**反查（公钥 → 逻辑身份）不是 resolver 的契约能力**，没有任何 provider 承诺它；有历史的权威源（如 BNS）可以顺手提供索引，但那是可选服务。真要反查时，它是两个独立过程的组合：先用任意索引从公钥查到**候选名字**——这一步不携带任何信任，索引来源无所谓；再对候选名字走一遍**标准正向解析**，比对返回文档里的公钥与手里的公钥——信任只来自这一步。还有一条边界要认清：比对通过只说明"这个名字当前发布了这把 key"，不证明这个名字的主人控制这把 key（任何人都能在自己的文档里写进别人的公钥），也不存在"这把 key 的规范名字"——公钥到名字不是单射，候选里挑哪一个是应用层语义。
+**公钥反查（key → 逻辑身份）没有任何标准 provider 提供**；某个部署若提供，也只是**私有接口**，不在 resolve_did 的 provider 管线里（2.2 节的注册模型不为它开口子）。需要"验证一把 key 属于谁"时，是应用层自己拼装两步：① 把 key 交给那个私有接口，得到**候选名字**——这一步不携带任何信任；② 对候选名字走一遍**标准正向解析**，比对返回文档里的公钥与手里的公钥——信任只来自这一步。底层对整个流程不做任何承诺。还有一条边界要认清：比对通过只说明"这个名字当前发布了这把 key"，不证明这个名字的主人控制这把 key（任何人都能在自己的文档里写进别人的公钥），也不存在"这把 key 的规范名字"——公钥到名字不是单射，候选里挑哪一个是应用层语义。
 
 ## 7. 开发期旁路：本地覆盖（hosts 语义）
 
@@ -301,4 +300,4 @@ def did_cache_update(did, doc_type, incoming):
 6. owner 不要写成独立流程——它只是“need_proof = false 的权威结果”，递归自然终止；
 7. 一份坏 body 只作废它自己（continue），不终止整个解析；
 8. 本地覆盖必须打标、带 scope、不合并不导出；
-9. 反查（公钥 → 名字）不是 resolver 契约——索引不携带信任，信任只能来自对候选名字的正向解析 + 公钥比对。
+9. key 类 DID 永远不是 resolve_did 的入参；公钥反查没有标准 provider（有也是私有接口，应用层自拼）——索引不携带信任，信任只能来自对候选名字的正向解析 + 公钥比对。
