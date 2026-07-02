@@ -228,7 +228,7 @@ impl Default for NameStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DocumentStatus {
-    Missing,
+    Missing,//unknown
     Active,
     Revoked,
     Expired,
