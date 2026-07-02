@@ -30,7 +30,7 @@ pub enum DeviceType {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct DeviceMiniConfig {
+pub struct DeviceMiniDocument {
     #[serde(rename = "n")]
     pub name: String,
     pub x: String,
@@ -43,15 +43,15 @@ pub struct DeviceMiniConfig {
     pub extra_info: HashMap<String, serde_json::Value>,
 }
 
-impl DeviceMiniConfig {
-    pub fn new_by_device_config(device_config: &DeviceConfig) -> Self {
-        let default_key = device_config.get_default_key().unwrap();
+impl DeviceMiniDocument {
+    pub fn new_by_device_document(device_document: &DeviceDocument) -> Self {
+        let default_key = device_document.get_default_key().unwrap();
         let x = get_x_from_jwk(&default_key).unwrap();
         Self {
-            name: device_config.name.clone(),
+            name: device_document.name.clone(),
             x,
-            rtcp_port: device_config.rtcp_port.clone(),
-            exp: device_config.exp,
+            rtcp_port: device_document.rtcp_port.clone(),
+            exp: device_document.exp,
             extra_info: HashMap::new(),
         }
     }
@@ -61,22 +61,22 @@ impl DeviceMiniConfig {
         header.typ = None; // Default is JWT, set to None to save space
 
         let token = encode(&header, self, owner_private_key).map_err(|error| {
-            NSError::Failed(format!("Failed to encode device mini config:{}", error))
+            NSError::Failed(format!("Failed to encode device mini document:{}", error))
         })?;
         return Ok(token);
     }
 
     pub fn from_jwt(jwt: &str, key: &DecodingKey) -> NSResult<Self> {
         let json_result = decode_json_from_jwt_with_pk(jwt, key)?;
-        let result: DeviceMiniConfig = serde_json::from_value(json_result).map_err(|error| {
-            NSError::Failed(format!("Failed to decode device mini config:{}", error))
+        let result: DeviceMiniDocument = serde_json::from_value(json_result).map_err(|error| {
+            NSError::Failed(format!("Failed to decode device mini document:{}", error))
         })?;
         return Ok(result);
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct DeviceConfig {
+pub struct DeviceDocument {
     #[serde(rename = "@context", default = "default_device_context")]
     pub context: DIDContext,
     pub id: DID,
@@ -113,7 +113,7 @@ pub struct DeviceConfig {
     pub device_type: String, //[ood,server,sensor
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub device_mini_config_jwt: Option<String>,
+    pub device_mini_document_jwt: Option<String>,
     pub name: String, //short name,like ood1
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rtcp_port: Option<u32>,
@@ -133,37 +133,37 @@ pub struct DeviceConfig {
     pub capbilities: HashMap<String, i64>, //capbility id -> resource value (like memory size, cpu core count, etc.)
 }
 
-impl DeviceConfig {
+impl DeviceDocument {
     pub fn new_by_jwk(name: &str, pk: Jwk) -> Self {
         let x = get_x_from_jwk(&pk).unwrap();
-        return DeviceConfig::new(name, x);
+        return DeviceDocument::new(name, x);
     }
 
-    pub fn new_by_mini_config(
-        mini_config_jwt: &String,
-        mini_config: &DeviceMiniConfig,
+    pub fn new_by_mini_document(
+        mini_document_jwt: &String,
+        mini_document: &DeviceMiniDocument,
         zone_did: DID,
         owner_did: DID,
     ) -> Self {
-        let did = format!("did:dev:{}", mini_config.x);
+        let did = format!("did:dev:{}", mini_document.x);
         let jwk = json!(
             {
                 "kty": "OKP",
                 "crv": "Ed25519",
-                "x": mini_config.x
+                "x": mini_document.x
             }
         );
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk).unwrap();
-        DeviceConfig {
-            device_mini_config_jwt: Some(mini_config_jwt.clone()),
+        DeviceDocument {
+            device_mini_document_jwt: Some(mini_document_jwt.clone()),
             context: default_device_context(),
             id: DID::from_str(&did).unwrap(),
-            name: mini_config.name.clone(),
+            name: mini_document.name.clone(),
             device_type: "ood".to_string(),
             ips: vec![],
             net_id: None,
             ddns_sn_url: None,
-            rtcp_port: mini_config.rtcp_port,
+            rtcp_port: mini_document.rtcp_port,
             verification_method: vec![VerificationMethodNode {
                 key_type: "Ed25519VerificationKey2020".to_string(),
                 key_id: "#main_key".to_string(),
@@ -178,8 +178,8 @@ impl DeviceConfig {
             zone_did: Some(zone_did.clone()),
             owner: owner_did,
             capbilities: HashMap::new(),
-            exp: mini_config.exp,
-            iat: mini_config.exp - DEFAULT_EXPIRE_TIME,
+            exp: mini_document.exp,
+            iat: mini_document.exp - DEFAULT_EXPIRE_TIME,
             version_seq: Some(0),
             extra_info: HashMap::new(),
             key_scope: HashMap::new(),
@@ -201,7 +201,7 @@ impl DeviceConfig {
         );
 
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk).unwrap();
-        DeviceConfig {
+        DeviceDocument {
             context: default_device_context(),
             id: DID::from_str(&did).unwrap(),
             name: name.to_string(),
@@ -223,7 +223,7 @@ impl DeviceConfig {
             support_container: true,
             zone_did: None,
             owner: DID::undefined(),
-            device_mini_config_jwt: None,
+            device_mini_document_jwt: None,
             capbilities: HashMap::new(),
             exp: buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME,
             iat: buckyos_get_unix_timestamp() as u64,
@@ -260,7 +260,7 @@ impl DeviceConfig {
     }
 }
 
-impl DIDDocumentTrait for DeviceConfig {
+impl DIDDocumentTrait for DeviceDocument {
     fn get_id(&self) -> DID {
         return self.id.clone();
     }
@@ -351,12 +351,12 @@ impl DIDDocumentTrait for DeviceConfig {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
-        ensure_version_seq_for_jwt("DeviceConfig", self.version_seq)?;
+        ensure_version_seq_for_jwt("DeviceDocument", self.version_seq)?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
         let token = encode(&header, self, key).map_err(|error| {
-            NSError::Failed(format!("Failed to encode DeviceConfig :{}", error))
+            NSError::Failed(format!("Failed to encode DeviceDocument :{}", error))
         })?;
         return Ok(EncodedDocument::Jwt(token));
     }
@@ -372,17 +372,17 @@ impl DIDDocumentTrait for DeviceConfig {
                 } else {
                     json_result = decode_json_from_jwt_with_pk(jwt_str, key.unwrap())?;
                 }
-                let result: DeviceConfig =
+                let result: DeviceDocument =
                     serde_json::from_value(json_result).map_err(|error| {
-                        NSError::Failed(format!("Failed to decode device config:{}", error))
+                        NSError::Failed(format!("Failed to decode device document:{}", error))
                     })?;
-                ensure_version_seq_for_jwt("DeviceConfig", result.version_seq)?;
+                ensure_version_seq_for_jwt("DeviceDocument", result.version_seq)?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {
-                let result: DeviceConfig =
+                let result: DeviceDocument =
                     serde_json::from_value(json_value.clone()).map_err(|error| {
-                        NSError::Failed(format!("Failed to decode device config:{}", error))
+                        NSError::Failed(format!("Failed to decode device document:{}", error))
                     })?;
                 return Ok(result);
             }
@@ -400,7 +400,7 @@ impl DIDDocumentTrait for DeviceConfig {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeviceInfo {
     #[serde(flatten)]
-    pub device_doc: DeviceConfig,
+    pub device_doc: DeviceDocument,
     pub arch: String,
     pub os: String, //linux,windows,apple
     pub update_time: u64,
@@ -451,7 +451,7 @@ pub struct DeviceInfo {
 }
 
 impl Deref for DeviceInfo {
-    type Target = DeviceConfig;
+    type Target = DeviceDocument;
 
     fn deref(&self) -> &Self::Target {
         &self.device_doc
@@ -467,7 +467,7 @@ impl DeviceInfo {
         }
     }
 
-    pub fn from_device_doc(device_doc: &DeviceConfig) -> Self {
+    pub fn from_device_doc(device_doc: &DeviceDocument) -> Self {
         let os_type = Self::get_os_type();
 
         let result_info = DeviceInfo {
@@ -547,7 +547,7 @@ impl DeviceInfo {
         let ip = ood_string.ip.clone();
         let os_type = Self::get_os_type();
 
-        let mut config = DeviceConfig::new(device_name.as_str(), did.id.to_string());
+        let mut config = DeviceDocument::new(device_name.as_str(), did.id.to_string());
         if ip.is_some() {
             config.ips.push(ip.unwrap());
         }
@@ -1460,16 +1460,16 @@ mod tests {
     }
 
     #[test]
-    fn test_device_info_merged_ips_prefers_device_config_ips() {
-        let mut device_config = DeviceConfig::new(
+    fn test_device_info_merged_ips_prefers_device_document_ips() {
+        let mut device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
-        device_config.ips = vec![
+        device_document.ips = vec![
             "192.0.2.10".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
         ];
-        let mut device_info = DeviceInfo::from_device_doc(&device_config);
+        let mut device_info = DeviceInfo::from_device_doc(&device_document);
         device_info.all_ip = vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()];
 
         assert_eq!(
@@ -1640,7 +1640,7 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
     }
 
     #[test]
-    fn test_device_mini_config() {
+    fn test_device_mini_document() {
         let owner_private_key_pem = r#"
         -----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -1661,7 +1661,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let exp: u64 = now + 3600 * 24 * 365 * 5;
 
-        let mini_config = DeviceMiniConfig {
+        let mini_document = DeviceMiniDocument {
             name: "ood1".to_string(),
             x: "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
             rtcp_port: None,
@@ -1669,40 +1669,41 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             extra_info: HashMap::new(),
         };
 
-        let mini_json = serde_json::to_string_pretty(&mini_config).unwrap();
+        let mini_json = serde_json::to_string_pretty(&mini_document).unwrap();
         println!("json {}", mini_json);
 
-        let mini_jwt = mini_config.to_jwt(&owner_private_key).unwrap();
+        let mini_jwt = mini_document.to_jwt(&owner_private_key).unwrap();
         let txt_record = format!("DEV={};", mini_jwt);
         println!("mini_jwt:{} {}", &txt_record, txt_record.len());
 
-        let mini_config_from_jwt =
-            DeviceMiniConfig::from_jwt(&mini_jwt, &owner_public_key).unwrap();
-        let mini_config_from_jwt_json =
-            serde_json::to_string_pretty(&mini_config_from_jwt).unwrap();
-        println!("jwt decoded json: {}", mini_config_from_jwt_json);
+        let mini_document_from_jwt =
+            DeviceMiniDocument::from_jwt(&mini_jwt, &owner_public_key).unwrap();
+        let mini_document_from_jwt_json =
+            serde_json::to_string_pretty(&mini_document_from_jwt).unwrap();
+        println!("jwt decoded json: {}", mini_document_from_jwt_json);
 
-        let device_config = DeviceConfig::new_by_mini_config(
+        let device_document = DeviceDocument::new_by_mini_document(
             &mini_jwt,
-            &mini_config,
+            &mini_document,
             DID::new("bns", "ood1"),
             DID::new("bns", "lzc"),
         );
-        let device_config_json = serde_json::to_string_pretty(&device_config).unwrap();
-        println!("{}", device_config_json);
+        let device_document_json = serde_json::to_string_pretty(&device_document).unwrap();
+        println!("{}", device_document_json);
 
-        let device_mini_config = DeviceMiniConfig::new_by_device_config(&device_config);
-        assert_eq!(mini_config, device_mini_config);
-        let device_mini_config_json = serde_json::to_string_pretty(&device_mini_config).unwrap();
-        println!("{}", device_mini_config_json);
+        let device_mini_document = DeviceMiniDocument::new_by_device_document(&device_document);
+        assert_eq!(mini_document, device_mini_document);
+        let device_mini_document_json =
+            serde_json::to_string_pretty(&device_mini_document).unwrap();
+        println!("{}", device_mini_document_json);
 
-        let device_mini_config_jwt = device_mini_config.to_jwt(&owner_private_key).unwrap();
-        println!("device mini config jwt: {}", device_mini_config_jwt);
-        assert_eq!(mini_jwt, device_mini_config_jwt);
+        let device_mini_document_jwt = device_mini_document.to_jwt(&owner_private_key).unwrap();
+        println!("device mini document jwt: {}", device_mini_document_jwt);
+        assert_eq!(mini_jwt, device_mini_document_jwt);
     }
 
     #[tokio::test]
-    async fn test_device_config() {
+    async fn test_device_document() {
         let owner_private_key_pem = r#"
         -----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -1730,19 +1731,19 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             }
         );
         let ood_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(ood_public_key).unwrap();
-        let mut device_config = DeviceConfig::new(
+        let mut device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
-        device_config.owner = DID::new("bns", "lzc");
+        device_document.owner = DID::new("bns", "lzc");
 
-        let json_str = serde_json::to_string(&device_config).unwrap();
+        let json_str = serde_json::to_string(&device_document).unwrap();
         println!("ood json_str: {}", json_str);
 
-        let encoded = device_config.encode(Some(&owner_private_key)).unwrap();
+        let encoded = device_document.encode(Some(&owner_private_key)).unwrap();
         println!("ood encoded: {:?}", encoded);
 
-        let decoded = DeviceConfig::decode(&encoded, Some(&public_key)).unwrap();
+        let decoded = DeviceDocument::decode(&encoded, Some(&public_key)).unwrap();
         println!(
             "ood decoded: {:?}",
             serde_json::to_string(&decoded).unwrap()
@@ -1759,7 +1760,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         println!("ood device_info2: {}", device_info2_str);
         let device_info3 = serde_json::from_str::<DeviceInfo>(&device_info2_str).unwrap();
 
-        assert_eq!(device_config, decoded);
+        assert_eq!(device_document, decoded);
         assert_eq!(encoded, token2);
 
         // Public Key (JWK base64URL):
@@ -1777,25 +1778,25 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
         let gateway_key_jwk: jsonwebtoken::jwk::Jwk =
             serde_json::from_value(gateway_public_key).unwrap();
-        let device_config = DeviceConfig::new(
+        let device_document = DeviceDocument::new(
             "gateway",
             "M3-pAdhs0uFkWmmjdHLBfs494R91QmQeXzCEhEHP-tI".to_string(),
         );
 
-        let json_str = serde_json::to_string(&device_config).unwrap();
+        let json_str = serde_json::to_string(&device_document).unwrap();
         println!("gateway json_str: {:?}", json_str);
 
-        let encoded = device_config.encode(Some(&owner_private_key)).unwrap();
+        let encoded = device_document.encode(Some(&owner_private_key)).unwrap();
         println!("gateway encoded: {:?}", encoded);
 
-        let decoded = DeviceConfig::decode(&encoded, Some(&public_key)).unwrap();
+        let decoded = DeviceDocument::decode(&encoded, Some(&public_key)).unwrap();
         println!(
             "gateway decoded: {:?}",
             serde_json::to_string(&decoded).unwrap()
         );
         let token2 = decoded.encode(Some(&owner_private_key)).unwrap();
 
-        assert_eq!(device_config, decoded);
+        assert_eq!(device_document, decoded);
         assert_eq!(encoded, token2);
 
         //Public Key (JWK base64URL): LBgzvFCD4VqQxTsO2LCZjs9FPVaQV2Dt0Q5W_lr4mr0
@@ -1812,28 +1813,28 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
         let server_key_jwk: jsonwebtoken::jwk::Jwk =
             serde_json::from_value(server_public_key).unwrap();
-        let mut device_config = DeviceConfig::new(
+        let mut device_document = DeviceDocument::new(
             "server1",
             "LBgzvFCD4VqQxTsO2LCZjs9FPVaQV2Dt0Q5W_lr4mr0".to_string(),
         );
-        device_config.owner = DID::new("bns", "waterflier");
-        device_config.ips = Vec::new();
-        device_config.net_id = None;
+        device_document.owner = DID::new("bns", "waterflier");
+        device_document.ips = Vec::new();
+        device_document.net_id = None;
 
-        let json_str = serde_json::to_string(&device_config).unwrap();
+        let json_str = serde_json::to_string(&device_document).unwrap();
         println!("server json_str: {:?}", json_str);
 
-        let encoded = device_config.encode(Some(&owner_private_key)).unwrap();
+        let encoded = device_document.encode(Some(&owner_private_key)).unwrap();
         println!("server encoded: {:?}", encoded);
 
-        let decoded = DeviceConfig::decode(&encoded, Some(&public_key)).unwrap();
+        let decoded = DeviceDocument::decode(&encoded, Some(&public_key)).unwrap();
         println!(
             "server decoded: {:?}",
             serde_json::to_string(&decoded).unwrap()
         );
         let token2 = decoded.encode(Some(&owner_private_key)).unwrap();
 
-        assert_eq!(device_config, decoded);
+        assert_eq!(device_document, decoded);
         assert_eq!(encoded, token2);
     }
 }

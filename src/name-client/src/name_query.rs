@@ -754,14 +754,15 @@ impl NameQuery {
             )))
         })?;
 
-        let owner_config = OwnerConfig::decode(&owner_resolved.document, None).map_err(|err| {
-            CandidateRejection::Failed(NSError::Failed(format!(
-                "owner document {} is not a valid OwnerConfig: {}",
-                declared_owner.to_string(),
-                err
-            )))
-        })?;
-        let (decoding_key, _jwk) = owner_config.get_auth_key(None).ok_or_else(|| {
+        let owner_document =
+            OwnerDocument::decode(&owner_resolved.document, None).map_err(|err| {
+                CandidateRejection::Failed(NSError::Failed(format!(
+                    "owner document {} is not a valid OwnerDocument: {}",
+                    declared_owner.to_string(),
+                    err
+                )))
+            })?;
+        let (decoding_key, _jwk) = owner_document.get_auth_key(None).ok_or_else(|| {
             CandidateRejection::Failed(NSError::Failed(format!(
                 "owner document {} has no usable auth key",
                 declared_owner.to_string()
@@ -770,7 +771,7 @@ impl NameQuery {
 
         // T2.1: owner 声明的 revoke_before_iat 门槛，在验签通过之前先做（拒绝比签名
         // 校验更早失败没有安全意义上的差别，但能在候选明显过期时更快拒绝）。
-        let owner_policy = OwnerDocumentPolicy::from_owner_config(&owner_config);
+        let owner_policy = OwnerDocumentPolicy::from_owner_document(&owner_document);
         if let Some(revoke_before_iat) = owner_policy.revoke_before_iat {
             let iat = body
                 .document
@@ -802,7 +803,7 @@ impl NameQuery {
                 unreachable!("is_proof() only true for Jwt documents");
             };
             if decode_json_from_jwt_with_pk(jwt, &decoding_key).is_err() {
-                let verified_with_historical_key = owner_config
+                let verified_with_historical_key = owner_document
                     .get_historical_keys()
                     .into_iter()
                     .any(|(_kid, jwk)| match DecodingKey::from_jwk(&jwk) {
@@ -989,7 +990,7 @@ mod tests {
 
     fn build_owner_doc(owner_did: &DID, valid_iat: Option<u64>) -> EncodedDocument {
         let (key, jwk) = owner_signing_key();
-        let mut owner = OwnerConfig::new(
+        let mut owner = OwnerDocument::new(
             owner_did.clone(),
             "owner".to_string(),
             "owner@test".to_string(),
@@ -1002,7 +1003,7 @@ mod tests {
 
     /// 构造一个刚发生过 key rotation 的 owner 文档：`#main_key` 是新 key（owner
     /// signing key），另外保留一个 `#legacy_key` 历史条目（"other" key）。
-    /// `OwnerConfig::new` 只会生成单个 verification method，`VerificationMethodNode`
+    /// `OwnerDocument::new` 只会生成单个 verification method，`VerificationMethodNode`
     /// 又是 crate-private 类型，所以这里绕过构造函数直接拼 JSON 再反序列化。
     fn build_owner_doc_with_legacy_key(owner_did: &DID, new_key: &EncodingKey) -> EncodedDocument {
         let (_, new_jwk) = owner_signing_key();
@@ -1031,7 +1032,7 @@ mod tests {
             "name": "owner",
             "display_name": "owner@test",
         });
-        let owner: OwnerConfig = serde_json::from_value(json_doc).unwrap();
+        let owner: OwnerDocument = serde_json::from_value(json_doc).unwrap();
         owner.encode(Some(new_key)).unwrap()
     }
 
@@ -1043,7 +1044,7 @@ mod tests {
         key: &EncodingKey,
     ) -> EncodedDocument {
         let (_, owner_jwk) = owner_signing_key();
-        let mut zone = ZoneConfig::new(zone_did.clone(), owner_did.clone(), owner_jwk);
+        let mut zone = ZoneDocument::new(zone_did.clone(), owner_did.clone(), owner_jwk);
         zone.iat = iat;
         zone.exp = iat + 3600 * 24 * 365;
         zone.version_seq = Some(1);

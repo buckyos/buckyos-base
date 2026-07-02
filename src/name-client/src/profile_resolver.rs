@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use jsonwebtoken::DecodingKey;
 use name_lib::{DIDDocumentTrait, EncodedDocument, NSError, NSResult};
-use name_lib::{OwnerConfig, UserProfile, DID};
+use name_lib::{OwnerDocument, UserProfile, DID};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -20,7 +20,7 @@ pub struct ProfileResolveOptions {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProfileSource {
     Profile,
-    OwnerConfig,
+    OwnerDocument,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -33,20 +33,20 @@ pub struct MergedProfile {
 }
 
 impl NameClient {
-    pub async fn resolve_owner_config(&self, did: &DID) -> NSResult<OwnerConfig> {
-        self.resolve_owner_config_with_options(did, false).await
+    pub async fn resolve_owner_document(&self, did: &DID) -> NSResult<OwnerDocument> {
+        self.resolve_owner_document_with_options(did, false).await
     }
 
-    pub async fn resolve_owner_config_with_options(
+    pub async fn resolve_owner_document_with_options(
         &self,
         did: &DID,
         force_refresh: bool,
-    ) -> NSResult<OwnerConfig> {
+    ) -> NSResult<OwnerDocument> {
         if force_refresh {
             self.invalidate_did_cache(did.clone(), Some(OWNER_DOC_TYPE));
         }
         let owner_doc = self.resolve_did(did, Some(OWNER_DOC_TYPE)).await?;
-        decode_owner_config(did, &owner_doc)
+        decode_owner_document(did, &owner_doc)
     }
 
     pub async fn resolve_user_profile(
@@ -55,32 +55,32 @@ impl NameClient {
         opts: ProfileResolveOptions,
     ) -> NSResult<MergedProfile> {
         let (owner_did, _) = split_bns_user_zone_did(did);
-        let owner_config = self
-            .resolve_owner_config_with_options(&owner_did, opts.force_refresh)
+        let owner_document = self
+            .resolve_owner_document_with_options(&owner_did, opts.force_refresh)
             .await?;
         let profile = self
-            .resolve_profile_source(did, &owner_config, opts.force_refresh)
+            .resolve_profile_source(did, &owner_document, opts.force_refresh)
             .await?;
         let profile_source = profile.as_ref().map(|_| ProfileSource::Profile);
 
-        merge_profile_with_owner_config(
+        merge_profile_with_owner_document(
             did.clone(),
             profile,
             profile_source,
-            &owner_config,
-            owner_config.get_default_zone_did(),
+            &owner_document,
+            owner_document.get_default_zone_did(),
         )
     }
 
     pub async fn owner_is_bound_to_zone(&self, did: &DID, zone_did: &DID) -> NSResult<bool> {
-        let owner_config = self.resolve_owner_config(did).await?;
-        Ok(owner_config.is_bound_to_zone(zone_did))
+        let owner_document = self.resolve_owner_document(did).await?;
+        Ok(owner_document.is_bound_to_zone(zone_did))
     }
 
     async fn resolve_profile_source(
         &self,
         profile_did: &DID,
-        owner_config: &OwnerConfig,
+        owner_document: &OwnerDocument,
         force_refresh: bool,
     ) -> NSResult<Option<UserProfile>> {
         if force_refresh {
@@ -96,55 +96,55 @@ impl NameClient {
             Err(_) => return Ok(None),
         };
 
-        let profile = decode_user_profile(owner_config, &profile_doc)?;
+        let profile = decode_user_profile(owner_document, &profile_doc)?;
         Ok(Some(profile))
     }
 }
 
-fn decode_owner_config(did: &DID, owner_doc: &EncodedDocument) -> NSResult<OwnerConfig> {
-    let unverified_owner_config = OwnerConfig::decode(owner_doc, None)?;
-    if unverified_owner_config.id != *did {
+fn decode_owner_document(did: &DID, owner_doc: &EncodedDocument) -> NSResult<OwnerDocument> {
+    let unverified_owner_document = OwnerDocument::decode(owner_doc, None)?;
+    if unverified_owner_document.id != *did {
         return Err(NSError::InvalidDID(format!(
-            "owner-config id {} does not match requested {}",
-            unverified_owner_config.id.to_string(),
+            "owner-document id {} does not match requested {}",
+            unverified_owner_document.id.to_string(),
             did.to_string()
         )));
     }
 
     if !owner_doc.is_proof() {
-        return Ok(unverified_owner_config);
+        return Ok(unverified_owner_document);
     }
 
-    let owner_public_key = unverified_owner_config
+    let owner_public_key = unverified_owner_document
         .get_default_key()
-        .ok_or_else(|| NSError::NotFound("owner-config default key not found".to_string()))?;
+        .ok_or_else(|| NSError::NotFound("owner-document default key not found".to_string()))?;
     let owner_public_key = DecodingKey::from_jwk(&owner_public_key).map_err(|err| {
         NSError::DecodeJWTError(format!("owner public key decode failed: {}", err))
     })?;
-    let verified_owner_config = OwnerConfig::decode(owner_doc, Some(&owner_public_key))?;
-    if verified_owner_config.id != *did {
+    let verified_owner_document = OwnerDocument::decode(owner_doc, Some(&owner_public_key))?;
+    if verified_owner_document.id != *did {
         return Err(NSError::InvalidDID(format!(
-            "verified owner-config id {} does not match requested {}",
-            verified_owner_config.id.to_string(),
+            "verified owner-document id {} does not match requested {}",
+            verified_owner_document.id.to_string(),
             did.to_string()
         )));
     }
-    Ok(verified_owner_config)
+    Ok(verified_owner_document)
 }
 
 fn decode_user_profile(
-    owner_config: &OwnerConfig,
+    owner_document: &OwnerDocument,
     profile_doc: &EncodedDocument,
 ) -> NSResult<UserProfile> {
-    owner_config.validate_jwt_revocation(USER_PROFILE_DOC_TYPE.as_str(), profile_doc)?;
+    owner_document.validate_jwt_revocation(USER_PROFILE_DOC_TYPE.as_str(), profile_doc)?;
 
     if !profile_doc.is_proof() {
         return UserProfile::decode(profile_doc, None);
     }
 
-    let owner_public_key = owner_config
+    let owner_public_key = owner_document
         .get_default_key()
-        .ok_or_else(|| NSError::NotFound("owner-config default key not found".to_string()))?;
+        .ok_or_else(|| NSError::NotFound("owner-document default key not found".to_string()))?;
     let owner_public_key = DecodingKey::from_jwk(&owner_public_key).map_err(|err| {
         NSError::DecodeJWTError(format!("owner public key decode failed: {}", err))
     })?;
@@ -165,11 +165,11 @@ fn split_bns_user_zone_did(did: &DID) -> (DID, Option<DID>) {
     (did.clone(), None)
 }
 
-fn merge_profile_with_owner_config(
+fn merge_profile_with_owner_document(
     requested_did: DID,
     profile: Option<UserProfile>,
     profile_source: Option<ProfileSource>,
-    owner_config: &OwnerConfig,
+    owner_document: &OwnerDocument,
     default_zone_did: Option<DID>,
 ) -> NSResult<MergedProfile> {
     let mut merged = Map::new();
@@ -179,7 +179,7 @@ fn merge_profile_with_owner_config(
         merge_profile_source(&mut merged, &mut field_sources, profile, profile_source)?;
     }
 
-    merge_owner_config_identity(&mut merged, &mut field_sources, owner_config);
+    merge_owner_document_identity(&mut merged, &mut field_sources, owner_document);
 
     merged.insert(
         "did".to_string(),
@@ -198,45 +198,45 @@ fn merge_profile_with_owner_config(
     })
 }
 
-fn merge_owner_config_identity(
+fn merge_owner_document_identity(
     merged: &mut Map<String, Value>,
     field_sources: &mut HashMap<String, ProfileSource>,
-    owner_config: &OwnerConfig,
+    owner_document: &OwnerDocument,
 ) {
-    insert_owner_config_field(
+    insert_owner_document_field(
         merged,
         field_sources,
         "name",
-        Value::String(owner_config.name.clone()),
+        Value::String(owner_document.name.clone()),
     );
-    insert_owner_config_field(
+    insert_owner_document_field(
         merged,
         field_sources,
         "display_name",
-        Value::String(owner_config.display_name.clone()),
+        Value::String(owner_document.display_name.clone()),
     );
-    if let Some(avatar) = owner_config.avatar.as_ref() {
-        insert_owner_config_field(
+    if let Some(avatar) = owner_document.avatar.as_ref() {
+        insert_owner_document_field(
             merged,
             field_sources,
             "avatar",
             Value::String(avatar.clone()),
         );
     }
-    if let Some(meta) = owner_config.meta.as_ref() {
-        insert_owner_config_field(merged, field_sources, "meta", meta.clone());
-        merge_owner_config_meta_overlay(merged, field_sources, meta);
+    if let Some(meta) = owner_document.meta.as_ref() {
+        insert_owner_document_field(merged, field_sources, "meta", meta.clone());
+        merge_owner_document_meta_overlay(merged, field_sources, meta);
     }
 
-    for (field_name, field_value) in owner_config.extra_info.iter() {
+    for (field_name, field_value) in owner_document.extra_info.iter() {
         if field_name == "did" || field_name == "id" || field_value.is_null() {
             continue;
         }
-        insert_owner_config_path(merged, field_sources, field_name, field_value.clone());
+        insert_owner_document_path(merged, field_sources, field_name, field_value.clone());
     }
 }
 
-fn insert_owner_config_field(
+fn insert_owner_document_field(
     merged: &mut Map<String, Value>,
     field_sources: &mut HashMap<String, ProfileSource>,
     field_name: &str,
@@ -246,10 +246,10 @@ fn insert_owner_config_field(
         return;
     }
     merged.insert(field_name.to_string(), field_value);
-    field_sources.insert(field_name.to_string(), ProfileSource::OwnerConfig);
+    field_sources.insert(field_name.to_string(), ProfileSource::OwnerDocument);
 }
 
-fn merge_owner_config_meta_overlay(
+fn merge_owner_document_meta_overlay(
     merged: &mut Map<String, Value>,
     field_sources: &mut HashMap<String, ProfileSource>,
     meta: &Value,
@@ -262,11 +262,11 @@ fn merge_owner_config_meta_overlay(
         if field_path == "meta" || field_value.is_null() {
             continue;
         }
-        insert_owner_config_path(merged, field_sources, field_path, field_value.clone());
+        insert_owner_document_path(merged, field_sources, field_path, field_value.clone());
     }
 }
 
-fn insert_owner_config_path(
+fn insert_owner_document_path(
     merged: &mut Map<String, Value>,
     field_sources: &mut HashMap<String, ProfileSource>,
     field_path: &str,
@@ -291,7 +291,7 @@ fn insert_owner_config_path(
             .or_insert_with(|| Value::Object(Map::new()));
         merge_json_path(target, &parts[1..], field_value);
     }
-    field_sources.insert(first_part.to_string(), ProfileSource::OwnerConfig);
+    field_sources.insert(first_part.to_string(), ProfileSource::OwnerDocument);
 }
 
 fn merge_json_path(target: &mut Value, path: &[&str], value: Value) {
@@ -381,15 +381,15 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     fn owner_doc(owner_did: DID, zone_did: Option<DID>) -> EncodedDocument {
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             owner_did,
             "alice".to_string(),
             "Alice Document".to_string(),
             owner_public_jwk(),
         );
-        owner_config.avatar = Some("https://example.com/alice.png".to_string());
-        owner_config.meta = Some(json!({
-            "identity": "owner-config",
+        owner_document.avatar = Some("https://example.com/alice.png".to_string());
+        owner_document.meta = Some(json!({
+            "identity": "owner-document",
             "headline": "from owner meta",
             "links": {
                 "github": {
@@ -402,13 +402,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 "address": "owner@example.com"
             }
         }));
-        owner_config
+        owner_document
             .extra_info
             .insert("title".to_string(), json!("Owner Title"));
         if let Some(zone_did) = zone_did {
-            owner_config.set_default_zone_did(zone_did);
+            owner_document.set_default_zone_did(zone_did);
         }
-        owner_config.encode(Some(&owner_private_key())).unwrap()
+        owner_document.encode(Some(&owner_private_key())).unwrap()
     }
 
     fn profile_doc(did: DID, version_seq: u64, fields: Value) -> EncodedDocument {
@@ -480,7 +480,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[tokio::test]
-    async fn resolve_user_profile_uses_standard_did_resolution_then_owner_config_overrides_identity_fields(
+    async fn resolve_user_profile_uses_standard_did_resolution_then_owner_document_overrides_identity_fields(
     ) {
         let owner_did = DID::new("bns", "alice");
         let zone_did = DID::new("bns", "home");
@@ -581,7 +581,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 .meta
                 .as_ref()
                 .and_then(|meta| meta.get("identity")),
-            Some(&json!("owner-config"))
+            Some(&json!("owner-document"))
         );
         assert_eq!(merged.profile.bio.as_deref(), None);
         assert_eq!(merged.profile.location.as_deref(), None);
@@ -589,7 +589,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(merged.profile.title.as_deref(), Some("Owner Title"));
         assert_eq!(
             merged.profile.extra.get("identity"),
-            Some(&json!("owner-config"))
+            Some(&json!("owner-document"))
         );
         assert_eq!(
             merged
@@ -631,23 +631,23 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
         assert_eq!(
             merged.field_sources.get("display_name"),
-            Some(&ProfileSource::OwnerConfig)
+            Some(&ProfileSource::OwnerDocument)
         );
         assert_eq!(
             merged.field_sources.get("avatar"),
-            Some(&ProfileSource::OwnerConfig)
+            Some(&ProfileSource::OwnerDocument)
         );
         assert_eq!(
             merged.field_sources.get("headline"),
-            Some(&ProfileSource::OwnerConfig)
+            Some(&ProfileSource::OwnerDocument)
         );
         assert_eq!(
             merged.field_sources.get("links"),
-            Some(&ProfileSource::OwnerConfig)
+            Some(&ProfileSource::OwnerDocument)
         );
         assert_eq!(
             merged.field_sources.get("public_contacts"),
-            Some(&ProfileSource::OwnerConfig)
+            Some(&ProfileSource::OwnerDocument)
         );
         assert!(!merged.field_sources.contains_key("bio"));
     }
@@ -698,7 +698,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(merged.profile.location.as_deref(), Some("Home"));
         assert_eq!(
             merged.field_sources.get("display_name"),
-            Some(&ProfileSource::OwnerConfig)
+            Some(&ProfileSource::OwnerDocument)
         );
         assert_eq!(
             merged.field_sources.get("location"),
@@ -707,7 +707,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[tokio::test]
-    async fn resolve_user_profile_returns_owner_config_identity_without_profile_doc() {
+    async fn resolve_user_profile_returns_owner_document_identity_without_profile_doc() {
         let owner_did = DID::new("bns", "alice");
 
         let mut docs = HashMap::new();
@@ -744,7 +744,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(merged.profile.title.as_deref(), Some("Owner Title"));
         assert_eq!(
             merged.field_sources.get("display_name"),
-            Some(&ProfileSource::OwnerConfig)
+            Some(&ProfileSource::OwnerDocument)
         );
     }
 

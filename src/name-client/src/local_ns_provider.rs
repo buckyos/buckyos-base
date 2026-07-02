@@ -425,7 +425,7 @@ ptr_records = ["node1.example.com", "node1-alt.example.com"]
             .await
             .unwrap();
 
-        let _boot_config = ZoneBootConfig::decode(&result, None).unwrap();
+        let _boot_document = ZoneBootDocument::decode(&result, None).unwrap();
         let result = provider
             .query_did(
                 &DID::new("web", "www.example.com"),

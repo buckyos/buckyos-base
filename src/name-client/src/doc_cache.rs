@@ -8,7 +8,7 @@ use buckyos_kit::{
     buckyos_get_unix_timestamp, get_buckyos_service_local_data_dir, get_buckyos_system_etc_dir,
 };
 use log::{debug, error, info, warn};
-use name_lib::{DIDDocumentTrait, EncodedDocument, OwnerConfig, DEFAULT_EXPIRE_TIME, DID};
+use name_lib::{DIDDocumentTrait, EncodedDocument, OwnerDocument, DEFAULT_EXPIRE_TIME, DID};
 use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
@@ -244,8 +244,8 @@ impl DIDDocumentFsCache {
             },
         );
 
-        if let Some(owner_config) = parse_owner_config_doc(doc_type, &doc) {
-            self.evict_revoked_docs(&did, doc_type, &owner_config);
+        if let Some(owner_document) = parse_owner_document_doc(doc_type, &doc) {
+            self.evict_revoked_docs(&did, doc_type, &owner_document);
         }
     }
 
@@ -403,18 +403,18 @@ impl DIDDocumentFsCache {
             return Ok(());
         }
 
-        if let Some(owner_config) = self.load_cached_owner_config(did) {
-            owner_config.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
+        if let Some(owner_document) = self.load_cached_owner_document(did) {
+            owner_document.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
         }
         Ok(())
     }
 
-    fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
+    fn load_cached_owner_document(&self, did: &DID) -> Option<OwnerDocument> {
         self.load_from_disk(did, Some(&DidDocType::Owner))
-            .and_then(|(doc, _)| parse_owner_config_doc(Some(&DidDocType::Owner), &doc))
+            .and_then(|(doc, _)| parse_owner_document_doc(Some(&DidDocType::Owner), &doc))
             .or_else(|| {
                 self.load_from_disk(did, None)
-                    .and_then(|(doc, _)| parse_owner_config_doc(None, &doc))
+                    .and_then(|(doc, _)| parse_owner_document_doc(None, &doc))
             })
     }
 
@@ -422,7 +422,7 @@ impl DIDDocumentFsCache {
         &self,
         did: &DID,
         owner_doc_type: Option<&DidDocType>,
-        owner_config: &OwnerConfig,
+        owner_document: &OwnerDocument,
     ) {
         let did_key = did_cache_key(did);
         let entries = match fs::read_dir(&self.cache_dir) {
@@ -448,7 +448,7 @@ impl DIDDocumentFsCache {
             let Some((doc, _)) = self.load_from_disk(did, doc_type.as_ref()) else {
                 continue;
             };
-            if owner_config
+            if owner_document
                 .validate_jwt_revocation(doc_type_str(doc_type.as_ref()), &doc)
                 .is_err()
             {
@@ -580,8 +580,8 @@ impl DIDDocumentDBCache {
             warn!("write did doc sqlite cache failed: {}", err);
         }
 
-        if let Some(owner_config) = parse_owner_config_doc(doc_type, &doc) {
-            self.evict_revoked_docs(&did, doc_type, &owner_config);
+        if let Some(owner_document) = parse_owner_document_doc(doc_type, &doc) {
+            self.evict_revoked_docs(&did, doc_type, &owner_document);
         }
     }
 
@@ -656,18 +656,18 @@ impl DIDDocumentDBCache {
             return Ok(());
         }
 
-        if let Some(owner_config) = self.load_cached_owner_config(did) {
-            owner_config.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
+        if let Some(owner_document) = self.load_cached_owner_document(did) {
+            owner_document.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
         }
         Ok(())
     }
 
-    fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
+    fn load_cached_owner_document(&self, did: &DID) -> Option<OwnerDocument> {
         self.get(did, Some(&DidDocType::Owner))
-            .and_then(|(doc, _, _)| parse_owner_config_doc(Some(&DidDocType::Owner), &doc))
+            .and_then(|(doc, _, _)| parse_owner_document_doc(Some(&DidDocType::Owner), &doc))
             .or_else(|| {
                 self.get(did, None)
-                    .and_then(|(doc, _, _)| parse_owner_config_doc(None, &doc))
+                    .and_then(|(doc, _, _)| parse_owner_document_doc(None, &doc))
             })
     }
 
@@ -675,7 +675,7 @@ impl DIDDocumentDBCache {
         &self,
         did: &DID,
         owner_doc_type: Option<&DidDocType>,
-        owner_config: &OwnerConfig,
+        owner_document: &OwnerDocument,
     ) {
         let conn = match self.open_conn() {
             Ok(c) => c,
@@ -714,7 +714,7 @@ impl DIDDocumentDBCache {
             let Ok(doc) = EncodedDocument::from_str(row.1) else {
                 continue;
             };
-            if owner_config
+            if owner_document
                 .validate_jwt_revocation(doc_type_str(doc_type.as_ref()), &doc)
                 .is_err()
             {
@@ -838,7 +838,7 @@ impl DIDDocumentMemCache {
             return;
         }
 
-        let owner_config = parse_owner_config_doc(doc_type, &doc);
+        let owner_document = parse_owner_document_doc(doc_type, &doc);
         let key = combine_key(&did, doc_type);
         if let Ok(mut guard) = self.entries.write() {
             guard.insert(
@@ -852,8 +852,8 @@ impl DIDDocumentMemCache {
             );
         }
 
-        if let Some(owner_config) = owner_config {
-            self.evict_revoked_docs(&did, doc_type, &owner_config);
+        if let Some(owner_document) = owner_document {
+            self.evict_revoked_docs(&did, doc_type, &owner_document);
         }
     }
 
@@ -874,18 +874,18 @@ impl DIDDocumentMemCache {
             return Ok(());
         }
 
-        if let Some(owner_config) = self.load_cached_owner_config(did) {
-            owner_config.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
+        if let Some(owner_document) = self.load_cached_owner_document(did) {
+            owner_document.validate_jwt_revocation(doc_type_str(doc_type), doc)?;
         }
         Ok(())
     }
 
-    fn load_cached_owner_config(&self, did: &DID) -> Option<OwnerConfig> {
+    fn load_cached_owner_document(&self, did: &DID) -> Option<OwnerDocument> {
         self.get(did, Some(&DidDocType::Owner))
-            .and_then(|(doc, _, _)| parse_owner_config_doc(Some(&DidDocType::Owner), &doc))
+            .and_then(|(doc, _, _)| parse_owner_document_doc(Some(&DidDocType::Owner), &doc))
             .or_else(|| {
                 self.get(did, None)
-                    .and_then(|(doc, _, _)| parse_owner_config_doc(None, &doc))
+                    .and_then(|(doc, _, _)| parse_owner_document_doc(None, &doc))
             })
     }
 
@@ -893,7 +893,7 @@ impl DIDDocumentMemCache {
         &self,
         did: &DID,
         owner_doc_type: Option<&DidDocType>,
-        owner_config: &OwnerConfig,
+        owner_document: &OwnerDocument,
     ) {
         let did_key = did_cache_key(did);
         if let Ok(mut guard) = self.entries.write() {
@@ -906,7 +906,7 @@ impl DIDDocumentMemCache {
                 if same_doc_type(doc_type.as_ref(), owner_doc_type) {
                     return true;
                 }
-                owner_config
+                owner_document
                     .validate_jwt_revocation(doc_type_str(doc_type.as_ref()), &entry.doc)
                     .is_ok()
             });
@@ -1064,17 +1064,17 @@ fn is_owner_doc(doc_type: Option<&DidDocType>, doc: &EncodedDocument) -> bool {
         })
 }
 
-fn parse_owner_config_doc(
+fn parse_owner_document_doc(
     doc_type: Option<&DidDocType>,
     doc: &EncodedDocument,
-) -> Option<OwnerConfig> {
+) -> Option<OwnerDocument> {
     if !is_owner_doc(doc_type, doc) {
         return None;
     }
-    match OwnerConfig::decode(doc, None) {
-        Ok(owner_config) => Some(owner_config),
+    match OwnerDocument::decode(doc, None) {
+        Ok(owner_document) => Some(owner_document),
         Err(err) => {
-            warn!("parse owner config from did-cache failed: {}", err);
+            warn!("parse owner document from did-cache failed: {}", err);
             None
         }
     }
@@ -1117,7 +1117,9 @@ mod tests {
     use super::*;
     use crate::DEFAULT_PROVIDER_TRUST_LEVEL;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-    use name_lib::{DIDDocumentTrait, NSError, OwnerConfig, ZoneBootConfig, DEFAULT_EXPIRE_TIME};
+    use name_lib::{
+        DIDDocumentTrait, NSError, OwnerDocument, ZoneBootDocument, DEFAULT_EXPIRE_TIME,
+    };
     use rusqlite::{params, Connection};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1180,19 +1182,19 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         version_seq: Option<u64>,
         marker: &str,
     ) -> EncodedDocument {
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             DID::new("bns", "tester"),
             format!("tester-{marker}"),
             "Tester Example".to_string(),
             owner_public_jwk(),
         );
-        owner_config.iat = iat;
-        owner_config.exp = iat + DEFAULT_EXPIRE_TIME;
-        owner_config.version_seq = version_seq;
-        owner_config
+        owner_document.iat = iat;
+        owner_document.exp = iat + DEFAULT_EXPIRE_TIME;
+        owner_document.version_seq = version_seq;
+        owner_document
             .extra_info
             .insert("marker".to_string(), json!(marker));
-        owner_config.encode(Some(&owner_encoding_key())).unwrap()
+        owner_document.encode(Some(&owner_encoding_key())).unwrap()
     }
 
     fn build_owner_doc_with_revocation(
@@ -1202,21 +1204,21 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         valid_iat: Option<u64>,
         marker: &str,
     ) -> EncodedDocument {
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             did.clone(),
             format!("tester-{marker}"),
             "Tester Example".to_string(),
             owner_public_jwk(),
         );
-        owner_config.iat = iat;
-        owner_config.exp = iat + DEFAULT_EXPIRE_TIME;
-        owner_config.version_seq = Some(1);
-        owner_config.mini_version_seq = mini_version_seq;
-        owner_config.valid_iat = valid_iat;
-        owner_config
+        owner_document.iat = iat;
+        owner_document.exp = iat + DEFAULT_EXPIRE_TIME;
+        owner_document.version_seq = Some(1);
+        owner_document.mini_version_seq = mini_version_seq;
+        owner_document.valid_iat = valid_iat;
+        owner_document
             .extra_info
             .insert("marker".to_string(), json!(marker));
-        owner_config.encode(Some(&owner_encoding_key())).unwrap()
+        owner_document.encode(Some(&owner_encoding_key())).unwrap()
     }
 
     fn build_jwt_doc(version_seq: u64, iat: u64, marker: &str) -> EncodedDocument {
@@ -1300,7 +1302,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     fn build_zone_doc(did: &DID, exp: u64, marker: &str) -> EncodedDocument {
         let mut extra_info = HashMap::new();
         extra_info.insert("marker".to_string(), json!(marker));
-        let zone_boot_config = ZoneBootConfig {
+        let zone_boot_document = ZoneBootDocument {
             id: Some(did.clone()),
             oods: vec!["ood1".parse().unwrap()],
             sn: Some("sn.unit-test.buckyos".to_string()),
@@ -1309,7 +1311,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             owner_key: None,
             extra_info,
         };
-        EncodedDocument::JsonLd(serde_json::to_value(zone_boot_config).unwrap())
+        EncodedDocument::JsonLd(serde_json::to_value(zone_boot_document).unwrap())
     }
 
     fn assert_path_did_does_not_collide_with_host_did(cache: &DIDDocumentCache) {

@@ -6,7 +6,7 @@ BNS使用智能合约作为底层，完整的支持了 name(did:bns:$name) -> di
 
 ### 去中心化的实现 name->did-document 的可信查询
 基于智能合约的特性
-- 通过name可以得到可信的owner（OwnerConfig,包含公钥）
+- 通过name可以得到可信的owner（OwnerDocument,包含公钥）
 - 智能合约保障了只有Owner才能更新did-document，并通过Owner公钥对DID-Document的JWT进行传播验证
 
 比现在的DNS协议可靠（防篡改）
@@ -26,7 +26,7 @@ BNS通过合约机制，允许任何人“注册”新名字，并将名字绑�
 ## 实际使用
 
 - 创建用户 （通常zonename和用户名相同）
-创建did:bns:$zonename 默认段 -> zone-document , 附加段(owner) -> owner-config
+创建did:bns:$zonename 默认段 -> zone-document , 附加段(owner) -> owner-document
 
 
 ### pkg的did

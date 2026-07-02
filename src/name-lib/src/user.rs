@@ -23,7 +23,7 @@ pub struct OwnerWallet {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct OwnerConfig {
+pub struct OwnerDocument {
     #[serde(rename = "@context", default = "default_owner_context")]
     pub context: DIDContext,
     pub id: DID,
@@ -76,7 +76,7 @@ pub struct OwnerConfig {
     pub wallets: HashMap<String, OwnerWallet>,
 }
 
-impl OwnerConfig {
+impl OwnerDocument {
     fn validate_pkx_x(x: &str) -> NSResult<()> {
         let decoded = URL_SAFE_NO_PAD
             .decode(x)
@@ -103,7 +103,7 @@ impl OwnerConfig {
             let owner_name = owenr_did.id.clone();
             let full_name = format!("{}@{}", owner_name, hostname);
 
-            return Ok(OwnerConfig::new(
+            return Ok(OwnerDocument::new(
                 owenr_did,
                 owner_name.clone(),
                 full_name,
@@ -115,7 +115,7 @@ impl OwnerConfig {
             let owner_did = DID::new(parts[1], parts[2]);
             let owner_name = parts[2].to_string();
             let full_name = format!("{}@{}", owner_name, hostname);
-            return Ok(OwnerConfig::new(
+            return Ok(OwnerDocument::new(
                 owner_did,
                 owner_name.clone(),
                 full_name,
@@ -134,7 +134,7 @@ impl OwnerConfig {
             public_key: public_key,
         }];
 
-        OwnerConfig {
+        OwnerDocument {
             context: default_owner_context(),
             id: id,
             name: name,
@@ -177,7 +177,7 @@ impl OwnerConfig {
         });
     }
 
-    pub fn load_owner_config(file_path: &PathBuf) -> NSResult<OwnerConfig> {
+    pub fn load_owner_document(file_path: &PathBuf) -> NSResult<OwnerDocument> {
         let contents = std::fs::read_to_string(file_path.clone()).map_err(|err| {
             error!("read {} failed! {}", file_path.to_string_lossy(), err);
             return NSError::ReadLocalFileError(format!(
@@ -186,10 +186,10 @@ impl OwnerConfig {
                 err
             ));
         })?;
-        let config: OwnerConfig = serde_json::from_str(&contents).map_err(|err| {
+        let config: OwnerDocument = serde_json::from_str(&contents).map_err(|err| {
             error!("parse {} failed! {}", file_path.to_string_lossy(), err);
             return NSError::ReadLocalFileError(format!(
-                "Failed to parse OwnerConfig json: {}",
+                "Failed to parse OwnerDocument json: {}",
                 err
             ));
         })?;
@@ -275,7 +275,7 @@ impl OwnerConfig {
     }
 }
 
-impl DIDDocumentTrait for OwnerConfig {
+impl DIDDocumentTrait for OwnerDocument {
     fn get_id(&self) -> DID {
         return self.id.clone();
     }
@@ -358,12 +358,13 @@ impl DIDDocumentTrait for OwnerConfig {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
-        ensure_version_seq_for_jwt("OwnerConfig", self.version_seq)?;
+        ensure_version_seq_for_jwt("OwnerDocument", self.version_seq)?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
-        let token = encode(&header, self, key)
-            .map_err(|error| NSError::Failed(format!("Failed to encode OwnerConfig :{}", error)))?;
+        let token = encode(&header, self, key).map_err(|error| {
+            NSError::Failed(format!("Failed to encode OwnerDocument :{}", error))
+        })?;
         return Ok(EncodedDocument::Jwt(token));
     }
 
@@ -379,16 +380,17 @@ impl DIDDocumentTrait for OwnerConfig {
                 } else {
                     json_result = decode_json_from_jwt_with_pk(jwt_str, key.unwrap())?;
                 }
-                let result: OwnerConfig = serde_json::from_value(json_result).map_err(|error| {
-                    NSError::Failed(format!("Failed to decode owner config:{}", error))
-                })?;
-                ensure_version_seq_for_jwt("OwnerConfig", result.version_seq)?;
+                let result: OwnerDocument =
+                    serde_json::from_value(json_result).map_err(|error| {
+                        NSError::Failed(format!("Failed to decode owner document:{}", error))
+                    })?;
+                ensure_version_seq_for_jwt("OwnerDocument", result.version_seq)?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {
-                let result: OwnerConfig =
+                let result: OwnerDocument =
                     serde_json::from_value(json_value.clone()).map_err(|error| {
-                        NSError::Failed(format!("Failed to decode owner config:{}", error))
+                        NSError::Failed(format!("Failed to decode owner document:{}", error))
                     })?;
                 return Ok(result);
             }
@@ -403,7 +405,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_owner_config() {
+    fn test_owner_document() {
         let private_key_pem = r#"
         -----BEGIN PRIVATE KEY-----
         MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -421,34 +423,34 @@ mod tests {
             EncodingKey::from_ed_pem(private_key_pem.as_bytes()).unwrap();
         let public_key = DecodingKey::from_jwk(&public_key_jwk).unwrap();
 
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             DID::new("bns", "lzc"),
             "lzc".to_string(),
             "zhicong liu".to_string(),
             public_key_jwk,
         );
 
-        owner_config.set_default_zone_did(DID::new("bns", "waterflier"));
+        owner_document.set_default_zone_did(DID::new("bns", "waterflier"));
 
-        let json_str = serde_json::to_string_pretty(&owner_config).unwrap();
+        let json_str = serde_json::to_string_pretty(&owner_document).unwrap();
         println!("json_str: {}", json_str.as_str());
 
-        let encoded = owner_config.encode(Some(&private_key)).unwrap();
+        let encoded = owner_document.encode(Some(&private_key)).unwrap();
         println!("encoded: {:?}", encoded);
 
-        let decoded = OwnerConfig::decode(&encoded, Some(&public_key)).unwrap();
+        let decoded = OwnerDocument::decode(&encoded, Some(&public_key)).unwrap();
         println!(
             "decoded: {}",
             serde_json::to_string_pretty(&decoded).unwrap()
         );
         let token2 = decoded.encode(Some(&private_key)).unwrap();
 
-        assert_eq!(owner_config, decoded);
+        assert_eq!(owner_document, decoded);
         assert_eq!(encoded, token2);
     }
 
     #[test]
-    fn owner_config_serializes_wallets_by_name() {
+    fn owner_document_serializes_wallets_by_name() {
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
             {
                 "kty": "OKP",
@@ -457,14 +459,14 @@ mod tests {
             }
         ))
         .unwrap();
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             DID::new("bns", "lzc"),
             "lzc".to_string(),
             "zhicong liu".to_string(),
             public_key_jwk,
         );
 
-        owner_config.wallets.insert(
+        owner_document.wallets.insert(
             "main".to_string(),
             OwnerWallet {
                 wallet_type: "eth".to_string(),
@@ -472,7 +474,7 @@ mod tests {
             },
         );
 
-        let json_value = serde_json::to_value(&owner_config).unwrap();
+        let json_value = serde_json::to_value(&owner_document).unwrap();
         assert_eq!(
             json_value["wallets"]["main"],
             json!({
@@ -481,7 +483,7 @@ mod tests {
             })
         );
 
-        let decoded: OwnerConfig = serde_json::from_value(json_value).unwrap();
+        let decoded: OwnerDocument = serde_json::from_value(json_value).unwrap();
         assert_eq!(
             decoded.wallets.get("main").unwrap(),
             &OwnerWallet {
@@ -492,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_config_serializes_key_scope_by_scope_name() {
+    fn owner_document_serializes_key_scope_by_scope_name() {
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
             {
                 "kty": "OKP",
@@ -501,42 +503,44 @@ mod tests {
             }
         ))
         .unwrap();
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             DID::new("bns", "lzc"),
             "lzc".to_string(),
             "zhicong liu".to_string(),
             public_key_jwk,
         );
 
-        let empty_json_value = serde_json::to_value(&owner_config).unwrap();
+        let empty_json_value = serde_json::to_value(&owner_document).unwrap();
         assert!(empty_json_value.get("keyScope").is_none());
-        assert!(owner_config.is_key_allowed_in_scope(crate::key_scope::CONTENT_CREATE, "#main_key"));
+        assert!(
+            owner_document.is_key_allowed_in_scope(crate::key_scope::CONTENT_CREATE, "#main_key")
+        );
         assert_eq!(
-            owner_config
+            owner_document
                 .get_key_by_scope(crate::key_scope::CONTENT_CREATE)
                 .map(|(key_id, _, _)| key_id),
             Some("#main_key".to_string())
         );
 
-        let main_key_id = format!("{}#main_key", owner_config.id.to_string());
-        owner_config.key_scope.insert(
+        let main_key_id = format!("{}#main_key", owner_document.id.to_string());
+        owner_document.key_scope.insert(
             crate::key_scope::MANUAL.to_string(),
             vec![main_key_id.clone()],
         );
         assert!(
-            !owner_config.is_key_allowed_in_scope(crate::key_scope::CONTENT_CREATE, "#main_key")
+            !owner_document.is_key_allowed_in_scope(crate::key_scope::CONTENT_CREATE, "#main_key")
         );
-        assert!(owner_config
+        assert!(owner_document
             .get_key_by_scope(crate::key_scope::CONTENT_CREATE)
             .is_none());
 
-        let json_value = serde_json::to_value(&owner_config).unwrap();
+        let json_value = serde_json::to_value(&owner_document).unwrap();
         assert_eq!(
             json_value["keyScope"][crate::key_scope::MANUAL],
             json!([main_key_id])
         );
 
-        let decoded: OwnerConfig = serde_json::from_value(json_value).unwrap();
+        let decoded: OwnerDocument = serde_json::from_value(json_value).unwrap();
         assert_eq!(
             decoded.key_scope.get(crate::key_scope::MANUAL).unwrap(),
             &vec![main_key_id.clone()]
@@ -552,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_config_accepts_buckyos_scopes_alias() {
+    fn owner_document_accepts_buckyos_scopes_alias() {
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
             {
                 "kty": "OKP",
@@ -561,13 +565,13 @@ mod tests {
             }
         ))
         .unwrap();
-        let owner_config = OwnerConfig::new(
+        let owner_document = OwnerDocument::new(
             DID::new("bns", "lzc"),
             "lzc".to_string(),
             "zhicong liu".to_string(),
             public_key_jwk,
         );
-        let mut json_value = serde_json::to_value(&owner_config).unwrap();
+        let mut json_value = serde_json::to_value(&owner_document).unwrap();
         let json_object = json_value.as_object_mut().unwrap();
         json_object.insert(
             "buckyos:scopes".to_string(),
@@ -576,7 +580,7 @@ mod tests {
             }),
         );
 
-        let decoded: OwnerConfig = serde_json::from_value(json_value).unwrap();
+        let decoded: OwnerDocument = serde_json::from_value(json_value).unwrap();
         assert_eq!(
             decoded
                 .key_scope
@@ -588,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_config_jwt_requires_version_seq() {
+    fn owner_document_jwt_requires_version_seq() {
         let private_key_pem = r#"
         -----BEGIN PRIVATE KEY-----
         MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -603,21 +607,21 @@ mod tests {
         ))
         .unwrap();
         let private_key = EncodingKey::from_ed_pem(private_key_pem.as_bytes()).unwrap();
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             DID::new("bns", "lzc"),
             "lzc".to_string(),
             "zhicong liu".to_string(),
             public_key_jwk,
         );
 
-        owner_config.version_seq = None;
+        owner_document.version_seq = None;
 
-        let err = owner_config.encode(Some(&private_key)).unwrap_err();
+        let err = owner_document.encode(Some(&private_key)).unwrap_err();
         assert!(matches!(err, NSError::Failed(_)));
     }
 
     #[test]
-    fn owner_config_replay_guard_rejects_stale_jwt() {
+    fn owner_document_replay_guard_rejects_stale_jwt() {
         let private_key_pem = r#"
         -----BEGIN PRIVATE KEY-----
         MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -625,7 +629,7 @@ mod tests {
         "#;
         let private_key = EncodingKey::from_ed_pem(private_key_pem.as_bytes()).unwrap();
 
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             DID::new("bns", "lzc"),
             "lzc".to_string(),
             "zhicong liu".to_string(),
@@ -636,8 +640,8 @@ mod tests {
             }))
             .unwrap(),
         );
-        owner_config.mini_version_seq = Some(3);
-        owner_config.valid_iat = Some(100);
+        owner_document.mini_version_seq = Some(3);
+        owner_document.valid_iat = Some(100);
 
         let fresh_jwt = encode(
             &Header::new(Algorithm::EdDSA),
@@ -649,8 +653,8 @@ mod tests {
             &private_key,
         )
         .unwrap();
-        owner_config
-            .validate_jwt_revocation("ZoneConfig", &EncodedDocument::Jwt(fresh_jwt))
+        owner_document
+            .validate_jwt_revocation("ZoneDocument", &EncodedDocument::Jwt(fresh_jwt))
             .unwrap();
 
         let stale_version_jwt = encode(
@@ -663,8 +667,8 @@ mod tests {
             &private_key,
         )
         .unwrap();
-        assert!(owner_config
-            .validate_jwt_revocation("ZoneConfig", &EncodedDocument::Jwt(stale_version_jwt))
+        assert!(owner_document
+            .validate_jwt_revocation("ZoneDocument", &EncodedDocument::Jwt(stale_version_jwt))
             .is_err());
 
         let stale_iat_jwt = encode(
@@ -677,8 +681,8 @@ mod tests {
             &private_key,
         )
         .unwrap();
-        assert!(owner_config
-            .validate_jwt_revocation("ZoneConfig", &EncodedDocument::Jwt(stale_iat_jwt))
+        assert!(owner_document
+            .validate_jwt_revocation("ZoneDocument", &EncodedDocument::Jwt(stale_iat_jwt))
             .is_err());
     }
 
@@ -687,7 +691,7 @@ mod tests {
         let pkx = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"; // valid base64url(32 bytes)
         let hostname = "did:web:example.com";
 
-        let cfg = OwnerConfig::new_by_pkx(pkx, hostname).expect("should build owner config");
+        let cfg = OwnerDocument::new_by_pkx(pkx, hostname).expect("should build owner document");
 
         assert_eq!(cfg.id.method, "web");
         assert_eq!(cfg.id.id, "example.com");
@@ -700,7 +704,7 @@ mod tests {
         let pkx = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8:bns:user1:xxxx";
         let hostname = "bridge.buckyos.org";
 
-        let cfg = OwnerConfig::new_by_pkx(pkx, hostname).expect("should build owner config");
+        let cfg = OwnerDocument::new_by_pkx(pkx, hostname).expect("should build owner document");
 
         assert_eq!(cfg.id.method, "bns");
         assert_eq!(cfg.id.id, "user1");
@@ -713,7 +717,7 @@ mod tests {
         let pkx = "abc123:onlytwo";
         let hostname = "did:web:example.com";
 
-        let err = OwnerConfig::new_by_pkx(pkx, hostname).unwrap_err();
+        let err = OwnerDocument::new_by_pkx(pkx, hostname).unwrap_err();
         assert!(matches!(err, NSError::InvalidDID(_)));
     }
 
@@ -722,7 +726,7 @@ mod tests {
         let pkx = "not_base64!:bns:user1";
         let hostname = "bridge.buckyos.org";
 
-        let err = OwnerConfig::new_by_pkx(pkx, hostname).unwrap_err();
+        let err = OwnerDocument::new_by_pkx(pkx, hostname).unwrap_err();
         assert!(matches!(err, NSError::InvalidDID(_)));
     }
 
@@ -732,7 +736,7 @@ mod tests {
         let pkx = "AQ:bns:user1";
         let hostname = "bridge.buckyos.org";
 
-        let err = OwnerConfig::new_by_pkx(pkx, hostname).unwrap_err();
+        let err = OwnerDocument::new_by_pkx(pkx, hostname).unwrap_err();
         assert!(matches!(err, NSError::InvalidDID(_)));
     }
 }

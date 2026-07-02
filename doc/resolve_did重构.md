@@ -55,7 +55,7 @@ doc_type 解决两件事：
 
 实现上，这个边界必须由 `DidResolver::requires_verification(doc_type)` 显式落地：声明为免验证的 Info 类 `doc_type` 不进入 `PublishedState / DocumentStatus` 状态机，不触发 owner 递归，也不受 `Missing / Revoked / Tombstoned` 这类 Document 门禁约束。它仍然使用第 3 节的 method-scoped resolver 选择，避免 wildcard resolver 覆盖具体 DID method，但解析结果只能作为非权威实时信息使用。
 
-**IP 解析的演进目标**：随着 IPv6 普及、每个节点都能拥有公网固定 IP，Zone config / device document 里会直接带上固定 IP。那时 **resolve Document 就等同于 resolve IP**，不再需要独立的地址解析流程。（当前实现里地址提取的顺序和位置还不一定对，属于待校正项，也回应了 review 中提到的 “resolve-ip 流程是否纳入统一递归” 的问题。）
+**IP 解析的演进目标**：随着 IPv6 普及、每个节点都能拥有公网固定 IP，Zone document / device document 里会直接带上固定 IP。那时 **resolve Document 就等同于 resolve IP**，不再需要独立的地址解析流程。（当前实现里地址提取的顺序和位置还不一定对，属于待校正项，也回应了 review 中提到的 “resolve-ip 流程是否纳入统一递归” 的问题。）
 
 **过渡期**：当节点位于 NAT 后、无公网 IP、或公网 IP 动态可变时，固定 IP 假设不成立。此时仍需依赖传统的 SN（Super Node）服务作为过渡，由 SN / DNS 承担动态地址的发现与中转。因此 SN 返回的地址不改变 Document 的权威性。
 

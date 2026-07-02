@@ -242,17 +242,17 @@ fn resolve_exchange_key_from_doc(
 ) -> NSResult<Option<(DecodingKey, jsonwebtoken::jwk::Jwk)>> {
     let doc_value = did_doc.clone().to_json_value()?;
     if doc_value.get("device_type").is_some() {
-        let device_config = DeviceConfig::decode(did_doc, None)?;
-        return Ok(device_config.get_exchange_key(None));
+        let device_document = DeviceDocument::decode(did_doc, None)?;
+        return Ok(device_document.get_exchange_key(None));
     }
     if doc_value.get("hostname").is_some() {
-        let zone_config = ZoneConfig::decode(did_doc, None)?;
-        let Some(gateway_name) = zone_config.get_default_zone_gateway() else {
+        let zone_document = ZoneDocument::decode(did_doc, None)?;
+        let Some(gateway_name) = zone_document.get_default_zone_gateway() else {
             return Ok(None);
         };
-        return Ok(zone_config
-            .get_device_config(&gateway_name)
-            .and_then(|device_config| device_config.get_exchange_key(None)));
+        return Ok(zone_document
+            .get_device_document(&gateway_name)
+            .and_then(|device_document| device_document.get_exchange_key(None)));
     }
     Ok(None)
 }
@@ -279,12 +279,12 @@ pub async fn resolve_did_ex(
     client.resolve_did_ex(did, doc_type, policy).await
 }
 
-pub async fn resolve_owner_config(did: &DID) -> NSResult<OwnerConfig> {
+pub async fn resolve_owner_document(did: &DID) -> NSResult<OwnerDocument> {
     let client = get_name_client();
     if client.is_none() {
         return Err(NSError::NotFound("Name client not found".to_string()));
     }
-    client.unwrap().resolve_owner_config(did).await
+    client.unwrap().resolve_owner_document(did).await
 }
 
 pub async fn resolve_user_profile(

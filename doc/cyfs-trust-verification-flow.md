@@ -564,8 +564,8 @@ flowchart TD
 - `owner` / `zone-controller` 可以用于定位 OwnerDocument，但不能在验签前作为可信结论；
 - 验证通过后，内容信用绑定到 `verified_owner` / `verified_zone`；
 - 如果上层业务需要确认 Host 身份，则必须额外走 Host-bound 验证。
-- OwnerConfig 可以作为 Owner 侧的可信状态源，声明当前绑定的 Zone 信息，例如 `default_zone_did` 或后续扩展的 bound zone 列表。Resolver 在验证 ZoneDocument 签名后，还应确认 `verified_zone` 仍在 OwnerConfig 声明的绑定范围内，避免攻击者重放同一 Owner 过去签发、但已经不再被 Owner 认可的旧 ZoneDocument。
-- 如果 OwnerConfig 同时声明了 `mini_version_seq`、`valid_iat` 等吊销 / 新鲜度策略，ZoneDocument JWT 还必须满足这些下限。也就是说，OwnerConfig 的绑定关系校验不能替代 `exp`、版本号和吊销检查，但可以把“签名仍有效的旧 ZoneDocument”进一步限制在 Owner 当前认可的 Zone 集合内，从而缩小重放窗口。
+- OwnerDocument 可以作为 Owner 侧的可信状态源，声明当前绑定的 Zone 信息，例如 `default_zone_did` 或后续扩展的 bound zone 列表。Resolver 在验证 ZoneDocument 签名后，还应确认 `verified_zone` 仍在 OwnerDocument 声明的绑定范围内，避免攻击者重放同一 Owner 过去签发、但已经不再被 Owner 认可的旧 ZoneDocument。
+- 如果 OwnerDocument 同时声明了 `mini_version_seq`、`valid_iat` 等吊销 / 新鲜度策略，ZoneDocument JWT 还必须满足这些下限。也就是说，OwnerDocument 的绑定关系校验不能替代 `exp`、版本号和吊销检查，但可以把“签名仍有效的旧 ZoneDocument”进一步限制在 Owner 当前认可的 Zone 集合内，从而缩小重放窗口。
 
 ### 5.4 通过 DNS TXT Record 获取
 

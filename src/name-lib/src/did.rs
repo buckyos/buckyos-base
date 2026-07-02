@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use crate::agent::AgentDocument;
 use crate::did_object_card::{DIDObjectCard, DID_OBJECT_SERVICE_TYPE};
-use crate::user::OwnerConfig;
-use crate::zone::{ZoneBootConfig, ZoneConfig};
-use crate::DeviceConfig;
+use crate::user::OwnerDocument;
+use crate::zone::{ZoneBootDocument, ZoneDocument};
+use crate::DeviceDocument;
 use crate::{decode_jwt_claim_without_verify, NSError, NSResult};
 use async_trait::async_trait;
 use base64::{
@@ -436,7 +436,7 @@ pub trait DIDDocumentTrait: Send + Sync {
 
     //key id is none means the default key
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
-    //TODO 该方法变成DeviceConfig的特殊方法
+    //TODO 该方法变成DeviceDocument的特殊方法
     //fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
 
     fn get_key_ids_by_scope(&self, _scope: &str) -> Option<&[String]> {
@@ -566,12 +566,12 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
             || doc_value.get("displayName").is_some()
             || doc_value.get("full_name").is_some())
     {
-        let owner_config = serde_json::from_value::<OwnerConfig>(doc_value)
-            .map_err(|e| NSError::Failed(format!("parse owner config failed: {}", e)))?;
+        let owner_document = serde_json::from_value::<OwnerDocument>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse owner document failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("OwnerConfig", owner_config.get_version_seq())?;
+            ensure_version_seq_for_jwt("OwnerDocument", owner_document.get_version_seq())?;
         }
-        return Ok(Box::new(owner_config));
+        return Ok(Box::new(owner_document));
     }
     if doc_value.get("httpServicePorts").is_some() {
         let agent_document = serde_json::from_value::<AgentDocument>(doc_value)
@@ -582,21 +582,21 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
         return Ok(Box::new(agent_document));
     }
     if doc_value.get("device_type").is_some() {
-        let device_config = serde_json::from_value::<DeviceConfig>(doc_value)
-            .map_err(|e| NSError::Failed(format!("parse device config failed: {}", e)))?;
+        let device_document = serde_json::from_value::<DeviceDocument>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse device document failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("DeviceConfig", device_config.get_version_seq())?;
+            ensure_version_seq_for_jwt("DeviceDocument", device_document.get_version_seq())?;
         }
-        return Ok(Box::new(device_config));
+        return Ok(Box::new(device_document));
     }
 
     if doc_value.get("oods").is_some() {
-        let zone_config = serde_json::from_value::<ZoneConfig>(doc_value)
-            .map_err(|e| NSError::Failed(format!("parse zone config failed: {}", e)))?;
+        let zone_document = serde_json::from_value::<ZoneDocument>(doc_value)
+            .map_err(|e| NSError::Failed(format!("parse zone document failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("ZoneConfig", zone_config.get_version_seq())?;
+            ensure_version_seq_for_jwt("ZoneDocument", zone_document.get_version_seq())?;
         }
-        return Ok(Box::new(zone_config));
+        return Ok(Box::new(zone_document));
     }
 
     if doc_value
@@ -766,7 +766,7 @@ mod tests {
         }))
         .unwrap();
 
-        let owner = OwnerConfig::new(
+        let owner = OwnerDocument::new(
             DID::new("bns", "alice"),
             "alice".to_string(),
             "alice@bns".to_string(),
@@ -787,7 +787,7 @@ mod tests {
         let agent_parsed = parse_did_doc(agent_doc).unwrap();
         assert_eq!(agent_parsed.get_id(), agent.id);
 
-        let device = DeviceConfig::new(
+        let device = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
@@ -795,7 +795,7 @@ mod tests {
         let device_parsed = parse_did_doc(device_doc).unwrap();
         assert_eq!(device_parsed.get_id(), device.id);
 
-        let mut zone = ZoneConfig::new(
+        let mut zone = ZoneDocument::new(
             DID::new("bns", "zone1"),
             DID::new("bns", "alice"),
             owner_jwk,

@@ -1,6 +1,6 @@
 use buckyos_kit::buckyos_get_unix_timestamp;
 use jsonwebtoken::DecodingKey;
-use name_lib::OwnerConfig;
+use name_lib::OwnerDocument;
 use name_lib::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -425,6 +425,7 @@ pub struct DidDocumentMetadata {
     pub buckyos: BuckyOSDocumentMetadata,
 }
 
+/// This structure follows the W3C DID Resolution Result standard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedDocument {
     pub document: EncodedDocument,
@@ -709,11 +710,11 @@ pub struct OwnerDocumentPolicy {
 
 impl OwnerDocumentPolicy {
     /// 从递归解析并验签得到的 owner 文档派生策略。目前只落地 `revoke_before_iat`
-    /// （复用 `OwnerConfig::valid_iat` 既有语义），其余字段是尚未被 owner 文档
+    /// （复用 `OwnerDocument::valid_iat` 既有语义），其余字段是尚未被 owner 文档
     /// 显式声明的扩展点，默认空 map 表示"由调用方 ResolvePolicy 兜底"。
-    pub fn from_owner_config(owner_config: &OwnerConfig) -> Self {
+    pub fn from_owner_document(owner_document: &OwnerDocument) -> Self {
         Self {
-            revoke_before_iat: owner_config.valid_iat,
+            revoke_before_iat: owner_document.valid_iat,
             allow_self_signed_when_missing: HashMap::new(),
             allow_cache_when_authority_unavailable: HashMap::new(),
             reachability_sensitive: HashMap::new(),
@@ -901,7 +902,7 @@ impl NameInfo {
         let mut owner_x = None;
         let mut devices = Vec::new();
         let mut boot_jwt = None;
-        let mut zone_config: Option<ZoneConfig> = None;
+        let mut zone_document: Option<ZoneDocument> = None;
 
         for txt in self.txt.iter() {
             debug!("- TXT:{}", txt);
@@ -922,81 +923,82 @@ impl NameInfo {
 
         if owner_x.is_some() {
             let owner_x = owner_x.unwrap();
-            let owner_config = OwnerConfig::new_by_pkx(owner_x.as_str(), host_name.as_str())?;
-            let public_key_jwk = owner_config.get_default_key().unwrap();
+            let owner_document = OwnerDocument::new_by_pkx(owner_x.as_str(), host_name.as_str())?;
+            let public_key_jwk = owner_document.get_default_key().unwrap();
             let owner_public_key = DecodingKey::from_jwk(&public_key_jwk)
                 .map_err(|e| NSError::Failed(format!("parse public key failed! {}", e)))?;
             did_documents.insert(
                 "owner".to_string(),
-                EncodedDocument::JsonLd(serde_json::to_value(&owner_config).unwrap()),
+                EncodedDocument::JsonLd(serde_json::to_value(&owner_document).unwrap()),
             );
             //verify did_document by pkx_list
             if boot_jwt.is_some() {
                 let boot_jwt = boot_jwt.unwrap();
-                let mut boot_config =
-                    ZoneBootConfig::decode(&EncodedDocument::Jwt(boot_jwt.clone()), None)?;
-                boot_config.owner_key = Some(public_key_jwk.clone());
-                boot_config.id = Some(DID::from_str(host_name.as_str()).unwrap());
-                let real_zone_config = boot_config.to_zone_config(&boot_jwt);
-                zone_config = Some(real_zone_config);
+                let mut boot_document =
+                    ZoneBootDocument::decode(&EncodedDocument::Jwt(boot_jwt.clone()), None)?;
+                boot_document.owner_key = Some(public_key_jwk.clone());
+                boot_document.id = Some(DID::from_str(host_name.as_str()).unwrap());
+                let real_zone_document = boot_document.to_zone_document(&boot_jwt);
+                zone_document = Some(real_zone_document);
                 did_documents.insert("boot".to_string(), EncodedDocument::Jwt(boot_jwt));
             }
 
             if devices.len() > 0 {
                 for device_jwt in devices {
-                    //用zone_boot_config.owner_key验证device_jwt
-                    let device_mini_config =
-                        DeviceMiniConfig::from_jwt(&device_jwt, &owner_public_key);
-                    if device_mini_config.is_err() {
+                    //用zone_boot_document.owner_key验证device_jwt
+                    let device_mini_document =
+                        DeviceMiniDocument::from_jwt(&device_jwt, &owner_public_key);
+                    if device_mini_document.is_err() {
                         warn!("{} in not device_minit_config jwt", device_jwt);
                         continue;
                     }
-                    let device_mini_config = device_mini_config.unwrap();
-                    let device_config = DeviceConfig::new_by_mini_config(
+                    let device_mini_document = device_mini_document.unwrap();
+                    let device_document = DeviceDocument::new_by_mini_document(
                         &device_jwt,
-                        &device_mini_config,
+                        &device_mini_document,
                         DID::from_str(host_name.as_str()).unwrap(),
                         DID::from_str(host_name.as_str()).unwrap(),
                     );
-                    let device_name = device_config.name.clone();
-                    let device_config_json = serde_json::to_value(&device_config).unwrap();
-                    did_documents.insert(device_name, EncodedDocument::JsonLd(device_config_json));
-                    if zone_config.is_some() {
-                        zone_config
+                    let device_name = device_document.name.clone();
+                    let device_document_json = serde_json::to_value(&device_document).unwrap();
+                    did_documents
+                        .insert(device_name, EncodedDocument::JsonLd(device_document_json));
+                    if zone_document.is_some() {
+                        zone_document
                             .as_mut()
                             .unwrap()
                             .mini_device_jwts
-                            .insert(device_config.name.clone(), device_jwt);
-                        zone_config
+                            .insert(device_document.name.clone(), device_jwt);
+                        zone_document
                             .as_mut()
                             .unwrap()
                             .devices
-                            .insert(device_config.name.clone(), device_config);
+                            .insert(device_document.name.clone(), device_document);
                     }
                 }
             }
 
-            if zone_config.is_some() {
-                let zone_config = zone_config.unwrap();
-                let zone_config_json = serde_json::to_value(&zone_config).unwrap();
+            if zone_document.is_some() {
+                let zone_document = zone_document.unwrap();
+                let zone_document_json = serde_json::to_value(&zone_document).unwrap();
                 did_documents.insert(
                     "zone".to_string(),
-                    EncodedDocument::JsonLd(zone_config_json),
+                    EncodedDocument::JsonLd(zone_document_json),
                 );
             }
         }
 
         return Ok(did_documents);
     }
-    // pub fn from_zone_config_str(
+    // pub fn from_zone_document_str(
     //     name: &str,
-    //     zone_config_jwt: &str,
-    //     zone_config_pkx: &str,
+    //     zone_document_jwt: &str,
+    //     zone_document_pkx: &str,
     //     zone_gateway_device_list: &Option<Vec<String>>,
     // ) -> Self {
 
     //     let ttl = 3600;
-    //     let pkx_string = format!("0:{}", zone_config_pkx);
+    //     let pkx_string = format!("0:{}", zone_document_pkx);
     //     let mut pk_x_list = vec![pkx_string];
     //     if let Some(device_list) = zone_gateway_device_list {
     //         for device_did in device_list {
@@ -1009,7 +1011,7 @@ impl NameInfo {
     //         }
     //     }
 
-    //     let zone_boot_config_doc = EncodedDocument::from_str(zone_config_jwt.to_string()).unwrap();
+    //     let zone_boot_document_doc = EncodedDocument::from_str(zone_document_jwt.to_string()).unwrap();
     //     Self {
     //         name: name.to_string(),
     //         address: vec![],
@@ -1111,12 +1113,12 @@ mod tests {
     use jsonwebtoken::{DecodingKey, EncodingKey};
     use serde_json::json;
 
-    // 测试辅助函数：创建测试用的密钥和 ZoneBootConfig
-    fn create_test_zone_boot_config() -> (
+    // 测试辅助函数：创建测试用的密钥和 ZoneBootDocument
+    fn create_test_zone_boot_document() -> (
         EncodingKey,
         DecodingKey,
         jsonwebtoken::jwk::Jwk,
-        ZoneBootConfig,
+        ZoneBootDocument,
     ) {
         let private_key_pem = r#"
         -----BEGIN PRIVATE KEY-----
@@ -1133,7 +1135,7 @@ mod tests {
         let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk).unwrap();
         let public_key = DecodingKey::from_jwk(&public_key_jwk).unwrap();
 
-        let zone_boot_config = ZoneBootConfig {
+        let zone_boot_document = ZoneBootDocument {
             id: None,
             oods: vec![
                 "ood1".parse().unwrap(),
@@ -1146,12 +1148,12 @@ mod tests {
             extra_info: HashMap::new(),
         };
 
-        (private_key, public_key, public_key_jwk, zone_boot_config)
+        (private_key, public_key, public_key_jwk, zone_boot_document)
     }
 
-    // 测试辅助函数：创建测试用的 DeviceMiniConfig
-    fn create_test_device_mini_config(owner_private_key: &EncodingKey) -> String {
-        let mini_config = DeviceMiniConfig {
+    // 测试辅助函数：创建测试用的 DeviceMiniDocument
+    fn create_test_device_mini_document(owner_private_key: &EncodingKey) -> String {
+        let mini_document = DeviceMiniDocument {
             name: "device1".to_string(),
             x: "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
             rtcp_port: None,
@@ -1159,20 +1161,20 @@ mod tests {
             extra_info: HashMap::new(),
         };
 
-        mini_config.to_jwt(owner_private_key).unwrap()
+        mini_document.to_jwt(owner_private_key).unwrap()
     }
 
     #[test]
     fn test_parse_txt_record_to_did_documents() {
         // 准备测试数据
-        let (private_key, _public_key, public_key_jwk, zone_boot_config) =
-            create_test_zone_boot_config();
+        let (private_key, _public_key, public_key_jwk, zone_boot_document) =
+            create_test_zone_boot_document();
 
-        // 编码 ZoneBootConfig 为 JWT
-        let boot_jwt = zone_boot_config.encode(Some(&private_key)).unwrap();
+        // 编码 ZoneBootDocument 为 JWT
+        let boot_jwt = zone_boot_document.encode(Some(&private_key)).unwrap();
 
         // 创建设备 JWT
-        let device_jwt = create_test_device_mini_config(&private_key);
+        let device_jwt = create_test_device_mini_document(&private_key);
 
         // 获取 owner key 的 x 值
         let owner_x = get_x_from_jwk(&public_key_jwk).unwrap();
@@ -1217,8 +1219,8 @@ mod tests {
             "should contain device document"
         );
 
-        let zone_boot_config = did_documents.get("zone").unwrap();
-        let did_doc = parse_did_doc(zone_boot_config.clone()).unwrap();
+        let zone_boot_document = did_documents.get("zone").unwrap();
+        let did_doc = parse_did_doc(zone_boot_document.clone()).unwrap();
         let auth_key = did_doc.get_auth_key(None).unwrap();
         let _auth_key_x = get_x_from_jwk(&auth_key.1).unwrap();
         //assert_eq!(auth_key_x, owner_x);

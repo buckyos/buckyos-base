@@ -442,13 +442,13 @@ impl NameClient {
             return Ok(None);
         }
 
-        let device_config = serde_json::from_value::<DeviceConfig>(value).map_err(|e| {
+        let device_document = serde_json::from_value::<DeviceDocument>(value).map_err(|e| {
             NSError::Failed(format!(
-                "parse device config from DID document failed: {}",
+                "parse device document from DID document failed: {}",
                 e
             ))
         })?;
-        Ok((!device_config.ips.is_empty()).then_some(device_config.ips))
+        Ok((!device_document.ips.is_empty()).then_some(device_document.ips))
     }
 
     fn extract_device_info_ips(doc: EncodedDocument) -> NSResult<Vec<IpAddr>> {
@@ -742,7 +742,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
         let jwk = test_owner_public_jwk();
 
-        let mut owner = OwnerConfig::new(
+        let mut owner = OwnerDocument::new(
             did.clone(),
             "owner".to_string(),
             "owner@test".to_string(),
@@ -751,7 +751,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         owner.version_seq = Some(0);
         let owner_doc = owner.encode(Some(&private_key)).unwrap();
 
-        let mut zone = ZoneConfig::new(did.clone(), did.clone(), jwk);
+        let mut zone = ZoneDocument::new(did.clone(), did.clone(), jwk);
         zone.iat = iat;
         zone.exp = iat + 3600 * 24 * 365;
         zone.version_seq = Some(1);
@@ -1218,28 +1218,28 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         // old/fresh 现在必须是真实可验证的 zone 文档（owner 递归 + 签名校验），
         // 不能再用裸 JWT payload 占位——不然会在新验证路径里被当成
         // "不可识别的文档" 直接拒绝，而不是走到 replay guard 这一层的判断。
-        let mut old_zone = ZoneConfig::new(did.clone(), did.clone(), test_owner_public_jwk());
+        let mut old_zone = ZoneDocument::new(did.clone(), did.clone(), test_owner_public_jwk());
         old_zone.iat = now + 150;
         old_zone.exp = old_zone.iat + DEFAULT_EXPIRE_TIME;
         old_zone.version_seq = Some(1);
         let old_doc = old_zone.encode(Some(&private_key)).unwrap();
 
-        let mut fresh_zone = ZoneConfig::new(did.clone(), did.clone(), test_owner_public_jwk());
+        let mut fresh_zone = ZoneDocument::new(did.clone(), did.clone(), test_owner_public_jwk());
         fresh_zone.iat = now + 300;
         fresh_zone.exp = fresh_zone.iat + DEFAULT_EXPIRE_TIME;
         fresh_zone.version_seq = Some(2);
         let fresh_doc = fresh_zone.encode(Some(&private_key)).unwrap();
 
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             did.clone(),
             "example".to_string(),
             "example@example.com".to_string(),
             test_owner_public_jwk(),
         );
-        owner_config.version_seq = Some(0);
-        owner_config.mini_version_seq = Some(1);
-        owner_config.valid_iat = Some(owner_valid_iat);
-        let owner_doc = owner_config.encode(Some(&private_key)).unwrap();
+        owner_document.version_seq = Some(0);
+        owner_document.mini_version_seq = Some(1);
+        owner_document.valid_iat = Some(owner_valid_iat);
+        let owner_doc = owner_document.encode(Some(&private_key)).unwrap();
 
         client.doc_cache.insert(
             did.clone(),
@@ -1701,26 +1701,26 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         // 设备文档必须能递归解析到一个真实可验证的 owner，这里让设备"自持有"，
         // 用同一把 key 签发 owner 文档。
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             device_did.clone(),
             "ood1-owner".to_string(),
             "ood1-owner@test".to_string(),
             test_owner_public_jwk(),
         );
-        owner_config.version_seq = Some(0);
-        let owner_doc = owner_config.encode(Some(&owner_private_key)).unwrap();
+        owner_document.version_seq = Some(0);
+        let owner_doc = owner_document.encode(Some(&owner_private_key)).unwrap();
 
-        let mut signed_device_config = DeviceConfig::new(
+        let mut signed_device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
-        signed_device_config.owner = device_did.clone();
-        signed_device_config.ips = vec!["192.0.2.10".parse().unwrap()];
-        let signed_doc = signed_device_config
+        signed_device_document.owner = device_did.clone();
+        signed_device_document.ips = vec!["192.0.2.10".parse().unwrap()];
+        let signed_doc = signed_device_document
             .encode(Some(&owner_private_key))
             .unwrap();
 
-        let mut info_config = signed_device_config.clone();
+        let mut info_config = signed_device_document.clone();
         info_config.ips = vec!["192.0.2.20".parse().unwrap()];
         let mut device_info = DeviceInfo::from_device_doc(&info_config);
         device_info.all_ip = vec!["192.0.2.40".parse().unwrap()];
@@ -1750,24 +1750,24 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     async fn resolve_ips_uses_verified_jsonld_device_document_ips() {
         let device_did = DID::from_str("did:web:ood1.example").unwrap();
 
-        let owner_config = OwnerConfig::new(
+        let owner_document = OwnerDocument::new(
             device_did.clone(),
             "ood1-owner".to_string(),
             "ood1-owner@test".to_string(),
             test_owner_public_jwk(),
         );
-        let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_config).unwrap());
+        let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_document).unwrap());
 
-        let mut device_config = DeviceConfig::new(
+        let mut device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
-        device_config.id = device_did.clone();
-        device_config.owner = device_did.clone();
-        device_config.ips = vec!["192.0.2.10".parse().unwrap()];
-        let device_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_config).unwrap());
+        device_document.id = device_did.clone();
+        device_document.owner = device_did.clone();
+        device_document.ips = vec!["192.0.2.10".parse().unwrap()];
+        let device_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_document).unwrap());
 
-        let mut info_config = device_config.clone();
+        let mut info_config = device_document.clone();
         info_config.ips = vec!["192.0.2.20".parse().unwrap()];
         let mut device_info = DeviceInfo::from_device_doc(&info_config);
         device_info.all_ip = vec!["192.0.2.40".parse().unwrap()];
@@ -1803,24 +1803,24 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
         let device_did = DID::from_str("did:web:ood1.example").unwrap();
 
-        let mut owner_config = OwnerConfig::new(
+        let mut owner_document = OwnerDocument::new(
             device_did.clone(),
             "ood1-owner".to_string(),
             "ood1-owner@test".to_string(),
             test_owner_public_jwk(),
         );
-        owner_config.version_seq = Some(0);
-        let owner_doc = owner_config.encode(Some(&owner_private_key)).unwrap();
+        owner_document.version_seq = Some(0);
+        let owner_doc = owner_document.encode(Some(&owner_private_key)).unwrap();
 
-        let mut device_config = DeviceConfig::new(
+        let mut device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
-        device_config.id = device_did.clone();
-        device_config.owner = device_did.clone();
-        let device_doc = device_config.encode(Some(&owner_private_key)).unwrap();
+        device_document.id = device_did.clone();
+        device_document.owner = device_did.clone();
+        let device_doc = device_document.encode(Some(&owner_private_key)).unwrap();
 
-        let mut info_config = device_config.clone();
+        let mut info_config = device_document.clone();
         info_config.ips = vec!["192.0.2.20".parse().unwrap()];
         let mut device_info = DeviceInfo::from_device_doc(&info_config);
         device_info.all_ip = vec!["192.0.2.30".parse().unwrap()];
@@ -1894,15 +1894,15 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             }
         }
 
-        let mut device_config = DeviceConfig::new(
+        let mut device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
-        device_config.ips = vec![
+        device_document.ips = vec![
             "192.0.2.20".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
         ];
-        let mut device_info = DeviceInfo::from_device_doc(&device_config);
+        let mut device_info = DeviceInfo::from_device_doc(&device_document);
         device_info.all_ip = vec!["192.0.2.30".parse().unwrap()];
         let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
 
@@ -1932,15 +1932,15 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     #[tokio::test]
     async fn resolve_ips_falls_back_to_device_info_ips() {
-        let mut device_config = DeviceConfig::new(
+        let mut device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
-        device_config.ips = vec![
+        device_document.ips = vec![
             "192.0.2.10".parse().unwrap(),
             "2001:db8::1".parse().unwrap(),
         ];
-        let mut device_info = DeviceInfo::from_device_doc(&device_config);
+        let mut device_info = DeviceInfo::from_device_doc(&device_document);
         device_info.all_ip = vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()];
         let doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
 
@@ -1986,7 +1986,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert!(matches!(before_cache, Err(NSError::NotFound(_))));
 
         let endpoint_ip: IpAddr = "192.168.1.20".parse().unwrap();
-        let mut discovered_doc = DeviceConfig::new(
+        let mut discovered_doc = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );

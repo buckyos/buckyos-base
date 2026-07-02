@@ -58,7 +58,7 @@
 ## 2. 决策点（开工前拍板）
 
 - [ ] **D1：unproof（B 策略点③）不实现。** 代码从未有过这条路径，A 也不允许；B 引入它是一处放宽。建议：B 里标注"设计保留，当前不实现、默认关闭"，代码不加。
-- [ ] **D2：did:dev 的归位。** `BnsProvider` 现在 match `["bns","dev"]`。B 的退化梯子里 did:dev 是生成式（权威 = 自证 key，无发布渠道）。建议：dev 无 authority，web3 桥作为补充源——状态门禁自动不触发，自然退化成"自签名候选 + 自证 key 验证"（B §6）。备选：桥继续当 dev 的 authority（则 dev 获得 Missing 门禁，语义更强但依赖桥在线）。
+- [ ] **D2：did:dev 的归位。** `BnsProvider` 现在 match `["bns","dev"]`。**2026-07-02 语义澄清（已写入 B §6）**：系统不设计 did:key / did:dev → 内容文档的关系——key 类 DID 只有从名字自证构造的 owner 文档，是解析的终点与递归基，不是内容入口；设备的可解析文档挂在逻辑名字（zone 下的名字）之下，公钥在系统内部只当唯一性标识。归位方案随之收敛：dev 不注册内容 provider（web3 桥不再以 did:dev 为 key 提供文档），只保留生成式 owner 构造，`BnsProvider` 的 match 去掉 `"dev"`；原"桥当补充源 / 桥当 authority"两案作废。落地前需盘点现有 did:dev 解析调用方。
 - [ ] **D3：真快路径的取舍确认。** in-TTL 正缓存直接返回（`Hit`），吊销可见性最多滞后一个 TTL，由负状态缓存（T3.1）+ 读时 replay guard 缓解。当前实现是"命中缓存仍查更权威 provider"的折中（代价：每次解析都可能打权威源，且真命中被标成 `Fallback`）。这是信任模型级别的改变，需要明确拍板并写进 B（T4.1）。
 - [ ] **D4：did:web 的 authority 定谁。** 按 did:web 规范应是 canonical endpoint（`SmartProvider` 的 `.well-known` 路径）；DNS TXT（`DnsProvider`，现 trust 16 排在前面）按 A §0 的定位是"过渡与兼容层"，应降为补充源。注意行为变化：TXT 来源的文档从今天的 Anchored 证据（见 T1.2 的"证据谎言"）降为诚实的 SelfSignedCandidate，需过 owner 验签。
 
@@ -69,7 +69,7 @@
 ### P0 —— 纯删除与收缩（无行为变化，规模 S，~1-2 天）
 
 - [ ] **T0.1** 删 `VerificationRoot` / `OwnerContext` / `owner_document_policy()`（[provider.rs:826-850](../src/name-client/src/provider.rs:826)）。引擎实际用 `is_owner_root` 布尔（[name_query.rs:559](../src/name-client/src/name_query.rs:559)），这些类型零使用者。
-- [ ] **T0.2** 删 `ReachabilityPolicy`（provider.rs:795）；`OwnerDocumentPolicy`（provider.rs:800）收缩——3 个永远为空的 HashMap 删除，`revoke_before_iat` 直接内联到 `verify_owned_candidate`（[name_query.rs:773](../src/name-client/src/name_query.rs:773)）从 `OwnerConfig::valid_iat` 读。
+- [ ] **T0.2** 删 `ReachabilityPolicy`（provider.rs:795）；`OwnerDocumentPolicy`（provider.rs:800）收缩——3 个永远为空的 HashMap 删除，`revoke_before_iat` 直接内联到 `verify_owned_candidate`（[name_query.rs:773](../src/name-client/src/name_query.rs:773)）从 `OwnerDocument::valid_iat` 读。
 - [ ] **T0.3** 删 `NameQuery::query_did_from_providers`（[name_query.rs:868-932](../src/name-client/src/name_query.rs:868)，无调用者）。
 - [ ] **T0.4** 删 `GLOBAL_BOOT_NAME_CLIENT`（lib.rs，声明后从未使用）。
 - [ ] **T0.5** `EvidenceKind` 7 → 3（provider.rs:179）：`Negative / NotFound / TransportError / PublishedState` 从未作为 `DocumentBody` 证据出现。剩下三档的 `rank()` 与 B §5 的证据等级一一对应。
@@ -195,7 +195,7 @@
 
 ## 6. 对外兼容性
 
-- `lib.rs` 全局函数（`resolve_did / resolve_did_ex / resolve_owner_config / resolve_auth_key / ...`）与 `ResolvedDocument` 三段式结构签名不变——仓库外（buckyos 主仓）的调用方不感知本轮改动。
+- `lib.rs` 全局函数（`resolve_did / resolve_did_ex / resolve_owner_document / resolve_auth_key / ...`）与 `ResolvedDocument` 三段式结构签名不变——仓库外（buckyos 主仓）的调用方不感知本轮改动。
 - `NameClient::add_provider(provider, trust_level)` 签名改为按角色注册；仓库内唯一外部调用点在 `buckyos-http-server/src/test_did_obj_server.rs`。
 - `NameQuery::query_did` 返回值中的 `trust_level` 失去原语义，兼容层返回证据档或 0；确认调用方后可整体废弃。
 - 测试规模预估：全仓 108 个相关测试，约 60 个需机械性改造（mock 从 trust_level/caps 改为 authority/supplement 声明），断言语义不变。

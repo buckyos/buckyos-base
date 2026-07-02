@@ -14,8 +14,8 @@ Language: English (ASCII)
 ### name-lib
 - DID parsing and host name conversions.
 - EncodedDocument parsing and did-doc decoding.
-- ZoneBootConfig and ZoneConfig logic (JWT encode/decode, OOD parsing).
-- OwnerConfig, DeviceConfig, DeviceMiniConfig, DeviceInfo, DeviceMiniInfo.
+- ZoneBootDocument and ZoneDocument logic (JWT encode/decode, OOD parsing).
+- OwnerDocument, DeviceDocument, DeviceMiniDocument, DeviceInfo, DeviceMiniInfo.
 - Utility crypto helpers and key derivation.
 
 ### name-client
@@ -38,15 +38,15 @@ The following tests are currently implemented in crate modules. This list is int
   - `test_parse_did_doc_routes_by_shape`: Owner/Device/Zone routing.
 - `src/name-lib/src/zone.rs`
   - Extensive `OODDescriptionString` parsing/serialization tests (OOD/Gateway/OODOnly, error cases, round-trip).
-  - Helper routines in tests for ZoneBootConfig creation and related fixtures.
-  - `test_zone_config_encode_decode`: ZoneConfig JWT encode/decode and auth key.
+  - Helper routines in tests for ZoneBootDocument creation and related fixtures.
+  - `test_zone_document_encode_decode`: ZoneDocument JWT encode/decode and auth key.
 - `src/name-lib/src/user.rs`
-  - `test_owner_config`: encode/decode round-trip with Ed25519 keys.
+  - `test_owner_document`: encode/decode round-trip with Ed25519 keys.
   - `new_by_pkx_*`: pkx validation and error cases.
 - `src/name-lib/src/device.rs`
   - `test_device_mini_info`, `test_device_info`: auto-fill system info.
-  - `test_device_mini_config`: mini-config JWT encode/decode and round-trip.
-  - `test_device_config`: DeviceConfig encode/decode and DeviceInfo round-trip.
+  - `test_device_mini_document`: mini-document JWT encode/decode and round-trip.
+  - `test_device_document`: DeviceDocument encode/decode and DeviceInfo round-trip.
 - `src/name-lib/src/utility.rs`
   - `test_generate_x25519_key_pair_share_secret`.
   - `test_generate_ed25519_key_pair`.
@@ -81,13 +81,13 @@ Legend: [x] Implemented, [ ] Planned
 - EncodedDocument JsonLd/JWT detection [ ]
 - EncodedDocument JsonLd/JWT detection [x]
 - parse_did_doc routing (Owner/Device/Zone) [x]
-- ZoneBootConfig encode/decode (JWT + JsonLd) [x]
-- ZoneConfig encode/decode + key selection [x]
+- ZoneBootDocument encode/decode (JWT + JsonLd) [x]
+- ZoneDocument encode/decode + key selection [x]
 - OODDescriptionString parsing and serialization [x]
-- OwnerConfig new_by_pkx validation [x]
-- OwnerConfig encode/decode round-trip [x]
-- DeviceConfig encode/decode round-trip [x]
-- DeviceMiniConfig JWT round-trip [x]
+- OwnerDocument new_by_pkx validation [x]
+- OwnerDocument encode/decode round-trip [x]
+- DeviceDocument encode/decode round-trip [x]
+- DeviceMiniDocument JWT round-trip [x]
 - DeviceInfo and DeviceMiniInfo auto-fill [x]
 - Utility key load and pkcs8 parsing error cases [x]
 - Mnemonic-based key derivation determinism [x] (prints only, assertions minimal)
@@ -118,21 +118,21 @@ Legend: [x] Implemented, [ ] Planned
 
 #### EncodedDocument and parse_did_doc
 - JsonLd vs JWT detection for `EncodedDocument::from_str`.
-- parse_did_doc routes to OwnerConfig/DeviceConfig/ZoneConfig correctly.
+- parse_did_doc routes to OwnerDocument/DeviceDocument/ZoneDocument correctly.
 - Error when no recognized markers present.
 
-#### ZoneBootConfig and ZoneConfig
+#### ZoneBootDocument and ZoneDocument
 - Encode/decode with and without public key verification.
 - `device_is_ood`, `device_is_gateway`, `get_gateway_name` on mixed OOD lists.
 - `select_same_subnet_ood` and `select_wan_ood` selection behavior with multiple OODs.
 - `get_auth_key` and `get_exchange_key` behavior when missing keys.
 
-#### OwnerConfig
+#### OwnerDocument
 - `set_default_zone_did` adds service endpoint correctly.
 - Decode error handling with invalid JWT or invalid JWK.
 
-#### DeviceConfig, DeviceInfo, DeviceMiniConfig
-- `new_by_mini_config` populates id/owner/zone correctly.
+#### DeviceDocument, DeviceInfo, DeviceMiniDocument
+- `new_by_mini_document` populates id/owner/zone correctly.
 - `get_exchange_key` and `get_auth_key` for missing kid or missing keys.
 - `is_wan_device` behavior across `net_id` values.
 - Auto-fill error handling when system info collection fails (mock system calls).
@@ -193,7 +193,7 @@ P0:
 
 P1:
 - Provider-specific integration behavior (DNS/HTTPS/BNS).
-- ZoneConfig and DeviceConfig encode/decode error handling.
+- ZoneDocument and DeviceDocument encode/decode error handling.
 
 P2:
 - Property/fuzz tests, performance and concurrency stress.

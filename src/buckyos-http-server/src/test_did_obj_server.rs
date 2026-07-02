@@ -9,7 +9,7 @@ use hyper::body::Bytes;
 use name_client::{
     CacheBackend, DIDObjectClient, DidDocType, NameClient, NameClientConfig, SmartProvider,
 };
-use name_lib::{DIDObjectCard, EncodedDocument, OwnerConfig, DID};
+use name_lib::{DIDObjectCard, EncodedDocument, OwnerDocument, DID};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -355,8 +355,8 @@ async fn example_name_client() -> NameClient {
         "name": "myhome",
         "display_name": "myhome@test",
     });
-    let owner_config: OwnerConfig = serde_json::from_value(owner_json).unwrap();
-    let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_config).unwrap());
+    let owner_document: OwnerDocument = serde_json::from_value(owner_json).unwrap();
+    let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_document).unwrap());
     client.set_local_authority_override(
         DID::new("web", "myhome.com"),
         DidDocType::Owner,

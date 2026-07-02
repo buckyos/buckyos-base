@@ -68,7 +68,7 @@
 
 - **问题**：目前全仓库没有在 resolve 路径里对 JWT 类型的候选文档做"用 owner key 验证签名"这一步，`is_proof()` 只是格式判断。
 - **要做的事**：
-  - 检查 `name-lib` 里现有的 JWT 解码/校验能力（例如 `OwnerConfig::decode`、`jsonwebtoken::decode` 的现有用法，参考 `src/name-lib` 里已有的 owner/device 文档校验代码作为起点，不要重新发明）。
+  - 检查 `name-lib` 里现有的 JWT 解码/校验能力（例如 `OwnerDocument::decode`、`jsonwebtoken::decode` 的现有用法，参考 `src/name-lib` 里已有的 owner/device 文档校验代码作为起点，不要重新发明）。
   - 在拿到 `VerificationRoot`（T1.1）之后，新增一步：用 verification root 提供的公钥，对候选文档执行真正的 JWT 签名验证；验证失败的候选要被丢弃（不能进入 `compare_document_body` 参与排序）。
   - 区分"验证失败"和"证据契约违规"（设计文档第 13 节第 11 条）：结构上不可能验证的（如 `SelfSignedCandidate` 但是 `JsonLd` 编码）算契约违规，直接丢弃并记 `ResolveWarning::EvidenceContractViolation`；能验证但签名不对的，算验证失败。
 - **验收**：新增测试，构造一份用错误私钥签名的候选文档，确认它不会被选中；用正确私钥签名的能被选中。
