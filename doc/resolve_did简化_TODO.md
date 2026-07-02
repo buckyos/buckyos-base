@@ -1,5 +1,14 @@
 # resolve_did 简化 TODO
 
+> **状态:已完成(2026-07-02)。** P0-P4 全部落地于 `src/name-client`
+> (provider.rs / name_query.rs / doc_cache.rs / name_client.rs 及各 provider),
+> workspace 测试全绿。本文件保留作为这轮简化的任务记录;实现语义以
+> [简单介绍resolve-did.md](./简单介绍resolve-did.md) 为准。
+> 实现层面在 TODO 之外补充的两个决定:
+> ① 已验证文档缓存 TTL 上限 1 小时(`DOC_CACHE_TTL_SECS`,快路径的吊销盲区 ≤ TTL);
+> ② did:web 的权威渠道 = DNS TXT + `.well-known` 两个委托读取端的 first-win 合并
+> (`AuthorityReaders`,Missing 需两者一致,任一传输失败按 unknown 处理)。
+
 目标：以 [简单介绍resolve-did.md](./简单介绍resolve-did.md) 为准，把现有 `name-client`
 里的 DID 解析逻辑先修正确，再收敛成一条可读的主循环。
 

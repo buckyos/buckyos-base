@@ -89,20 +89,31 @@ pub async fn init_name_lib_ex(
     }
 
     let client = NameClient::new(config);
+    // did:bns —— 权威渠道:web3 bridge 的 BNS 网关(合约的委托读取端);
+    // 补充源:通用 host URI 取回,只产出需要验证的候选。
     let bns_provider = BnsProvider::new()?;
+    client.set_method_authority("bns", Box::new(bns_provider)).await;
     client
-        .add_provider(Box::new(bns_provider), Some(ROOT_TRUST_LEVEL))
+        .add_method_supplement("bns", Box::new(SmartProvider::new()))
         .await;
+    // did:web —— 权威渠道是域名自身的发布面:DNS TXT 与 .well-known 静态文件是
+    // 同一渠道(域名控制权)的两个委托读取端,first-win 合并;Missing 需要两个
+    // 读取端一致才成立,任何一个传输失败都按 unknown 处理。
     client
-        .add_provider(Box::new(DnsProvider::new(None)), Some(DNS_TRUST_LEVEL))
-        .await;
-    //基于当前zone创建https provider?
-    client
-        .add_provider(
-            Box::new(SmartProvider::new()),
-            Some(DEFAULT_PROVIDER_TRUST_LEVEL),
+        .set_method_authority(
+            "web",
+            Box::new(AuthorityReaders::new(
+                "web-authority",
+                vec![
+                    Box::new(DnsProvider::new(None)),
+                    Box::new(SmartProvider::new()),
+                ],
+            )),
         )
         .await;
+    // 普通名字解析(resolve / resolve_ip)与 DID 管线独立注册。
+    client.add_dns_provider(Box::new(DnsProvider::new(None))).await;
+    // did:dev / did:key 不注册任何 provider:key 类 DID 不是解析入口(简化文档第 6 节)。
     let set_result = GLOBAL_NAME_CLIENT.set(client);
     if set_result.is_err() {
         if GLOBAL_NAME_CLIENT.get().is_none() {

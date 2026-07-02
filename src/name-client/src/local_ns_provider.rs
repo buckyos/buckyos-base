@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::{DidDocType, MethodMatcher, NSResult, NameInfo, NsProvider, RecordType};
+use crate::{DidDocType, NSResult, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 
 /* config file example (toml):
@@ -269,8 +269,8 @@ impl NsProvider for LocalConfigDnsProvider {
         "local dns-record-config provider".to_string()
     }
 
-    fn methods(&self) -> MethodMatcher {
-        MethodMatcher::exact(["web"])
+    fn methods(&self) -> Vec<String> {
+        vec!["web".to_string()]
     }
 
     async fn query(

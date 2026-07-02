@@ -13,7 +13,7 @@ use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
-use crate::{DidDocType, MethodMatcher, NameInfo, NsProvider, RecordType};
+use crate::{DidDocType, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -69,8 +69,8 @@ impl NsProvider for DnsProvider {
         return "dns provider".to_string();
     }
 
-    fn methods(&self) -> MethodMatcher {
-        MethodMatcher::exact(["web"])
+    fn methods(&self) -> Vec<String> {
+        vec!["web".to_string()]
     }
 
     async fn query(
@@ -88,6 +88,12 @@ impl NsProvider for DnsProvider {
                 let response = resolver.txt_lookup(name).await;
                 if response.is_err() {
                     let err = response.err().unwrap();
+                    // NoRecordsFound/NXDOMAIN 是 DNS 渠道的权威回答("没有"),
+                    // 必须与传输失败(没得到回答)区分:前者是 NotFound,
+                    // 后者才是 Failed(简化文档 2.1 节的 DR/unknown 二分)。
+                    if err.is_no_records_found() {
+                        return Err(NSError::NotFound(format!("no TXT record for {}", name)));
+                    }
                     warn!("lookup txt failed! {}", err.to_string());
                     return Err(NSError::Failed(format!("lookup txt failed! {}", err)));
                 }

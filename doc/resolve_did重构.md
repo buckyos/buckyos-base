@@ -1,5 +1,21 @@
 # resolve_did 重构设计
 
+> **阅读须知（2026-07）**：本文是历史设计文档,核心设计意图的**主规范**是
+> [简单介绍resolve-did.md](./简单介绍resolve-did.md),实现已按主规范简化收敛
+> （见 `src/name-client`）。两者冲突时以简化文档为准,特别是:
+>
+> - **trust-level 已废弃**:provider 注册模型是"每个 method 至多一个权威渠道 + 显式有序的
+>   少数补充源(first-win)",不再有 trust_level 排序、`max_trust_level` 剪枝和 wildcard 注册;
+> - **同级多 provider 并发查询已废弃**:主动查询是严格 first-win,真正的"多来源"只发生在
+>   Cache 合并层(证据等级优先,同级才比 version/iat);
+> - **复杂状态机字段已裁剪**:`PublishedState` 只保留
+>   `did / doc_type / document_status / document_ref(doc_hash) / document_version /
+>   effective_owner / authority_seq / migration_target`;`NameStatus`、`OwnerSource`、
+>   `lineage_epoch`、`authority_root`、`canonical_id/equivalent_ids`、
+>   `VerificationRoot/OwnerContext` 等已删除;
+> - **expected_owner 硬规则**:验签用的 owner 绝不由候选文档自证,只来自权威源 owner 绑定
+>   或名字结构默认值;key 类 DID(did:key/did:dev)不是 `resolve_did` 的合法入参。
+
 本文描述 `resolve_did(did, doc_type)` 的新流程。目标是把早期“多个 provider 返回 DID Document，再按 trust level / iat 选一个”的模型，升级为可以表达 BNS Registry、Document tombstone/revoke、自签名文档扩散、method-scoped resolver 的统一解析框架。
 
 ## 0. 文档定位与体系升级意图

@@ -5,12 +5,13 @@ use crate::addr_rtt_db::{
     PersistencePolicy, RankedAddress, RttDatabase, SortPolicy,
 };
 use crate::dns_provider::DnsProvider;
-use crate::doc_cache::{CacheBackend, DIDDocumentCache, UnauthenticatedInfoCache};
-use crate::name_query::NameQuery;
+use crate::doc_cache::{CacheBackend, CacheEvidence, CacheLookup, DIDDocumentCache, UnauthenticatedInfoCache};
+use crate::name_query::{NameQuery, ResolveOutcome};
 use crate::provider::RecordType;
 use crate::{
-    CacheStatus, DidDocType, LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy,
-    ResolveWarning, ResolvedDocument,
+    is_key_class_method, BodyEvidence, CacheStatus, DidDocType, DocumentStatus,
+    LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy, ResolveWarning,
+    ResolvedDocument,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
@@ -18,16 +19,21 @@ use name_lib::DEFAULT_EXPIRE_TIME;
 use name_lib::*;
 
 use log::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 
+/// 旧注册接口的 trust_level 常量。method registry(T2.2)之后 trust_level 不再
+/// 参与解析决策,保留常量只为兼容旧调用方的传参。
 pub const DEFAULT_PROVIDER_TRUST_LEVEL: i32 = 100;
 pub const ROOT_TRUST_LEVEL: i32 = 0;
 pub const DNS_TRUST_LEVEL: i32 = 16;
 pub const DEFAULT_DEVICE_INFO_CACHE_TTL_SECS: u64 = 3600 * 24 * 7;
+/// 已验证文档缓存的 TTL 上限:文档自身的 exp 可能长达数年,但缓存快路径会在
+/// TTL 内完全跳过权威源查询,吊销可见性 ≤ TTL,所以要单独封顶。
+pub const DOC_CACHE_TTL_SECS: u64 = 3600;
 const MAX_CACHED_LOCAL_IPS: usize = 8;
 
 #[derive(Clone)]
@@ -48,6 +54,7 @@ impl Default for NameClientConfig {
         }
     }
 }
+
 pub struct NameClient {
     name_query: NameQuery,
     config: NameClientConfig,
@@ -62,9 +69,7 @@ pub struct NameClient {
 
 impl NameClient {
     pub fn new(config: NameClientConfig) -> Self {
-        let mut name_query = NameQuery::new();
-        //name_query.add_provider(Box::new(DnsProvider::new(None)));
-        //name_query.add_provider(Box::new(ZoneProvider::new()));
+        let name_query = NameQuery::new();
 
         let doc_cache_dir = config
             .local_cache_dir
@@ -106,8 +111,8 @@ impl NameClient {
         }
     }
 
-    /// 写入本地测试/运维 override（设计文档第 7.3 节，类似 hosts 文件）。只应由本地
-    /// 管理员、测试框架或显式运维命令调用；不会进入普通 `doc_cache`，也不会被导出。
+    /// 写入本地测试/运维 override(简化文档第 7 节,类似 hosts 文件)。只应由本地
+    /// 管理员、测试框架或显式运维命令调用;不会进入普通 `doc_cache`,也不会被导出。
     pub fn set_local_authority_override(
         &self,
         did: DID,
@@ -162,21 +167,56 @@ impl NameClient {
         }
     }
 
+    // ---- provider 注册(T2.2 method registry) ----
+
+    /// 注册某 method 的权威发布渠道(一个 method 至多一个)。
+    pub async fn set_method_authority(
+        &self,
+        method: impl Into<String>,
+        provider: Box<dyn NsProvider>,
+    ) {
+        self.name_query.set_method_authority(method, provider).await;
+    }
+
+    /// 追加某 method 的补充源(显式有序,first-win)。
+    pub async fn add_method_supplement(
+        &self,
+        method: impl Into<String>,
+        provider: Box<dyn NsProvider>,
+    ) {
+        self.name_query.add_method_supplement(method, provider).await;
+    }
+
+    /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
+    pub async fn set_no_proof_doc_types(&self, method: &str, doc_types: HashSet<DidDocType>) {
+        self.name_query.set_no_proof_doc_types(method, doc_types).await;
+    }
+
+    /// 注册普通名字解析(DNS 语义)的 provider。
+    pub async fn add_dns_provider(&self, provider: Box<dyn NsProvider>) {
+        self.name_query.add_dns_provider(provider).await;
+    }
+
+    /// 兼容旧注册接口:trust_level 已不再参与解析决策。按 provider 自声明的
+    /// method 注册(首个注册者成为权威渠道);不声明 method 的 provider 只服务
+    /// 普通名字解析。新代码请使用显式注册接口。
     pub async fn add_provider(&self, provider: Box<dyn NsProvider>, trust_level: Option<i32>) {
-        let trust_level = trust_level.unwrap_or(DEFAULT_PROVIDER_TRUST_LEVEL);
         self.name_query.add_provider(provider, trust_level).await;
     }
 
+    // ---- 缓存旁路写入 ----
+
+    /// push / 社交网络等旁路拿到的文档从这里进入缓存,证据等级按"未验证"对待:
+    /// 它压不过已发布/已验证条目,也翻不了负状态(简化文档第 5 节)。
     pub fn update_did_cache(
         &self,
         did: DID,
         doc_type: Option<DidDocType>,
         doc: EncodedDocument,
     ) -> NSResult<()> {
-        let exp = Self::extract_exp(&doc)
-            .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
+        let exp = Self::cache_ttl_exp(&doc);
         self.doc_cache
-            .update(did, doc_type, doc, exp, DEFAULT_PROVIDER_TRUST_LEVEL);
+            .update(did, doc_type, doc, exp, CacheEvidence::Unverified);
         Ok(())
     }
 
@@ -237,7 +277,6 @@ impl NameClient {
             }
         }
 
-        //let mut cache = cache.blocking_write();
         cache.write().await.insert(real_name, info);
         Ok(())
     }
@@ -425,6 +464,8 @@ impl NameClient {
         let doc = match self.resolve_did(&did, None).await {
             Ok(doc) => doc,
             Err(NSError::NotFound(_)) => return Ok(None),
+            // key 类 DID 不是解析入口:让 resolve_ips 继续走 nameinfo / device-info 路径。
+            Err(NSError::InvalidDID(_)) => return Ok(None),
             Err(err) => return Err(err),
         };
         Self::extract_device_document_ips(doc)
@@ -519,10 +560,6 @@ impl NameClient {
         Ok(())
     }
 
-    fn is_expired(&self, exp: u64) -> bool {
-        exp <= buckyos_get_unix_timestamp()
-    }
-
     fn extract_exp(doc: &EncodedDocument) -> Option<u64> {
         doc.clone()
             .to_json_value()
@@ -530,165 +567,286 @@ impl NameClient {
             .and_then(|value| value.get("exp").and_then(|ts| ts.as_u64()))
     }
 
+    /// 缓存条目的 TTL:文档自身 exp 与 `DOC_CACHE_TTL_SECS` 取小。TTL 只决定
+    /// 快路径的新鲜度,不代表文档作废时间。
+    fn cache_ttl_exp(doc: &EncodedDocument) -> u64 {
+        let now = buckyos_get_unix_timestamp();
+        let doc_exp = Self::extract_exp(doc).unwrap_or_else(|| now + DEFAULT_EXPIRE_TIME);
+        doc_exp.min(now + DOC_CACHE_TTL_SECS)
+    }
+
+    /// 文档自身是否已作废(自声明的 exp 已过)。stale cache 兜底只对"TTL 过期
+    /// 但文档未作废"的条目开放(策略点④)。
+    fn doc_self_expired(doc: &EncodedDocument) -> bool {
+        match Self::extract_exp(doc) {
+            Some(exp) => exp <= buckyos_get_unix_timestamp(),
+            None => false,
+        }
+    }
+
+    /// resolve_did 外层(简化文档第 3 节第 0/2 步):
+    /// 1. 本地覆盖快路径(hosts 语义);
+    /// 2. in-TTL positive cache 快路径(`CacheStatus::Hit`);
+    /// 3. in-TTL negative cache 快路径(直接报错);
+    /// 4. 进入 resolver 主循环;
+    /// 5. 只有主循环没产出可核实文档、且没有负状态屏蔽、权威源也没回答 Missing
+    ///    时,才按策略用"过期但未作废"的缓存兜底。
     pub async fn resolve_did_ex(
         &self,
         did: &DID,
         doc_type: Option<DidDocType>,
         policy: ResolvePolicy,
     ) -> NSResult<ResolvedDocument> {
+        // 硬门禁(T0.1):key 类 DID 不是解析入口,也不查任何缓存。
+        if is_key_class_method(&did.method) {
+            return Err(NSError::InvalidDID(format!(
+                "key-class DID {} is not a legal resolve_did input; keys only appear inside documents",
+                did.to_string()
+            )));
+        }
+
         let policy = policy.with_local_authority_override(self.local_authority_overrides.clone());
-        let cache_doc_type = doc_type.clone();
-        let canonical_doc_type = doc_type.unwrap_or_default();
-        let is_unauthenticated_info = canonical_doc_type == DidDocType::Info;
-        let mut cached_trust_level: i32 = i32::MAX;
-        let mut cached_result: Option<(EncodedDocument, u64, i32)> = None;
-        if self.config.enable_cache {
-            // unauthenticated_info_cache 和 doc_cache（verified_cache 的角色）是两个
-            // 独立的存储：Info 类结果只按 iat/ttl 判断可用性，不做 owner replay guard。
-            cached_result = if is_unauthenticated_info {
-                self.unauthenticated_info_cache
-                    .get(did, cache_doc_type.clone())
-            } else {
-                self.doc_cache.get(did, cache_doc_type.clone())
-            };
-            if let Some((_, exp, trust_level)) = cached_result.as_ref() {
-                if !self.is_expired(*exp) {
-                    info!(
-                        "cached did:{}#{} is not expired, trust_level set to: {}",
-                        did.to_string(),
-                        cache_doc_type
-                            .as_ref()
-                            .map(DidDocType::as_str)
-                            .unwrap_or(""),
-                        trust_level
-                    );
-                    cached_trust_level = *trust_level;
+        let allow_stale_cache = policy.allow_stale_cache;
+        let doc_type_c = doc_type.clone().unwrap_or_default();
+
+        // Info 契约走独立轻量路径 + UnauthenticatedInfoCache 隔离。
+        if self
+            .name_query
+            .is_no_proof_doc_type(&did.method, &doc_type_c)
+            .await
+        {
+            return self
+                .resolve_unproof_info_with_cache(did, doc_type, &doc_type_c, policy)
+                .await;
+        }
+
+        // 0. 本地覆盖快路径:短路在一切缓存与查询之前,显式打标。
+        if let Some(document) = self.local_authority_overrides.get(did, &doc_type_c) {
+            return Ok(ResolvedDocument::from_document(
+                document,
+                did,
+                &doc_type_c,
+                Some("local-authority-override".to_string()),
+                BodyEvidence::Anchored,
+                None,
+            )
+            .with_warning(ResolveWarning::LocalAuthorityOverride));
+        }
+
+        let mut cached = if self.config.enable_cache {
+            self.doc_cache.lookup(did, doc_type.clone())
+        } else {
+            None
+        };
+
+        // 1. 负状态快路径:负状态是"回答",命中返回错误,不是"查不到"。
+        if let Some(CacheLookup::Negative {
+            message,
+            in_ttl: true,
+            ..
+        }) = &cached
+        {
+            return Err(NSError::Disabled(message.clone()));
+        }
+
+        // 2. in-TTL positive 快路径。owner replay guard 对缓存命中同样生效。
+        if let Some(CacheLookup::Positive {
+            doc,
+            exp,
+            evidence,
+            in_ttl: true,
+        }) = &cached
+        {
+            match self.validate_doc_replay_guard(did, doc_type.clone(), doc) {
+                Ok(()) => {
+                    return Ok(ResolvedDocument::from_cache(
+                        doc.clone(),
+                        did,
+                        &doc_type_c,
+                        *exp,
+                        evidence.to_body_evidence(),
+                        CacheStatus::Hit,
+                    ));
                 }
-            }
-            if !is_unauthenticated_info {
-                if let Some((doc, _, _)) = cached_result.as_ref() {
-                    if let Err(err) =
-                        self.validate_doc_replay_guard(did, cache_doc_type.clone(), doc)
-                    {
-                        info!(
-                            "cached did:{}#{} rejected by owner replay guard: {}",
-                            did.to_string(),
-                            cache_doc_type
-                                .as_ref()
-                                .map(DidDocType::as_str)
-                                .unwrap_or(""),
-                            err
-                        );
-                        self.doc_cache.delete(did.clone(), cache_doc_type.clone());
-                        cached_result = None;
-                        cached_trust_level = i32::MAX;
-                    }
+                Err(err) => {
+                    info!(
+                        "cached did:{}#{} rejected by owner replay guard: {}",
+                        did.to_string(),
+                        doc_type_c,
+                        err
+                    );
+                    self.doc_cache.delete(did.clone(), doc_type.clone());
+                    cached = None;
                 }
             }
         }
 
-        let max_trust_level = if is_unauthenticated_info {
-            None
-        } else {
-            Some(cached_trust_level)
-        };
-        let reslove_result = self
+        // 3. resolver 主循环。
+        let had_cache = cached.is_some();
+        let outcome = self
             .name_query
-            .query_did_ex(
-                did,
-                Some(canonical_doc_type.clone()),
-                max_trust_level,
-                policy,
-            )
-            .await;
+            .query_did_outcome(did, doc_type.clone(), policy)
+            .await?;
 
-        match reslove_result {
-            Ok(mut resolved) => {
-                let exp = Self::extract_exp(&resolved.document)
-                    .unwrap_or_else(|| buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME);
-                let result_trust_level = resolved
-                    .resolution_metadata
-                    .authority_rank
-                    .unwrap_or(DEFAULT_PROVIDER_TRUST_LEVEL);
-                info!(
-                    "resolve did:{}#{} success, exp:{}",
-                    did.to_string(),
-                    canonical_doc_type,
-                    exp
-                );
-                // local_authority_override 命中的结果不受普通验证/缓存规则约束：
-                // 它不应该反过来污染普通 doc_cache（设计文档第 7.3 节第 3 条），
-                // 也不需要走 owner replay guard（override 本身就是最高优先级）。
+        match outcome {
+            ResolveOutcome::Resolved(mut resolved) => {
+                // 负状态记忆只能被权威源的新"已发布"回答(Anchored 证据)翻篇。
+                // Missing + 策略放行的自签名候选是 fallback 路径,不许越过吊销记忆
+                // (速查规则 1:吊销之后不允许任何 fallback)。
+                if let Some(CacheLookup::Negative { message, .. }) = &cached {
+                    if resolved.resolution_metadata.evidence != Some(BodyEvidence::Anchored) {
+                        return Err(NSError::Disabled(message.clone()));
+                    }
+                }
                 let is_local_override = resolved
                     .resolution_metadata
                     .warnings
                     .contains(&ResolveWarning::LocalAuthorityOverride);
-                if !is_unauthenticated_info && !is_local_override {
-                    self.validate_doc_replay_guard(
-                        did,
-                        cache_doc_type.clone(),
-                        &resolved.document,
-                    )?;
-                }
-                if self.config.enable_cache {
-                    if is_unauthenticated_info {
-                        self.unauthenticated_info_cache.insert(
-                            did,
-                            cache_doc_type.clone(),
-                            resolved.document.clone(),
-                            exp,
-                            result_trust_level,
-                        );
-                    } else if !is_local_override {
+                if !is_local_override {
+                    self.validate_doc_replay_guard(did, doc_type.clone(), &resolved.document)?;
+                    if self.config.enable_cache {
+                        let evidence = match resolved.resolution_metadata.evidence {
+                            Some(BodyEvidence::Anchored) => CacheEvidence::Published,
+                            Some(BodyEvidence::NeedProof) => CacheEvidence::Verified,
+                            _ => CacheEvidence::Unverified,
+                        };
+                        let exp = Self::cache_ttl_exp(&resolved.document);
                         self.doc_cache.update(
                             did.clone(),
-                            cache_doc_type.clone(),
+                            doc_type.clone(),
                             resolved.document.clone(),
                             exp,
-                            result_trust_level,
+                            evidence,
                         );
                     }
                 }
-                resolved.resolution_metadata.cache_status = Some(if cached_result.is_some() {
+                resolved.resolution_metadata.cache_status = Some(if had_cache {
                     CacheStatus::Refresh
                 } else {
                     CacheStatus::Miss
                 });
                 Ok(resolved)
             }
-            Err(result_error) => match result_error {
-                NSError::Disabled(msg) => {
-                    info!("{}'s doc disabled, delete cache", did.to_string());
-                    if self.config.enable_cache {
-                        self.doc_cache.delete(did.clone(), cache_doc_type);
+            ResolveOutcome::Negative { status, message } => {
+                // 策略点①的缓存动作:吊销删除 positive、写入负状态本身;
+                // Migrated 只删除 positive(不是可缓存的终态否决)。
+                if self.config.enable_cache {
+                    match status {
+                        DocumentStatus::Revoked | DocumentStatus::Tombstoned => {
+                            self.doc_cache.replace_with_negative(
+                                did,
+                                doc_type.clone(),
+                                &status,
+                                &message,
+                            );
+                        }
+                        _ => {
+                            self.doc_cache.delete(did.clone(), doc_type.clone());
+                        }
                     }
-                    Err(NSError::Disabled(msg))
                 }
-                _ => {
-                    if let Some((doc, exp, trust_level)) = cached_result {
-                        info!(
-                            "resolve did:{}#{} by cache success, exp:{}",
+                Err(NSError::Disabled(message))
+            }
+            ResolveOutcome::NoAnswer {
+                authority_missing,
+                last_error,
+                ..
+            } => {
+                // 负状态记忆屏蔽一切兜底,且不受 TTL 约束:过期的"已吊销"也只能
+                // 被权威源的新回答翻篇。
+                if let Some(CacheLookup::Negative { message, .. }) = &cached {
+                    return Err(NSError::Disabled(message.clone()));
+                }
+                // 权威源明确 Missing:旧的 positive cache 与权威答复矛盾,不兜底。
+                if authority_missing {
+                    return Err(last_error.unwrap_or_else(|| {
+                        NSError::NotFound(format!(
+                            "{}#{} missing in method authority",
                             did.to_string(),
-                            canonical_doc_type,
-                            exp
-                        );
-                        let cache_status = if is_unauthenticated_info {
-                            CacheStatus::UnauthenticatedInfoHit
-                        } else {
-                            CacheStatus::Fallback
-                        };
-                        return Ok(ResolvedDocument::from_cache(
-                            doc,
-                            did,
-                            &canonical_doc_type,
-                            exp,
-                            trust_level,
-                            cache_status,
-                        ));
-                    }
-                    Err(result_error)
+                            doc_type_c
+                        ))
+                    }));
                 }
-            },
+                // 策略点④:过期但未作废的缓存兜底。
+                if allow_stale_cache {
+                    if let Some(CacheLookup::Positive {
+                        doc, exp, evidence, ..
+                    }) = cached
+                    {
+                        if !Self::doc_self_expired(&doc) {
+                            info!(
+                                "resolve did:{}#{} falls back to stale cache",
+                                did.to_string(),
+                                doc_type_c
+                            );
+                            return Ok(ResolvedDocument::from_cache(
+                                doc,
+                                did,
+                                &doc_type_c,
+                                exp,
+                                evidence.to_body_evidence(),
+                                CacheStatus::Fallback,
+                            ));
+                        }
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| NSError::NotFound(did.to_host_name())))
+            }
+        }
+    }
+
+    /// Info 契约的轻量路径:in-TTL 命中 UnauthenticatedInfoCache 即返回,否则查询
+    /// 后写回。该缓存与 doc_cache(verified cache)完全隔离。
+    async fn resolve_unproof_info_with_cache(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+        doc_type_c: &DidDocType,
+        policy: ResolvePolicy,
+    ) -> NSResult<ResolvedDocument> {
+        if self.config.enable_cache {
+            if let Some((doc, exp, _rank)) =
+                self.unauthenticated_info_cache.get(did, doc_type.clone())
+            {
+                return Ok(ResolvedDocument::from_cache(
+                    doc,
+                    did,
+                    doc_type_c,
+                    exp,
+                    BodyEvidence::UnproofInfo,
+                    CacheStatus::UnauthenticatedInfoHit,
+                ));
+            }
+        }
+
+        match self
+            .name_query
+            .query_did_outcome(did, doc_type.clone(), policy)
+            .await?
+        {
+            ResolveOutcome::Resolved(resolved) => {
+                if self.config.enable_cache {
+                    let now = buckyos_get_unix_timestamp();
+                    let exp = Self::extract_exp(&resolved.document)
+                        .unwrap_or_else(|| now + DEFAULT_EXPIRE_TIME);
+                    self.unauthenticated_info_cache.insert(
+                        did,
+                        doc_type,
+                        resolved.document.clone(),
+                        exp,
+                        DEFAULT_PROVIDER_TRUST_LEVEL,
+                    );
+                }
+                Ok(resolved)
+            }
+            ResolveOutcome::Negative { message, .. } => Err(NSError::Disabled(message)),
+            ResolveOutcome::NoAnswer { last_error, .. } => Err(last_error.unwrap_or_else(|| {
+                NSError::NotFound(format!(
+                    "unauthenticated info not found: {}#{}",
+                    did.to_string(),
+                    doc_type_c
+                ))
+            })),
         }
     }
 
@@ -707,10 +865,11 @@ impl NameClient {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::{init_name_lib_ex, resolve_did};
+    use crate::{resolve_did, DocumentRef, PublishedState};
 
     use super::*;
     use async_trait::async_trait;
@@ -731,9 +890,23 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         }))
     }
 
-    // 构造一个自持有（owner == 自己）的 zone 文档 + 对应 owner 文档，两者都用同一把
-    // 测试 key 签名，用来在需要真实 owner 验签的 resolve 路径测试里替代裸的 JsonLd
-    // 占位文档。
+    /// 没有自声明 exp 的文档:TTL 过期后仍"未作废",是 stale 兜底的合法对象。
+    fn make_doc_without_exp(marker: &str) -> EncodedDocument {
+        EncodedDocument::JsonLd(serde_json::json!({
+            "marker": marker
+        }))
+    }
+
+    fn test_owner_public_jwk() -> jsonwebtoken::jwk::Jwk {
+        serde_json::from_value(serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+        }))
+        .unwrap()
+    }
+
+    // 构造一个自持有(owner == 自己)的 zone 文档 + 对应 owner 文档。
     fn build_self_owned_zone_and_owner(
         did: &DID,
         iat: u64,
@@ -810,37 +983,47 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(RecordType::HTTPS.to_string(), "HTTPS");
     }
 
-    #[derive(Clone, Copy)]
-    enum MockErr {
-        NotFound,
+    /// 可切换行为的权威源 mock:Ok(doc) / NotFound(=Missing) / Failed(=unknown)
+    /// / Disabled(=负状态)。
+    #[derive(Clone, Copy, PartialEq)]
+    enum AuthorityMode {
+        Ok,
+        Missing,
+        Down,
         Disabled,
     }
 
-    struct MockProvider {
+    struct MockAuthority {
         doc: Option<EncodedDocument>,
         owner_doc: Option<EncodedDocument>,
-        err: Option<MockErr>,
+        mode: Arc<std::sync::Mutex<AuthorityMode>>,
+        calls: AtomicUsize,
     }
 
-    impl MockProvider {
+    impl MockAuthority {
         fn ok(doc: EncodedDocument) -> Self {
             Self {
                 doc: Some(doc),
                 owner_doc: None,
-                err: None,
+                mode: Arc::new(std::sync::Mutex::new(AuthorityMode::Ok)),
+                calls: AtomicUsize::new(0),
             }
         }
 
-        fn err(err: MockErr) -> Self {
+        fn with_mode(mode: AuthorityMode) -> Self {
             Self {
                 doc: None,
                 owner_doc: None,
-                err: Some(err),
+                mode: Arc::new(std::sync::Mutex::new(mode)),
+                calls: AtomicUsize::new(0),
             }
         }
 
-        // 让同一个 provider 也能在 doc_type == "owner" 时返回一份不同的文档，
-        // 用来搭建"文档 -> owner 递归验签"需要的最小可验证链路。
+        /// 返回可在注册后继续切换行为的句柄,模拟"权威源先回答、后断网"。
+        fn mode_handle(&self) -> Arc<std::sync::Mutex<AuthorityMode>> {
+            self.mode.clone()
+        }
+
         fn with_owner_doc(mut self, owner_doc: EncodedDocument) -> Self {
             self.owner_doc = Some(owner_doc);
             self
@@ -848,9 +1031,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[async_trait]
-    impl NsProvider for MockProvider {
+    impl NsProvider for MockAuthority {
         fn get_id(&self) -> String {
-            "mock".to_string()
+            "mock-authority".to_string()
         }
 
         async fn query(
@@ -868,17 +1051,498 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             if doc_type == Some(DidDocType::Owner) {
                 if let Some(owner_doc) = self.owner_doc.as_ref() {
                     return Ok(owner_doc.clone());
                 }
             }
-            match self.err {
-                Some(MockErr::NotFound) => Err(NSError::NotFound("mock notfound".into())),
-                Some(MockErr::Disabled) => Err(NSError::Disabled("mock disabled".into())),
-                None => Ok(self.doc.as_ref().unwrap().clone()),
+            match *self.mode.lock().unwrap() {
+                AuthorityMode::Ok => self
+                    .doc
+                    .clone()
+                    .ok_or_else(|| NSError::NotFound("no doc".into())),
+                AuthorityMode::Missing => Err(NSError::NotFound("mock missing".into())),
+                AuthorityMode::Down => Err(NSError::Failed("mock network down".into())),
+                AuthorityMode::Disabled => Err(NSError::Disabled("mock disabled".into())),
             }
         }
+    }
+
+    fn client_with_temp_cache(cache_backend: CacheBackend) -> NameClient {
+        let tmp = tempdir().unwrap().keep();
+        let cfg = NameClientConfig {
+            enable_cache: true,
+            local_cache_dir: Some(tmp.to_string_lossy().to_string()),
+            cache_backend,
+            ..Default::default()
+        };
+        NameClient::new(cfg)
+    }
+
+    fn mem_client() -> NameClient {
+        NameClient::new(NameClientConfig {
+            enable_cache: true,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        })
+    }
+
+    // ---- T0.1: key 类 DID 入参门禁 ----
+
+    #[tokio::test]
+    async fn key_class_did_rejected_before_cache_and_providers() {
+        let client = mem_client();
+        let authority = Box::new(MockAuthority::ok(make_doc(0, 10, "dev-doc")));
+        let calls_probe = &authority.calls as *const AtomicUsize;
+        client.set_method_authority("dev", authority).await;
+
+        let did = DID::from_str("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE").unwrap();
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::InvalidDID(_)));
+        // Info 路径同样被门禁拦住。
+        let err = client
+            .resolve_did(&did, Some(DidDocType::Info))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NSError::InvalidDID(_)));
+        // 没有任何 provider 被触碰。
+        assert_eq!(unsafe { (*calls_probe).load(Ordering::SeqCst) }, 0);
+    }
+
+    // ---- T0.6: in-TTL 快路径 ----
+
+    #[tokio::test]
+    async fn in_ttl_cache_hit_short_circuits_providers() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached = make_doc(now, now + 1000, "cached");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+
+        let authority = MockAuthority::ok(make_doc(now + 10, now + 2000, "fresh"));
+        client.set_method_authority("web", Box::new(authority)).await;
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, cached);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+        assert!(!resolved
+            .resolution_metadata
+            .warnings
+            .contains(&ResolveWarning::CacheFallback));
+    }
+
+    #[tokio::test]
+    async fn resolve_from_cache_without_any_provider() {
+        let client = client_with_temp_cache(CacheBackend::Filesystem);
+        let did = DID::from_str("did:web:cache.only").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached_doc = make_doc(now, now + 1800, "cache-only");
+
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached_doc.clone(),
+            now + 1800,
+            CacheEvidence::Published,
+        );
+
+        let resolved = client.resolve_did(&did, None).await.unwrap();
+        assert_eq!(resolved, cached_doc);
+    }
+
+    // ---- T0.5 / T0.4: 负状态与 Missing / unknown ----
+
+    #[tokio::test]
+    async fn disabled_authority_answer_writes_negative_and_removes_positive() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        // 植入一个已过期的 positive(避免 TTL 快路径直接短路)。
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            make_doc_without_exp("stale"),
+            now.saturating_sub(10),
+            CacheEvidence::Published,
+        );
+
+        client
+            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Disabled)))
+            .await;
+
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::Disabled(_)));
+
+        // positive 被负状态条目取代。
+        assert!(client.doc_cache.get(&did, None).is_none());
+        assert!(client.doc_cache.lookup(&did, None).unwrap().is_negative());
+    }
+
+    #[tokio::test]
+    async fn negative_state_survives_authority_unknown_and_blocks_stale_fallback() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:revoked.example").unwrap();
+
+        let authority = MockAuthority::with_mode(AuthorityMode::Disabled);
+        let mode = authority.mode_handle();
+        client.set_method_authority("web", Box::new(authority)).await;
+
+        // 第一次:拿到 Revoked,写入负状态。
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::Disabled(_)));
+
+        // 权威源转为断网(unknown):负状态记忆仍然屏蔽一切,不返回 NotFound、
+        // 不做 stale 兜底(in-TTL 时由负状态快路径直接命中)。
+        *mode.lock().unwrap() = AuthorityMode::Down;
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::Disabled(_)));
+    }
+
+    #[tokio::test]
+    async fn expired_negative_state_blocks_verified_candidate_under_missing() {
+        // 吊销记忆存在时,即使权威源后来回答 Missing、策略放行自签名候选、候选
+        // 也通过了完整 verify,它仍然是 fallback,不许越过负状态;只有权威源的
+        // 新"已发布"回答能翻篇。
+        let app_did = DID::new("bns", "app1.alice");
+        let owner_did = DID::new("bns", "alice");
+        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+
+        let mut owner = OwnerDocument::new(
+            owner_did.clone(),
+            "alice".to_string(),
+            "alice@test".to_string(),
+            test_owner_public_jwk(),
+        );
+        owner.version_seq = Some(0);
+        let owner_doc = owner.encode(Some(&private_key)).unwrap();
+
+        let now = buckyos_get_unix_timestamp();
+        let mut zone = ZoneDocument::new(app_did.clone(), owner_did.clone(), test_owner_public_jwk());
+        zone.iat = now;
+        zone.exp = now + 3600 * 24;
+        zone.version_seq = Some(1);
+        let candidate_doc = zone.encode(Some(&private_key)).unwrap();
+
+        let client = mem_client();
+        client.doc_cache.replace_with_negative_expired(
+            &app_did,
+            None,
+            &DocumentStatus::Revoked,
+            "revoked long ago",
+        );
+        // 权威源:zone 回答 Missing,owner 文档正常可取(anchored)。
+        client
+            .set_method_authority(
+                "bns",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Missing).with_owner_doc(owner_doc)),
+            )
+            .await;
+        // 补充源提供签名合法的候选。
+        client
+            .add_method_supplement("bns", Box::new(MockAuthority::ok(candidate_doc)))
+            .await;
+
+        let mut policy = ResolvePolicy::default();
+        policy.allow_self_signed_when_missing = true;
+        let err = client
+            .resolve_did_ex(&app_did, None, policy)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NSError::Disabled(_)));
+        // 负状态记忆原样保留。
+        assert!(client.doc_cache.lookup(&app_did, None).unwrap().is_negative());
+    }
+
+    #[tokio::test]
+    async fn expired_negative_state_still_blocks_fallback_when_authority_unknown() {
+        // 负状态屏蔽兜底不受 TTL 约束:TTL 过期只允许重新询问权威源;权威源
+        // 没回答时,过期的"已吊销"记忆仍然优先于一切 fallback。
+        let client = mem_client();
+        let did = DID::from_str("did:web:revoked-stale.example").unwrap();
+        client.doc_cache.replace_with_negative_expired(
+            &did,
+            None,
+            &DocumentStatus::Revoked,
+            "revoked long ago",
+        );
+
+        client
+            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Down)))
+            .await;
+
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::Disabled(_)));
+    }
+
+    #[tokio::test]
+    async fn negative_state_blocks_push_into_cache() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:revoked2.example").unwrap();
+        client
+            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Disabled)))
+            .await;
+        let _ = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(client.doc_cache.lookup(&did, None).unwrap().is_negative());
+
+        // push(update_did_cache)写不进去,负状态仍在。
+        let now = buckyos_get_unix_timestamp();
+        client
+            .update_did_cache(did.clone(), None, make_doc(now, now + 1000, "pushed"))
+            .unwrap();
+        assert!(client.doc_cache.lookup(&did, None).unwrap().is_negative());
+        assert!(client.doc_cache.get(&did, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn authority_missing_does_not_fallback_to_stale_positive_cache() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:gone.example").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        // 过期(TTL)但未作废的 positive:若权威源 unknown 本可兜底,但 Missing 不行。
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            make_doc_without_exp("stale"),
+            now.saturating_sub(10),
+            CacheEvidence::Published,
+        );
+
+        client
+            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Missing)))
+            .await;
+
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn authority_unknown_uses_stale_cache_when_policy_allows() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:down.example").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let stale_doc = make_doc_without_exp("stale-but-usable");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            stale_doc.clone(),
+            now.saturating_sub(10),
+            CacheEvidence::Published,
+        );
+
+        client
+            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Down)))
+            .await;
+
+        // 默认策略允许 stale 兜底。
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, stale_doc);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::Fallback)
+        );
+        assert!(resolved
+            .resolution_metadata
+            .warnings
+            .contains(&ResolveWarning::CacheFallback));
+
+        // 策略关闭时不得兜底。
+        let mut policy = ResolvePolicy::default();
+        policy.allow_stale_cache = false;
+        let err = client.resolve_did_ex(&did, None, policy).await.unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn self_expired_doc_is_not_used_for_stale_fallback() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:expired.example").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        // 文档自声明的 exp 已过:它已"作废",不是策略点④的兜底对象。
+        let dead_doc = make_doc(now.saturating_sub(100), now.saturating_sub(10), "dead");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            dead_doc,
+            now.saturating_sub(10),
+            CacheEvidence::Published,
+        );
+
+        client
+            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Down)))
+            .await;
+
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+    }
+
+    // ---- 解析成功路径与缓存回写 ----
+
+    #[tokio::test]
+    async fn resolved_document_is_cached_and_served_from_ttl_fast_path() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let (zone_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "fresh");
+
+        let authority = MockAuthority::ok(zone_doc.clone()).with_owner_doc(owner_doc);
+        client.set_method_authority("web", Box::new(authority)).await;
+
+        let first = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(first.document, zone_doc);
+        assert_eq!(
+            first.resolution_metadata.cache_status,
+            Some(CacheStatus::Miss)
+        );
+
+        // 第二次命中 TTL 快路径,不再触发查询。
+        let second = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(second.document, zone_doc);
+        assert_eq!(
+            second.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_authority_override_wins_over_provider_and_skips_normal_cache() {
+        let client = client_with_temp_cache(CacheBackend::Filesystem);
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let (provider_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "from-provider");
+        let override_doc = make_doc(now, now + 1000, "from-override");
+
+        client
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::ok(provider_doc.clone()).with_owner_doc(owner_doc)),
+            )
+            .await;
+        client.set_local_authority_override(
+            did.clone(),
+            DidDocType::Zone,
+            override_doc.clone(),
+            "test-env",
+            None,
+        );
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, override_doc);
+        assert!(resolved
+            .resolution_metadata
+            .warnings
+            .contains(&ResolveWarning::LocalAuthorityOverride));
+
+        // override 不应该泄漏进普通 doc_cache。
+        assert!(client.doc_cache.get(&did, None).is_none());
+
+        // 清除 override 后应该正常回落到 provider 的结果。
+        client.clear_local_authority_override(&did, DidDocType::Zone);
+        let resolved_after_clear = client.resolve_did(&did, None).await.unwrap();
+        assert_eq!(resolved_after_clear, provider_doc);
+    }
+
+    struct FlakyInfoProvider {
+        doc: EncodedDocument,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl NsProvider for FlakyInfoProvider {
+        fn get_id(&self) -> String {
+            "flaky-info".to_string()
+        }
+
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Err(NSError::NotFound("not implemented".into()))
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            _doc_type: Option<DidDocType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Ok(self.doc.clone())
+            } else {
+                Err(NSError::NotFound("provider gone".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_info_cache_serves_and_stays_isolated() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:flaky.example").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let doc = make_doc(now, now + 1000, "flaky-info");
+
+        client
+            .set_method_authority(
+                "web",
+                Box::new(FlakyInfoProvider {
+                    doc: doc.clone(),
+                    calls: AtomicUsize::new(0),
+                }),
+            )
+            .await;
+
+        let first = client
+            .resolve_did_ex(&did, Some(DidDocType::Info), ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(first.document, doc);
+        assert_eq!(first.document_metadata.buckyos.document_status, None);
+        assert_eq!(first.document_metadata.deactivated, None);
+
+        // provider 从第二次调用起总是失败;这一次由 UnauthenticatedInfoCache 命中。
+        let second = client
+            .resolve_did_ex(&did, Some(DidDocType::Info), ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(second.document, doc);
+        assert_eq!(
+            second.resolution_metadata.cache_status,
+            Some(CacheStatus::UnauthenticatedInfoHit)
+        );
+        assert!(second
+            .resolution_metadata
+            .warnings
+            .contains(&ResolveWarning::UnauthenticatedInfoCache));
+
+        // Info 结果只进入 UnauthenticatedInfoCache,与 doc_cache 完全隔离。
+        assert!(client.doc_cache.get(&did, Some(DidDocType::Info)).is_none());
     }
 
     struct ReplayGuardProvider {
@@ -914,6 +1578,69 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         }
     }
 
+    #[tokio::test]
+    async fn owner_replay_guard_rejects_cached_stale_jwt_and_resolves_again() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let owner_valid_iat = now + 200;
+        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+
+        let mut old_zone = ZoneDocument::new(did.clone(), did.clone(), test_owner_public_jwk());
+        old_zone.iat = now + 150;
+        old_zone.exp = old_zone.iat + DEFAULT_EXPIRE_TIME;
+        old_zone.version_seq = Some(1);
+        let old_doc = old_zone.encode(Some(&private_key)).unwrap();
+
+        let mut fresh_zone = ZoneDocument::new(did.clone(), did.clone(), test_owner_public_jwk());
+        fresh_zone.iat = now + 300;
+        fresh_zone.exp = fresh_zone.iat + DEFAULT_EXPIRE_TIME;
+        fresh_zone.version_seq = Some(2);
+        let fresh_doc = fresh_zone.encode(Some(&private_key)).unwrap();
+
+        let mut owner_document = OwnerDocument::new(
+            did.clone(),
+            "example".to_string(),
+            "example@example.com".to_string(),
+            test_owner_public_jwk(),
+        );
+        owner_document.version_seq = Some(0);
+        owner_document.mini_version_seq = Some(1);
+        owner_document.valid_iat = Some(owner_valid_iat);
+        let owner_doc = owner_document.encode(Some(&private_key)).unwrap();
+
+        // 缓存里是 owner replay guard 判定作废的旧 JWT(in-TTL,快路径会先命中它,
+        // 但 replay guard 把它踢出去并继续真正的解析)。
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            old_doc,
+            now + DOC_CACHE_TTL_SECS,
+            CacheEvidence::Published,
+        );
+        client.doc_cache.insert(
+            did.clone(),
+            Some(DidDocType::Owner),
+            owner_doc.clone(),
+            now + DOC_CACHE_TTL_SECS,
+            CacheEvidence::Published,
+        );
+        client
+            .set_method_authority(
+                "web",
+                Box::new(ReplayGuardProvider {
+                    owner_doc,
+                    fresh_doc: fresh_doc.clone(),
+                }),
+            )
+            .await;
+
+        let resolved = client.resolve_did(&did, None).await.unwrap();
+        assert_eq!(resolved, fresh_doc);
+    }
+
+    // ---- 普通名字解析路径 ----
+
     struct NameMockProvider {
         called_name: Arc<Mutex<Option<String>>>,
     }
@@ -945,185 +1672,40 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         }
     }
 
-    struct DeviceDocumentProvider {
-        device_doc: EncodedDocument,
-        owner_doc: EncodedDocument,
-        info_doc: EncodedDocument,
-        name_info: NameInfo,
-    }
-
-    #[async_trait]
-    impl NsProvider for DeviceDocumentProvider {
-        fn get_id(&self) -> String {
-            "device-document-provider".to_string()
-        }
-
-        async fn query(
-            &self,
-            _name: &str,
-            _record_type: Option<RecordType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<NameInfo> {
-            Ok(self.name_info.clone())
-        }
-
-        async fn query_did(
-            &self,
-            _did: &DID,
-            doc_type: Option<DidDocType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<EncodedDocument> {
-            match doc_type {
-                Some(DidDocType::Info) => Ok(self.info_doc.clone()),
-                Some(DidDocType::Owner) => Ok(self.owner_doc.clone()),
-                None => Ok(self.device_doc.clone()),
-                _ => Err(NSError::NotFound("not implemented".into())),
-            }
-        }
-    }
-
-    fn client_with_temp_cache(cache_backend: CacheBackend) -> NameClient {
-        let tmp = tempdir().unwrap().keep(); // 持久化临时目录，避免 drop 后被删除
-        let cfg = NameClientConfig {
-            enable_cache: true,
-            local_cache_dir: Some(tmp.to_string_lossy().to_string()),
-            cache_backend,
-            ..Default::default()
+    #[tokio::test]
+    async fn resolve_did_web_normalizes_to_host_name() {
+        let called_name = Arc::new(Mutex::new(None));
+        let provider = NameMockProvider {
+            called_name: called_name.clone(),
         };
-        NameClient::new(cfg)
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            cache_backend: CacheBackend::Memory,
+            ..Default::default()
+        });
+        client.add_dns_provider(Box::new(provider)).await;
+
+        let result = client.resolve("did:web:example.com", None).await.unwrap();
+        assert_eq!(result.name, "example.com".to_string());
+
+        let observed = called_name.lock().await.clone().unwrap();
+        assert_eq!(observed, "example.com".to_string());
     }
 
-    fn get_default_web3_bridge_config() -> HashMap<String, String> {
-        let mut config = HashMap::new();
-        config.insert("bns".to_string(), "web3.buckyos.ai".to_string());
+    // ---- add_provider 兼容注册 ----
 
-        config
-    }
-
-    fn test_owner_public_jwk() -> jsonwebtoken::jwk::Jwk {
-        serde_json::from_value(serde_json::json!({
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
-        }))
-        .unwrap()
-    }
-
-    fn make_jwt_doc(version_seq: u64, iat: u64, marker: &str) -> EncodedDocument {
-        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
-        let jwt = encode(
-            &Header::new(Algorithm::EdDSA),
-            &serde_json::json!({
-                "version_seq": version_seq,
-                "iat": iat,
-                "exp": iat + DEFAULT_EXPIRE_TIME,
-                "marker": marker
-            }),
-            &private_key,
-        )
-        .unwrap();
-        EncodedDocument::Jwt(jwt)
-    }
-
-    #[tokio::test]
-    async fn prefer_higher_trust_provider_over_cached() {
-        let mut client = client_with_temp_cache(CacheBackend::Filesystem);
-        let did = DID::from_str("did:web:example.com").unwrap();
-        let now = buckyos_get_unix_timestamp();
-        let cached = make_doc(now, now + 1000, "cached");
-        // "fresh" 走真正需要验证的 zone doc_type，必须是一份能通过 owner 递归验签的
-        // 真实文档；未验证签名的裸 JsonLd 现在会被拒绝，从而错误地退回到 cache。
-        let (fresh, owner_doc) = build_self_owned_zone_and_owner(&did, now + 10, "fresh");
-
-        // 先写入低优先级缓存
-        client
-            .doc_cache
-            .insert(did.clone(), None, cached.clone(), now + 1000, 50);
-
-        // 高优先级 provider
-        client
-            .add_provider(
-                Box::new(MockProvider::ok(fresh.clone()).with_owner_doc(owner_doc)),
-                Some(10),
-            )
-            .await;
-
-        let resolved = client.resolve_did(&did, None).await.unwrap();
-        assert_eq!(resolved, fresh);
-    }
-
-    #[tokio::test]
-    async fn fallback_to_cache_on_error() {
-        let mut client = client_with_temp_cache(CacheBackend::Filesystem);
-        let did = DID::from_str("did:web:example.com").unwrap();
-        let now = buckyos_get_unix_timestamp();
-        let cached = make_doc(now, now + 1000, "cached");
-
-        client
-            .doc_cache
-            .insert(did.clone(), None, cached.clone(), now + 1000, 50);
-
-        // 高优先级 provider 返回 NotFound
-        client
-            .add_provider(Box::new(MockProvider::err(MockErr::NotFound)), Some(10))
-            .await;
-
-        let resolved = client.resolve_did(&did, None).await.unwrap();
-        assert_eq!(resolved, cached);
-    }
-
-    #[tokio::test]
-    async fn local_authority_override_wins_over_provider_and_skips_normal_cache() {
-        // T4.1: override 命中时优先级高于任何 provider 返回的结果，带
-        // LocalAuthorityOverride warning，且不会被写入普通 doc_cache。
-        let mut client = client_with_temp_cache(CacheBackend::Filesystem);
-        let did = DID::from_str("did:web:example.com").unwrap();
-        let now = buckyos_get_unix_timestamp();
-        let (provider_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "from-provider");
-        let override_doc = make_doc(now, now + 1000, "from-override");
-
-        client
-            .add_provider(
-                Box::new(MockProvider::ok(provider_doc.clone()).with_owner_doc(owner_doc)),
-                Some(0),
-            )
-            .await;
-        client.set_local_authority_override(
-            did.clone(),
-            DidDocType::Zone,
-            override_doc.clone(),
-            "test-env",
-            None,
-        );
-
-        let resolved = client
-            .resolve_did_ex(&did, None, ResolvePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(resolved.document, override_doc);
-        assert!(resolved
-            .resolution_metadata
-            .warnings
-            .contains(&ResolveWarning::LocalAuthorityOverride));
-
-        // override 不应该泄漏进普通 doc_cache。
-        assert!(client.doc_cache.get(&did, None).is_none());
-
-        // 清除 override 后应该正常回落到 provider 的结果。
-        client.clear_local_authority_override(&did, DidDocType::Zone);
-        let resolved_after_clear = client.resolve_did(&did, None).await.unwrap();
-        assert_eq!(resolved_after_clear, provider_doc);
-    }
-
-    struct FlakyInfoProvider {
+    struct WebDeclaredProvider {
         doc: EncodedDocument,
-        calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
-    impl NsProvider for FlakyInfoProvider {
+    impl NsProvider for WebDeclaredProvider {
         fn get_id(&self) -> String {
-            "flaky-info".to_string()
+            "web-declared".to_string()
+        }
+
+        fn methods(&self) -> Vec<String> {
+            vec!["web".to_string()]
         }
 
         async fn query(
@@ -1141,283 +1723,30 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             _doc_type: Option<DidDocType>,
             _from_ip: Option<std::net::IpAddr>,
         ) -> NSResult<EncodedDocument> {
-            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if call == 0 {
-                Ok(self.doc.clone())
-            } else {
-                Err(NSError::NotFound("provider gone".into()))
-            }
+            Ok(self.doc.clone())
         }
     }
 
     #[tokio::test]
-    async fn unauthenticated_info_cache_serves_as_fallback_when_provider_goes_away() {
-        // T4.2: unauthenticated_info_cache 是独立于 doc_cache 的存储，Info 结果第一次
-        // 解析成功后应该被缓存下来；provider 之后失效时能从这个独立 cache 回落。
+    async fn add_provider_compat_registers_declared_method_as_authority() {
         let client = NameClient::new(NameClientConfig {
-            enable_cache: true,
+            enable_cache: false,
             cache_backend: CacheBackend::Memory,
             ..Default::default()
         });
-        let did = DID::from_str("did:web:flaky.example").unwrap();
+        let did = DID::from_str("did:web:compat.example").unwrap();
         let now = buckyos_get_unix_timestamp();
-        let doc = make_doc(now, now + 1000, "flaky-info");
+        let doc = make_doc(now, now + 600, "compat");
 
         client
-            .add_provider(
-                Box::new(FlakyInfoProvider {
-                    doc: doc.clone(),
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                }),
-                Some(10),
-            )
-            .await;
-
-        let first = client
-            .resolve_did_ex(&did, Some(DidDocType::Info), ResolvePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(first.document, doc);
-        assert_eq!(first.document_metadata.buckyos.document_status, None);
-        assert_eq!(first.document_metadata.deactivated, None);
-
-        // provider 从第二次调用起总是失败，只有 unauthenticated_info_cache 命中才能
-        // 让这次解析成功。
-        let second = client
-            .resolve_did_ex(&did, Some(DidDocType::Info), ResolvePolicy::default())
-            .await
-            .unwrap();
-        assert_eq!(second.document, doc);
-        assert_eq!(second.document_metadata.buckyos.document_status, None);
-        assert_eq!(second.document_metadata.deactivated, None);
-        assert_eq!(
-            second.resolution_metadata.cache_status,
-            Some(CacheStatus::UnauthenticatedInfoHit)
-        );
-        assert!(second
-            .resolution_metadata
-            .warnings
-            .contains(&ResolveWarning::UnauthenticatedInfoCache));
-
-        // 这个 cache 完全独立于普通 doc_cache（verified_cache 的角色）。
-        assert!(client.doc_cache.get(&did, Some(DidDocType::Info)).is_none());
-    }
-
-    #[tokio::test]
-    async fn owner_replay_guard_rejects_cached_stale_jwt_and_resolves_again() {
-        let client = NameClient::new(NameClientConfig {
-            enable_cache: true,
-            cache_backend: CacheBackend::Memory,
-            ..Default::default()
-        });
-        let did = DID::from_str("did:web:example.com").unwrap();
-        let now = buckyos_get_unix_timestamp();
-        let owner_valid_iat = now + 200;
-        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
-
-        // old/fresh 现在必须是真实可验证的 zone 文档（owner 递归 + 签名校验），
-        // 不能再用裸 JWT payload 占位——不然会在新验证路径里被当成
-        // "不可识别的文档" 直接拒绝，而不是走到 replay guard 这一层的判断。
-        let mut old_zone = ZoneDocument::new(did.clone(), did.clone(), test_owner_public_jwk());
-        old_zone.iat = now + 150;
-        old_zone.exp = old_zone.iat + DEFAULT_EXPIRE_TIME;
-        old_zone.version_seq = Some(1);
-        let old_doc = old_zone.encode(Some(&private_key)).unwrap();
-
-        let mut fresh_zone = ZoneDocument::new(did.clone(), did.clone(), test_owner_public_jwk());
-        fresh_zone.iat = now + 300;
-        fresh_zone.exp = fresh_zone.iat + DEFAULT_EXPIRE_TIME;
-        fresh_zone.version_seq = Some(2);
-        let fresh_doc = fresh_zone.encode(Some(&private_key)).unwrap();
-
-        let mut owner_document = OwnerDocument::new(
-            did.clone(),
-            "example".to_string(),
-            "example@example.com".to_string(),
-            test_owner_public_jwk(),
-        );
-        owner_document.version_seq = Some(0);
-        owner_document.mini_version_seq = Some(1);
-        owner_document.valid_iat = Some(owner_valid_iat);
-        let owner_doc = owner_document.encode(Some(&private_key)).unwrap();
-
-        client.doc_cache.insert(
-            did.clone(),
-            None,
-            old_doc,
-            now + DEFAULT_EXPIRE_TIME,
-            DEFAULT_PROVIDER_TRUST_LEVEL,
-        );
-        client.doc_cache.insert(
-            did.clone(),
-            Some(DidDocType::Owner),
-            owner_doc.clone(),
-            now + DEFAULT_EXPIRE_TIME,
-            DEFAULT_PROVIDER_TRUST_LEVEL,
-        );
-        client
-            .add_provider(
-                Box::new(ReplayGuardProvider {
-                    owner_doc,
-                    fresh_doc: fresh_doc.clone(),
-                }),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
+            .add_provider(Box::new(WebDeclaredProvider { doc: doc.clone() }), Some(0))
             .await;
 
         let resolved = client.resolve_did(&did, None).await.unwrap();
-        assert_eq!(resolved, fresh_doc);
-    }
-
-    #[tokio::test]
-    async fn disabled_removes_cache() {
-        let tmp_dir = tempdir().unwrap().keep();
-        let did = DID::from_str("did:web:example.com").unwrap();
-        let now = buckyos_get_unix_timestamp();
-        let cached = make_doc(now, now + 1000, "cached");
-
-        let mut client = NameClient::new(NameClientConfig {
-            enable_cache: true,
-            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
-            cache_backend: CacheBackend::Filesystem,
-            ..Default::default()
-        });
-
-        client
-            .doc_cache
-            .insert(did.clone(), None, cached.clone(), now + 1000, 50);
-
-        client
-            .add_provider(Box::new(MockProvider::err(MockErr::Disabled)), Some(10))
-            .await;
-
-        let err = client.resolve_did(&did, None).await.unwrap_err();
-        assert!(matches!(err, NSError::Disabled(_)));
-        assert!(client.doc_cache.get(&did, None).is_none());
-    }
-
-    #[tokio::test]
-    async fn cache_from_high_priority_works_when_only_low_priority_available() {
-        // 第一次客户端：有高优先级 provider，生成缓存
-        let tmp_dir = tempdir().unwrap().keep();
-        let did = DID::from_str("did:web:example.com").unwrap();
-        let now = buckyos_get_unix_timestamp();
-        let (high_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "high");
-
-        let mut client_high = NameClient::new(NameClientConfig {
-            enable_cache: true,
-            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
-            cache_backend: CacheBackend::Filesystem,
-            ..Default::default()
-        });
-
-        client_high
-            .add_provider(
-                Box::new(MockProvider::ok(high_doc.clone()).with_owner_doc(owner_doc)),
-                Some(10),
-            )
-            .await;
-
-        let resolved_first = client_high.resolve_did(&did, None).await.unwrap();
-        assert_eq!(resolved_first, high_doc);
-
-        // 第二次客户端：只配置低优先级 provider（会返回 NotFound），但使用同一缓存目录
-        let mut client_low_only = NameClient::new(NameClientConfig {
-            enable_cache: true,
-            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
-            cache_backend: CacheBackend::Filesystem,
-            ..Default::default()
-        });
-
-        client_low_only
-            .add_provider(Box::new(MockProvider::err(MockErr::NotFound)), Some(50))
-            .await;
-
-        // 期望通过已有缓存成功返回
-        let resolved_again = client_low_only.resolve_did(&did, None).await.unwrap();
-        assert_eq!(resolved_again, high_doc);
-    }
-
-    #[tokio::test]
-    async fn resolve_from_default_cache_without_providers() {
-        // 使用默认的 NameClient 配置，但指定临时缓存目录，模拟默认 did-cache 行为
-        let tmp_dir = tempdir().unwrap().keep();
-        let did = DID::from_str("did:web:cache.only").unwrap();
-        let now = buckyos_get_unix_timestamp();
-        let cached_doc = make_doc(now, now + 1800, "cache-only");
-
-        let mut client = NameClient::new(NameClientConfig {
-            enable_cache: true,
-            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
-            cache_backend: CacheBackend::Filesystem,
-            ..Default::default()
-        });
-
-        client.doc_cache.insert(
-            did.clone(),
-            None,
-            cached_doc.clone(),
-            now + 1800,
-            DEFAULT_PROVIDER_TRUST_LEVEL,
-        );
-
-        // 未配置任何 provider，仍应直接从缓存返回
-        let resolved = client.resolve_did(&did, None).await.unwrap();
-        assert_eq!(resolved, cached_doc);
-    }
-
-    #[tokio::test]
-    async fn resolve_via_init_name_lib_with_mock_provider() {
-        init_logging("test-name-client", false);
-        let now = buckyos_get_unix_timestamp();
-        let doc = make_doc(now, now + 600, "init-mock");
-        let did = DID::from_str("did:web:mock.example").unwrap();
-
-        if crate::GLOBAL_NAME_CLIENT.get().is_none() {
-            let tmp_dir = tempdir().unwrap().keep();
-            let mut client = NameClient::new(NameClientConfig {
-                enable_cache: true,
-                local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
-                cache_backend: CacheBackend::Filesystem,
-                ..Default::default()
-            });
-            client
-                .add_provider(Box::new(MockProvider::err(MockErr::NotFound)), Some(10))
-                .await;
-            let _ = crate::GLOBAL_NAME_CLIENT.set(client);
-            let _ = crate::IS_NAME_LIB_INITED.set(true);
-        }
-
-        crate::update_did_cache(did.clone(), None, doc.clone())
-            .await
-            .unwrap();
-        let resolved = resolve_did(&did, None).await.unwrap();
         assert_eq!(resolved, doc);
     }
 
-    #[tokio::test]
-    async fn resolve_did_web_normalizes_to_host_name() {
-        let called_name = Arc::new(Mutex::new(None));
-        let provider = NameMockProvider {
-            called_name: called_name.clone(),
-        };
-        let tmp_dir = tempdir().unwrap().keep();
-        let client = NameClient::new(NameClientConfig {
-            enable_cache: false,
-            local_cache_dir: Some(tmp_dir.to_string_lossy().to_string()),
-            cache_backend: CacheBackend::Filesystem,
-            ..Default::default()
-        });
-        client
-            .add_provider(Box::new(provider), Some(DEFAULT_PROVIDER_TRUST_LEVEL))
-            .await;
-
-        let result = client.resolve("did:web:example.com", None).await.unwrap();
-        assert_eq!(result.name, "example.com".to_string());
-
-        let observed = called_name.lock().await.clone().unwrap();
-        assert_eq!(observed, "example.com".to_string());
-    }
+    // ---- resolve_ips 路径 ----
 
     #[tokio::test]
     async fn resolve_with_local_ip_reorders_addresses_by_rtt_history() {
@@ -1461,12 +1790,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             cache_backend: CacheBackend::Memory,
             ..Default::default()
         });
-        client
-            .add_provider(
-                Box::new(AddressProvider),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
+        client.add_dns_provider(Box::new(AddressProvider)).await;
 
         client
             .record_connection_outcome(
@@ -1499,299 +1823,81 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
     }
 
-    #[tokio::test]
-    async fn resolve_ip_uses_cached_local_ip_and_rtt_history() {
-        struct AddressProvider;
-
-        #[async_trait]
-        impl NsProvider for AddressProvider {
-            fn get_id(&self) -> String {
-                "address-provider".to_string()
-            }
-
-            async fn query(
-                &self,
-                _name: &str,
-                _record_type: Option<RecordType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<NameInfo> {
-                Ok(NameInfo::from_address_vec(
-                    "example.com",
-                    vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()],
-                ))
-            }
-
-            async fn query_did(
-                &self,
-                _did: &DID,
-                _doc_type: Option<DidDocType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<EncodedDocument> {
-                Err(NSError::NotFound("not implemented".into()))
-            }
-        }
-
-        let local_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let slow_remote: SocketAddr = "192.0.2.10:443".parse().unwrap();
-        let fast_remote: SocketAddr = "192.0.2.20:8443".parse().unwrap();
-        let client = NameClient::new(NameClientConfig {
-            cache_backend: CacheBackend::Memory,
-            ..Default::default()
-        });
-        client
-            .add_provider(
-                Box::new(AddressProvider),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
-
-        client
-            .record_connection_outcome(
-                local_ip,
-                slow_remote,
-                ConnectionOutcome::Success {
-                    rtt: Duration::from_millis(120),
-                    layer: crate::MeasurementLayer::Tcp,
-                },
-            )
-            .unwrap();
-        client
-            .record_connection_outcome(
-                local_ip,
-                fast_remote,
-                ConnectionOutcome::Success {
-                    rtt: Duration::from_millis(20),
-                    layer: crate::MeasurementLayer::Tcp,
-                },
-            )
-            .unwrap();
-
-        let resolved = client.resolve_ip("example.com").await.unwrap();
-        assert_eq!(resolved, "192.0.2.20".parse::<IpAddr>().unwrap());
+    struct DeviceDocumentProvider {
+        device_doc: EncodedDocument,
+        info_doc: EncodedDocument,
+        name_info: NameInfo,
     }
 
-    #[tokio::test]
-    async fn resolve_ips_returns_ranked_ipv4_and_ipv6_addresses() {
-        struct AddressProvider;
-
-        #[async_trait]
-        impl NsProvider for AddressProvider {
-            fn get_id(&self) -> String {
-                "address-provider".to_string()
-            }
-
-            async fn query(
-                &self,
-                _name: &str,
-                _record_type: Option<RecordType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<NameInfo> {
-                Ok(NameInfo::from_address_vec(
-                    "example.com",
-                    vec![
-                        "192.0.2.10".parse().unwrap(),
-                        "2001:db8::1".parse().unwrap(),
-                    ],
-                ))
-            }
-
-            async fn query_did(
-                &self,
-                _did: &DID,
-                _doc_type: Option<DidDocType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<EncodedDocument> {
-                Err(NSError::NotFound("not implemented".into()))
-            }
+    #[async_trait]
+    impl NsProvider for DeviceDocumentProvider {
+        fn get_id(&self) -> String {
+            "device-document-provider".to_string()
         }
 
-        let local_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let ipv4_remote: SocketAddr = "192.0.2.10:443".parse().unwrap();
-        let ipv6_remote: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
-        let client = NameClient::new(NameClientConfig {
-            cache_backend: CacheBackend::Memory,
-            ..Default::default()
-        });
-        client
-            .add_provider(
-                Box::new(AddressProvider),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Ok(self.name_info.clone())
+        }
 
-        client
-            .record_connection_outcome(
-                local_ip,
-                ipv4_remote,
-                ConnectionOutcome::Success {
-                    rtt: Duration::from_millis(120),
-                    layer: crate::MeasurementLayer::Tcp,
-                },
-            )
-            .unwrap();
-        client
-            .record_connection_outcome(
-                local_ip,
-                ipv6_remote,
-                ConnectionOutcome::Success {
-                    rtt: Duration::from_millis(20),
-                    layer: crate::MeasurementLayer::Tcp,
-                },
-            )
-            .unwrap();
-
-        let resolved = client.resolve_ips("example.com").await.unwrap();
-        assert_eq!(
-            resolved,
-            vec![
-                "2001:db8::1".parse::<IpAddr>().unwrap(),
-                "192.0.2.10".parse::<IpAddr>().unwrap(),
-            ]
-        );
+        async fn query_did(
+            &self,
+            _did: &DID,
+            doc_type: Option<DidDocType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            match doc_type {
+                Some(DidDocType::Info) => Ok(self.info_doc.clone()),
+                None => Ok(self.device_doc.clone()),
+                _ => Err(NSError::NotFound("not implemented".into())),
+            }
+        }
     }
 
-    #[tokio::test]
-    async fn resolve_ips_prefers_signed_device_document_over_unverified_ips() {
-        struct MixedProvider {
-            signed_doc: EncodedDocument,
-            info_doc: EncodedDocument,
-            owner_doc: EncodedDocument,
-        }
-
-        #[async_trait]
-        impl NsProvider for MixedProvider {
-            fn get_id(&self) -> String {
-                "mixed-provider".to_string()
-            }
-
-            async fn query(
-                &self,
-                _name: &str,
-                _record_type: Option<RecordType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<NameInfo> {
-                Ok(NameInfo::from_address_vec(
-                    "ood1.example",
-                    vec!["192.0.2.30".parse().unwrap()],
-                ))
-            }
-
-            async fn query_did(
-                &self,
-                _did: &DID,
-                doc_type: Option<DidDocType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<EncodedDocument> {
-                match doc_type {
-                    Some(DidDocType::Info) => Ok(self.info_doc.clone()),
-                    Some(DidDocType::Owner) => Ok(self.owner_doc.clone()),
-                    None => Ok(self.signed_doc.clone()),
-                    _ => Err(NSError::NotFound("not implemented".into())),
-                }
-            }
-        }
-
-        let owner_private_key_pem = r#"
-        -----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
-        -----END PRIVATE KEY-----
-        "#;
-        let owner_private_key = EncodingKey::from_ed_pem(owner_private_key_pem.as_bytes()).unwrap();
+    fn build_device_provider(
+        device_ips: Vec<IpAddr>,
+        info_ips: Vec<IpAddr>,
+        name_ips: Vec<IpAddr>,
+    ) -> DeviceDocumentProvider {
         let device_did = DID::from_str("did:web:ood1.example").unwrap();
-
-        // 设备文档必须能递归解析到一个真实可验证的 owner，这里让设备"自持有"，
-        // 用同一把 key 签发 owner 文档。
-        let mut owner_document = OwnerDocument::new(
-            device_did.clone(),
-            "ood1-owner".to_string(),
-            "ood1-owner@test".to_string(),
-            test_owner_public_jwk(),
-        );
-        owner_document.version_seq = Some(0);
-        let owner_doc = owner_document.encode(Some(&owner_private_key)).unwrap();
-
-        let mut signed_device_document = DeviceDocument::new(
-            "ood1",
-            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
-        );
-        signed_device_document.owner = device_did.clone();
-        signed_device_document.ips = vec!["192.0.2.10".parse().unwrap()];
-        let signed_doc = signed_device_document
-            .encode(Some(&owner_private_key))
-            .unwrap();
-
-        let mut info_config = signed_device_document.clone();
-        info_config.ips = vec!["192.0.2.20".parse().unwrap()];
-        let mut device_info = DeviceInfo::from_device_doc(&info_config);
-        device_info.all_ip = vec!["192.0.2.40".parse().unwrap()];
-        let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
-
-        let client = NameClient::new(NameClientConfig {
-            enable_cache: false,
-            cache_backend: CacheBackend::Memory,
-            ..Default::default()
-        });
-        client
-            .add_provider(
-                Box::new(MixedProvider {
-                    signed_doc,
-                    info_doc,
-                    owner_doc,
-                }),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
-
-        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
-        assert_eq!(resolved, vec!["192.0.2.10".parse::<IpAddr>().unwrap()]);
-    }
-
-    #[tokio::test]
-    async fn resolve_ips_uses_verified_jsonld_device_document_ips() {
-        let device_did = DID::from_str("did:web:ood1.example").unwrap();
-
-        let owner_document = OwnerDocument::new(
-            device_did.clone(),
-            "ood1-owner".to_string(),
-            "ood1-owner@test".to_string(),
-            test_owner_public_jwk(),
-        );
-        let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_document).unwrap());
-
         let mut device_document = DeviceDocument::new(
             "ood1",
             "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
         );
         device_document.id = device_did.clone();
         device_document.owner = device_did.clone();
-        device_document.ips = vec!["192.0.2.10".parse().unwrap()];
+        device_document.ips = device_ips;
         let device_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_document).unwrap());
 
         let mut info_config = device_document.clone();
-        info_config.ips = vec!["192.0.2.20".parse().unwrap()];
         let mut device_info = DeviceInfo::from_device_doc(&info_config);
-        device_info.all_ip = vec!["192.0.2.40".parse().unwrap()];
+        device_info.all_ip = info_ips;
         let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
 
+        DeviceDocumentProvider {
+            device_doc,
+            info_doc,
+            name_info: NameInfo::from_address_vec("ood1.example", name_ips),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_prefers_device_document_ips() {
         let client = NameClient::new(NameClientConfig {
             enable_cache: false,
             cache_backend: CacheBackend::Memory,
             ..Default::default()
         });
-        client
-            .add_provider(
-                Box::new(DeviceDocumentProvider {
-                    device_doc,
-                    owner_doc,
-                    info_doc,
-                    name_info: NameInfo::from_address_vec(
-                        "ood1.example",
-                        vec!["192.0.2.30".parse().unwrap()],
-                    ),
-                }),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
+        let provider = build_device_provider(
+            vec!["192.0.2.10".parse().unwrap()],
+            vec!["192.0.2.40".parse().unwrap()],
+            vec!["192.0.2.30".parse().unwrap()],
+        );
+        client.set_method_authority("web", Box::new(provider)).await;
 
         let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
         assert_eq!(resolved, vec!["192.0.2.10".parse::<IpAddr>().unwrap()]);
@@ -1799,191 +1905,45 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     #[tokio::test]
     async fn resolve_ips_falls_back_when_device_document_has_no_fixed_ips() {
-        let owner_private_key =
-            EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
-        let device_did = DID::from_str("did:web:ood1.example").unwrap();
-
-        let mut owner_document = OwnerDocument::new(
-            device_did.clone(),
-            "ood1-owner".to_string(),
-            "ood1-owner@test".to_string(),
-            test_owner_public_jwk(),
-        );
-        owner_document.version_seq = Some(0);
-        let owner_doc = owner_document.encode(Some(&owner_private_key)).unwrap();
-
-        let mut device_document = DeviceDocument::new(
-            "ood1",
-            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
-        );
-        device_document.id = device_did.clone();
-        device_document.owner = device_did.clone();
-        let device_doc = device_document.encode(Some(&owner_private_key)).unwrap();
-
-        let mut info_config = device_document.clone();
-        info_config.ips = vec!["192.0.2.20".parse().unwrap()];
-        let mut device_info = DeviceInfo::from_device_doc(&info_config);
-        device_info.all_ip = vec!["192.0.2.30".parse().unwrap()];
-        let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
-
         let client = NameClient::new(NameClientConfig {
             enable_cache: false,
             cache_backend: CacheBackend::Memory,
             ..Default::default()
         });
-        client
-            .add_provider(
-                Box::new(DeviceDocumentProvider {
-                    device_doc,
-                    owner_doc,
-                    info_doc,
-                    name_info: NameInfo::from_address_vec(
-                        "ood1.example",
-                        vec!["192.0.2.10".parse().unwrap()],
-                    ),
-                }),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
+        let provider = build_device_provider(
+            Vec::new(),
+            vec!["192.0.2.30".parse().unwrap()],
+            vec!["192.0.2.10".parse().unwrap()],
+        );
+        // 同一个 provider 同时服务 DID 管线与普通名字解析。
+        let provider2 = build_device_provider(
+            Vec::new(),
+            vec!["192.0.2.30".parse().unwrap()],
+            vec!["192.0.2.10".parse().unwrap()],
+        );
+        client.set_method_authority("web", Box::new(provider)).await;
+        client.add_dns_provider(Box::new(provider2)).await;
 
         let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
         assert_eq!(
             resolved,
             vec![
                 "192.0.2.10".parse::<IpAddr>().unwrap(),
-                "192.0.2.20".parse::<IpAddr>().unwrap(),
                 "192.0.2.30".parse::<IpAddr>().unwrap(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_ips_merges_nameinfo_and_device_info_ips() {
-        struct MergeProvider {
-            info_doc: EncodedDocument,
-        }
-
-        #[async_trait]
-        impl NsProvider for MergeProvider {
-            fn get_id(&self) -> String {
-                "merge-provider".to_string()
-            }
-
-            async fn query(
-                &self,
-                _name: &str,
-                _record_type: Option<RecordType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<NameInfo> {
-                Ok(NameInfo::from_address_vec(
-                    "ood1.example",
-                    vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()],
-                ))
-            }
-
-            async fn query_did(
-                &self,
-                _did: &DID,
-                doc_type: Option<DidDocType>,
-                _from_ip: Option<std::net::IpAddr>,
-            ) -> NSResult<EncodedDocument> {
-                match doc_type {
-                    Some(DidDocType::Info) => Ok(self.info_doc.clone()),
-                    _ => Err(NSError::NotFound("not implemented".into())),
-                }
-            }
-        }
-
-        let mut device_document = DeviceDocument::new(
-            "ood1",
-            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
-        );
-        device_document.ips = vec![
-            "192.0.2.20".parse().unwrap(),
-            "2001:db8::1".parse().unwrap(),
-        ];
-        let mut device_info = DeviceInfo::from_device_doc(&device_document);
-        device_info.all_ip = vec!["192.0.2.30".parse().unwrap()];
-        let info_doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
-
-        let client = NameClient::new(NameClientConfig {
-            enable_cache: false,
-            cache_backend: CacheBackend::Memory,
-            ..Default::default()
-        });
-        client
-            .add_provider(
-                Box::new(MergeProvider { info_doc }),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
-
-        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
-        assert_eq!(
-            resolved,
-            vec![
-                "192.0.2.10".parse::<IpAddr>().unwrap(),
-                "192.0.2.20".parse::<IpAddr>().unwrap(),
-                "2001:db8::1".parse::<IpAddr>().unwrap(),
-                "192.0.2.30".parse::<IpAddr>().unwrap(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_ips_falls_back_to_device_info_ips() {
-        let mut device_document = DeviceDocument::new(
-            "ood1",
-            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
-        );
-        device_document.ips = vec![
-            "192.0.2.10".parse().unwrap(),
-            "2001:db8::1".parse().unwrap(),
-        ];
-        let mut device_info = DeviceInfo::from_device_doc(&device_document);
-        device_info.all_ip = vec!["192.0.2.10".parse().unwrap(), "192.0.2.20".parse().unwrap()];
-        let doc = EncodedDocument::JsonLd(serde_json::to_value(&device_info).unwrap());
-
-        let client = NameClient::new(NameClientConfig {
-            enable_cache: false,
-            cache_backend: CacheBackend::Memory,
-            ..Default::default()
-        });
-        client
-            .add_provider(
-                Box::new(MockProvider::ok(doc)),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
-            .await;
-
-        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
-        assert_eq!(
-            resolved,
-            vec![
-                "192.0.2.10".parse::<IpAddr>().unwrap(),
-                "2001:db8::1".parse::<IpAddr>().unwrap(),
-                "192.0.2.20".parse::<IpAddr>().unwrap(),
             ]
         );
     }
 
     #[tokio::test]
     async fn resolve_ips_uses_cached_finder_device_info_after_discovery() {
-        let client = NameClient::new(NameClientConfig {
-            enable_cache: true,
-            cache_backend: CacheBackend::Memory,
-            ..Default::default()
-        });
+        let client = mem_client();
         client
-            .add_provider(
-                Box::new(MockProvider::err(MockErr::NotFound)),
-                Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-            )
+            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Missing)))
             .await;
 
         let device_did = DID::from_str("did:web:ood1.example").unwrap();
         let before_cache = client.resolve_ips("did:web:ood1.example").await;
-        assert!(matches!(before_cache, Err(NSError::NotFound(_))));
+        assert!(before_cache.is_err());
 
         let endpoint_ip: IpAddr = "192.168.1.20".parse().unwrap();
         let mut discovered_doc = DeviceDocument::new(

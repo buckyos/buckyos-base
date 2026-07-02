@@ -5,8 +5,7 @@
 */
 
 use crate::{
-    DidDocType, DocumentRef, DocumentStatus, NameInfo, NameStatus, NsProvider, OwnerSource,
-    PublishedState, RecordType,
+    DidDocType, DocumentRef, DocumentStatus, NameInfo, NsProvider, PublishedState, RecordType,
 };
 use async_trait::async_trait;
 use log::info;
@@ -198,60 +197,39 @@ impl HttpsProvider {
             }
         };
 
-        let name_status = match document_status {
-            DocumentStatus::Tombstoned => NameStatus::Tombstoned,
-            DocumentStatus::Missing => NameStatus::Missing,
-            DocumentStatus::Expired => NameStatus::Expired,
-            _ => NameStatus::Active,
-        };
-
-        let owner_source = match buckyos.owner_source.as_deref() {
-            Some("methodAuthority") => OwnerSource::MethodAuthority,
-            Some("documentClaim") => OwnerSource::DocumentClaim,
-            _ => OwnerSource::Unknown,
-        };
-
         let effective_owner = parse_optional_did(buckyos.effective_owner.as_deref())?;
         let migration_target = parse_optional_did(buckyos.migration_target.as_deref())?;
-        let canonical_id = parse_optional_did(metadata.canonical_id.as_deref())?;
-        let equivalent_ids = metadata
-            .equivalent_id
-            .iter()
-            .map(|id| DID::from_str(id))
-            .collect::<NSResult<Vec<_>>>()?;
 
         let document_ref = response.did_document.map(|value| {
             let document = match value {
                 Value::String(jwt) => EncodedDocument::Jwt(jwt),
                 other => EncodedDocument::JsonLd(other),
             };
-            DocumentRef::inline(document)
+            let mut doc_ref = DocumentRef::inline(document);
+            doc_ref.content_hash = buckyos.doc_hash.clone();
+            doc_ref
+        });
+        // 只有锚点没有 body 的回答:doc_hash 单独成为 DocumentRef。
+        let document_ref = document_ref.or_else(|| {
+            buckyos.doc_hash.as_ref().map(|hash| DocumentRef {
+                uri: None,
+                content_hash: Some(hash.clone()),
+                inline_document: None,
+            })
         });
 
         let document_version = buckyos
             .document_version
             .or_else(|| metadata.version_id.as_deref().and_then(|v| v.parse().ok()));
-        let next_version = metadata
-            .next_version_id
-            .as_deref()
-            .and_then(|v| v.parse().ok());
 
         Ok(Some(PublishedState {
             did: did.clone(),
             doc_type: buckyos.doc_type.unwrap_or_else(|| doc_type.to_string()),
-            name_status,
             document_status,
             document_ref,
             document_version,
-            previous_version: buckyos.previous_version,
-            next_version,
             effective_owner,
-            owner_source,
-            authority_root: buckyos.authority_root,
             authority_seq: buckyos.authority_seq,
-            lineage_epoch: buckyos.lineage_epoch,
-            canonical_id,
-            equivalent_ids,
             migration_target,
         }))
     }
@@ -275,12 +253,6 @@ struct DidResolutionResponseWire {
 struct DidDocumentMetadataWire {
     #[serde(rename = "versionId", default)]
     version_id: Option<String>,
-    #[serde(rename = "nextVersionId", default)]
-    next_version_id: Option<String>,
-    #[serde(rename = "canonicalId", default)]
-    canonical_id: Option<String>,
-    #[serde(rename = "equivalentId", default)]
-    equivalent_id: Vec<String>,
     #[serde(default)]
     buckyos: Option<BuckyosMetadataWire>,
 }
@@ -293,18 +265,12 @@ struct BuckyosMetadataWire {
     document_status: Option<String>,
     #[serde(rename = "documentVersion", default)]
     document_version: Option<u64>,
-    #[serde(rename = "previousVersion", default)]
-    previous_version: Option<u64>,
-    #[serde(rename = "lineageEpoch", default)]
-    lineage_epoch: Option<u64>,
     #[serde(rename = "authoritySeq", default)]
     authority_seq: Option<u64>,
     #[serde(rename = "effectiveOwner", default)]
     effective_owner: Option<String>,
-    #[serde(rename = "ownerSource", default)]
-    owner_source: Option<String>,
-    #[serde(rename = "authorityRoot", default)]
-    authority_root: Option<String>,
+    #[serde(rename = "docHash", default)]
+    doc_hash: Option<String>,
     #[serde(rename = "migrationTarget", default)]
     migration_target: Option<String>,
 }
@@ -313,13 +279,6 @@ struct BuckyosMetadataWire {
 impl NsProvider for HttpsProvider {
     fn get_id(&self) -> String {
         format!("https-resolver:{}", self.resolver_host)
-    }
-
-    fn caps(&self) -> crate::ResolverCaps {
-        crate::ResolverCaps {
-            published_state: true,
-            ..crate::ResolverCaps::legacy_document()
-        }
     }
 
     async fn query(
@@ -443,6 +402,10 @@ impl SmartProvider {
 impl NsProvider for SmartProvider {
     fn get_id(&self) -> String {
         "smart-resolver".to_string()
+    }
+
+    fn methods(&self) -> Vec<String> {
+        vec!["web".to_string()]
     }
 
     async fn query(

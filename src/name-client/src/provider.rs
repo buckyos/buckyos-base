@@ -4,130 +4,57 @@ use name_lib::OwnerDocument;
 use name_lib::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{Arc, RwLock},
 };
 
 pub use name_lib::{DidDocType, DEFAULT_DID_DOC_TYPE, DOC_TYPE_INFO, DOC_TYPE_OWNER};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MethodMatcher {
-    Exact(Vec<String>),
-    Any,
+/// key 类 DID(did:key / did:dev)不是 `resolve_did` 的合法入参(简化文档第 6 节):
+/// 解析的目的是"通过逻辑名字得到当前可信的公钥",而 key 类 DID 的名字就是公钥本身,
+/// 解析它没有意义。key 只作为文档内容里的 key 材料和系统内部唯一性标识存在。
+pub fn is_key_class_method(method: &str) -> bool {
+    matches!(method, "key" | "dev")
 }
 
-impl MethodMatcher {
-    pub fn exact(methods: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self::Exact(methods.into_iter().map(Into::into).collect())
-    }
-
-    pub fn matches(&self, method: &str) -> bool {
-        match self {
-            Self::Exact(methods) => methods.iter().any(|item| item == method),
-            Self::Any => true,
-        }
-    }
-
-    pub fn is_exact_match(&self, method: &str) -> bool {
-        match self {
-            Self::Exact(methods) => methods.iter().any(|item| item == method),
-            Self::Any => false,
-        }
+/// 名字结构推导出的默认 owner(简化文档 2.4 节):二级名字天然自带 owner 假设,
+/// `did:bns:app1.alice` 的 expected_owner 就是 `did:bns:alice`。一级名字是根,
+/// 从结构推不出 owner,绑定只能来自权威源。其它 method(如 did:web)不定义结构 owner。
+pub fn structural_owner(did: &DID) -> Option<DID> {
+    match did.method.as_str() {
+        "bns" => did
+            .id
+            .split_once('.')
+            .map(|(_, parent)| DID::new("bns", parent)),
+        _ => None,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolverCaps {
-    pub published_state: bool,
-    pub document_body: bool,
-    pub self_signed_candidate: bool,
-    pub unauthenticated_info: bool,
-    pub negative_state: bool,
+/// 计算文档 body 的内容哈希(权威源锚定 `doc_hash` 时用来做成员判断)。
+/// 约定为编码后文档字符串(JWT 原文或 JSON 序列化)的 sha256 hex。
+pub fn document_content_hash(doc: &EncodedDocument) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(doc.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
-impl ResolverCaps {
-    pub fn legacy_document() -> Self {
-        Self {
-            published_state: false,
-            document_body: true,
-            self_signed_candidate: true,
-            unauthenticated_info: true,
-            negative_state: true,
-        }
-    }
-
-    pub fn dns_only() -> Self {
-        Self {
-            published_state: false,
-            document_body: false,
-            self_signed_candidate: false,
-            unauthenticated_info: false,
-            negative_state: false,
-        }
-    }
+/// 权威源锚定的 hash 与 body 是否匹配。允许 `sha256:` 前缀,大小写不敏感。
+pub fn content_hash_matches(expected: &str, doc: &EncodedDocument) -> bool {
+    let expected = expected
+        .strip_prefix("sha256:")
+        .unwrap_or(expected)
+        .to_ascii_lowercase();
+    document_content_hash(doc) == expected
 }
 
-impl Default for ResolverCaps {
-    fn default() -> Self {
-        Self::legacy_document()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EvidenceKind {
-    PublishedState,
-    AnchoredDocumentBody,
-    SelfSignedCandidate,
-    UnauthenticatedInfo,
-    Negative,
-    NotFound,
-    TransportError,
-}
-
-impl EvidenceKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EvidenceKind::PublishedState => "PublishedState",
-            EvidenceKind::AnchoredDocumentBody => "AnchoredDocumentBody",
-            EvidenceKind::SelfSignedCandidate => "SelfSignedCandidate",
-            EvidenceKind::UnauthenticatedInfo => "UnauthenticatedInfo",
-            EvidenceKind::Negative => "Negative",
-            EvidenceKind::NotFound => "NotFound",
-            EvidenceKind::TransportError => "TransportError",
-        }
-    }
-
-    pub fn rank(&self) -> u8 {
-        match self {
-            EvidenceKind::PublishedState => 0,
-            EvidenceKind::AnchoredDocumentBody => 1,
-            EvidenceKind::SelfSignedCandidate => 2,
-            EvidenceKind::UnauthenticatedInfo => 3,
-            EvidenceKind::Negative => 4,
-            EvidenceKind::NotFound => 5,
-            EvidenceKind::TransportError => 6,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NameStatus {
-    Active,
-    Missing,
-    Expired,
-    Tombstoned,
-}
-
-impl Default for NameStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
-
+/// 发布状态:权威源对"什么被发布过"的记忆(简化文档第 6 节)。
+/// `Missing / Revoked / Tombstoned / Active` 都是权威源给出的**回答**(DR),
+/// 与"没有得到回答"(unknown)严格区分。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DocumentStatus {
-    Missing, //unknown
+    Missing,
     Active,
     Revoked,
     Expired,
@@ -144,20 +71,6 @@ impl Default for DocumentStatus {
 impl DocumentStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Revoked | Self::Tombstoned)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OwnerSource {
-    MethodAuthority,
-    DocumentClaim,
-    LocalOverride,
-    Unknown,
-}
-
-impl Default for OwnerSource {
-    fn default() -> Self {
-        Self::Unknown
     }
 }
 
@@ -178,23 +91,19 @@ impl DocumentRef {
     }
 }
 
+/// 权威源对 (did, doc_type) 的完整回答。只保留当前有真实生产者/消费者的字段
+/// (简化 TODO T2.1)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishedState {
     pub did: DID,
     pub doc_type: String,
-    pub name_status: NameStatus,
     pub document_status: DocumentStatus,
     pub document_ref: Option<DocumentRef>,
     pub document_version: Option<u64>,
-    pub previous_version: Option<u64>,
-    pub next_version: Option<u64>,
+    /// 权威源记录的 owner 绑定。owner 变更/委托只能通过这里生效,
+    /// 候选文档自声明的 owner 说了不算(简化文档 2.4 节)。
     pub effective_owner: Option<DID>,
-    pub owner_source: OwnerSource,
-    pub authority_root: Option<String>,
     pub authority_seq: Option<u64>,
-    pub lineage_epoch: Option<u64>,
-    pub canonical_id: Option<DID>,
-    pub equivalent_ids: Vec<DID>,
     pub migration_target: Option<DID>,
 }
 
@@ -203,19 +112,11 @@ impl PublishedState {
         Self {
             did,
             doc_type,
-            name_status: NameStatus::Active,
             document_status: DocumentStatus::Active,
             document_ref: Some(DocumentRef::inline(document)),
             document_version: None,
-            previous_version: None,
-            next_version: None,
             effective_owner: None,
-            owner_source: OwnerSource::Unknown,
-            authority_root: None,
             authority_seq: None,
-            lineage_epoch: None,
-            canonical_id: None,
-            equivalent_ids: Vec::new(),
             migration_target: None,
         }
     }
@@ -224,20 +125,34 @@ impl PublishedState {
         Self {
             did,
             doc_type,
-            name_status: NameStatus::Active,
             document_status: DocumentStatus::Missing,
             document_ref: None,
             document_version: None,
-            previous_version: None,
-            next_version: None,
             effective_owner: None,
-            owner_source: OwnerSource::Unknown,
-            authority_root: None,
             authority_seq: None,
-            lineage_epoch: None,
-            canonical_id: None,
-            equivalent_ids: Vec::new(),
             migration_target: None,
+        }
+    }
+}
+
+/// 文档 body 的证据等级,按**取回信道**和 doc_type 契约打标,永远不看 body 长相
+/// (简化文档 2.3 节)。resolver 主流程只认这三档。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BodyEvidence {
+    /// 已发布/已锚定:从权威信道取回,need_proof = false。
+    Anchored,
+    /// 候选文档:从补充信道取回,需要 expected_owner + owner 验签。
+    NeedProof,
+    /// 免验证的 Info 类:按 method 契约事先声明,不验证、只进入 UnauthenticatedInfoCache。
+    UnproofInfo,
+}
+
+impl BodyEvidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BodyEvidence::Anchored => "Anchored",
+            BodyEvidence::NeedProof => "NeedProof",
+            BodyEvidence::UnproofInfo => "UnproofInfo",
         }
     }
 }
@@ -245,37 +160,175 @@ impl PublishedState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentBody {
     pub document: EncodedDocument,
-    pub evidence_kind: EvidenceKind,
+    pub evidence: BodyEvidence,
     pub resolver_id: Option<String>,
     pub retrieved: Option<u64>,
 }
 
 impl DocumentBody {
     pub fn anchored(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+        Self::with_evidence(document, BodyEvidence::Anchored, resolver_id)
+    }
+
+    pub fn need_proof(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+        Self::with_evidence(document, BodyEvidence::NeedProof, resolver_id)
+    }
+
+    pub fn unproof_info(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+        Self::with_evidence(document, BodyEvidence::UnproofInfo, resolver_id)
+    }
+
+    fn with_evidence(
+        document: EncodedDocument,
+        evidence: BodyEvidence,
+        resolver_id: Option<String>,
+    ) -> Self {
         Self {
             document,
-            evidence_kind: EvidenceKind::AnchoredDocumentBody,
+            evidence,
             resolver_id,
             retrieved: Some(buckyos_get_unix_timestamp()),
         }
     }
+}
 
-    pub fn self_signed(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+/// provider 的归一化回答(简化 TODO T1.1)。`status / owner_binding / doc_hash /
+/// migration_target` 只有权威源能填;补充源永远只返回候选 body。
+#[derive(Debug, Clone, Default)]
+pub struct ProviderAnswer {
+    pub status: Option<DocumentStatus>,
+    pub owner_binding: Option<DID>,
+    pub doc_hash: Option<String>,
+    pub migration_target: Option<DID>,
+    pub body: Option<DocumentBody>,
+    /// 权威源的完整发布状态,只用于结果元数据透传(document_version 等),
+    /// 主循环的门禁只看上面的归一化字段。
+    pub published: Option<PublishedState>,
+}
+
+/// 结果二分法(简化文档 2.1 节):DR = 得到了回答(发布状态是回答的一部分),
+/// Unknown = 没有得到回答(断网、超时)。界线是"有没有得到回答",
+/// 不是"有没有拿到文档"——Missing 是回答,不是 unknown。
+#[derive(Debug)]
+pub enum ProviderResolveResult {
+    Dr(ProviderAnswer),
+    Unknown(NSError),
+}
+
+/// 一个 DID method 的解析注册模型(简化 TODO T2.2):至多一个权威发布渠道 +
+/// 显式有序的少数补充源(first-win)。免验证 doc_type 是 method 契约,
+/// 不由 provider 运行时协商。
+pub struct MethodProviders {
+    pub authority: Option<Box<dyn NsProvider>>,
+    pub supplements: Vec<Box<dyn NsProvider>>,
+    pub no_proof_doc_types: HashSet<DidDocType>,
+}
+
+impl MethodProviders {
+    pub fn new() -> Self {
+        let mut no_proof_doc_types = HashSet::new();
+        no_proof_doc_types.insert(DidDocType::Info);
         Self {
-            document,
-            evidence_kind: EvidenceKind::SelfSignedCandidate,
-            resolver_id,
-            retrieved: Some(buckyos_get_unix_timestamp()),
+            authority: None,
+            supplements: Vec::new(),
+            no_proof_doc_types,
         }
     }
+}
 
-    pub fn unauthenticated(document: EncodedDocument, resolver_id: Option<String>) -> Self {
+impl Default for MethodProviders {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 同一权威发布渠道的多个委托读取端(镜像、网关、不同传输),first-win 合并成
+/// 一个权威 provider。简化文档 2.2 节:唯一的是"发布渠道",不是"能读到权威数据
+/// 的节点数"。Missing 只有在所有读取端都一致回答"没有"时才成立;任何一个读取端
+/// 传输失败而其余读取端又给不出 DR 时,整体是 unknown——宁可少回答,不能把
+/// "断网"伪装成"从未发布"。
+pub struct AuthorityReaders {
+    id: String,
+    readers: Vec<Box<dyn NsProvider>>,
+}
+
+impl AuthorityReaders {
+    pub fn new(id: impl Into<String>, readers: Vec<Box<dyn NsProvider>>) -> Self {
         Self {
-            document,
-            evidence_kind: EvidenceKind::UnauthenticatedInfo,
-            resolver_id,
-            retrieved: Some(buckyos_get_unix_timestamp()),
+            id: id.into(),
+            readers,
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl NsProvider for AuthorityReaders {
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    async fn query(
+        &self,
+        name: &str,
+        record_type: Option<RecordType>,
+        from_ip: Option<IpAddr>,
+    ) -> NSResult<NameInfo> {
+        for reader in &self.readers {
+            if let Ok(info) = reader.query(name, record_type, from_ip).await {
+                return Ok(info);
+            }
+        }
+        Err(NSError::NotFound(name.to_string()))
+    }
+
+    async fn query_did(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+        from_ip: Option<IpAddr>,
+    ) -> NSResult<EncodedDocument> {
+        let mut unknown: Option<NSError> = None;
+        let mut not_found: Option<NSError> = None;
+        for reader in &self.readers {
+            match reader.query_did(did, doc_type.clone(), from_ip).await {
+                Ok(doc) => return Ok(doc),
+                Err(NSError::Disabled(msg)) => return Err(NSError::Disabled(msg)),
+                Err(NSError::NotFound(msg)) => not_found = Some(NSError::NotFound(msg)),
+                Err(err) => {
+                    if unknown.is_none() {
+                        unknown = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = unknown {
+            return Err(err);
+        }
+        Err(not_found.unwrap_or_else(|| NSError::NotFound(did.to_string())))
+    }
+
+    async fn resolve_published_state(
+        &self,
+        did: &DID,
+        doc_type: &DidDocType,
+    ) -> NSResult<Option<PublishedState>> {
+        let mut unknown: Option<NSError> = None;
+        for reader in &self.readers {
+            match reader.resolve_published_state(did, doc_type).await {
+                Ok(Some(state)) => return Ok(Some(state)),
+                Ok(None) => {}
+                Err(NSError::Disabled(msg)) => return Err(NSError::Disabled(msg)),
+                Err(err) => {
+                    if unknown.is_none() {
+                        unknown = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = unknown {
+            return Err(err);
+        }
+        Ok(None)
     }
 }
 
@@ -287,13 +340,13 @@ pub enum ResolveWarning {
         evidence: String,
         reason: String,
     },
-    SignedByHistoricalKey,
-    KeyRotatedAfterIat,
-    PendingActivation {
-        pending_version: u64,
-        valid_from: u64,
+    /// 候选文档自声明的 owner 与 expected_owner 不一致:强攻击信号(owner 冒充,
+    /// 或未经权威源发布的 owner 变更),候选作废并打警告(简化文档 2.4 节)。
+    OwnerMismatch {
+        declared: String,
+        expected: String,
     },
-    LegacyResolverEvidence,
+    SignedByHistoricalKey,
     CacheFallback,
 }
 
@@ -381,7 +434,8 @@ pub struct DidResolutionMetadata {
     pub content_type: Option<String>,
     pub retrieved: Option<u64>,
     pub resolver_id: Option<String>,
-    pub authority_rank: Option<i32>,
+    /// 结果 body 的证据等级(按取回信道打标,简化文档 2.3 节)。
+    pub evidence: Option<BodyEvidence>,
     pub cache_status: Option<CacheStatus>,
     pub warnings: Vec<ResolveWarning>,
     pub error: Option<DidResolutionError>,
@@ -393,7 +447,7 @@ impl Default for DidResolutionMetadata {
             content_type: None,
             retrieved: None,
             resolver_id: None,
-            authority_rank: None,
+            evidence: None,
             cache_status: None,
             warnings: Vec::new(),
             error: None,
@@ -406,10 +460,7 @@ pub struct BuckyOSDocumentMetadata {
     pub doc_type: String,
     pub document_status: Option<DocumentStatus>,
     pub document_version: Option<u64>,
-    pub previous_version: Option<u64>,
-    pub lineage_epoch: Option<u64>,
     pub authority_seq: Option<u64>,
-    pub proof_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,9 +469,6 @@ pub struct DidDocumentMetadata {
     pub updated: Option<u64>,
     pub deactivated: Option<bool>,
     pub version_id: Option<String>,
-    pub next_version_id: Option<String>,
-    pub canonical_id: Option<DID>,
-    pub equivalent_ids: Vec<DID>,
     #[serde(rename = "buckyos")]
     pub buckyos: BuckyOSDocumentMetadata,
 }
@@ -438,9 +486,8 @@ impl ResolvedDocument {
         document: EncodedDocument,
         _did: &DID,
         doc_type: &DidDocType,
-        authority_rank: Option<i32>,
         resolver_id: Option<String>,
-        evidence_kind: EvidenceKind,
+        evidence: BodyEvidence,
         published: Option<&PublishedState>,
     ) -> Self {
         let doc_value = document.clone().to_json_value().ok();
@@ -456,8 +503,6 @@ impl ResolvedDocument {
         let document_version = published
             .and_then(|state| state.document_version)
             .or(version_seq);
-        let previous_version = published.and_then(|state| state.previous_version);
-        let next_version = published.and_then(|state| state.next_version);
 
         let content_type = match &document {
             EncodedDocument::Jwt(_) => "application/did+jwt",
@@ -465,20 +510,15 @@ impl ResolvedDocument {
         }
         .to_string();
 
-        let mut warnings = Vec::new();
-        if evidence_kind == EvidenceKind::AnchoredDocumentBody && published.is_none() {
-            warnings.push(ResolveWarning::LegacyResolverEvidence);
-        }
-
         Self {
             document,
             resolution_metadata: DidResolutionMetadata {
                 content_type: Some(content_type),
                 retrieved: Some(buckyos_get_unix_timestamp()),
                 resolver_id,
-                authority_rank,
+                evidence: Some(evidence),
                 cache_status: Some(CacheStatus::Miss),
-                warnings,
+                warnings: Vec::new(),
                 error: None,
             },
             document_metadata: DidDocumentMetadata {
@@ -486,19 +526,11 @@ impl ResolvedDocument {
                 updated,
                 deactivated: document_status.as_ref().map(DocumentStatus::is_terminal),
                 version_id: document_version.map(|version| version.to_string()),
-                next_version_id: next_version.map(|version| version.to_string()),
-                canonical_id: published.and_then(|state| state.canonical_id.clone()),
-                equivalent_ids: published
-                    .map(|state| state.equivalent_ids.clone())
-                    .unwrap_or_default(),
                 buckyos: BuckyOSDocumentMetadata {
                     doc_type: doc_type.to_string(),
                     document_status,
                     document_version,
-                    previous_version,
-                    lineage_epoch: published.and_then(|state| state.lineage_epoch),
                     authority_seq: published.and_then(|state| state.authority_seq),
-                    proof_root: published.and_then(|state| state.authority_root.clone()),
                 },
             },
         }
@@ -509,26 +541,34 @@ impl ResolvedDocument {
         did: &DID,
         doc_type: &DidDocType,
         exp: u64,
-        trust_level: i32,
+        evidence: BodyEvidence,
         cache_status: CacheStatus,
     ) -> Self {
         let mut resolved = Self::from_document(
             document,
             did,
             doc_type,
-            Some(trust_level),
             Some("did-cache".to_string()),
-            EvidenceKind::AnchoredDocumentBody,
+            evidence,
             None,
         );
         resolved.resolution_metadata.cache_status = Some(cache_status);
         resolved.document_metadata.updated = Some(exp);
-        let warning = if cache_status == CacheStatus::UnauthenticatedInfoHit {
-            ResolveWarning::UnauthenticatedInfoCache
-        } else {
-            ResolveWarning::CacheFallback
-        };
-        resolved.resolution_metadata.warnings.push(warning);
+        match cache_status {
+            CacheStatus::UnauthenticatedInfoHit => {
+                resolved
+                    .resolution_metadata
+                    .warnings
+                    .push(ResolveWarning::UnauthenticatedInfoCache);
+            }
+            CacheStatus::Fallback => {
+                resolved
+                    .resolution_metadata
+                    .warnings
+                    .push(ResolveWarning::CacheFallback);
+            }
+            _ => {}
+        }
         resolved
     }
 
@@ -536,16 +576,14 @@ impl ResolvedDocument {
         document: EncodedDocument,
         did: &DID,
         doc_type: &DidDocType,
-        authority_rank: Option<i32>,
         resolver_id: Option<String>,
     ) -> Self {
         Self::from_document(
             document,
             did,
             doc_type,
-            authority_rank,
             resolver_id,
-            EvidenceKind::UnauthenticatedInfo,
+            BodyEvidence::UnproofInfo,
             None,
         )
     }
@@ -564,12 +602,16 @@ impl ResolvedDocument {
 #[derive(Debug, Clone)]
 pub struct ResolvePolicy {
     pub follow_migration: bool,
+    /// 策略点②:权威源明确回答 Missing 时,自签名候选是否有入场资格。
+    /// 入场不豁免 expected_owner 一致性与验签。
     pub allow_self_signed_when_missing: bool,
-    pub allow_cache_when_authority_unavailable: bool,
+    /// 策略点④:查询没有产出可核实文档、且没有负状态屏蔽时,是否允许用
+    /// "过期但未作废"的缓存兜底。
+    pub allow_stale_cache: bool,
     pub max_depth: usize,
-    /// 本地测试/运维显式注入的发布模拟（设计文档第 7.3 节），类似 hosts 文件。
-    /// 挂在 policy 上而不是单独传参，是为了让它随 `descend()`/`for_authority_lookup()`
-    /// 一起传播到 owner 递归里——owner 解析同样要能命中 override。
+    /// 本地测试/运维显式注入的发布模拟(简化文档第 7 节),类似 hosts 文件。
+    /// 挂在 policy 上是为了让它随 `descend()`/`for_authority_lookup()` 一起传播到
+    /// owner 递归里——owner 解析同样要能命中 override。
     pub local_authority_override: Option<Arc<LocalAuthorityOverrideStore>>,
     visited: Vec<(DID, DidDocType)>,
 }
@@ -579,7 +621,7 @@ impl Default for ResolvePolicy {
         Self {
             follow_migration: true,
             allow_self_signed_when_missing: false,
-            allow_cache_when_authority_unavailable: true,
+            allow_stale_cache: true,
             max_depth: 8,
             local_authority_override: None,
             visited: Vec::new(),
@@ -596,10 +638,12 @@ impl ResolvePolicy {
         self
     }
 
+    /// owner 递归使用的收紧 policy:owner 文档只信权威渠道,关闭 Missing 自签名
+    /// 入场和 stale cache 兜底。
     pub fn for_authority_lookup(&self) -> Self {
         let mut policy = self.clone();
         policy.allow_self_signed_when_missing = false;
-        policy.allow_cache_when_authority_unavailable = false;
+        policy.allow_stale_cache = false;
         policy
     }
 
@@ -626,20 +670,20 @@ impl ResolvePolicy {
     }
 }
 
-/// 本地测试/运维显式注入的一条发布模拟记录（设计文档第 7.3 节）。
+/// 本地测试/运维显式注入的一条发布模拟记录(简化文档第 7 节)。
 #[derive(Debug, Clone)]
 struct LocalAuthorityOverrideEntry {
     document: EncodedDocument,
-    /// 记录写入者声明的作用域（machine/zone/test-env/CI job），目前只用于日志和
-    /// 调试；不参与匹配逻辑。
+    /// 记录写入者声明的作用域(machine/zone/test-env/CI job),目前只用于日志和
+    /// 调试;不参与匹配逻辑。
     #[allow(dead_code)]
     scope: String,
     /// `None` 表示不过期。
     expires_at: Option<u64>,
 }
 
-/// hosts 文件式的本地 override 存储：只能被显式写入 API 写入，不参与普通
-/// `DIDDocumentCache` 的持久化/淘汰逻辑，默认不导出、不广播、不同步到普通 cache。
+/// hosts 文件式的本地 override 存储:只能被显式写入 API 写入,不参与普通
+/// `DIDDocumentCache` 的持久化/淘汰逻辑,默认不导出、不广播、不同步到普通 cache。
 #[derive(Debug, Default)]
 pub struct LocalAuthorityOverrideStore {
     entries: RwLock<HashMap<(DID, String), LocalAuthorityOverrideEntry>>,
@@ -689,62 +733,18 @@ impl LocalAuthorityOverrideStore {
     }
 }
 
-/// Owner 对可达性敏感 doc_type 的发布保护策略。设计文档第 12 节的落点，
-/// Phase 1-2 阶段先留空结构，具体规则在后续 Phase 落地。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReachabilityPolicy {}
-
-/// Owner Config 是验证策略源（设计文档第 6 节），不是调用方传入的 `ResolvePolicy`。
-/// 它来自递归解析出的 owner 文档本身，而不是调用方配置。
+/// owner 文档声明的验证策略(简化 TODO T2.1:收缩到 `revoke_before_iat`,
+/// 其它按 doc_type 的策略等 owner 文档真实声明后再加回)。
 #[derive(Debug, Clone, Default)]
 pub struct OwnerDocumentPolicy {
-    /// 一键否决此时间点（含）之前签发的所有文档，即使签名合法。
+    /// 一键否决此时间点(含)之前签发的所有文档,即使签名合法(replay guard)。
     pub revoke_before_iat: Option<u64>,
-    /// 权威发布源返回 Missing 时，是否允许按 doc_type 进入自签名 fallback。
-    pub allow_self_signed_when_missing: HashMap<String, bool>,
-    /// 权威发布源不可达时，是否允许按 doc_type 使用已验证过的本地结果。
-    pub allow_cache_when_authority_unavailable: HashMap<String, bool>,
-    /// 可达性敏感 doc_type（zone/device/service 等）的发布保护策略。
-    pub reachability_sensitive: HashMap<String, ReachabilityPolicy>,
 }
 
 impl OwnerDocumentPolicy {
-    /// 从递归解析并验签得到的 owner 文档派生策略。目前只落地 `revoke_before_iat`
-    /// （复用 `OwnerDocument::valid_iat` 既有语义），其余字段是尚未被 owner 文档
-    /// 显式声明的扩展点，默认空 map 表示"由调用方 ResolvePolicy 兜底"。
     pub fn from_owner_document(owner_document: &OwnerDocument) -> Self {
         Self {
             revoke_before_iat: owner_document.valid_iat,
-            allow_self_signed_when_missing: HashMap::new(),
-            allow_cache_when_authority_unavailable: HashMap::new(),
-            reachability_sensitive: HashMap::new(),
-        }
-    }
-}
-
-/// 递归解析得到的 owner 验证上下文：owner 的 DID、用于验签的 key，以及
-/// owner 自己声明的验证策略。
-#[derive(Debug, Clone)]
-pub struct OwnerContext {
-    pub owner_did: DID,
-    pub decoding_key: DecodingKey,
-    pub public_key: jsonwebtoken::jwk::Jwk,
-    pub policy: OwnerDocumentPolicy,
-}
-
-/// 验证根：owner 是递归基（`MethodAuthority`），普通文档递归到 owner 文档
-/// 拿到 `Owner(OwnerContext)`。参见设计文档第 1.1/9 节。
-#[derive(Debug, Clone)]
-pub enum VerificationRoot {
-    MethodAuthority,
-    Owner(OwnerContext),
-}
-
-impl VerificationRoot {
-    pub fn owner_document_policy(&self) -> OwnerDocumentPolicy {
-        match self {
-            VerificationRoot::MethodAuthority => OwnerDocumentPolicy::default(),
-            VerificationRoot::Owner(ctx) => ctx.policy.clone(),
         }
     }
 }
@@ -990,65 +990,24 @@ impl NameInfo {
 
         return Ok(did_documents);
     }
-    // pub fn from_zone_document_str(
-    //     name: &str,
-    //     zone_document_jwt: &str,
-    //     zone_document_pkx: &str,
-    //     zone_gateway_device_list: &Option<Vec<String>>,
-    // ) -> Self {
-
-    //     let ttl = 3600;
-    //     let pkx_string = format!("0:{}", zone_document_pkx);
-    //     let mut pk_x_list = vec![pkx_string];
-    //     if let Some(device_list) = zone_gateway_device_list {
-    //         for device_did in device_list {
-    //             let device_did = DID::from_str(device_did.as_str());
-    //             if device_did.is_ok() {
-    //                 let device_did = device_did.unwrap();
-    //                 let pkx_string = format!("1:{}", device_did.id);
-    //                 pk_x_list.push(pkx_string);
-    //             }
-    //         }
-    //     }
-
-    //     let zone_boot_document_doc = EncodedDocument::from_str(zone_document_jwt.to_string()).unwrap();
-    //     Self {
-    //         name: name.to_string(),
-    //         address: vec![],
-    //         cname: None,
-    //         txt: Vec::new(),
-    //         iat: 0,
-    //         ttl: Some(ttl),
-    //     }
-    // }
 }
 
+/// resolver-provider 是内核模型(简化文档 2.2 节):所有 provider 都是内核实现,
+/// 可信的是"它如实转述了从哪条信道查到了什么";内容本身可不可信,由主循环的
+/// need_proof / verify 判定。provider 只需要诚实回答两件事:
+/// - `resolve_published_state`:权威源的发布状态 + owner 绑定(补充源永远返回 `Ok(None)`);
+/// - `query_did`:从自己的信道取回文档 body(`NotFound` = 该信道没有,其它错误 = 没得到回答)。
+///
+/// 证据等级不由 provider 自己声明,而是由注册位置(权威渠道 / 补充源)决定。
 #[async_trait::async_trait]
 pub trait NsProvider: 'static + Send + Sync {
     fn get_id(&self) -> String;
 
-    fn methods(&self) -> MethodMatcher {
-        MethodMatcher::Any
-    }
-
-    fn caps(&self) -> ResolverCaps {
-        ResolverCaps::default()
-    }
-
-    fn requires_verification(&self, doc_type: &DidDocType) -> bool {
-        doc_type != &DidDocType::Info
-    }
-
-    /// 该 (did, doc_type) 是否是 owner 递归的递归基：默认约定是
-    /// `doc_type == "owner"`（设计文档第 6.4 节）。method 有自证根
-    /// （例如 did:dev 用 DID 自身的 key）时可以覆盖。
-    fn is_owner_root(
-        &self,
-        _did: &DID,
-        doc_type: &DidDocType,
-        _published: Option<&PublishedState>,
-    ) -> bool {
-        doc_type == &DidDocType::Owner
+    /// 该 provider 默认服务的 DID method 列表。仅供 `NameClient::add_provider`
+    /// 兼容注册使用;新代码应通过 `set_method_authority` / `add_method_supplement`
+    /// 显式注册,不支持 wildcard。
+    fn methods(&self) -> Vec<String> {
+        Vec::new()
     }
 
     async fn query(
@@ -1057,6 +1016,7 @@ pub trait NsProvider: 'static + Send + Sync {
         record_type: Option<RecordType>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<NameInfo>;
+
     async fn query_did(
         &self,
         did: &DID,
@@ -1070,39 +1030,6 @@ pub trait NsProvider: 'static + Send + Sync {
         _doc_type: &DidDocType,
     ) -> NSResult<Option<PublishedState>> {
         Ok(None)
-    }
-
-    async fn fetch_document_body(&self, doc_ref: &DocumentRef) -> NSResult<Option<DocumentBody>> {
-        Ok(doc_ref
-            .inline_document
-            .as_ref()
-            .map(|doc| DocumentBody::anchored(doc.clone(), Some(self.get_id()))))
-    }
-
-    async fn query_self_signed_candidates(
-        &self,
-        did: &DID,
-        doc_type: &DidDocType,
-    ) -> NSResult<Vec<DocumentBody>> {
-        let legacy_doc_type = if doc_type == &DidDocType::Zone {
-            None
-        } else {
-            Some(doc_type.clone())
-        };
-        let doc = self.query_did(did, legacy_doc_type, None).await?;
-        Ok(vec![DocumentBody::anchored(doc, Some(self.get_id()))])
-    }
-
-    async fn query_unauthenticated_info(
-        &self,
-        did: &DID,
-        doc_type: &DidDocType,
-    ) -> NSResult<Vec<DocumentBody>> {
-        let doc = self.query_did(did, Some(doc_type.clone()), None).await?;
-        Ok(vec![DocumentBody::unauthenticated(
-            doc,
-            Some(self.get_id()),
-        )])
     }
 }
 
@@ -1248,5 +1175,40 @@ mod tests {
         assert_eq!(name_info.txt.len(), 1, "should preserve original TXT");
 
         println!("✓ test_parse_txt_record_without_owner_key passed");
+    }
+
+    #[test]
+    fn test_structural_owner_derivation() {
+        // 二级 bns 名字:结构 owner 是去掉第一段后的父名字。
+        assert_eq!(
+            structural_owner(&DID::new("bns", "app1.alice")),
+            Some(DID::new("bns", "alice"))
+        );
+        assert_eq!(
+            structural_owner(&DID::new("bns", "a.b.c")),
+            Some(DID::new("bns", "b.c"))
+        );
+        // 一级名字是根,推不出结构 owner。
+        assert_eq!(structural_owner(&DID::new("bns", "alice")), None);
+        // did:web 的点号是 DNS 层级,不是 bns 所有权结构。
+        assert_eq!(structural_owner(&DID::new("web", "www.example.com")), None);
+    }
+
+    #[test]
+    fn test_key_class_method_detection() {
+        assert!(is_key_class_method("dev"));
+        assert!(is_key_class_method("key"));
+        assert!(!is_key_class_method("bns"));
+        assert!(!is_key_class_method("web"));
+    }
+
+    #[test]
+    fn test_content_hash_matches() {
+        let doc = EncodedDocument::JsonLd(json!({"marker": "hash-me"}));
+        let hash = document_content_hash(&doc);
+        assert!(content_hash_matches(&hash, &doc));
+        assert!(content_hash_matches(&format!("sha256:{}", hash), &doc));
+        assert!(content_hash_matches(&hash.to_uppercase(), &doc));
+        assert!(!content_hash_matches("deadbeef", &doc));
     }
 }

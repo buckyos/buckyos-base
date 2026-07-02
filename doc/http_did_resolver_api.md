@@ -18,9 +18,9 @@
 > 换句话说：**任何新 did:method，只要想要完整的验证/状态机语义，走的都应该是本文档定义的 HTTP
 > 协议**，而不是给 DNS resolver 加字段，也不是给 `resolve_did` 加 method-specific 分支。
 >
-> 背景：[resolve_did重构.md](./resolve_did重构.md) 把 `resolve_did` 升级为围绕 `PublishedState`
-> 状态机的解析引擎；[resolve_did重构_TODO.md](./resolve_did重构_TODO.md) Phase 3（T3.1/T3.2）在
-> `src/name-client/src/bns_provider.rs` 里把状态机映射逻辑和单测先跑通了。本文档定稿后，
+> 背景：[简单介绍resolve-did.md](./简单介绍resolve-did.md) 是解析语义的主规范
+>（[resolve_did重构.md](./resolve_did重构.md) 是它的历史设计文档）。`resolve_did` 主循环里
+> "权威源回答发布状态 + owner 绑定 + doc_hash"这一类回答,在 HTTP 上就按本文档的信封传递。
 > **客户端（`name-client`）一侧已经按这份协议实现**：见下面的"落地状态"。
 >
 > **落地状态**：
@@ -28,8 +28,10 @@
 >   直接发起 `GET /1.0/identifiers/{did}?type={doc_type}` 请求，按本文档 §3 的信封解析
 >   `didDocumentMetadata.buckyos.*`；纯解析逻辑拆成 `parse_published_state_body`（见该文件
 >   `#[cfg(test)] mod tests` 里的用例，直接用字面量状态码/JSON body 验证，不需要真的发请求）。
->   `HttpsProvider::caps().published_state` 现在是 `true`，对任何走 `HttpsProvider` 的
->   did:method 都生效（不只是 BNS）。`BnsProvider::resolve_published_state` 就是一行转发：
+>   `resolve_published_state` 对任何走 `HttpsProvider` 的 did:method 都生效（不只是 BNS）;
+>   一个 provider 是不是"权威源"由它在 method registry 里的注册位置决定
+>   （`set_method_authority` / `add_method_supplement`），不再由 caps 声明。
+>   `BnsProvider::resolve_published_state` 就是一行转发：
 >   `self.inner.resolve_published_state(did, doc_type)`，本身不再有任何 transport 抽象或状态机
 >   映射代码。
 > - **服务端（resolver 实现方，例如 bns-server）：未实现。** 目前没有任何真实端点会在响应体里带
@@ -65,8 +67,9 @@ GET https://{provider}/1.0/identifiers/{did}?type={doc_type}
    `didResolutionMetadata` / `didDocument` / `didDocumentMetadata` 三段式，wire 协议理应对齐同一套，
    与 method 无关。
 4. `resolve_did` 引擎侧的 `NsProvider::resolve_published_state` 也是 method-agnostic 的接口
-   （不同 method 通过 `MethodMatcher` 决定该不该被调用，而不是接口本身区分 method），协议层保持
-   一致，未来加新 method 不需要改协议、只需要新增一个实现方。
+   （一个 provider 服务哪个 method、是权威渠道还是补充源，由 method registry 的注册位置决定，
+   而不是接口本身区分 method），协议层保持一致，未来加新 method 不需要改协议、
+   只需要新增一个实现方。
 
 ## 2. 请求
 
@@ -96,24 +99,18 @@ Accept: application/did-resolution+json
     "contentType": "application/did+ld+json", // 或 "application/did+jwt"，取决于 didDocument 的编码
     "error": null                              // 见第 5 节；仅在错误时非空
   },
-  "didDocument": { /* Active/Expired 时必填，内联的 DID 文档（JsonLd 或 JWT 字符串） */ },
+  "didDocument": { /* Active 时建议内联的 DID 文档（JsonLd 或 JWT 字符串），也可只给 docHash 锚点 */ },
   "didDocumentMetadata": {
     "versionId": "3",            // 字符串化的 document_version
-    "nextVersionId": null,       // 只有确实知道下一版时才填
-    "canonicalId": null,
-    "equivalentId": [],
     "deactivated": false,        // Revoked/Tombstoned 时为 true
     "buckyos": {
       "docType": "zone",
       "documentStatus": "active",   // active | missing | revoked | tombstoned | migrated | expired
       "documentVersion": 3,
-      "previousVersion": 2,
-      "lineageEpoch": 1,
       "authoritySeq": 9,
-      "effectiveOwner": "did:bns:waterflier",
-      "ownerSource": "methodAuthority", // methodAuthority | documentClaim | unknown
-      "authorityRoot": "0x...",         // 合约/证明根的十六进制哈希，可为 null
-      "migrationTarget": null           // Migrated 时必填，目标 DID 字符串
+      "effectiveOwner": "did:bns:waterflier", // 权威源的 owner 绑定，可以不带文档本体单独返回
+      "docHash": "sha256:...",      // 可选：已发布 body 的内容哈希锚点（编码后文档字符串的 sha256）
+      "migrationTarget": null       // Migrated 时必填，目标 DID 字符串
     }
   }
 }
@@ -121,25 +118,22 @@ Accept: application/did-resolution+json
 
 ### 字段 ↔ Rust 类型对照表
 
+随 `PublishedState` 裁剪（resolve_did 简化,只保留有真实生产者/消费者的字段），客户端只消费下表
+字段；旧草案中的 `previousVersion` / `nextVersionId` / `lineageEpoch` / `ownerSource` /
+`authorityRoot` / `canonicalId` / `equivalentId` **不再被消费**，服务端可以不实现（返回了也会被
+忽略，不会报错）。
+
 | JSON 字段（camelCase） | Rust 字段（`PublishedState`，见 `https_provider.rs` 的 `BuckyosMetadataWire`） | 说明 |
 | --- | --- | --- |
-| `didDocumentMetadata.versionId` | `document_version` | 字符串化的 `u64` |
-| `didDocumentMetadata.nextVersionId` | `next_version` | 只有能证明下一版时才填 |
+| `didDocumentMetadata.versionId` | `document_version` | 字符串化的 `u64`（`documentVersion` 的后备来源） |
 | `didDocumentMetadata.buckyos.docType` | `doc_type` | |
 | `didDocumentMetadata.buckyos.documentStatus` | `document_status`（`DocumentStatus` 枚举） | 见第 4 节映射 |
 | `didDocumentMetadata.buckyos.documentVersion` | `document_version` | |
-| `didDocumentMetadata.buckyos.previousVersion` | `previous_version` | |
-| `didDocumentMetadata.buckyos.lineageEpoch` | `lineage_epoch` | 世代变化是信任断点（设计文档 7.1 第 4 条） |
 | `didDocumentMetadata.buckyos.authoritySeq` | `authority_seq` | |
-| `didDocumentMetadata.buckyos.effectiveOwner` | `effective_owner`（`DID`） | 完整 DID 字符串，如 `did:bns:alice` |
-| `didDocumentMetadata.buckyos.ownerSource` | `owner_source`（`OwnerSource` 枚举） | 见下方取值 |
-| `didDocumentMetadata.buckyos.authorityRoot` | `authority_root` | |
+| `didDocumentMetadata.buckyos.effectiveOwner` | `effective_owner`（`DID`） | 权威源的 owner 绑定；候选文档的 `doc.owner` 必须与它一致（expected_owner 硬规则） |
+| `didDocumentMetadata.buckyos.docHash` | `document_ref.content_hash` | 已发布 body 的锚点；见第 6 节 |
 | `didDocumentMetadata.buckyos.migrationTarget` | `migration_target`（`DID`） | 仅 Migrated 状态使用 |
-| `didDocumentMetadata.canonicalId` / `equivalentId` | `canonical_id` / `equivalent_ids` | 只有同 method 强等价时才填，见设计文档 1.4 |
 | `didDocument` | `document_ref.inline_document` | 见第 6 节 |
-
-`ownerSource` 取值：`methodAuthority`（Registry 直接给出）、`documentClaim`（退化到文档自声明）、
-`unknown`（无法判断，`BnsProvider` 会当作待验证处理）。
 
 ## 4. `document_status` 状态机
 
@@ -156,9 +150,9 @@ Accept: application/did-resolution+json
 `HttpsProvider::published_state_from_wire` 对 `documentStatus` 字符串的匹配分支——resolver
 实现方按这张表把状态映射到对应的字符串/状态码即可，客户端这边已经按这份协议实现好了。
 
-`Revoked` / `Tombstoned` 是强负状态：解析引擎收到后会直接拒绝并清掉本地 fallback cache（
-`resolve_from_published_state` 里 `DocumentStatus::Revoked | Tombstoned` 分支），**不允许**被后续
-self-signed candidate 或本地 cache 绕过。resolver 实现方要保证一旦转入这两个状态，`GET` 必须稳定返回
+`Revoked` / `Tombstoned` 是强负状态（主循环策略点①）：解析引擎收到后终止查询、删除本地 positive
+cache、**把负状态本身缓存下来**，之后的任何 fallback——过期缓存、自签名候选、push 写入——都会被它
+屏蔽，只能被权威源新的"已发布"回答翻篇。resolver 实现方要保证一旦转入这两个状态，`GET` 必须稳定返回
 `410`，不能因为缓存/多副本不一致而偶发地又吐出旧的 `200 active`。
 
 ## 5. HTTP 状态码与错误的边界（对应 T3.2）
@@ -185,25 +179,20 @@ self-signed candidate 或本地 cache 绕过。resolver 实现方要保证一旦
 `NotApplicable` 改用一个自定义响应头（如 `X-Buckyos-Not-Applicable: 1`）而不是复用 404，待实现阶段
 根据实际情况再定。
 
-## 6. 文档内容：v1 只要求内联，不做外链 content-hash 拉取
+## 6. 文档内容：内联 body 或 `docHash` 锚点
 
-`PublishedState.document_ref` 在 Rust 里同时支持 `inline_document` 和 `uri + content_hash` 两种形态
-（[provider.rs](../src/name-client/src/provider.rs) 的 `DocumentRef`），但**这份协议的 v1 版本只要求
-内联**：`didDocument` 字段直接携带完整文档内容（JsonLd 对象或 JWT 字符串）。
+`PublishedState.document_ref` 在 Rust 里同时支持 `inline_document` 和 `content_hash` 两种形态
+（[provider.rs](../src/name-client/src/provider.rs) 的 `DocumentRef`）。协议支持两种回答方式：
 
-理由：外链 + content-hash 校验需要额外一次网络往返和一套独立的 hash 校验逻辑，`fetch_document_body`
-目前的默认实现也只处理内联情形（见 `BnsProvider::fetch_document_body` 里的注释）。等确认有大文档
-（超过合理的响应体大小）需要外链时，再补充：
+1. **内联**（推荐）：`didDocument` 字段直接携带完整文档内容（JsonLd 对象或 JWT 字符串）。
+2. **锚点**（anchor-only）：`Active` 回答只携带 `buckyos.docHash`，body 由解析引擎从后续补充源
+   取回；只有内容哈希命中锚点的 body 才被视为"属于已发布集合"，验签不通过锚点的候选一律作废
+   （简化文档第 4 节的 hash 锚定执行点）。两者同时给出时，客户端也会对内联 body 做锚点校验。
 
-```jsonc
-"buckyos": {
-  "documentRefUri": "https://.../blob/abcd1234",
-  "contentHash": "sha256:...."
-}
-```
+`docHash` 的取值约定：**编码后文档字符串**（JWT 原文，或 JSON 序列化结果）的 sha256，hex 编码，
+可带 `sha256:` 前缀，大小写不敏感（见 `provider.rs` 的 `document_content_hash`）。
 
-并在 `name-client` 里实现对应的外链拉取 + hash 校验（目前代码里只有字段占位，没有实现，见
-`DocumentRef` 定义处的注释）。
+外链 `uri` 拉取目前仍未实现（`DocumentRef.uri` 只有字段占位）；有真实需求时再补充。
 
 ## 7. 历史 owner 查询：`effective_owner_at(iat)`
 
@@ -241,11 +230,11 @@ GET {resolver_base}/1.0/identifiers/{did}?type=owner&iat={unix_timestamp}
 用 `501` 专门表示"能力缺失，非错误、非负状态"，和第 5 节"网络/内部错误 → transport error"、
 "明确判定 Missing → 404"分开，避免三种语义互相污染。
 
-> 代码侧提醒（不在本文档范围内，留给后续实现）：目前 `verify_owned_candidate`
-> （[name_query.rs](../src/name-client/src/name_query.rs)）里的 `OwnerConflict` 检查用的是"当前
-> `effective_owner`"，签名验证失败时对历史 key 是无差别地逐个尝试（`get_historical_keys()`），
-> 都还没有把候选文档自己的 `iat` 传下去做时间点匹配。等这个端点真正实现之后，应该让
-> `verify_owned_candidate` 把候选文档的 `iat` 带上，查询更精确的历史 owner/key，而不是"当前 owner
+> 代码侧提醒（不在本文档范围内，留给后续实现）：目前 `verify_need_proof_candidate`
+> （[name_query.rs](../src/name-client/src/name_query.rs)）的 expected_owner 用的是"当前
+> `effectiveOwner` 绑定（或名字结构默认值）"，签名验证失败时对历史 key 是无差别地逐个尝试
+> （`get_historical_keys()`），还没有把候选文档自己的 `iat` 传下去做时间点匹配。等这个端点真正
+> 实现之后，应该把候选文档的 `iat` 带上，查询更精确的历史 owner/key，而不是"当前 owner
 > + 历史 key 盲试"这种近似实现。这是一个独立的代码改动，不含在这次的文档变更里。
 
 ## 8. 未决问题

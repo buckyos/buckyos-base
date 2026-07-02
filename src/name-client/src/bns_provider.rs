@@ -2,7 +2,9 @@
 实现基于bns合约的NsProvider实现
 从接口上是对https_provider的封装
 1. 通过输入machine_config的web3网桥配置，得到正确的查询URL
-2. 只处理 did method是bns和dev的请求，其它一概返回不支持
+2. 只处理 did method 是 bns 的请求,其它一概返回不支持。
+   did:dev 是 key 类 DID,不是 resolve_did 的合法入参(简化文档第 6 节),
+   任何 provider 都不再受理它。
 
 `BnsProvider` 就是本文件唯一该有的"Bns"命名：一个指向 web3_bridge.bns host 的薄配置壳。
 所有实际的 HTTP 请求/响应解析——包括 `query_did` 和 `resolve_published_state`——都转发给
@@ -11,10 +13,7 @@
 协议见 doc/http_did_resolver_api.md。
 */
 
-use crate::{
-    DidDocType, HttpsProvider, MethodMatcher, NameInfo, NsProvider, PublishedState, RecordType,
-    ResolverCaps,
-};
+use crate::{DidDocType, HttpsProvider, NameInfo, NsProvider, PublishedState, RecordType};
 use async_trait::async_trait;
 use buckyos_kit::BuckyOSMachineConfig;
 use log::info;
@@ -22,7 +21,8 @@ use name_lib::{EncodedDocument, NSError, NSResult, DID};
 use serde_json::Value;
 use std::net::IpAddr;
 
-/// 基于 web3 bridge 的 BNS/DEV DID 解析器，内部完全复用 `HttpsProvider`。
+/// 基于 web3 bridge 的 BNS DID 解析器(bns method 的权威渠道委托读取端),
+/// 内部完全复用 `HttpsProvider`。
 pub struct BnsProvider {
     inner: HttpsProvider,
 }
@@ -76,18 +76,8 @@ impl NsProvider for BnsProvider {
         "bns-provider".to_string()
     }
 
-    fn methods(&self) -> MethodMatcher {
-        MethodMatcher::exact(["bns", "dev"])
-    }
-
-    fn caps(&self) -> ResolverCaps {
-        ResolverCaps {
-            published_state: true,
-            document_body: true,
-            self_signed_candidate: true,
-            unauthenticated_info: true,
-            negative_state: true,
-        }
+    fn methods(&self) -> Vec<String> {
+        vec!["bns".to_string()]
     }
 
     async fn query(
@@ -107,7 +97,7 @@ impl NsProvider for BnsProvider {
         doc_type: Option<DidDocType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        if did.method != "bns" && did.method != "dev" {
+        if did.method != "bns" {
             return Err(NSError::NotFound(format!(
                 "unsupported did method: {}",
                 did.to_string()
@@ -126,7 +116,7 @@ impl NsProvider for BnsProvider {
         did: &DID,
         doc_type: &DidDocType,
     ) -> NSResult<Option<PublishedState>> {
-        if did.method != "bns" && did.method != "dev" {
+        if did.method != "bns" {
             return Ok(None);
         }
 
@@ -143,6 +133,11 @@ mod tests {
         let provider = BnsProvider::new().unwrap();
         let did = DID::from_str("did:web:example.com").unwrap();
         let err = provider.query_did(&did, None, None).await.unwrap_err();
+        assert!(matches!(err, NSError::NotFound(_)));
+
+        // did:dev 不再是任何 provider 的受理对象。
+        let dev_did = DID::from_str("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE").unwrap();
+        let err = provider.query_did(&dev_did, None, None).await.unwrap_err();
         assert!(matches!(err, NSError::NotFound(_)));
     }
 

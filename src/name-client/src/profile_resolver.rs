@@ -440,15 +440,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             "profile-mock".to_string()
         }
 
-        // "user" 文档不是自声明 owner 字段的通用 Document 类型：它的归属由请求 DID
-        // 的命名结构（`split_bns_user_zone_did`）决定，而不是文档内容自身。它的真实性
-        // 由 `decode_user_profile` 用调用方已解析出的 owner key 单独验证，因此这里
-        // 声明成免验证，交给 resolve_profile_source 自己的验签逻辑处理，避免走进
-        // 通用递归验证管线（那条管线无法从文档内容推断出这个 owner 关系）。
-        fn requires_verification(&self, doc_type: &DidDocType) -> bool {
-            doc_type != &DidDocType::User
-        }
-
+        // "user" 文档的真实性由 `decode_user_profile` 用调用方已解析出的 owner key
+        // 单独验证;测试里 mock 注册为权威渠道,取回的 body 按 anchored 对待,
+        // 不进入管线内的 owner 递归验签。
         async fn query(
             &self,
             _name: &str,
@@ -543,20 +537,21 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             cache_backend: crate::CacheBackend::Memory,
             ..Default::default()
         });
+        // 权威渠道 first-win:注册为 authority 的 provider 的回答优先于补充源。
         client
-            .add_provider(
-                Box::new(ProfileMockProvider {
-                    docs: low_priority_docs,
-                }),
-                Some(50),
-            )
-            .await;
-        client
-            .add_provider(
+            .set_method_authority(
+                "bns",
                 Box::new(ProfileMockProvider {
                     docs: high_priority_docs,
                 }),
-                Some(10),
+            )
+            .await;
+        client
+            .add_method_supplement(
+                "bns",
+                Box::new(ProfileMockProvider {
+                    docs: low_priority_docs,
+                }),
             )
             .await;
 
@@ -680,7 +675,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             ..Default::default()
         });
         client
-            .add_provider(Box::new(ProfileMockProvider { docs }), Some(10))
+            .set_method_authority("bns", Box::new(ProfileMockProvider { docs }))
             .await;
 
         let merged = client
@@ -722,7 +717,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             ..Default::default()
         });
         client
-            .add_provider(Box::new(ProfileMockProvider { docs }), Some(10))
+            .set_method_authority("bns", Box::new(ProfileMockProvider { docs }))
             .await;
 
         let merged = client
@@ -764,7 +759,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             ..Default::default()
         });
         client
-            .add_provider(Box::new(ProfileMockProvider { docs }), Some(10))
+            .set_method_authority("bns", Box::new(ProfileMockProvider { docs }))
             .await;
 
         assert!(client
