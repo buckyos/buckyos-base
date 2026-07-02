@@ -17,13 +17,13 @@ use serde_json::Value;
 use std::net::IpAddr;
 
 /// Resolve DID documents through an HTTPS resolver endpoint.
-pub struct HttpsProvider {
+pub struct BaseHttpProvider {
     resolver_host: String,
     client: Client,
     scheme: String,
 }
 
-impl HttpsProvider {
+impl BaseHttpProvider {
     /// Create a provider with default https scheme.
     pub fn new(resolver_host: &str) -> Self {
         Self {
@@ -75,7 +75,13 @@ impl HttpsProvider {
         }
     }
 
-    async fn parse_response(did: &DID, resp: reqwest::Response) -> NSResult<EncodedDocument> {
+    /// method-agnostic 的 HTTP DID 响应归一:状态码映射(404/403/410)、
+    /// resolver 信封拆包、JsonLd/Jwt 识别。各 method 的 provider
+    /// (SmartProvider / WebProvider)统一复用,不各自实现。
+    pub(crate) async fn parse_response(
+        did: &DID,
+        resp: reqwest::Response,
+    ) -> NSResult<EncodedDocument> {
         let status = resp.status();
         let body = resp
             .text()
@@ -276,7 +282,7 @@ struct BuckyosMetadataWire {
 }
 
 #[async_trait]
-impl NsProvider for HttpsProvider {
+impl NsProvider for BaseHttpProvider {
     fn get_id(&self) -> String {
         format!("https-resolver:{}", self.resolver_host)
     }
@@ -299,14 +305,14 @@ impl NsProvider for HttpsProvider {
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         let url = self.build_url(did, doc_type.as_ref());
-        info!("https provider querying {}", url);
+        debug!("https provider querying {}", url);
         let resp = self
             .client
             .get(url.clone())
             .send()
             .await
             .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
-        HttpsProvider::parse_response(did, resp).await
+        BaseHttpProvider::parse_response(did, resp).await
     }
 
     async fn resolve_published_state(
@@ -434,7 +440,7 @@ impl NsProvider for SmartProvider {
             .await
             .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
 
-        HttpsProvider::parse_response(did, resp).await
+        BaseHttpProvider::parse_response(did, resp).await
     }
 }
 
@@ -469,7 +475,7 @@ mod tests {
         })
         .to_string();
 
-        let state = HttpsProvider::parse_published_state_body(
+        let state = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::OK,
@@ -497,7 +503,7 @@ mod tests {
             "didDocumentMetadata": {"buckyos": {"documentStatus": "missing"}}
         })
         .to_string();
-        let missing = HttpsProvider::parse_published_state_body(
+        let missing = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::NOT_FOUND,
@@ -511,7 +517,7 @@ mod tests {
             "didDocumentMetadata": {"buckyos": {"documentStatus": "revoked"}}
         })
         .to_string();
-        let revoked = HttpsProvider::parse_published_state_body(
+        let revoked = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::GONE,
@@ -525,7 +531,7 @@ mod tests {
             "didDocumentMetadata": {"buckyos": {"documentStatus": "tombstoned"}}
         })
         .to_string();
-        let tombstoned = HttpsProvider::parse_published_state_body(
+        let tombstoned = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::GONE,
@@ -541,7 +547,7 @@ mod tests {
             }
         })
         .to_string();
-        let migrated = HttpsProvider::parse_published_state_body(
+        let migrated = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::OK,
@@ -564,7 +570,7 @@ mod tests {
         })
         .to_string();
 
-        let state = HttpsProvider::parse_published_state_body(
+        let state = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::OK,
@@ -581,7 +587,7 @@ mod tests {
         // 第三方 did:web / did:key resolver（identity.foundation、uniresolver.io 等）根本不
         // 知道这个扩展，普通的 404（甚至没有 JSON body）必须被当成"不适用"，而不是报错。
         let did = DID::from_str("did:web:example.com").unwrap();
-        let state = HttpsProvider::parse_published_state_body(
+        let state = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::NOT_FOUND,
@@ -601,7 +607,7 @@ mod tests {
             "didDocumentMetadata": {"deactivated": false}
         })
         .to_string();
-        let state = HttpsProvider::parse_published_state_body(
+        let state = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::OK,
@@ -616,7 +622,7 @@ mod tests {
     #[test]
     fn unexpected_status_code_is_transport_error_not_negative_state() {
         let did = DID::from_str("did:bns:waterflier").unwrap();
-        let err = HttpsProvider::parse_published_state_body(
+        let err = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -629,7 +635,7 @@ mod tests {
     #[test]
     fn malformed_json_on_200_is_transport_error() {
         let did = DID::from_str("did:bns:waterflier").unwrap();
-        let err = HttpsProvider::parse_published_state_body(
+        let err = BaseHttpProvider::parse_published_state_body(
             &did,
             &DidDocType::Zone,
             StatusCode::OK,
@@ -641,7 +647,7 @@ mod tests {
 
     #[test]
     fn build_url_uses_http_base_url_directly() {
-        let provider = HttpsProvider::new("http://127.0.0.1:3200");
+        let provider = BaseHttpProvider::new("http://127.0.0.1:3200");
         let did = DID::from_str("did:bns:example").unwrap();
 
         assert_eq!(
@@ -652,7 +658,7 @@ mod tests {
 
     #[test]
     fn build_url_keeps_default_https_for_bare_host() {
-        let provider = HttpsProvider::new("127.0.0.1:3200");
+        let provider = BaseHttpProvider::new("127.0.0.1:3200");
         let did = DID::from_str("did:bns:example").unwrap();
 
         assert_eq!(
@@ -720,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_did_via_identity_foundation() {
-        let provider = HttpsProvider::new("resolver.identity.foundation");
+        let provider = BaseHttpProvider::new("resolver.identity.foundation");
         // 使用 resolver.identity.foundation 自身的 did:web 作为稳定样例
         let did = DID::from_str("did:web:identity.foundation").unwrap();
 
@@ -740,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_did_via_uniresolver() {
-        let provider = HttpsProvider::new("uniresolver.io");
+        let provider = BaseHttpProvider::new("uniresolver.io");
         // did:key 由密钥直接派生，uniresolver 官方示例，可稳定解析
         let did =
             DID::from_str("did:key:z6Mksw4bDmn77uB5iVbQJBALV4CfqUGNoTCJQwdse1dQcvbK").unwrap();

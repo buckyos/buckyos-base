@@ -13,6 +13,7 @@ mod name_query;
 mod profile_resolver;
 mod provider;
 mod utility;
+mod web_provider;
 
 pub use addr_rtt_db::*;
 pub use bns_provider::*;
@@ -28,6 +29,7 @@ pub use name_query::*;
 pub use profile_resolver::*;
 pub use provider::*;
 pub use utility::*;
+pub use web_provider::*;
 
 use log::*;
 use name_lib::*;
@@ -96,9 +98,11 @@ pub async fn init_name_lib_ex(
     client
         .add_method_supplement("bns", Box::new(SmartProvider::new()))
         .await;
-    // did:web —— 权威渠道是域名自身的发布面:DNS TXT 与 .well-known 静态文件是
-    // 同一渠道(域名控制权)的两个委托读取端,first-win 合并;Missing 需要两个
-    // 读取端一致才成立,任何一个传输失败都按 unknown 处理。
+    // did:web —— 权威渠道是域名自身的发布面:DNS TXT 与 WebProvider 是同一渠道
+    // (域名控制权)的两个委托读取端,first-win 合并;Missing 需要读取端一致才
+    // 成立,任何一个传输失败都按 unknown 处理。WebProvider 内部先查 W3C
+    // well-known 静态 URL(静态部署即可发布),未命中再回退 uppername 的
+    // resolver 接口(上级域名为子域集中提供动态解析),见 web_provider.rs。
     client
         .set_method_authority(
             "web",
@@ -106,7 +110,7 @@ pub async fn init_name_lib_ex(
                 "web-authority",
                 vec![
                     Box::new(DnsProvider::new(None)),
-                    Box::new(SmartProvider::new()),
+                    Box::new(WebProvider::new()),
                 ],
             )),
         )

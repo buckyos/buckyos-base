@@ -195,6 +195,46 @@ impl DID {
         None
     }
 
+    /// 名字层级上的上级名字(uppername):去掉名字最左边一个 label,得到上级
+    /// 名字的 DID。名字之外的部分不参与层级、也不被上级继承:did:web 的
+    /// %3A 编码端口和路径段都会被去掉。上级必须仍是可独立查询的名字,
+    /// 否则返回 None:
+    ///
+    ///   did:web:ood1.example.com            => Some(did:web:example.com)
+    ///   did:web:ood1.example.com%3A8080     => Some(did:web:example.com)
+    ///   did:web:ood1.example.com:devices:c1 => Some(did:web:example.com)
+    ///   did:web:example.com                 => None(域名默认至少有一个点,
+    ///                                         上级只剩顶级域,不可能向它查询)
+    ///   did:web:127.0.0.1                   => None(IP 没有名字层级)
+    ///   did:bns:app1.alice                  => Some(did:bns:alice)
+    ///   did:bns:alice                       => None(一级名字是根)
+    ///   did:dev / did:key                   => None(key 类 DID 没有名字层级)
+    pub fn upper_did(&self) -> Option<DID> {
+        // 名字部分:id 的第一段(web 的路径段以 ':' 分隔),再去掉 %3A 编码的
+        // 端口(hostname 合法字符不需要 pct-encode,'%' 只会出现在端口编码里)。
+        let name = self.id.split(':').next().unwrap_or_default();
+        let name = name.split('%').next().unwrap_or_default();
+        match self.method.as_str() {
+            "web" => {
+                if name.parse::<std::net::IpAddr>().is_ok() {
+                    return None;
+                }
+                let (_, upper) = name.split_once('.')?;
+                // 域名默认至少有一个点:上级只剩单 label(com 这类顶级域)时,
+                // 不可能向它查询,视为没有 upper。
+                if !upper.contains('.') {
+                    return None;
+                }
+                Some(DID::new("web", upper))
+            }
+            "bns" => {
+                let (_, upper) = name.split_once('.')?;
+                Some(DID::new("bns", upper))
+            }
+            _ => None,
+        }
+    }
+
     pub fn from_str(did: &str) -> NSResult<Self> {
         let parts: Vec<&str> = did.split(':').collect();
         if parts[0] != "did" {
@@ -628,6 +668,45 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_upper_did() {
+        let upper = |s: &str| DID::from_str(s).unwrap().upper_did();
+
+        assert_eq!(
+            upper("did:web:ood1.example.com"),
+            Some(DID::new("web", "example.com"))
+        );
+        assert_eq!(
+            upper("did:web:a.b.example.com"),
+            Some(DID::new("web", "b.example.com"))
+        );
+        // 端口与路径不参与名字层级,也不被上级继承
+        assert_eq!(
+            upper("did:web:ood1.example.com%3A8080"),
+            Some(DID::new("web", "example.com"))
+        );
+        assert_eq!(
+            upper("did:web:ood1.example.com:devices:cam01"),
+            Some(DID::new("web", "example.com"))
+        );
+        // 域名默认至少有一个点:上级只剩顶级域(com)时没有 upper
+        assert_eq!(upper("did:web:example.com"), None);
+        // IP 没有名字层级
+        assert_eq!(upper("did:web:127.0.0.1"), None);
+        assert_eq!(upper("did:web:127.0.0.1%3A3200"), None);
+        // bns 的名字层级:一级名字是根
+        assert_eq!(
+            upper("did:bns:app1.alice"),
+            Some(DID::new("bns", "alice"))
+        );
+        assert_eq!(upper("did:bns:alice"), None);
+        // key 类 DID 没有名字层级
+        assert_eq!(
+            upper("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE"),
+            None
+        );
+    }
 
     #[test]
     fn test_did_from_str() {

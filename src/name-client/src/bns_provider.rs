@@ -13,7 +13,7 @@
 协议见 doc/http_did_resolver_api.md。
 */
 
-use crate::{DidDocType, HttpsProvider, NameInfo, NsProvider, PublishedState, RecordType};
+use crate::{DidDocType, BaseHttpProvider, NameInfo, NsProvider, PublishedState, RecordType};
 use async_trait::async_trait;
 use buckyos_kit::BuckyOSMachineConfig;
 use log::info;
@@ -24,7 +24,7 @@ use std::net::IpAddr;
 /// 基于 web3 bridge 的 BNS DID 解析器(bns method 的权威渠道委托读取端),
 /// 内部完全复用 `HttpsProvider`。
 pub struct BnsProvider {
-    inner: HttpsProvider,
+    inner: BaseHttpProvider,
 }
 
 impl BnsProvider {
@@ -52,7 +52,7 @@ impl BnsProvider {
         info!("bns provider using resolver host: {}", resolver_host);
 
         Ok(Self {
-            inner: HttpsProvider::new(resolver_host.as_str()),
+            inner: BaseHttpProvider::new(resolver_host.as_str()),
         })
     }
 
@@ -65,7 +65,7 @@ impl BnsProvider {
             .cloned()
             .ok_or_else(|| NSError::Failed("web3_bridge.bns not set".to_string()))?;
         Ok(Self {
-            inner: HttpsProvider::new(host.as_str()),
+            inner: BaseHttpProvider::new(host.as_str()),
         })
     }
 }

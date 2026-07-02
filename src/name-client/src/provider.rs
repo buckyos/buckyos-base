@@ -19,14 +19,12 @@ pub fn is_key_class_method(method: &str) -> bool {
 }
 
 /// 名字结构推导出的默认 owner(简化文档 2.4 节):二级名字天然自带 owner 假设,
-/// `did:bns:app1.alice` 的 expected_owner 就是 `did:bns:alice`。一级名字是根,
-/// 从结构推不出 owner,绑定只能来自权威源。其它 method(如 did:web)不定义结构 owner。
+/// `did:bns:app1.alice` 的 expected_owner 就是 `did:bns:alice`——即名字层级
+/// 上的上级名字(`DID::upper_did`)。一级名字是根,从结构推不出 owner,绑定
+/// 只能来自权威源。其它 method(如 did:web)有名字层级但不定义结构 owner。
 pub fn structural_owner(did: &DID) -> Option<DID> {
     match did.method.as_str() {
-        "bns" => did
-            .id
-            .split_once('.')
-            .map(|(_, parent)| DID::new("bns", parent)),
+        "bns" => did.upper_did(),
         _ => None,
     }
 }
