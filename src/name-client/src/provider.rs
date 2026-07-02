@@ -9,108 +9,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DidDocType {
-    Zone,
-    Owner,
-    Info,
-    Boot,
-    User,
-    Device,
-    DidObject,
-    Custom(String),
-}
-
-impl DidDocType {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Zone => "zone",
-            Self::Owner => "owner",
-            Self::Info => "info",
-            Self::Boot => "boot",
-            Self::User => "user",
-            Self::Device => "device",
-            Self::DidObject => "did-object",
-            Self::Custom(doc_type) => doc_type.as_str(),
-        }
-    }
-
-    pub fn custom(doc_type: impl Into<String>) -> Self {
-        Self::from(doc_type.into())
-    }
-}
-
-impl Default for DidDocType {
-    fn default() -> Self {
-        Self::Zone
-    }
-}
-
-impl std::fmt::Display for DidDocType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl AsRef<str> for DidDocType {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl From<&str> for DidDocType {
-    fn from(value: &str) -> Self {
-        match value {
-            "zone" => Self::Zone,
-            "owner" => Self::Owner,
-            "info" => Self::Info,
-            "boot" => Self::Boot,
-            "user" => Self::User,
-            "device" => Self::Device,
-            "did-object" => Self::DidObject,
-            _ => Self::Custom(value.to_string()),
-        }
-    }
-}
-
-impl From<String> for DidDocType {
-    fn from(value: String) -> Self {
-        match value.as_str() {
-            "zone" => Self::Zone,
-            "owner" => Self::Owner,
-            "info" => Self::Info,
-            "boot" => Self::Boot,
-            "user" => Self::User,
-            "device" => Self::Device,
-            "did-object" => Self::DidObject,
-            _ => Self::Custom(value),
-        }
-    }
-}
-
-impl Serialize for DidDocType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for DidDocType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(Self::from(value))
-    }
-}
-
-pub const DEFAULT_DID_DOC_TYPE: DidDocType = DidDocType::Zone;
-
-pub const DOC_TYPE_OWNER: DidDocType = DidDocType::Owner;
-pub const DOC_TYPE_INFO: DidDocType = DidDocType::Info;
+pub use name_lib::{DidDocType, DEFAULT_DID_DOC_TYPE, DOC_TYPE_INFO, DOC_TYPE_OWNER};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MethodMatcher {
@@ -228,7 +127,7 @@ impl Default for NameStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DocumentStatus {
-    Missing,//unknown
+    Missing, //unknown
     Active,
     Revoked,
     Expired,

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    decode_jwt_claim_without_verify, DIDContext, DIDDocumentTrait, EncodedDocument, NSError,
-    NSResult, DID, DID_CORE_CONTEXT, DID_OBJECT_CONTEXT,
+    decode_jwt_claim_without_verify, DIDContext, DIDDocumentTrait, DidDocType, EncodedDocument,
+    NSError, NSResult, DID, DID_CORE_CONTEXT, DID_OBJECT_CONTEXT,
 };
 
 pub const DID_OBJECT_SERVICE_TYPE: &str = "DIDObjectService";
@@ -300,12 +300,16 @@ impl DIDDocumentTrait for DIDObjectCard {
         self.id.clone()
     }
 
-    fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
-        self.get_key_by_id(kid)
+    fn get_owner_did(&self) -> Option<DID> {
+        self.controller.clone()
     }
 
-    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
-        self.get_auth_key(kid)
+    fn get_doc_type(&self) -> DidDocType {
+        DidDocType::DidObject
+    }
+
+    fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
+        self.get_key_by_id(kid)
     }
 
     fn get_key_ids_by_scope(&self, scope: &str) -> Option<&[String]> {

@@ -228,14 +228,33 @@ pub async fn resolve_ed25519_exchange_key(remote_did: &DID) -> NSResult<[u8; 32]
     }
     let client = client.unwrap();
     let did_doc = client.resolve_did(remote_did, None).await?;
-    let did_doc = parse_did_doc(did_doc)?;
-    let exchange_key = did_doc.get_exchange_key(None);
+    let exchange_key = resolve_exchange_key_from_doc(&did_doc)?;
     if exchange_key.is_some() {
         let exchange_key = exchange_key.unwrap();
         let exchange_key = jwk_to_ed25519_pk(&exchange_key.1)?;
         return Ok(exchange_key);
     }
     return Err(NSError::NotFound("Invalid did document".to_string()));
+}
+
+fn resolve_exchange_key_from_doc(
+    did_doc: &EncodedDocument,
+) -> NSResult<Option<(DecodingKey, jsonwebtoken::jwk::Jwk)>> {
+    let doc_value = did_doc.clone().to_json_value()?;
+    if doc_value.get("device_type").is_some() {
+        let device_config = DeviceConfig::decode(did_doc, None)?;
+        return Ok(device_config.get_exchange_key(None));
+    }
+    if doc_value.get("hostname").is_some() {
+        let zone_config = ZoneConfig::decode(did_doc, None)?;
+        let Some(gateway_name) = zone_config.get_default_zone_gateway() else {
+            return Ok(None);
+        };
+        return Ok(zone_config
+            .get_device_config(&gateway_name)
+            .and_then(|device_config| device_config.get_exchange_key(None)));
+    }
+    Ok(None)
 }
 
 pub async fn resolve_did(did: &DID, doc_type: Option<DidDocType>) -> NSResult<EncodedDocument> {

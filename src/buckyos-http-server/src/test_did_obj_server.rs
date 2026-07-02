@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use http::StatusCode;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use name_client::{CacheBackend, DIDObjectClient, NameClient, NameClientConfig, SmartProvider};
+use name_client::{
+    CacheBackend, DIDObjectClient, DidDocType, NameClient, NameClientConfig, SmartProvider,
+};
 use name_lib::{DIDObjectCard, EncodedDocument, OwnerConfig, DID};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -357,7 +359,7 @@ async fn example_name_client() -> NameClient {
     let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_config).unwrap());
     client.set_local_authority_override(
         DID::new("web", "myhome.com"),
-        "owner",
+        DidDocType::Owner,
         owner_doc,
         "test-fixture",
         None,

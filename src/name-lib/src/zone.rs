@@ -25,7 +25,7 @@ use crate::{
     decode_json_from_jwt_with_default_pk, decode_json_from_jwt_with_pk,
     decode_jwt_claim_without_verify,
 };
-use crate::{ensure_version_seq_for_jwt, DIDDocumentTrait, EncodedDocument};
+use crate::{ensure_version_seq_for_jwt, DIDDocumentTrait, DidDocType, EncodedDocument};
 use crate::{NSError, NSResult};
 
 // Helper function for serde skip_serializing_if
@@ -718,6 +718,17 @@ impl DIDDocumentTrait for ZoneConfig {
         return self.id.clone();
     }
 
+    fn get_owner_did(&self) -> Option<DID> {
+        if self.owner.is_valid() {
+            return Some(self.owner.clone());
+        }
+        None
+    }
+
+    fn get_doc_type(&self) -> DidDocType {
+        DidDocType::Zone
+    }
+
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
         if self.verification_method.is_empty() {
             return None;
@@ -749,20 +760,6 @@ impl DIDDocumentTrait for ZoneConfig {
                 }
                 return Some((decoding_key.unwrap(), method.public_key.clone()));
             }
-        }
-        return None;
-    }
-
-    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
-        let gateway_name = self.get_default_zone_gateway();
-        if gateway_name.is_none() {
-            return None;
-        }
-        let gateway_name = gateway_name.unwrap();
-        let device_config = self.devices.get(&gateway_name);
-        if device_config.is_some() {
-            let device_config = device_config.unwrap();
-            return device_config.get_exchange_key(None);
         }
         return None;
     }

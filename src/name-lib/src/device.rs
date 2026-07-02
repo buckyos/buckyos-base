@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::zone::{default_device_context, ServiceNode, VerificationMethodNode};
 use crate::{
     decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, ensure_version_seq_for_jwt,
-    get_x_from_jwk, DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult,
+    get_x_from_jwk, DIDContext, DIDDocumentTrait, DidDocType, EncodedDocument, NSError, NSResult,
     OODDescriptionString, DEFAULT_EXPIRE_TIME, DID,
 };
 use nvml_wrapper::enum_wrappers::device::Clock;
@@ -254,11 +254,26 @@ impl DeviceConfig {
         //     ),
         // });
     }
+
+    pub fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
+        <Self as DIDDocumentTrait>::get_auth_key(self, kid)
+    }
 }
 
 impl DIDDocumentTrait for DeviceConfig {
     fn get_id(&self) -> DID {
         return self.id.clone();
+    }
+
+    fn get_owner_did(&self) -> Option<DID> {
+        if self.owner.is_valid() {
+            return Some(self.owner.clone());
+        }
+        None
+    }
+
+    fn get_doc_type(&self) -> DidDocType {
+        DidDocType::Device
     }
 
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
@@ -294,10 +309,6 @@ impl DIDDocumentTrait for DeviceConfig {
             }
         }
         return None;
-    }
-
-    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
-        return self.get_auth_key(kid);
     }
 
     fn get_key_ids_by_scope(&self, scope: &str) -> Option<&[String]> {

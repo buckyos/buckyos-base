@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, default_agent_context,
-    ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait, EncodedDocument, NSError, NSResult,
-    ServiceNode, VerificationMethodNode, DID,
+    ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait, DidDocType, EncodedDocument, NSError,
+    NSResult, ServiceNode, VerificationMethodNode, DID,
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -165,6 +165,14 @@ impl DIDDocumentTrait for AgentDocument {
         self.id.clone()
     }
 
+    fn get_owner_did(&self) -> Option<DID> {
+        Some(self.owner.clone())
+    }
+
+    fn get_doc_type(&self) -> DidDocType {
+        DidDocType::custom("agent")
+    }
+
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
         if self.verification_method.is_empty() {
             return None;
@@ -198,10 +206,6 @@ impl DIDDocumentTrait for AgentDocument {
             }
         }
         None
-    }
-
-    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
-        self.get_auth_key(kid)
     }
 
     fn get_key_ids_by_scope(&self, scope: &str) -> Option<&[String]> {

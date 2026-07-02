@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     create_jwt_by_x, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify,
-    default_owner_context, ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait,
+    default_owner_context, ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait, DidDocType,
     EncodedDocument, NSError, NSResult, ServiceNode, VerificationMethodNode, DID,
 };
 
@@ -279,6 +279,15 @@ impl DIDDocumentTrait for OwnerConfig {
     fn get_id(&self) -> DID {
         return self.id.clone();
     }
+
+    fn get_owner_did(&self) -> Option<DID> {
+        Some(self.id.clone())
+    }
+
+    fn get_doc_type(&self) -> DidDocType {
+        DidDocType::Owner
+    }
+
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
         if self.verification_method.is_empty() {
             return None;
@@ -311,11 +320,6 @@ impl DIDDocumentTrait for OwnerConfig {
                 return Some((decoding_key.unwrap(), method.public_key.clone()));
             }
         }
-        return None;
-    }
-
-    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
-        //return default zone's exchange key
         return None;
     }
 

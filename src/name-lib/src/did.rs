@@ -16,6 +16,108 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DidDocType {
+    Zone,
+    Owner,
+    Info,
+    Boot,
+    User,
+    Device,
+    DidObject,
+    Custom(String),
+}
+
+impl DidDocType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Zone => "zone",
+            Self::Owner => "owner",
+            Self::Info => "info",
+            Self::Boot => "boot",
+            Self::User => "user",
+            Self::Device => "device",
+            Self::DidObject => "did-object",
+            Self::Custom(doc_type) => doc_type.as_str(),
+        }
+    }
+
+    pub fn custom(doc_type: impl Into<String>) -> Self {
+        Self::from(doc_type.into())
+    }
+}
+
+impl Default for DidDocType {
+    fn default() -> Self {
+        Self::Zone
+    }
+}
+
+impl std::fmt::Display for DidDocType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for DidDocType {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for DidDocType {
+    fn from(value: &str) -> Self {
+        match value {
+            "zone" => Self::Zone,
+            "owner" => Self::Owner,
+            "info" => Self::Info,
+            "boot" => Self::Boot,
+            "user" => Self::User,
+            "device" => Self::Device,
+            "did-object" => Self::DidObject,
+            _ => Self::Custom(value.to_string()),
+        }
+    }
+}
+
+impl From<String> for DidDocType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "zone" => Self::Zone,
+            "owner" => Self::Owner,
+            "info" => Self::Info,
+            "boot" => Self::Boot,
+            "user" => Self::User,
+            "device" => Self::Device,
+            "did-object" => Self::DidObject,
+            _ => Self::Custom(value),
+        }
+    }
+}
+
+impl Serialize for DidDocType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DidDocType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::from(value))
+    }
+}
+
+pub const DEFAULT_DID_DOC_TYPE: DidDocType = DidDocType::Zone;
+
+pub const DOC_TYPE_OWNER: DidDocType = DidDocType::Owner;
+pub const DOC_TYPE_INFO: DidDocType = DidDocType::Info;
 #[derive(Clone, Debug, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct DID {
     pub method: String,
@@ -327,10 +429,15 @@ impl EncodedDocument {
 #[async_trait]
 pub trait DIDDocumentTrait: Send + Sync {
     fn get_id(&self) -> DID;
+
+    fn get_owner_did(&self) -> Option<DID>;
+
+    fn get_doc_type(&self) -> DidDocType;
+
     //key id is none means the default key
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
-    //实现了该方法的did document 可以进行密钥交换（建立rtcp连接)
-    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
+    //TODO 该方法变成DeviceConfig的特殊方法
+    //fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)>;
 
     fn get_key_ids_by_scope(&self, _scope: &str) -> Option<&[String]> {
         None
