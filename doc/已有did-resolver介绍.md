@@ -89,6 +89,11 @@ zone_resolver 通常会包含本机 cache 的能力,并叠加 cluster host / ove
 state 等管理逻辑。相比传统 hosts 文件只能模拟 IP 解析,它返回完整 DID resolver 结果,
 因此可以覆盖 Document、Info、Missing、Revoked / Tombstoned 和 metadata。
 
+zone_resolver 服务的内部实现自己也用 `resolve_did` 完成对外查询(它没命中时替
+客户端向权威源/补充源发问)。这类调用必须用
+`ResolvePolicy::without_zone_resolver()`(`use_zone_resolver = false`)跳过 Zone
+cache 快路径,否则服务会查询到自己(默认 endpoint 就是本机 3180)造成递归。
+
 相比 web_resolver,zone 启动之后通过 zone_resolver 可以获得**更多**的 did-document——比如
 zone 内的 device document,这些文档不一定对外发布。它也可以实现 Zone 内短路:只要持续返回某个
 DID/doc_type 的结果或负状态,客户端就不会把该请求发送到 Zone 外。
@@ -141,7 +146,7 @@ web_resolver → dns_resolver → sn_resolver
 ## 8. 与当前实现的对照(2026-07 快照)
 
 name-client 的 provider 注册(lib.rs 的 `init_name_lib_ex`)已与第 7 节的目标顺序基本一致;
-Zone Resolver 的 cache 层化仍待迁移:
+Zone Resolver 的 cache 层化已完成(2026-07-03):
 
 | 本文的 resolver | 代码 | 状态 |
 | --- | --- | --- |
@@ -149,7 +154,7 @@ Zone Resolver 的 cache 层化仍待迁移:
 | web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现,bns_root 与 BNS 网关共用 web3 bridge 配置;一级 bns 名字没有 uppername 回退(那个端点就是 BNS 网关本身,归 bns_resolver 管) |
 | dns_resolver | `DnsProvider`(dns_provider.rs) | 已按本文降为补充源:did:web 与 did:bns 下均注册在 web_resolver 之后,取回结果一律 need_proof 候选。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
 | sn_resolver | `BaseHttpProvider` 指向 SN host | web3 bridge 配置含 `"sn"` 键时,自动注册为 did:web / did:bns 的末位补充源;默认配置不含 sn,即默认未注册 |
-| zone_resolver | 目标:独立的 Zone cache 客户端,默认指向 `http://127.0.0.1:3180`;当前代码仍保留 `BaseHttpProvider` + `NameClient::set_zone_authority(zone_did, provider)` 的旧接法 | **待迁移**:旧接法把 zone_resolver 当成 zone 内权威读取端,只受理同 zone did,并和 method authority 合并。新定位要求它脱离 `NsProvider` / authority-reader 合并,作为 cache 层独占命中源:服务可用即返回 `ZoneHit`,服务不可用才落回 local cache 和 provider 链 |
+| zone_resolver | `ZoneResolverClient`(zone_resolver.rs,独立 cache 客户端,不是 `NsProvider`),默认启用、默认指向 `http://127.0.0.1:3180`,`NameClient::resolve_did_ex` 第 0 步查询 | **已迁移**:服务可用即独占返回 `CacheStatus::ZoneHit`(负状态 / Missing / unknown 都是回答,不触发 fallback);服务不可用(连接失败/超时/502/503/504)才落回 local cache 和 provider 链。旧的 `set_zone_authority` 接法与 `did_in_zone` 客户端过滤已删除;`disable_zone_resolver()` / `set_zone_resolver_endpoint(...)` 控制启停与地址,zone 回答不回写本机 cache |
 | smart_resolver(社交版) | 无 | 暂不实现 |
 
 另外:resolver 接口响应里的 buckyos 扩展信封(发布状态等)客户端解析已就绪(`BaseHttpProvider`),服务端尚未实现;在那之前,did:web 的发布状态由主循环把 200 / 404 / 410 归一成 Active / Missing / 负状态。

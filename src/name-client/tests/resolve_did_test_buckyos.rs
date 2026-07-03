@@ -3,24 +3,31 @@ use name_client::{
 };
 use name_lib::{DIDDocumentTrait, EncodedDocument, ZoneBootDocument, ZoneDocument, DID};
 
-#[tokio::test]
-async fn resolve_did_test_buckyos_io_returns_boot_and_zone_with_gateway_mini_doc() {
+async fn dns_test_client() -> NameClient {
     let client = NameClient::new(NameClientConfig {
         enable_cache: true,
         cache_backend: CacheBackend::Memory,
+        // 单机 DNS 解析语义测试:关闭 Zone Resolver,避免命中开发机上真实
+        // 运行的 127.0.0.1:3180 服务。
+        enable_zone_resolver: false,
         ..Default::default()
     });
     client
         .set_method_authority("web", Box::new(DnsProvider::new(None)))
         .await;
+    client
+}
 
+#[tokio::test]
+async fn resolve_did_test_buckyos_io_returns_boot_and_zone_with_gateway_mini_doc() {
+    let client = dns_test_client().await;
     let did = DID::from_str("did:web:test.buckyos.io").unwrap();
 
     let boot_doc = client
-        .resolve_did(&did, Some(DidDocType::Boot))
+        .resolve_did_ex(&did, Some(DidDocType::Boot), ResolvePolicy::default())
         .await
         .expect("did:web:test.buckyos.io should publish a boot document");
-    let boot = ZoneBootDocument::decode(&boot_doc, None)
+    let boot = ZoneBootDocument::decode(&boot_doc.document, None)
         .expect("boot response should decode as ZoneBootDocument");
     assert_eq!(boot.id.as_ref(), Some(&did));
     assert!(
@@ -28,12 +35,17 @@ async fn resolve_did_test_buckyos_io_returns_boot_and_zone_with_gateway_mini_doc
         "boot document should identify ood1 as a gateway"
     );
 
-    let zone_doc = client
-        .resolve_did(&did, Some(DidDocType::Zone))
+    let resolved_zone = client
+        .resolve_did_ex(&did, Some(DidDocType::Zone), ResolvePolicy::default())
         .await
         .expect("did:web:test.buckyos.io should resolve to a zone document");
-    let zone =
-        ZoneDocument::decode(&zone_doc, None).expect("zone response should decode as ZoneDocument");
+    assert_eq!(
+        resolved_zone.resolution_metadata.cache_status,
+        Some(CacheStatus::Hit),
+        "resolving boot should populate the sibling zone document in cache"
+    );
+    let zone = ZoneDocument::decode(&resolved_zone.document, None)
+        .expect("zone response should decode as ZoneDocument");
 
     assert_eq!(zone.id, did);
     assert_eq!(zone.get_default_zone_gateway().as_deref(), Some("ood1"));
@@ -69,5 +81,25 @@ async fn resolve_did_test_buckyos_io_returns_boot_and_zone_with_gateway_mini_doc
     assert_eq!(
         resolved_gateway.document,
         EncodedDocument::JsonLd(serde_json::to_value(gateway_device).unwrap())
+    );
+
+    let reverse_client = dns_test_client().await;
+    let resolved_zone_first = reverse_client
+        .resolve_did_ex(&did, Some(DidDocType::Zone), ResolvePolicy::default())
+        .await
+        .expect("zone document should resolve first");
+    assert_eq!(
+        resolved_zone_first.resolution_metadata.cache_status,
+        Some(CacheStatus::Miss)
+    );
+
+    let resolved_boot_after_zone = reverse_client
+        .resolve_did_ex(&did, Some(DidDocType::Boot), ResolvePolicy::default())
+        .await
+        .expect("boot document should be cached after resolving zone");
+    assert_eq!(
+        resolved_boot_after_zone.resolution_metadata.cache_status,
+        Some(CacheStatus::Hit),
+        "resolving zone should populate the sibling boot document in cache"
     );
 }

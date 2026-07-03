@@ -156,11 +156,20 @@ impl BodyEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredDocument {
+    pub did: DID,
+    pub doc_type: Option<DidDocType>,
+    pub document: EncodedDocument,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentBody {
     pub document: EncodedDocument,
     pub evidence: BodyEvidence,
     pub resolver_id: Option<String>,
     pub retrieved: Option<u64>,
+    #[serde(default)]
+    pub discovered_documents: Vec<DiscoveredDocument>,
 }
 
 impl DocumentBody {
@@ -176,7 +185,7 @@ impl DocumentBody {
         Self::with_evidence(document, BodyEvidence::UnproofInfo, resolver_id)
     }
 
-    fn with_evidence(
+    pub(crate) fn with_evidence(
         document: EncodedDocument,
         evidence: BodyEvidence,
         resolver_id: Option<String>,
@@ -186,7 +195,16 @@ impl DocumentBody {
             evidence,
             resolver_id,
             retrieved: Some(buckyos_get_unix_timestamp()),
+            discovered_documents: Vec::new(),
         }
+    }
+
+    pub fn with_discovered_documents(
+        mut self,
+        discovered_documents: Vec<DiscoveredDocument>,
+    ) -> Self {
+        self.discovered_documents = discovered_documents;
+        self
     }
 }
 
@@ -356,6 +374,10 @@ pub enum CacheStatus {
     Refresh,
     Fallback,
     UnauthenticatedInfoHit,
+    /// Zone Resolver(cluster-level cache)独占回答的命中(简化文档第 3 节
+    /// 第 0 步)。与本机 cache 的 `Hit` 和 method authority 的 `Miss/Refresh`
+    /// 相区分,UI / 日志不应把它当成 method authority 的直接回答。
+    ZoneHit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +499,8 @@ pub struct ResolvedDocument {
     pub document: EncodedDocument,
     pub resolution_metadata: DidResolutionMetadata,
     pub document_metadata: DidDocumentMetadata,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub discovered_documents: Vec<DiscoveredDocument>,
 }
 
 impl ResolvedDocument {
@@ -510,6 +534,7 @@ impl ResolvedDocument {
 
         Self {
             document,
+            discovered_documents: Vec::new(),
             resolution_metadata: DidResolutionMetadata {
                 content_type: Some(content_type),
                 retrieved: Some(buckyos_get_unix_timestamp()),
@@ -595,6 +620,14 @@ impl ResolvedDocument {
         self.resolution_metadata.cache_status = Some(cache_status);
         self
     }
+
+    pub fn with_discovered_documents(
+        mut self,
+        discovered_documents: Vec<DiscoveredDocument>,
+    ) -> Self {
+        self.discovered_documents = discovered_documents;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -606,6 +639,12 @@ pub struct ResolvePolicy {
     /// 策略点④:查询没有产出可核实文档、且没有负状态屏蔽时,是否允许用
     /// "过期但未作废"的缓存兜底。
     pub allow_stale_cache: bool,
+    /// 本次解析是否允许走 Zone Resolver cache 快路径(简化文档第 3 节第 0 步)。
+    /// 默认允许(是否真的查询还取决于 NameClient 级的启用状态)。设为 false
+    /// 的典型调用方是 zone-resolver-server 自己:它的内部实现用 resolve_did
+    /// 完成对外查询,若不跳过 zone 快路径,就会查询到自己(127.0.0.1:3180)
+    /// 造成自递归。
+    pub use_zone_resolver: bool,
     pub max_depth: usize,
     /// 本地测试/运维显式注入的发布模拟(简化文档第 7 节),类似 hosts 文件。
     /// 挂在 policy 上是为了让它随 `descend()`/`for_authority_lookup()` 一起传播到
@@ -620,6 +659,7 @@ impl Default for ResolvePolicy {
             follow_migration: true,
             allow_self_signed_when_missing: false,
             allow_stale_cache: true,
+            use_zone_resolver: true,
             max_depth: 8,
             local_authority_override: None,
             visited: Vec::new(),
@@ -633,6 +673,14 @@ impl ResolvePolicy {
         store: Arc<LocalAuthorityOverrideStore>,
     ) -> Self {
         self.local_authority_override = Some(store);
+        self
+    }
+
+    /// 跳过 Zone Resolver cache 快路径的 policy。zone-resolver-server 的内部
+    /// 实现用它调用 resolve_did 完成对外查询,避免查询到自己(默认 endpoint
+    /// 就是本机 3180)造成递归。
+    pub fn without_zone_resolver(mut self) -> Self {
+        self.use_zone_resolver = false;
         self
     }
 
@@ -1021,6 +1069,14 @@ pub trait NsProvider: 'static + Send + Sync {
         doc_type: Option<DidDocType>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument>;
+
+    async fn query_did_documents(
+        &self,
+        _did: &DID,
+        _from_ip: Option<IpAddr>,
+    ) -> NSResult<Option<HashMap<String, EncodedDocument>>> {
+        Ok(None)
+    }
 
     async fn resolve_published_state(
         &self,

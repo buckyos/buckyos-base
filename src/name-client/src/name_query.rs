@@ -7,9 +7,9 @@ use tokio::sync::RwLock;
 
 use crate::{
     content_hash_matches, is_key_class_method, structural_owner, BodyEvidence, DidDocType,
-    DocumentBody, DocumentStatus, MethodProviders, NameInfo, NsProvider, OwnerDocumentPolicy,
-    ProviderAnswer, ProviderResolveResult, PublishedState, RecordType, ResolvePolicy,
-    ResolveWarning, ResolvedDocument,
+    DiscoveredDocument, DocumentBody, DocumentStatus, MethodProviders, NameInfo, NsProvider,
+    OwnerDocumentPolicy, ProviderAnswer, ProviderResolveResult, PublishedState, RecordType,
+    ResolvePolicy, ResolveWarning, ResolvedDocument,
 };
 
 /// 候选文档在验证阶段被拒绝的原因。契约违规会被记录为 warning 并静默丢弃该候选,
@@ -51,36 +51,11 @@ enum Channel {
     Supplement,
 }
 
-/// zone 内权威读取端(介绍文档第 5、7 节):只受理同 zone did 的查询。
-/// 它与该 did 的 method 权威源读的是同一发布渠道(zone 自己的配置),
-/// 只是读取端不同,所以不违反"至多一个权威渠道"。
-struct ZoneAuthority {
-    zone_did: DID,
-    provider: Box<dyn NsProvider>,
-}
-
-/// did 是否属于 zone:zone 自身,或名字层级(`DID::upper_did`)上位于
-/// zone 之下的子名字(did:web:ood1.example.com ∈ did:web:example.com)。
-fn did_in_zone(did: &DID, zone_did: &DID) -> bool {
-    if did == zone_did {
-        return true;
-    }
-    let mut current = did.clone();
-    while let Some(upper) = current.upper_did() {
-        if &upper == zone_did {
-            return true;
-        }
-        current = upper;
-    }
-    false
-}
-
 pub struct NameQuery {
     /// 每个 DID method 的解析注册模型:至多一个权威渠道 + 有序补充源(T2.2)。
+    /// zone_resolver 不在这里:它是 cache 层组件,由 `NameClient` 在进入
+    /// resolver core 之前查询(T5.5),NameQuery 只保留 resolver core。
     methods: Arc<RwLock<HashMap<String, MethodProviders>>>,
-    /// zone 内权威读取端:对同 zone did 排在 method 权威读取端之前
-    /// (介绍文档第 7 节"注册在最前面")。
-    zone_authorities: Arc<RwLock<Vec<ZoneAuthority>>>,
     /// 普通名字解析(DNS 语义 `resolve(name)` / `resolve_ip`)使用的有序 provider
     /// 列表,与 DID 解析管线相互独立。
     dns_providers: Arc<RwLock<Vec<Box<dyn NsProvider>>>>,
@@ -90,7 +65,6 @@ impl NameQuery {
     pub fn new() -> NameQuery {
         NameQuery {
             methods: Arc::new(RwLock::new(HashMap::new())),
-            zone_authorities: Arc::new(RwLock::new(Vec::new())),
             dns_providers: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -128,33 +102,6 @@ impl NameQuery {
             .or_default()
             .supplements
             .push(provider);
-    }
-
-    /// 注册当前 zone 的权威读取端(zone_resolver,通常是 `BaseHttpProvider`
-    /// 指向 zone 内的 127.0.0.1 服务,介绍文档第 5 节)。只受理同 zone did
-    /// (zone 自身或其名字层级下的子名字)的查询,对这些 did 排在 method 权威
-    /// 读取端之前,两者按"同一权威渠道多读取端"纪律合并(first-win,Missing 须
-    /// 读取端一致)。同一 zone_did 重复注册时取代旧读取端。
-    pub async fn set_zone_authority(&self, zone_did: DID, provider: Box<dyn NsProvider>) {
-        let mut zones = self.zone_authorities.write().await;
-        if let Some(entry) = zones.iter_mut().find(|entry| entry.zone_did == zone_did) {
-            info!(
-                "zone authority for {} replaced by {}",
-                zone_did.to_string(),
-                provider.get_id()
-            );
-            entry.provider = provider;
-        } else {
-            zones.push(ZoneAuthority { zone_did, provider });
-        }
-    }
-
-    /// 注销某 zone 的权威读取端(zone 迁移/退出时)。
-    pub async fn clear_zone_authority(&self, zone_did: &DID) {
-        self.zone_authorities
-            .write()
-            .await
-            .retain(|entry| &entry.zone_did != zone_did);
     }
 
     /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
@@ -280,21 +227,10 @@ impl NameQuery {
             )));
         };
 
-        // zone 内 did 的权威读取端(zone_resolver)排在 method 权威源之前
-        // (介绍文档第 7 节);zone 启动后能看到比对外发布面更多的文档(第 5 节),
-        // Info 契约路径同样适用。
-        let zone_guard = self.zone_authorities.read().await;
-        let zone_reader: Option<&dyn NsProvider> = zone_guard
-            .iter()
-            .find(|entry| did_in_zone(did, &entry.zone_did))
-            .map(|entry| entry.provider.as_ref());
-
         // 免验证的 Info 类 doc_type 按 method 契约事先声明,走独立轻量路径,
         // 结果只进入 UnauthenticatedInfoCache(T1.3 保留资产)。
         if method_providers.no_proof_doc_types.contains(&doc_type) {
-            return self
-                .resolve_unproof_info(zone_reader, method_providers, did, &doc_type)
-                .await;
+            return self.resolve_unproof_info(method_providers, did, &doc_type).await;
         }
 
         // 本地覆盖(hosts 语义,简化文档第 7 节):短路在权威查询之前,连 REVOKED
@@ -325,22 +261,13 @@ impl NameQuery {
         let mut warnings: Vec<ResolveWarning> = Vec::new();
 
         // ---- 权威阶段(介绍文档第 7 节:第一个总是权威源)----
-        // 至多一个权威发布渠道,可能有多个委托读取端:zone_resolver(命中 zone 时)
-        // 排在最前,method 权威源随后,按多读取端纪律合并。
-        let mut authority_readers: Vec<&dyn NsProvider> = Vec::new();
-        if let Some(reader) = zone_reader {
-            authority_readers.push(reader);
-        }
-        if let Some(authority) = method_providers.authority.as_ref() {
-            authority_readers.push(authority.as_ref());
-        }
-
+        // 至多一个权威发布渠道;同一渠道的多个委托读取端(镜像、网关)在注册时
+        // 用 `AuthorityReaders` 组合,这里只面对一个权威 provider。zone_resolver
+        // 不在这里:它是 cache 层组件,在进入 resolver core 之前已由 NameClient
+        // 查询(T5.5)。
         let mut authority_body = None;
-        if !authority_readers.is_empty() {
-            match self
-                .merged_authority_answer(&authority_readers, did, &doc_type)
-                .await
-            {
+        if let Some(authority) = method_providers.authority.as_ref() {
+            match self.authority_answer(authority.as_ref(), did, &doc_type).await {
                 // 二分法:unknown = 没得到回答。权威源没回答要记下来:候选的
                 // "已验证"资格取决于它(2.1 节 → 策略点③)。
                 ProviderResolveResult::Unknown(err) => {
@@ -463,13 +390,12 @@ impl NameQuery {
         // 补充源永远只产出候选文档(need_proof),给不出发布状态和 owner 绑定;
         // 它答不上来也不影响任何门禁。
         for provider in method_providers.supplements.iter() {
-            let Ok(doc) = provider
-                .query_did(did, Self::legacy_doc_type(&doc_type), None)
+            let Ok(body) = self
+                .query_provider_body(provider.as_ref(), did, &doc_type, BodyEvidence::NeedProof)
                 .await
             else {
                 continue;
             };
-            let body = DocumentBody::need_proof(doc, Some(provider.get_id()));
 
             match self
                 .admit_body(
@@ -524,6 +450,7 @@ impl NameQuery {
         warnings: Vec<ResolveWarning>,
         candidate_warnings: Vec<ResolveWarning>,
     ) -> ResolvedDocument {
+        let discovered_documents = body.discovered_documents.clone();
         let mut resolved = ResolvedDocument::from_document(
             body.document,
             did,
@@ -531,57 +458,12 @@ impl NameQuery {
             body.resolver_id,
             body.evidence,
             published,
-        );
+        )
+        .with_discovered_documents(discovered_documents);
         for warning in warnings.into_iter().chain(candidate_warnings) {
             resolved = resolved.with_warning(warning);
         }
         resolved
-    }
-
-    /// 同一权威渠道多个委托读取端的合并(介绍文档第 2、5 节;与 `AuthorityReaders`
-    /// 的 provider 级合并同一纪律,这里作用在归一化回答上,供 zone_resolver 与
-    /// method 权威源动态组合):
-    /// - 第一个给出 Active / 负状态(Revoked、Tombstoned、Migrated)回答的读取端胜出;
-    /// - Missing / Expired 须在没有读取端传输失败的前提下才成立(读取端一致说"没有");
-    /// - 任一读取端传输失败而其余给不出胜出回答时,整体是 unknown——
-    ///   不能把"断网"伪装成"从未发布"。
-    async fn merged_authority_answer(
-        &self,
-        readers: &[&dyn NsProvider],
-        did: &DID,
-        doc_type: &DidDocType,
-    ) -> ProviderResolveResult {
-        let mut missing: Option<ProviderAnswer> = None;
-        let mut unknown: Option<NSError> = None;
-        for reader in readers {
-            match self.authority_answer(*reader, did, doc_type).await {
-                ProviderResolveResult::Dr(answer) => match &answer.status {
-                    Some(DocumentStatus::Missing) | Some(DocumentStatus::Expired) => {
-                        if missing.is_none() {
-                            missing = Some(answer);
-                        }
-                    }
-                    _ => return ProviderResolveResult::Dr(answer),
-                },
-                ProviderResolveResult::Unknown(err) => {
-                    if unknown.is_none() {
-                        unknown = Some(err);
-                    }
-                }
-            }
-        }
-        if let Some(err) = unknown {
-            return ProviderResolveResult::Unknown(err);
-        }
-        if let Some(answer) = missing {
-            return ProviderResolveResult::Dr(answer);
-        }
-        // 调用方保证 readers 非空;防御性兜底。
-        ProviderResolveResult::Unknown(NSError::NotFound(format!(
-            "no authority reader answered for {}#{}",
-            did.to_string(),
-            doc_type
-        )))
     }
 
     /// 把权威读取端的原始接口归一成 `ProviderAnswer`。证据等级由**注册位置**
@@ -603,11 +485,11 @@ impl NameQuery {
                 // 状态是 Active 而回答没有内联 body 时,再问一次权威渠道的文档接口;
                 // 失败不算 unknown——状态已经是 DR,body 可以由补充源提供(anchor-only)。
                 if body.is_none() && state.document_status == DocumentStatus::Active {
-                    if let Ok(doc) = provider
-                        .query_did(did, Self::legacy_doc_type(doc_type), None)
+                    if let Ok(doc_body) = self
+                        .query_provider_body(provider, did, doc_type, BodyEvidence::Anchored)
                         .await
                     {
-                        body = Some(DocumentBody::anchored(doc, Some(provider.get_id())));
+                        body = Some(doc_body);
                     }
                 }
                 ProviderResolveResult::Dr(ProviderAnswer {
@@ -626,15 +508,51 @@ impl NameQuery {
                 // 权威源没有发布状态能力(did:web 类 canonical endpoint):权威回答
                 // 退化为"取回文档本体"。NotFound 是权威渠道的明确回答(Missing),
                 // Disabled 是负状态,其余错误才是 unknown——网络错误不能伪装成"从未发布"。
-                match provider
-                    .query_did(did, Self::legacy_doc_type(doc_type), None)
-                    .await
-                {
-                    Ok(doc) => ProviderResolveResult::Dr(ProviderAnswer {
-                        status: Some(DocumentStatus::Active),
-                        body: Some(DocumentBody::anchored(doc, Some(provider.get_id()))),
-                        ..Default::default()
-                    }),
+                match provider.query_did_documents(did, None).await {
+                    Ok(Some(documents)) => {
+                        let requested_key = doc_type.as_str();
+                        match documents.get(requested_key) {
+                            Some(doc) => ProviderResolveResult::Dr(ProviderAnswer {
+                                status: Some(DocumentStatus::Active),
+                                body: Some(
+                                    DocumentBody::anchored(doc.clone(), Some(provider.get_id()))
+                                        .with_discovered_documents(Self::discovered_documents(
+                                            did, &documents,
+                                        )),
+                                ),
+                                ..Default::default()
+                            }),
+                            None => ProviderResolveResult::Dr(ProviderAnswer {
+                                status: Some(DocumentStatus::Missing),
+                                ..Default::default()
+                            }),
+                        }
+                    }
+                    Ok(None) => {
+                        match provider
+                            .query_did(did, Self::legacy_doc_type(doc_type), None)
+                            .await
+                        {
+                            Ok(doc) => ProviderResolveResult::Dr(ProviderAnswer {
+                                status: Some(DocumentStatus::Active),
+                                body: Some(DocumentBody::anchored(doc, Some(provider.get_id()))),
+                                ..Default::default()
+                            }),
+                            Err(NSError::NotFound(_)) => {
+                                ProviderResolveResult::Dr(ProviderAnswer {
+                                    status: Some(DocumentStatus::Missing),
+                                    ..Default::default()
+                                })
+                            }
+                            Err(NSError::Disabled(_)) => {
+                                ProviderResolveResult::Dr(ProviderAnswer {
+                                    status: Some(DocumentStatus::Revoked),
+                                    ..Default::default()
+                                })
+                            }
+                            Err(err) => ProviderResolveResult::Unknown(err),
+                        }
+                    }
                     Err(NSError::NotFound(_)) => ProviderResolveResult::Dr(ProviderAnswer {
                         status: Some(DocumentStatus::Missing),
                         ..Default::default()
@@ -648,6 +566,73 @@ impl NameQuery {
             }
             Err(err) => ProviderResolveResult::Unknown(err),
         }
+    }
+
+    async fn query_provider_body(
+        &self,
+        provider: &dyn NsProvider,
+        did: &DID,
+        doc_type: &DidDocType,
+        evidence: BodyEvidence,
+    ) -> NSResult<DocumentBody> {
+        match provider.query_did_documents(did, None).await? {
+            Some(documents) => {
+                let document = documents.get(doc_type.as_str()).cloned().ok_or_else(|| {
+                    NSError::NotFound(format!("DID Document not found: {doc_type}"))
+                })?;
+                Ok(
+                    DocumentBody::with_evidence(document, evidence, Some(provider.get_id()))
+                        .with_discovered_documents(Self::discovered_documents(did, &documents)),
+                )
+            }
+            None => {
+                let document = provider
+                    .query_did(did, Self::legacy_doc_type(doc_type), None)
+                    .await?;
+                Ok(DocumentBody::with_evidence(
+                    document,
+                    evidence,
+                    Some(provider.get_id()),
+                ))
+            }
+        }
+    }
+
+    fn discovered_documents(
+        zone_did: &DID,
+        documents: &HashMap<String, EncodedDocument>,
+    ) -> Vec<DiscoveredDocument> {
+        documents
+            .iter()
+            .filter_map(|(doc_type, document)| {
+                let (did, doc_type) = match doc_type.as_str() {
+                    "zone" => (zone_did.clone(), Some(DidDocType::Zone)),
+                    "boot" => (zone_did.clone(), Some(DidDocType::Boot)),
+                    "owner" => (zone_did.clone(), Some(DidDocType::Owner)),
+                    "info" => (zone_did.clone(), Some(DidDocType::Info)),
+                    "user" => (zone_did.clone(), Some(DidDocType::User)),
+                    "device" => (zone_did.clone(), Some(DidDocType::Device)),
+                    "did-object" => (zone_did.clone(), Some(DidDocType::DidObject)),
+                    device_name => {
+                        if device_name.is_empty() {
+                            return None;
+                        }
+                        (
+                            DID::new(
+                                &zone_did.method,
+                                &format!("{}.{}", device_name, zone_did.id),
+                            ),
+                            None,
+                        )
+                    }
+                };
+                Some(DiscoveredDocument {
+                    did,
+                    doc_type,
+                    document: document.clone(),
+                })
+            })
+            .collect()
     }
 
     /// 旧版 provider 约定:默认 doc_type(zone)的文档存放在不带 doc_type 的位置
@@ -943,11 +928,10 @@ impl NameQuery {
         Ok(candidate_warnings)
     }
 
-    /// 免验证 Info 类的轻量路径:仍然按"权威渠道优先(zone 读取端最前),
-    /// 补充源有序"first-win,但不做任何验证,证据固定为 UnproofInfo。
+    /// 免验证 Info 类的轻量路径:仍然按"权威渠道优先,补充源有序"first-win,
+    /// 但不做任何验证,证据固定为 UnproofInfo。
     async fn resolve_unproof_info(
         &self,
-        zone_reader: Option<&dyn NsProvider>,
         method_providers: &MethodProviders,
         did: &DID,
         doc_type: &DidDocType,
@@ -955,15 +939,10 @@ impl NameQuery {
         let mut authority_unknown = false;
         let mut last_error: Option<NSError> = None;
 
-        let providers = zone_reader
-            .into_iter()
-            .map(|provider| (Channel::Authority, provider))
-            .chain(
-                method_providers
-                    .authority
-                    .iter()
-                    .map(|provider| (Channel::Authority, provider.as_ref())),
-            )
+        let providers = method_providers
+            .authority
+            .iter()
+            .map(|provider| (Channel::Authority, provider.as_ref()))
             .chain(
                 method_providers
                     .supplements
@@ -2136,302 +2115,6 @@ mod tests {
             .resolution_metadata
             .warnings
             .contains(&ResolveWarning::LocalAuthorityOverride));
-    }
-
-    // ---- zone_resolver:zone 内权威读取端(介绍文档第 5、7 节) ----
-
-    #[test]
-    fn did_in_zone_matches_zone_itself_and_subnames() {
-        let zone = DID::new("web", "example.com");
-        assert!(did_in_zone(&DID::new("web", "example.com"), &zone));
-        assert!(did_in_zone(&DID::new("web", "ood1.example.com"), &zone));
-        assert!(did_in_zone(&DID::new("web", "a.b.example.com"), &zone));
-        assert!(!did_in_zone(&DID::new("web", "other.com"), &zone));
-        // method 不同不算同 zone。
-        assert!(!did_in_zone(&DID::new("bns", "example.com"), &zone));
-
-        let bns_zone = DID::new("bns", "alice");
-        assert!(did_in_zone(&DID::new("bns", "ood1.alice"), &bns_zone));
-        assert!(!did_in_zone(&DID::new("bns", "bob"), &bns_zone));
-    }
-
-    #[tokio::test]
-    async fn zone_authority_reader_wins_for_in_zone_did() {
-        // zone 读取端排在 method 权威源之前,first-win。
-        let q = NameQuery::new();
-        let zone_did = DID::new("web", "example.com");
-        let device_did = DID::new("web", "ood1.example.com");
-        let owner_did = DID::new("web", "example.com");
-        let zone_doc = build_zone_doc(&device_did, &owner_did, ts(100), "from-zone-reader");
-        let method_doc = build_zone_doc(&device_did, &owner_did, ts(200), "from-method-authority");
-
-        q.set_method_authority(
-            "web",
-            Box::new(DocProvider::new("method-authority").with_doc(
-                device_did.clone(),
-                "zone",
-                method_doc,
-            )),
-        )
-        .await;
-        q.set_zone_authority(
-            zone_did,
-            Box::new(DocProvider::new("zone-reader").with_doc(
-                device_did.clone(),
-                "zone",
-                zone_doc.clone(),
-            )),
-        )
-        .await;
-
-        let outcome = resolve(&q, &device_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        let ResolveOutcome::Resolved(resolved) = outcome else {
-            panic!("expected resolved");
-        };
-        assert_eq!(resolved.document, zone_doc);
-        assert_eq!(
-            resolved.resolution_metadata.evidence,
-            Some(BodyEvidence::Anchored)
-        );
-        assert_eq!(
-            resolved.resolution_metadata.resolver_id,
-            Some("zone-reader".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn zone_authority_not_consulted_for_out_of_zone_did() {
-        // zone 读取端只受理同 zone did:对 zone 外的 did,即使它有(错误的)
-        // 负状态记录,也不参与合并。
-        let q = NameQuery::new();
-        let zone_did = DID::new("web", "example.com");
-        let other_did = DID::new("web", "ood1.other.com");
-        let owner_did = DID::new("web", "other.com");
-        let other_doc = build_zone_doc(&other_did, &owner_did, ts(100), "other-zone-doc");
-
-        q.set_method_authority(
-            "web",
-            Box::new(DocProvider::new("method-authority").with_doc(
-                other_did.clone(),
-                "zone",
-                other_doc.clone(),
-            )),
-        )
-        .await;
-        q.set_zone_authority(
-            zone_did,
-            Box::new(DocProvider::new("zone-reader").with_state(negative_state(
-                &other_did,
-                "zone",
-                DocumentStatus::Revoked,
-            ))),
-        )
-        .await;
-
-        let outcome = resolve(&q, &other_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        let ResolveOutcome::Resolved(resolved) = outcome else {
-            panic!("expected resolved (zone reader must be skipped)");
-        };
-        assert_eq!(resolved.document, other_doc);
-    }
-
-    #[tokio::test]
-    async fn zone_reader_missing_with_method_authority_down_is_unknown_not_missing() {
-        // 多读取端纪律:Missing 须读取端一致;任一读取端传输失败而其余给不出
-        // 胜出回答时,整体是 unknown——不能把"断网"伪装成"从未发布"。
-        let q = NameQuery::new();
-        let zone_did = DID::new("web", "example.com");
-        let device_did = DID::new("web", "ood1.example.com");
-
-        q.set_method_authority("web", Box::new(DownProvider)).await;
-        // 空 DocProvider:query_did 一律 NotFound => 权威回答 Missing。
-        q.set_zone_authority(zone_did, Box::new(DocProvider::new("zone-reader")))
-            .await;
-
-        let outcome = resolve(&q, &device_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        match outcome {
-            ResolveOutcome::NoAnswer {
-                authority_unknown,
-                authority_missing,
-                ..
-            } => {
-                assert!(authority_unknown);
-                assert!(!authority_missing);
-            }
-            other => panic!("expected NoAnswer, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn zone_reader_down_falls_back_to_method_authority_answer() {
-        // zone 读取端断网时,method 权威源的 Active 回答照常胜出。
-        let q = NameQuery::new();
-        let zone_did = DID::new("web", "example.com");
-        let device_did = DID::new("web", "ood1.example.com");
-        let owner_did = DID::new("web", "example.com");
-        let method_doc = build_zone_doc(&device_did, &owner_did, ts(100), "method-doc");
-
-        q.set_method_authority(
-            "web",
-            Box::new(DocProvider::new("method-authority").with_doc(
-                device_did.clone(),
-                "zone",
-                method_doc.clone(),
-            )),
-        )
-        .await;
-        q.set_zone_authority(zone_did, Box::new(DownProvider)).await;
-
-        let outcome = resolve(&q, &device_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        let ResolveOutcome::Resolved(resolved) = outcome else {
-            panic!("expected resolved");
-        };
-        assert_eq!(resolved.document, method_doc);
-    }
-
-    #[tokio::test]
-    async fn zone_reader_and_method_authority_concur_on_missing() {
-        // 所有读取端一致回答"没有",Missing 才成立(策略点②照常生效)。
-        let q = NameQuery::new();
-        let zone_did = DID::new("web", "example.com");
-        let device_did = DID::new("web", "ood1.example.com");
-
-        q.set_method_authority(
-            "web",
-            Box::new(
-                DocProvider::new("method-authority").with_state(missing_state(&device_did, "zone")),
-            ),
-        )
-        .await;
-        q.set_zone_authority(zone_did, Box::new(DocProvider::new("zone-reader")))
-            .await;
-
-        let outcome = resolve(&q, &device_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        match outcome {
-            ResolveOutcome::NoAnswer {
-                authority_missing, ..
-            } => assert!(authority_missing),
-            other => panic!("expected NoAnswer, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn zone_reader_negative_answer_terminates_resolution() {
-        // zone 读取端也是权威读取端:它的负状态回答同样触发策略点①。
-        let q = NameQuery::new();
-        let zone_did = DID::new("bns", "alice");
-        let device_did = DID::new("bns", "ood1.alice");
-
-        q.set_method_authority("bns", Box::new(DocProvider::new("method-authority")))
-            .await;
-        q.set_zone_authority(
-            zone_did,
-            Box::new(DocProvider::new("zone-reader").with_state(negative_state(
-                &device_did,
-                "zone",
-                DocumentStatus::Revoked,
-            ))),
-        )
-        .await;
-
-        let outcome = resolve(&q, &device_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        match outcome {
-            ResolveOutcome::Negative { status, .. } => assert_eq!(status, DocumentStatus::Revoked),
-            other => panic!("expected Negative, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn zone_authority_serves_unproof_info_first() {
-        // Info 契约路径同样让 zone 读取端排最前(zone 内能看到更多文档)。
-        let q = NameQuery::new();
-        let zone_did = DID::new("web", "example.com");
-        let device_did = DID::new("web", "ood1.example.com");
-        let info_doc = EncodedDocument::JsonLd(json!({"info": "from-zone"}));
-
-        q.set_method_authority("web", Box::new(DocProvider::new("method-authority")))
-            .await;
-        q.set_zone_authority(
-            zone_did,
-            Box::new(DocProvider::new("zone-reader").with_doc(
-                device_did.clone(),
-                "info",
-                info_doc.clone(),
-            )),
-        )
-        .await;
-
-        let outcome = resolve(&q, &device_did, DidDocType::Info, ResolvePolicy::default())
-            .await
-            .unwrap();
-        let ResolveOutcome::Resolved(resolved) = outcome else {
-            panic!("expected resolved");
-        };
-        assert_eq!(resolved.document, info_doc);
-        assert_eq!(
-            resolved.resolution_metadata.evidence,
-            Some(BodyEvidence::UnproofInfo)
-        );
-    }
-
-    #[tokio::test]
-    async fn zone_authority_replacement_and_clear() {
-        let q = NameQuery::new();
-        let zone_did = DID::new("web", "example.com");
-        let device_did = DID::new("web", "ood1.example.com");
-        let owner_did = DID::new("web", "example.com");
-        let first_doc = build_zone_doc(&device_did, &owner_did, ts(100), "first-reader");
-        let second_doc = build_zone_doc(&device_did, &owner_did, ts(200), "second-reader");
-
-        q.set_method_authority("web", Box::new(DocProvider::new("method-authority")))
-            .await;
-        q.set_zone_authority(
-            zone_did.clone(),
-            Box::new(DocProvider::new("first").with_doc(device_did.clone(), "zone", first_doc)),
-        )
-        .await;
-        // 同一 zone_did 重复注册:取代旧读取端。
-        q.set_zone_authority(
-            zone_did.clone(),
-            Box::new(DocProvider::new("second").with_doc(
-                device_did.clone(),
-                "zone",
-                second_doc.clone(),
-            )),
-        )
-        .await;
-
-        let outcome = resolve(&q, &device_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        let ResolveOutcome::Resolved(resolved) = outcome else {
-            panic!("expected resolved");
-        };
-        assert_eq!(resolved.document, second_doc);
-
-        // 注销后 zone 读取端不再参与:method 权威源(空)一致回答 Missing。
-        q.clear_zone_authority(&zone_did).await;
-        let outcome = resolve(&q, &device_did, DidDocType::Zone, ResolvePolicy::default())
-            .await
-            .unwrap();
-        match outcome {
-            ResolveOutcome::NoAnswer {
-                authority_missing, ..
-            } => assert!(authority_missing),
-            other => panic!("expected NoAnswer, got {:?}", other),
-        }
     }
 
     // ---- method registry ----

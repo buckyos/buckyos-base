@@ -10,8 +10,16 @@
 > (`AuthorityReaders`,Missing 需两者一致,任一传输失败按 unknown 处理)。
 >
 > **新增(2026-07-03):** P5 记录 Zone Resolver 从 provider / authority
-> 读取端迁移到 cache 层的待办。P0-P4 的 resolver core 已完成,但当前
-> `zone_resolver` 的定位仍需按 P5 调整。
+> 读取端迁移到 cache 层的待办。
+> **P5 已完成(2026-07-03):** `ZoneResolverClient`(zone_resolver.rs)作为
+> cache 层客户端接入 `NameClient::resolve_did_ex` 第 0 步;
+> `set_zone_authority / clear_zone_authority`、`did_in_zone` 过滤与
+> `merged_authority_answer` 的 zone 合并逻辑已删除(仓库内无调用方,未留
+> deprecated wrapper)。实现说明:502/503/504 与传输失败同档视为
+> `ZoneUnavailable`;其余 HTTP 回答(含 500)都是 Zone 的语义回答,独占返回。
+> 另增 `ResolvePolicy::use_zone_resolver`(默认 true,便捷方法
+> `without_zone_resolver()`):zone-resolver-server 内部实现同样用 resolve_did
+> 完成对外查询,必须按调用跳过 Zone 快路径,否则查询到自己造成递归。
 
 目标：以 [简单介绍resolve-did.md](./简单介绍resolve-did.md) 为准，把现有 `name-client`
 里的 DID 解析逻辑先修正确，再收敛成一条可读的主循环。

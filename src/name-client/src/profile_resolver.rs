@@ -535,6 +535,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         // 权威渠道 first-win:注册为 authority 的 provider 的回答优先于补充源。
@@ -672,6 +673,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         client
@@ -714,6 +716,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         client
@@ -756,6 +759,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         client

@@ -14,6 +14,7 @@ mod profile_resolver;
 mod provider;
 mod utility;
 mod web_provider;
+mod zone_resolver;
 
 pub use addr_rtt_db::*;
 pub use bns_provider::*;
@@ -30,6 +31,7 @@ pub use profile_resolver::*;
 pub use provider::*;
 pub use utility::*;
 pub use web_provider::*;
+pub use zone_resolver::*;
 
 use log::*;
 use name_lib::*;
@@ -66,6 +68,9 @@ pub async fn init_name_lib(web3_bridge_config: &HashMap<String, String>) -> NSRe
 pub async fn init_name_lib_for_test(web3_bridge_config: &HashMap<String, String>) -> NSResult<()> {
     let mut config = NameClientConfig::default();
     config.cache_backend = CacheBackend::Memory;
+    // 测试环境关闭 Zone Resolver cache:开发机上可能真的跑着 127.0.0.1:3180
+    // 服务,默认启用会让测试命中它。
+    config.enable_zone_resolver = false;
     init_name_lib_ex(web3_bridge_config, config).await
 }
 
@@ -139,8 +144,9 @@ pub async fn init_name_lib_ex(
             .await;
     }
 
-    // zone_resolver(介绍文档第 5 节)由 buckyos 启动后经
-    // `NameClient::set_zone_authority` 注册,这里不做默认注册。
+    // zone_resolver(介绍文档第 5 节)不是 provider,不在这里注册:它是
+    // cluster-level cache,`NameClientConfig::enable_zone_resolver` 默认启用,
+    // 默认指向本机 `http://127.0.0.1:3180`(zone_resolver.rs)。
 
     // 普通名字解析(resolve / resolve_ip)与 DID 管线独立注册。
     client
@@ -454,6 +460,7 @@ mod tests {
                 enable_cache: true,
                 local_cache_dir: Some(tmp.to_string_lossy().to_string()),
                 cache_backend: CacheBackend::Filesystem,
+                enable_zone_resolver: false,
                 ..Default::default()
             });
             client

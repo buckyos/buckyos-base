@@ -254,15 +254,11 @@ impl NsProvider for DnsProvider {
     ) -> NSResult<EncodedDocument> {
         info!("NsProvider query did: {} ...", did.to_host_name());
 
-        let name_info = self
-            .query(&did.to_host_name(), Some(RecordType::TXT), None)
-            .await?;
-
-        //info!("NsProvicer will parse_txt_record_to_did_documents... for {}",did.to_host_name());
-
-        //识别TXT记录中的特殊记录
         let doc_type = doc_type.unwrap_or_default();
-        let did_documents = name_info.parse_txt_record_to_did_documents()?;
+        let did_documents = self
+            .query_did_documents(did, from_ip)
+            .await?
+            .unwrap_or_default();
         if let Some(did_document) = did_documents.get(doc_type.as_str()) {
             info!(
                 "NsProvider::query_did{}: DID Document found: {}",
@@ -280,6 +276,17 @@ impl NsProvider for DnsProvider {
             "DID Document not found: {}",
             doc_type
         )));
+    }
+
+    async fn query_did_documents(
+        &self,
+        did: &DID,
+        from_ip: Option<IpAddr>,
+    ) -> NSResult<Option<HashMap<String, EncodedDocument>>> {
+        let name_info = self
+            .query(&did.to_host_name(), Some(RecordType::TXT), from_ip)
+            .await?;
+        Ok(Some(name_info.parse_txt_record_to_did_documents()?))
     }
 }
 

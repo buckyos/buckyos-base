@@ -325,6 +325,7 @@ async fn example_name_client() -> NameClient {
     let client = NameClient::new(NameClientConfig {
         enable_cache: false,
         cache_backend: CacheBackend::Memory,
+        enable_zone_resolver: false,
         ..Default::default()
     });
     client

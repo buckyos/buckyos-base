@@ -10,8 +10,9 @@ use crate::doc_cache::{
 };
 use crate::name_query::{NameQuery, ResolveOutcome};
 use crate::provider::RecordType;
+use crate::zone_resolver::{ZoneLookup, ZoneResolverClient, ZoneResolverConfig};
 use crate::{
-    is_key_class_method, BodyEvidence, CacheStatus, DidDocType, DocumentStatus,
+    is_key_class_method, BodyEvidence, CacheStatus, DidDocType, DiscoveredDocument, DocumentStatus,
     LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy, ResolveWarning,
     ResolvedDocument,
 };
@@ -44,6 +45,13 @@ pub struct NameClientConfig {
     pub local_cache_dir: Option<String>,
     pub cache_backend: CacheBackend,
     pub rtt_db_config: AddrRttDbConfig,
+    /// Zone Resolver cache 快路径(cluster-level cache,简化文档第 3 节第 0 步)。
+    /// 默认启用:服务可用时它的回答独占本次解析;服务不可用(连接失败/超时)
+    /// 才落回本机 cache 与 resolver core,非 BuckyOS 环境下代价只是一次即时
+    /// 失败的本机连接。单元测试、离线工具应显式关闭,避免打到开发机上真实
+    /// 运行的 zone 服务。
+    pub enable_zone_resolver: bool,
+    pub zone_resolver: ZoneResolverConfig,
 }
 
 impl Default for NameClientConfig {
@@ -53,6 +61,8 @@ impl Default for NameClientConfig {
             local_cache_dir: None,
             cache_backend: CacheBackend::Filesystem,
             rtt_db_config: AddrRttDbConfig::default(),
+            enable_zone_resolver: true,
+            zone_resolver: ZoneResolverConfig::default(),
         }
     }
 }
@@ -67,6 +77,9 @@ pub struct NameClient {
     nameinfo_cache: Option<std::sync::Arc<RwLock<HashMap<String, NameInfo>>>>,
     local_authority_overrides: Arc<LocalAuthorityOverrideStore>,
     unauthenticated_info_cache: UnauthenticatedInfoCache,
+    /// Zone Resolver cache 客户端(T5.5):cluster-level cache,不是 NsProvider,
+    /// 不进入 NameQuery 的 provider 管线。None = 已关闭。
+    zone_resolver: StdRwLock<Option<Arc<ZoneResolverClient>>>,
 }
 
 impl NameClient {
@@ -100,6 +113,14 @@ impl NameClient {
         ));
         let addr_rtt_auto_flush = addr_rtt_db.spawn_auto_flush();
 
+        let zone_resolver = if config.enable_zone_resolver {
+            Some(Arc::new(ZoneResolverClient::new(
+                config.zone_resolver.clone(),
+            )))
+        } else {
+            None
+        };
+
         Self {
             name_query,
             config: config,
@@ -110,7 +131,39 @@ impl NameClient {
             nameinfo_cache,
             local_authority_overrides: Arc::new(LocalAuthorityOverrideStore::new()),
             unauthenticated_info_cache: UnauthenticatedInfoCache::new(),
+            zone_resolver: StdRwLock::new(zone_resolver),
         }
+    }
+
+    // ---- Zone Resolver cache(T5.1:启用与配置)----
+
+    /// 关闭 Zone Resolver cache 快路径,退回单机 cache + resolver 流程。
+    /// 非 BuckyOS 环境、单元测试、离线工具使用。
+    pub fn disable_zone_resolver(&self) {
+        if let Ok(mut zone) = self.zone_resolver.write() {
+            *zone = None;
+        }
+    }
+
+    /// 设置 Zone Resolver endpoint 并启用(timeout 沿用构造配置)。
+    pub fn set_zone_resolver_endpoint(&self, endpoint: impl Into<String>) {
+        let mut config = self.config.zone_resolver.clone();
+        config.endpoint = endpoint.into();
+        self.set_zone_resolver_config(config);
+    }
+
+    /// 设置完整 Zone Resolver 配置(endpoint / timeout)并启用。
+    pub fn set_zone_resolver_config(&self, config: ZoneResolverConfig) {
+        if let Ok(mut zone) = self.zone_resolver.write() {
+            *zone = Some(Arc::new(ZoneResolverClient::new(config)));
+        }
+    }
+
+    fn zone_resolver_snapshot(&self) -> Option<Arc<ZoneResolverClient>> {
+        self.zone_resolver
+            .read()
+            .ok()
+            .and_then(|zone| zone.clone())
     }
 
     /// 写入本地测试/运维 override(简化文档第 7 节,类似 hosts 文件)。只应由本地
@@ -189,20 +242,6 @@ impl NameClient {
         self.name_query
             .add_method_supplement(method, provider)
             .await;
-    }
-
-    /// 注册当前 zone 的权威读取端(zone_resolver,介绍文档第 5、7 节)。
-    /// buckyos 启动后调用,provider 通常是指向 zone 内服务的
-    /// `BaseHttpProvider`(如 `http://127.0.0.1:3180`)。只受理同 zone did
-    /// 的查询,对这些 did 排在 method 权威读取端之前(同一发布渠道的
-    /// 另一个读取端)。同一 zone_did 重复注册时取代旧读取端。
-    pub async fn set_zone_authority(&self, zone_did: DID, provider: Box<dyn NsProvider>) {
-        self.name_query.set_zone_authority(zone_did, provider).await;
-    }
-
-    /// 注销某 zone 的权威读取端(zone 迁移/退出时)。
-    pub async fn clear_zone_authority(&self, zone_did: &DID) {
-        self.name_query.clear_zone_authority(zone_did).await;
     }
 
     /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
@@ -654,7 +693,36 @@ impl NameClient {
         }
     }
 
+    fn cache_discovered_documents(
+        &self,
+        discovered_documents: &[DiscoveredDocument],
+        evidence: CacheEvidence,
+    ) {
+        for discovered in discovered_documents {
+            let exp = Self::cache_ttl_exp(&discovered.document);
+            self.doc_cache.update(
+                discovered.did.clone(),
+                discovered.doc_type.clone(),
+                discovered.document.clone(),
+                exp,
+                evidence,
+            );
+
+            if discovered.doc_type == Some(DidDocType::Zone) {
+                self.doc_cache.update(
+                    discovered.did.clone(),
+                    None,
+                    discovered.document.clone(),
+                    exp,
+                    evidence,
+                );
+                self.cache_embedded_zone_devices(&DidDocType::Zone, &discovered.document, evidence);
+            }
+        }
+    }
+
     /// resolve_did 外层(简化文档第 3 节第 0/2 步):
+    /// 0. Zone Resolver cache 快路径(cluster-level cache,服务可用即独占);
     /// 1. 本地覆盖快路径(hosts 语义);
     /// 2. in-TTL positive cache 快路径(`CacheStatus::Hit`);
     /// 3. in-TTL negative cache 快路径(直接报错);
@@ -678,6 +746,33 @@ impl NameClient {
         let policy = policy.with_local_authority_override(self.local_authority_overrides.clone());
         let allow_stale_cache = policy.allow_stale_cache;
         let doc_type_c = doc_type.clone().unwrap_or_default();
+
+        // 0. Zone Resolver cache 快路径(T5.2):服务可用时它的回答独占本次解析
+        // (`CacheStatus::ZoneHit`),local override、本机 cache、method authority、
+        // supplements 都不参与;Missing / 负状态 / unknown 都是回答,不触发
+        // fallback。结果不回写本机 cache(避免两层 cache 合并)。不做 did_in_zone
+        // 客户端过滤:覆盖范围由 Zone Resolver 服务内部策略决定(T5.3)。
+        // policy 可按调用关闭(`use_zone_resolver = false`):zone-resolver-server
+        // 内部用 resolve_did 完成对外查询,必须跳过这里,否则查询到自己造成递归。
+        if policy.use_zone_resolver {
+            if let Some(zone) = self.zone_resolver_snapshot() {
+                let no_proof = self
+                    .name_query
+                    .is_no_proof_doc_type(&did.method, &doc_type_c)
+                    .await;
+                match zone.lookup(did, &doc_type_c, no_proof).await {
+                    ZoneLookup::Answered(result) => return result,
+                    ZoneLookup::Unavailable(err) => {
+                        debug!(
+                            "zone resolver unavailable for {}#{}, falling back to local flow: {}",
+                            did.to_string(),
+                            doc_type_c,
+                            err
+                        );
+                    }
+                }
+            }
+        }
 
         // Info 契约走独立轻量路径 + UnauthenticatedInfoCache 隔离。
         if self
@@ -789,6 +884,7 @@ impl NameClient {
                             evidence,
                         );
                         self.cache_embedded_zone_devices(&doc_type_c, &resolved.document, evidence);
+                        self.cache_discovered_documents(&resolved.discovered_documents, evidence);
                     }
                 }
                 resolved.resolution_metadata.cache_status = Some(if had_cache {
@@ -1146,6 +1242,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             enable_cache: true,
             local_cache_dir: Some(tmp.to_string_lossy().to_string()),
             cache_backend,
+            // 单机语义测试:显式关闭 Zone Resolver,避免命中开发机上真实
+            // 运行的 127.0.0.1:3180 服务。
+            enable_zone_resolver: false,
             ..Default::default()
         };
         NameClient::new(cfg)
@@ -1155,8 +1254,406 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         NameClient::new(NameClientConfig {
             enable_cache: true,
             cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         })
+    }
+
+    // ---- T5: Zone Resolver cache 层(zone_resolver.rs + resolve_did_ex 第 0 步) ----
+
+    /// 极小的 zone resolver HTTP stub:对任意请求返回固定 status + body,
+    /// 记录请求次数。返回 (endpoint, hits)。
+    async fn spawn_zone_stub(status_line: &'static str, body: String) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_in_task = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_in_task.fetch_add(1, Ordering::SeqCst);
+                // 读到请求头结束(GET 无 body)。
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{}", addr), hits)
+    }
+
+    /// 拿一个当前没有监听者的本机端口(bind 后立即释放)。
+    async fn free_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{}", addr)
+    }
+
+    fn zone_doc_body(marker: &str) -> String {
+        serde_json::json!({
+            "didDocument": {"marker": marker},
+            "didDocumentMetadata": {
+                "buckyos": {"documentStatus": "active", "documentVersion": 3}
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn zone_answer_short_circuits_local_cache_and_providers() {
+        // T5.6:Zone Resolver 成功返回时,不调用 local cache、local override、
+        // method authority 或 supplements;结果打 ZoneHit,且不回写本机 cache。
+        let (endpoint, hits) = spawn_zone_stub("200 OK", zone_doc_body("zone-answer")).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        // in-TTL local positive cache 与 local override 都在场,但都不参与。
+        let cached = make_doc(now, now + 1000, "local-cache");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+        client.set_local_authority_override(
+            did.clone(),
+            DidDocType::Zone,
+            make_doc(now, now + 1000, "local-override"),
+            "test-env",
+            None,
+        );
+        let authority = MockAuthority::ok(make_doc(now, now + 2000, "from-authority"));
+        let calls_probe = &authority.calls as *const AtomicUsize;
+        client
+            .set_method_authority("web", Box::new(authority))
+            .await;
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.document,
+            EncodedDocument::JsonLd(serde_json::json!({"marker": "zone-answer"}))
+        );
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::ZoneHit)
+        );
+        assert_eq!(
+            resolved.document_metadata.buckyos.document_version,
+            Some(3)
+        );
+        assert!(resolved
+            .resolution_metadata
+            .resolver_id
+            .as_deref()
+            .unwrap()
+            .starts_with("zone-resolver:"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(unsafe { (*calls_probe).load(Ordering::SeqCst) }, 0);
+        // zone 结果不回写 local cache:原缓存条目原样保留。
+        assert_eq!(client.doc_cache.get(&did, None).unwrap().0, cached);
+    }
+
+    #[tokio::test]
+    async fn zone_disabled_falls_back_to_single_node_flow() {
+        // T5.6:disable_zone_resolver() 后不查询 Zone Resolver,退回单机
+        // cache + resolver 流程。
+        let (endpoint, hits) = spawn_zone_stub("200 OK", zone_doc_body("zone-answer")).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+        client.disable_zone_resolver();
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached = make_doc(now, now + 1000, "local-cache");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, cached);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn policy_without_zone_resolver_skips_zone_for_this_call_only() {
+        // ResolvePolicy::use_zone_resolver = false 是按调用的旁路:
+        // zone-resolver-server 内部用 resolve_did 向外查询时靠它避免自递归;
+        // 同一 client 上使用默认 policy 的调用不受影响。
+        let (endpoint, hits) = spawn_zone_stub("200 OK", zone_doc_body("zone-answer")).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached = make_doc(now, now + 1000, "local-cache");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+
+        // 关闭 zone 的调用:不触碰 stub,走本机 cache。
+        let resolved = client
+            .resolve_did_ex(
+                &did,
+                None,
+                ResolvePolicy::default().without_zone_resolver(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, cached);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // 默认 policy 的调用仍由 Zone 独占。
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::ZoneHit)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn zone_unavailable_falls_back_to_local_cache_hit() {
+        // T5.6:服务不可用(connection refused)时才落回 local cache,
+        // 命中返回原有 CacheStatus::Hit。
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(free_endpoint().await);
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached = make_doc(now, now + 1000, "local-cache");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, cached);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+    }
+
+    #[tokio::test]
+    async fn zone_negative_answer_blocks_local_positive_and_authority() {
+        // T5.6:Zone 返回 Revoked 时,local positive cache 和外部 authority
+        // 都不得绕过;负状态是回答,不是 miss。zone 回答也不改写本机 cache。
+        let body = serde_json::json!({
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "revoked"}}
+        })
+        .to_string();
+        let (endpoint, _hits) = spawn_zone_stub("410 Gone", body).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached = make_doc(now, now + 1000, "local-cache");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+        let authority = MockAuthority::ok(make_doc(now, now + 2000, "from-authority"));
+        let calls_probe = &authority.calls as *const AtomicUsize;
+        client
+            .set_method_authority("web", Box::new(authority))
+            .await;
+
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        let NSError::Disabled(msg) = err else {
+            panic!("expected disabled, got {:?}", err);
+        };
+        assert!(msg.contains("zone resolver"));
+        assert_eq!(unsafe { (*calls_probe).load(Ordering::SeqCst) }, 0);
+        // zone 的负状态回答不写本机 negative cache(不回写纪律)。
+        assert_eq!(client.doc_cache.get(&did, None).unwrap().0, cached);
+    }
+
+    #[tokio::test]
+    async fn zone_missing_answer_blocks_local_cache_and_external_resolvers() {
+        // T5.6:Zone 返回 Missing(404)时,不查 local cache,也不查外部 resolver。
+        let (endpoint, hits) = spawn_zone_stub("404 Not Found", String::new()).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            make_doc(now, now + 1000, "local-cache"),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+        let authority = MockAuthority::ok(make_doc(now, now + 2000, "from-authority"));
+        let calls_probe = &authority.calls as *const AtomicUsize;
+        client
+            .set_method_authority("web", Box::new(authority))
+            .await;
+
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        let NSError::NotFound(msg) = err else {
+            panic!("expected not-found, got {:?}", err);
+        };
+        assert!(msg.contains("zone resolver"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(unsafe { (*calls_probe).load(Ordering::SeqCst) }, 0);
+    }
+
+    #[tokio::test]
+    async fn update_did_cache_writes_local_only_and_zone_still_wins() {
+        // T5.6:`update DID cache` 只影响 local cache;Zone Resolver 可用时
+        // Zone 结果仍优先。
+        let (endpoint, _hits) = spawn_zone_stub("200 OK", zone_doc_body("zone-answer")).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let pushed = make_doc(now, now + 1000, "pushed");
+        client
+            .update_did_cache(did.clone(), None, pushed.clone())
+            .unwrap();
+        // push 进的是本机 cache。
+        assert_eq!(client.doc_cache.get(&did, None).unwrap().0, pushed);
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::ZoneHit)
+        );
+        assert_eq!(
+            resolved.document,
+            EncodedDocument::JsonLd(serde_json::json!({"marker": "zone-answer"}))
+        );
+        // 本机 cache 不受 zone 回答影响。
+        assert_eq!(client.doc_cache.get(&did, None).unwrap().0, pushed);
+    }
+
+    #[tokio::test]
+    async fn zone_covers_any_did_without_client_side_zone_filter() {
+        // T5.6:`did_in_zone` 过滤已移除——Zone Resolver 可覆盖任意 DID,
+        // 包括未注册 method 的 DID;覆盖范围由服务内部策略决定。
+        let (endpoint, hits) = spawn_zone_stub("200 OK", zone_doc_body("zone-any")).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        // 未注册任何 method provider。
+        for did_str in ["did:web:other.com", "did:bns:alice"] {
+            let did = DID::from_str(did_str).unwrap();
+            let resolved = client
+                .resolve_did_ex(&did, None, ResolvePolicy::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                resolved.resolution_metadata.cache_status,
+                Some(CacheStatus::ZoneHit)
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn zone_serves_info_doc_type_with_unproof_evidence() {
+        // Info 契约的请求同样由 Zone 独占,证据按契约打 UnproofInfo,
+        // 且不写 UnauthenticatedInfoCache(zone 结果不回写任何本机缓存)。
+        let body = serde_json::json!({"didDocument": {"info": "zone-info"}}).to_string();
+        let (endpoint, _hits) = spawn_zone_stub("200 OK", body).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:web:dev1.example.com").unwrap();
+        let resolved = client
+            .resolve_did_ex(&did, Some(DidDocType::Info), ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::ZoneHit)
+        );
+        assert_eq!(
+            resolved.resolution_metadata.evidence,
+            Some(BodyEvidence::UnproofInfo)
+        );
+        assert!(client
+            .unauthenticated_info_cache
+            .get(&did, Some(DidDocType::Info))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn key_class_did_rejected_before_zone_lookup() {
+        // key 类 DID 的硬门禁仍然排在 Zone 快路径之前。
+        let (endpoint, hits) = spawn_zone_stub("200 OK", zone_doc_body("zone-answer")).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE").unwrap();
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::InvalidDID(_)));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     // ---- T0.1: key 类 DID 入参门禁 ----
@@ -1783,6 +2280,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(NameClientConfig {
             enable_cache: false,
             cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         client.add_dns_provider(Box::new(provider)).await;
@@ -1834,6 +2332,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(NameClientConfig {
             enable_cache: false,
             cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         let did = DID::from_str("did:web:compat.example").unwrap();
@@ -1890,6 +2389,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let ipv6_remote: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let client = NameClient::new(NameClientConfig {
             cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         client.add_dns_provider(Box::new(AddressProvider)).await;
@@ -1992,6 +2492,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(NameClientConfig {
             enable_cache: false,
             cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         let provider = build_device_provider(
@@ -2010,6 +2511,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(NameClientConfig {
             enable_cache: false,
             cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
             ..Default::default()
         });
         let provider = build_device_provider(
