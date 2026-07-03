@@ -584,10 +584,10 @@ pub struct ZoneDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sn: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub docker_repo_base_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub verify_hub_info: Option<VerifyHubInfo>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub docker_repo_base_url: Option<String>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub verify_hub_info: Option<VerifyHubInfo>,
 }
 
 impl ZoneDocument {
@@ -622,8 +622,6 @@ impl ZoneDocument {
             devices: HashMap::new(),
             oods: vec![],
             sn: None,
-            docker_repo_base_url: None,
-            verify_hub_info: None,
         }
     }
 
