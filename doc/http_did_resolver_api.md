@@ -49,7 +49,7 @@
 GET https://{provider}/1.0/identifiers/{did}?type={doc_type}
 ```
 
-`src/name-client/src/https_provider.rs` 的 `HttpsProvider` / `SmartProvider` 已经在用这个约定发起
+`src/name-client/src/https_provider.rs` 的 `BaseHttpProvider`(以及 `WebProvider` 的 uppername 回退信道)已经在用这个约定发起
 请求，对 `did:web` / `did:key` / `did:bns` 等任意 method 都适用（只负责拿到文档本身，`query_did`，
 不带状态语义）；`BnsProvider::query_did` 目前是转发给 `HttpsProvider`
 （[bns_provider.rs](../src/name-client/src/bns_provider.rs)，指向 `machine.json` 里

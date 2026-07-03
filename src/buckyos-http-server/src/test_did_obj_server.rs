@@ -7,7 +7,7 @@ use http::StatusCode;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use name_client::{
-    CacheBackend, DIDObjectClient, DidDocType, NameClient, NameClientConfig, SmartProvider,
+    CacheBackend, DIDObjectClient, DidDocType, NameClient, NameClientConfig, WebProvider,
 };
 use name_lib::{DIDObjectCard, EncodedDocument, OwnerDocument, DID};
 use serde_json::{json, Value};
@@ -328,7 +328,7 @@ async fn example_name_client() -> NameClient {
         ..Default::default()
     });
     client
-        .add_provider(Box::new(SmartProvider::new_with_scheme("http")), Some(0))
+        .add_provider(Box::new(WebProvider::new_with_scheme("http")), Some(0))
         .await;
 
     // 这些 fixture 里的 DIDObjectCard 都把 controller 设成 did:web:myhome.com，

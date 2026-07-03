@@ -106,7 +106,7 @@ Legend: [x] Implemented, [ ] Planned
 - DNS provider query and did resolution (live network) [x]
 - LocalNsProvider behavior [ ]
 - BnsProvider behavior [ ]
-- HttpsProvider and SmartProvider behavior [ ]
+- BaseHttpProvider and WebProvider behavior [ ]
 
 ## 5. Planned Test Design by Module
 
@@ -168,9 +168,9 @@ Legend: [x] Implemented, [ ] Planned
 #### Providers
 - DnsProvider: TXT lookup error handling and TTL propagation.
 - BnsProvider: query + query_did with mock server (contract stub).
-- HttpsProvider: `.well-known` paths and doc_type resolution.
+- BaseHttpProvider: resolver endpoint URL construction and response envelope parsing.
 - LocalNsProvider: local cache or file-based resolution behavior.
-- SmartProvider: provider selection and fallback behavior.
+- WebProvider: `.well-known` paths, doc_type resolution and uppername fallback.
 
 ## 6. Test Types and Strategy
 - Unit tests: data structure correctness, parsing, encoding/decoding.

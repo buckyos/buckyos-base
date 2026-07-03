@@ -10,7 +10,6 @@ use crate::{
 use async_trait::async_trait;
 use log::info;
 use name_lib::{EncodedDocument, NSError, NSResult, DID};
-use percent_encoding::percent_decode_str;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -77,7 +76,7 @@ impl BaseHttpProvider {
 
     /// method-agnostic 的 HTTP DID 响应归一:状态码映射(404/403/410)、
     /// resolver 信封拆包、JsonLd/Jwt 识别。各 method 的 provider
-    /// (SmartProvider / WebProvider)统一复用,不各自实现。
+    /// (如 WebProvider)统一复用,不各自实现。
     pub(crate) async fn parse_response(
         did: &DID,
         resp: reqwest::Response,
@@ -337,113 +336,6 @@ impl NsProvider for BaseHttpProvider {
     }
 }
 
-//TODO:支持用任意协议连接zone
-pub struct SmartProvider {
-    client: Client,
-    scheme: String,
-}
-
-impl SmartProvider {
-    pub fn new() -> Self {
-        Self::new_with_scheme("https")
-    }
-
-    pub fn new_with_scheme(scheme: &str) -> Self {
-        Self {
-            client: Client::new(),
-            scheme: scheme.to_string(),
-        }
-    }
-
-    fn doc_file_stem(doc_type: Option<&DidDocType>) -> NSResult<&str> {
-        let doc_type = doc_type.map(DidDocType::as_str).unwrap_or("did");
-        if doc_type.is_empty()
-            || !doc_type
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        {
-            return Err(NSError::InvalidParam(format!(
-                "invalid DID document type: {}",
-                doc_type
-            )));
-        }
-        Ok(doc_type)
-    }
-
-    fn build_url(&self, did: &DID, doc_type: Option<&DidDocType>) -> NSResult<String> {
-        let real_doc_type = Self::doc_file_stem(doc_type)?;
-        if did.method == "web" {
-            let mut parts = did.id.split(':');
-            let host = parts.next().ok_or_else(|| {
-                NSError::InvalidDID(format!("missing did:web host: {}", did.to_string()))
-            })?;
-            let host = percent_decode_str(host)
-                .decode_utf8()
-                .map_err(|e| NSError::InvalidDID(format!("invalid did:web host: {e}")))?;
-            let path = parts.collect::<Vec<_>>().join("/");
-
-            if path.is_empty() {
-                return Ok(format!(
-                    "{}://{}/.well-known/{}.json",
-                    self.scheme, host, real_doc_type
-                ));
-            }
-
-            return Ok(format!(
-                "{}://{}/{}/{}.json",
-                self.scheme, host, path, real_doc_type
-            ));
-        }
-
-        Ok(format!(
-            "{}://{}/{}.json",
-            self.scheme,
-            did.to_host_uri(),
-            real_doc_type
-        ))
-    }
-}
-
-#[async_trait]
-impl NsProvider for SmartProvider {
-    fn get_id(&self) -> String {
-        "smart-resolver".to_string()
-    }
-
-    fn methods(&self) -> Vec<String> {
-        vec!["web".to_string()]
-    }
-
-    async fn query(
-        &self,
-        _name: &str,
-        _record_type: Option<RecordType>,
-        _from_ip: Option<IpAddr>,
-    ) -> NSResult<NameInfo> {
-        Err(NSError::NotFound(
-            "smart-resolver does not resolve dns records".to_string(),
-        ))
-    }
-
-    async fn query_did(
-        &self,
-        did: &DID,
-        doc_type: Option<DidDocType>,
-        _from_ip: Option<IpAddr>,
-    ) -> NSResult<EncodedDocument> {
-        let url = self.build_url(did, doc_type.as_ref())?;
-
-        let resp = self
-            .client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
-
-        BaseHttpProvider::parse_response(did, resp).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,63 +557,6 @@ mod tests {
             provider.build_url(&did, None),
             "https://127.0.0.1:3200/1.0/identifiers/did:bns:example"
         );
-    }
-
-    #[test]
-    fn smart_provider_builds_did_object_url() {
-        let provider = SmartProvider::new_with_scheme("http");
-        let did = DID::from_str("did:web:127.0.0.1%3A3200:devices:cam01").unwrap();
-
-        assert_eq!(
-            provider.build_url(&did, None).unwrap(),
-            "http://127.0.0.1:3200/devices/cam01/did.json"
-        );
-    }
-
-    #[test]
-    fn smart_provider_builds_root_did_web_url() {
-        let provider = SmartProvider::new_with_scheme("http");
-        let did = DID::from_str("did:web:example.com").unwrap();
-
-        assert_eq!(
-            provider.build_url(&did, None).unwrap(),
-            "http://example.com/.well-known/did.json"
-        );
-    }
-
-    #[test]
-    fn smart_provider_uses_doc_type_as_static_file_name() {
-        let provider = SmartProvider::new_with_scheme("http");
-        let root_did = DID::from_str("did:web:example.com").unwrap();
-        let path_did = DID::from_str("did:web:example.com:users:alice").unwrap();
-
-        assert_eq!(
-            provider
-                .build_url(&root_did, Some(&DidDocType::Owner))
-                .unwrap(),
-            "http://example.com/.well-known/owner.json"
-        );
-        assert_eq!(
-            provider
-                .build_url(&path_did, Some(&DidDocType::custom("profile")))
-                .unwrap(),
-            "http://example.com/users/alice/profile.json"
-        );
-    }
-
-    #[test]
-    fn smart_provider_rejects_unsafe_doc_type() {
-        let provider = SmartProvider::new_with_scheme("http");
-        let did = DID::from_str("did:web:example.com").unwrap();
-
-        assert!(matches!(
-            provider.build_url(&did, Some(&DidDocType::custom("../owner"))),
-            Err(NSError::InvalidParam(_))
-        ));
-        assert!(matches!(
-            provider.build_url(&did, Some(&DidDocType::custom("profile/v1"))),
-            Err(NSError::InvalidParam(_))
-        ));
     }
 
     #[tokio::test]

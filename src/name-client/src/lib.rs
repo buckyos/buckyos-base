@@ -91,13 +91,11 @@ pub async fn init_name_lib_ex(
     }
 
     let client = NameClient::new(config);
-    // did:bns —— 权威渠道:web3 bridge 的 BNS 网关(合约的委托读取端);
-    // 补充源:通用 host URI 取回,只产出需要验证的候选。
+    // did:bns —— 权威渠道:web3 bridge 的 BNS 网关(合约的委托读取端)。
+    // 直连补充源(目标形态是 web_resolver,见 doc/已有did-resolver介绍.md 第 7 节)
+    // 待 WebProvider 支持 did:bns 的名字映射后接入,当前不注册。
     let bns_provider = BnsProvider::new()?;
     client.set_method_authority("bns", Box::new(bns_provider)).await;
-    client
-        .add_method_supplement("bns", Box::new(SmartProvider::new()))
-        .await;
     // did:web —— 权威渠道是域名自身的发布面:DNS TXT 与 WebProvider 是同一渠道
     // (域名控制权)的两个委托读取端,first-win 合并;Missing 需要读取端一致才
     // 成立,任何一个传输失败都按 unknown 处理。WebProvider 内部先查 W3C
