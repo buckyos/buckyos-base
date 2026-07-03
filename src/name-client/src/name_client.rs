@@ -187,6 +187,20 @@ impl NameClient {
         self.name_query.add_method_supplement(method, provider).await;
     }
 
+    /// 注册当前 zone 的权威读取端(zone_resolver,介绍文档第 5、7 节)。
+    /// buckyos 启动后调用,provider 通常是指向 zone 内服务的
+    /// `BaseHttpProvider`(如 `http://127.0.0.1:3180`)。只受理同 zone did
+    /// 的查询,对这些 did 排在 method 权威读取端之前(同一发布渠道的
+    /// 另一个读取端)。同一 zone_did 重复注册时取代旧读取端。
+    pub async fn set_zone_authority(&self, zone_did: DID, provider: Box<dyn NsProvider>) {
+        self.name_query.set_zone_authority(zone_did, provider).await;
+    }
+
+    /// 注销某 zone 的权威读取端(zone 迁移/退出时)。
+    pub async fn clear_zone_authority(&self, zone_did: &DID) {
+        self.name_query.clear_zone_authority(zone_did).await;
+    }
+
     /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
     pub async fn set_no_proof_doc_types(&self, method: &str, doc_types: HashSet<DidDocType>) {
         self.name_query.set_no_proof_doc_types(method, doc_types).await;

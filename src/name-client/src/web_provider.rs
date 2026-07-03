@@ -1,8 +1,9 @@
 /*
-did:web 的权威 resolver。did:web 把身份锚定在域名的控制权上:文档发布在该域名
-HTTPS 站点的固定路径下,本 provider 是这个 canonical endpoint 的读取端。
+web_resolver(doc/已有did-resolver介绍.md 第 2 节):did:web 的权威 resolver,
+同时是 did:bns 的直连补充源。did:web 把身份锚定在域名的控制权上:文档发布在
+该域名 HTTPS 站点的固定路径下,本 provider 是这个 canonical endpoint 的读取端。
 
-获取顺序(权威渠道内的两个 HTTP 信道,均由本 provider 完成):
+获取顺序(同一发布渠道内的两个 HTTP 信道,均由本 provider 完成):
   1. 先查 W3C well-known 静态 URL(构造规则见下)。这个顺序的意义:持有域名和
      CA 证书的网站运营者只需静态部署一份符合规范的文件就完成了 DID 发布,
      不需要运行任何动态服务;
@@ -13,9 +14,20 @@ HTTPS 站点的固定路径下,本 provider 是这个 canonical endpoint 的读�
      子域集中提供动态解析,BuckyOS 里 zone gateway 为 zone 内设备 DID 提供
      解析就是这个形态。`upper_did()` 为 None 时不回退——域名默认至少有一个点,
      根域名(example.com)的上级只剩顶级域(com),不可能向它查询;IP host 同理;
-  3. 两个信道都失败时 unknown 优先于 NotFound(与 AuthorityReaders 的读取端
+  3. 两个信道都失败时 unknown 优先于 NotFound(与权威渠道多读取端的
      合并语义一致):只有两个信道一致回答"没有",才允许主循环归一成 Missing;
      410/deactivated 是权威负回答,出现即终止,不再尝试下一个信道。
+
+did:bns:同样的取回逻辑作用在名字的规范 host 映射上(介绍文档第 2 节):
+  did:bns:{name} ↔ {name}.{bns_root},bns_root 与 BNS 网关共用同一份 web3
+  bridge 配置(bns_provider.rs 的 bns_bridge_host)。
+  did:bns:alice        => https://alice.{bns_root}/.well-known/did.json
+  did:bns:ood1.alice   => https://ood1.alice.{bns_root}/.well-known/did.json
+    回退 uppername     => https://alice.{bns_root}/1.0/identifiers/did:bns:ood1.alice
+  一级名字(alice)没有 uppername——它的 resolver 接口端点就是 BNS 网关本身,
+  那是 bns_resolver(权威渠道)的职责,这里不重复查询。
+  注意:这条信道不是 BNS 的权威渠道(权威是 BNS 合约/网关),所以 WebProvider
+  在 did:bns 下只能注册为补充源,产出 need_proof 候选,注册见 lib.rs。
 
 well-known URL 构造遵循 W3C did:web 规范 §3.2 Read
 (https://w3c-ccg.github.io/did-method-web/):
@@ -56,6 +68,7 @@ uppername 端点补上真正的发布状态查询。did:web 的权威渠道 = DN
 两个委托读取端的 first-win 合并,注册见 lib.rs。
 */
 
+use crate::bns_provider::bns_bridge_host;
 use crate::{BaseHttpProvider, DidDocType, NameInfo, NsProvider, PublishedState, RecordType};
 use async_trait::async_trait;
 use log::{debug, info};
@@ -64,7 +77,8 @@ use percent_encoding::percent_decode_str;
 use reqwest::Client;
 use std::net::IpAddr;
 
-/// W3C did:web 的 canonical endpoint 读取端。
+/// canonical endpoint 读取端:did:web 的域名发布面,以及 did:bns 名字的
+/// 规范 host 映射(`{name}.{bns_root}`)。
 pub struct WebProvider {
     client: Client,
     scheme: String,
@@ -114,6 +128,37 @@ impl WebProvider {
         Ok(host.into_owned())
     }
 
+    /// did:bns 的规范 host 映射(介绍文档第 2 节):did:bns:{name} ↔
+    /// {name}.{bns_root}。名字部分不做百分号解码(bns 名字没有端口语义),
+    /// 只放行 hostname 合法字符,防止拼出跳出发布目录的 host。
+    fn bns_canonical_host(did: &DID, raw_name: &str) -> NSResult<String> {
+        let name_is_valid = !raw_name.is_empty()
+            && raw_name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-');
+        if !name_is_valid {
+            return Err(NSError::InvalidDID(format!(
+                "invalid did:bns name: {}",
+                did.to_string()
+            )));
+        }
+        let bridge = bns_bridge_host()?;
+        Ok(format!("{}.{}", raw_name, bridge))
+    }
+
+    /// 名字(id 第一段)到取回 host 的映射:did:web 直接用解码后的域名,
+    /// did:bns 落在名字的规范 host 映射上。
+    fn canonical_host(did: &DID, raw_name: &str) -> NSResult<String> {
+        match did.method.as_str() {
+            "web" => Self::decode_host(did, raw_name),
+            "bns" => Self::bns_canonical_host(did, raw_name),
+            other => Err(NSError::NotFound(format!(
+                "unsupported did method: {}",
+                other
+            ))),
+        }
+    }
+
     /// 路径段原样拼进 URL(pct-encoded 不解码),因此只放行 DID idchar,
     /// 并拒绝空段与 "." / ".."。
     fn validate_path_segment(did: &DID, segment: &str) -> NSResult<()> {
@@ -146,14 +191,14 @@ impl WebProvider {
         Ok(doc_type)
     }
 
-    /// 信道 1:W3C well-known 静态 URL。
+    /// 信道 1:W3C well-known 静态 URL(did:bns 用规范 host 映射代入同一构造)。
     fn build_url(&self, did: &DID, doc_type: Option<&DidDocType>) -> NSResult<String> {
         let doc_file = Self::doc_file_stem(doc_type)?;
 
-        // 规范第 1 步:":" => "/"。第一段是 host,其余段构成路径。
+        // 规范第 1 步:":" => "/"。第一段是名字(host),其余段构成路径。
         let mut segments = did.id.split(':');
         let raw_host = segments.next().unwrap_or_default();
-        let host = Self::decode_host(did, raw_host)?;
+        let host = Self::canonical_host(did, raw_host)?;
 
         let path_segments: Vec<&str> = segments.collect();
         for segment in &path_segments {
@@ -232,6 +277,9 @@ impl NsProvider for WebProvider {
     }
 
     fn methods(&self) -> Vec<String> {
+        // 仅供 add_provider 兼容注册(首个注册者成为该 method 的权威渠道)。
+        // did:bns 下本 provider 只能是补充源,不能经这条兼容路径注册,
+        // 所以这里只自声明 web;did:bns 请用 add_method_supplement 显式接入。
         vec!["web".to_string()]
     }
 
@@ -252,7 +300,7 @@ impl NsProvider for WebProvider {
         doc_type: Option<DidDocType>,
         _from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
-        if did.method != "web" {
+        if did.method != "web" && did.method != "bns" {
             return Err(NSError::NotFound(format!(
                 "unsupported did method: {}",
                 did.to_string()
@@ -269,10 +317,12 @@ impl NsProvider for WebProvider {
         };
 
         // 信道 2:回退到 uppername(DID::upper_did)的 resolver 接口。
+        // uppername 也走各 method 的规范 host 映射(did:bns:alice => alice.{bns_root})。
         let Some(upper_did) = did.upper_did() else {
             return Err(well_known_err);
         };
-        let resolver_url = self.build_upper_resolver_url(&upper_did.id, did, doc_type.as_ref())?;
+        let upper_host = Self::canonical_host(&upper_did, &upper_did.id)?;
+        let resolver_url = self.build_upper_resolver_url(&upper_host, did, doc_type.as_ref())?;
         info!(
             "did:web well-known miss for {} ({}), falling back to upper resolver {}",
             did.to_string(),
@@ -374,6 +424,87 @@ mod tests {
                 .unwrap(),
             "https://example.com/users/alice/profile.json"
         );
+    }
+
+    // ------------------------ did:bns 的规范 host 映射 ------------------------
+
+    /// 测试进程内保证 web3 bridge 配置就位,并读回实际生效的 bns 根域
+    /// (全局 OnceCell 可能已被其它测试或 machine.json 抢先初始化)。
+    fn ensure_bns_bridge() -> String {
+        let mut cfg = std::collections::HashMap::new();
+        cfg.insert("bns".to_string(), "web3.buckyos.ai".to_string());
+        let _ = name_lib::KNOWN_WEB3_BRIDGE_CONFIG.set(cfg);
+        bns_bridge_host().unwrap()
+    }
+
+    #[test]
+    fn builds_bns_well_known_url_via_bridge_mapping() {
+        let bridge = ensure_bns_bridge();
+        let provider = WebProvider::new();
+
+        let first_level = DID::from_str("did:bns:alice").unwrap();
+        assert_eq!(
+            provider.build_url(&first_level, None).unwrap(),
+            format!("https://alice.{}/.well-known/did.json", bridge)
+        );
+        assert_eq!(
+            provider
+                .build_url(&first_level, Some(&DidDocType::Owner))
+                .unwrap(),
+            format!("https://alice.{}/.well-known/owner.json", bridge)
+        );
+
+        let sub_name = DID::from_str("did:bns:ood1.alice").unwrap();
+        assert_eq!(
+            provider.build_url(&sub_name, None).unwrap(),
+            format!("https://ood1.alice.{}/.well-known/did.json", bridge)
+        );
+    }
+
+    #[test]
+    fn builds_bns_upper_resolver_url_via_bridge_mapping() {
+        let bridge = ensure_bns_bridge();
+        let provider = WebProvider::new();
+        let did = DID::from_str("did:bns:ood1.alice").unwrap();
+
+        let upper = did.upper_did().unwrap();
+        assert_eq!(upper, DID::new("bns", "alice"));
+        let upper_host = WebProvider::canonical_host(&upper, &upper.id).unwrap();
+        assert_eq!(upper_host, format!("alice.{}", bridge));
+        assert_eq!(
+            provider
+                .build_upper_resolver_url(&upper_host, &did, Some(&DidDocType::Owner))
+                .unwrap(),
+            format!(
+                "https://alice.{}/1.0/identifiers/did:bns:ood1.alice?type=owner",
+                bridge
+            )
+        );
+
+        // 一级名字没有 uppername:它的 resolver 接口就是 BNS 网关本身,
+        // 归 bns_resolver(权威渠道)负责,这里不产生回退请求。
+        assert_eq!(DID::from_str("did:bns:alice").unwrap().upper_did(), None);
+    }
+
+    #[test]
+    fn rejects_malformed_bns_names() {
+        ensure_bns_bridge();
+        for bad in [
+            "did:bns:",                // 空名字
+            "did:bns:alice%2Fevil",    // 名字里藏了 "/"
+            "did:bns:alice%3A3000",    // bns 名字没有端口语义
+            "did:bns:alice..evil%00",  // 非法字符
+        ] {
+            let did = DID::from_str(bad).unwrap();
+            assert!(
+                matches!(
+                    WebProvider::canonical_host(&did, did.id.split(':').next().unwrap()),
+                    Err(NSError::InvalidDID(_))
+                ),
+                "should reject {}",
+                bad
+            );
+        }
     }
 
     // ------------------------ uppername 回退信道 ------------------------
@@ -481,8 +612,10 @@ mod tests {
 
     #[tokio::test]
     async fn query_did_rejects_unsupported_method_without_network() {
+        // did:web / did:bns 之外的 method 一概不受理(key 类 DID 更是在主循环
+        // 入口就被拒绝,这里只是 provider 层的兜底)。
         let provider = WebProvider::new();
-        let did = DID::from_str("did:bns:waterflier").unwrap();
+        let did = DID::from_str("did:key:z6Mksw4bDmn77uB5iVbQJBALV4CfqUGNoTCJQwdse1dQcvbK").unwrap();
         let err = provider.query_did(&did, None, None).await.unwrap_err();
         assert!(matches!(err, NSError::NotFound(_)));
     }

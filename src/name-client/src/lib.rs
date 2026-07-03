@@ -46,6 +46,12 @@ pub static IS_NAME_LIB_INITED: OnceCell<bool> = OnceCell::new();
 //串行化首次初始化，避免并发调用 init_name_lib_ex 时重复构建 NameClient
 static NAME_LIB_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// 默认 web3 bridge 配置。键的含义:
+/// - "bns":BNS 网关 host,同时是 did:bns 名字的规范 host 映射根
+///   (`did:bns:alice` ↔ `alice.{bns_root}`)。目标名是 `bns.buckyos.ai`
+///   (介绍文档第 1 节),其 DNS 上线前默认仍指向 `web3.buckyos.ai`;
+///   与 BuckyOSMachineConfig::default 保持一致,切换时两处同改。
+/// - "sn":可选,SN 网关 host,配置后注册 sn_resolver 补充源(第 4 节)。
 pub fn get_default_web3_bridge_config() -> HashMap<String, String> {
     let mut web3_bridge_config = HashMap::new();
     web3_bridge_config.insert("bns".to_string(), "web3.buckyos.ai".to_string());
@@ -91,28 +97,49 @@ pub async fn init_name_lib_ex(
     }
 
     let client = NameClient::new(config);
-    // did:bns —— 权威渠道:web3 bridge 的 BNS 网关(合约的委托读取端)。
-    // 直连补充源(目标形态是 web_resolver,见 doc/已有did-resolver介绍.md 第 7 节)
-    // 待 WebProvider 支持 did:bns 的名字映射后接入,当前不注册。
+    // 注册模型与顺序见 doc/已有did-resolver介绍.md 第 7 节:每个 method
+    // 第一个总是权威源,补充源按注册顺序即优先级(first-win)。
+
+    // did:bns —— 权威渠道:BNS 智能合约,bns_resolver 是它的委托读取端
+    // (web3 bridge 的 BNS 网关)。补充源:web_resolver(名字的规范 host 映射
+    // alice.{bns_root} 上的 well-known / uppername 双信道)→ dns_resolver
+    // (同一映射 host 上的 TXT 记录,need_proof 候选)。
     let bns_provider = BnsProvider::new()?;
     client.set_method_authority("bns", Box::new(bns_provider)).await;
-    // did:web —— 权威渠道是域名自身的发布面:DNS TXT 与 WebProvider 是同一渠道
-    // (域名控制权)的两个委托读取端,first-win 合并;Missing 需要读取端一致才
-    // 成立,任何一个传输失败都按 unknown 处理。WebProvider 内部先查 W3C
-    // well-known 静态 URL(静态部署即可发布),未命中再回退 uppername 的
-    // resolver 接口(上级域名为子域集中提供动态解析),见 web_provider.rs。
     client
-        .set_method_authority(
-            "web",
-            Box::new(AuthorityReaders::new(
-                "web-authority",
-                vec![
-                    Box::new(DnsProvider::new(None)),
-                    Box::new(WebProvider::new()),
-                ],
-            )),
-        )
+        .add_method_supplement("bns", Box::new(WebProvider::new()))
         .await;
+    client
+        .add_method_supplement("bns", Box::new(DnsProvider::new(None)))
+        .await;
+
+    // did:web —— 权威发布面就是该域名 HTTPS 站点的固定路径,web_resolver 是
+    // 这个 canonical endpoint 的读取端(先查 W3C well-known 静态 URL,未命中
+    // 再回退 uppername 的 resolver 接口,见 web_provider.rs)。dns_resolver
+    // 降为补充源:DNS 信道本身没有认证能力,它取回的一切都只是 need_proof
+    // 候选("英雄不问出处,但要验证",介绍文档第 3 节)。
+    client
+        .set_method_authority("web", Box::new(WebProvider::new()))
+        .await;
+    client
+        .add_method_supplement("web", Box::new(DnsProvider::new(None)))
+        .await;
+
+    // sn_resolver(介绍文档第 4 节)—— 补充源,走 resolver 接口,支持跨 NAT
+    // 组网阶段取回 DeviceDocument / DeviceInfo。web3 bridge 配置里声明了
+    // "sn" 网关时注册为两个 method 的末位补充源;默认配置不含 sn,即默认不注册。
+    if let Some(sn_host) = web3_bridge_config.get("sn") {
+        client
+            .add_method_supplement("web", Box::new(BaseHttpProvider::new(sn_host)))
+            .await;
+        client
+            .add_method_supplement("bns", Box::new(BaseHttpProvider::new(sn_host)))
+            .await;
+    }
+
+    // zone_resolver(介绍文档第 5 节)由 buckyos 启动后经
+    // `NameClient::set_zone_authority` 注册,这里不做默认注册。
+
     // 普通名字解析(resolve / resolve_ip)与 DID 管线独立注册。
     client.add_dns_provider(Box::new(DnsProvider::new(None))).await;
     // did:dev / did:key 不注册任何 provider:key 类 DID 不是解析入口(简化文档第 6 节)。

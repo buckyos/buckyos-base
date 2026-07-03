@@ -21,6 +21,31 @@ use name_lib::{EncodedDocument, NSError, NSResult, DID};
 use serde_json::Value;
 use std::net::IpAddr;
 
+/// bns 的 web3 bridge 根域。既是 BNS 网关(resolver 接口)的 host,也是
+/// did:bns 名字的规范 host 映射根(`did:bns:alice` ↔ `alice.{bns_root}`,
+/// 见 doc/已有did-resolver介绍.md 第 1、2 节)——两个用途必须读同一份配置,
+/// WebProvider 的 did:bns 信道与 BnsProvider 共用本函数。
+/// 优先级:全局 `KNOWN_WEB3_BRIDGE_CONFIG` → machine.json → 默认配置。
+/// 默认值目前是 `web3.buckyos.ai`;文档的目标名 `bns.buckyos.ai` 的 DNS
+/// 尚未上线,上线后只需改 BuckyOSMachineConfig::default 一处。
+pub(crate) fn bns_bridge_host() -> NSResult<String> {
+    name_lib::KNOWN_WEB3_BRIDGE_CONFIG
+        .get()
+        .and_then(|m| m.get("bns"))
+        .cloned()
+        .or_else(|| {
+            BuckyOSMachineConfig::load_machine_config()
+                .and_then(|mc| mc.web3_bridge.get("bns").cloned())
+        })
+        .or_else(|| {
+            BuckyOSMachineConfig::default()
+                .web3_bridge
+                .get("bns")
+                .cloned()
+        })
+        .ok_or_else(|| NSError::Failed("web3_bridge.bns not set".to_string()))
+}
+
 /// 基于 web3 bridge 的 BNS DID 解析器(bns method 的权威渠道委托读取端),
 /// 内部完全复用 `HttpsProvider`。
 pub struct BnsProvider {
@@ -31,23 +56,7 @@ impl BnsProvider {
     /// 使用全局 `KNOWN_WEB3_BRIDGE_CONFIG` 的 bns 网关作为 resolver host。
     /// 若未初始化全局配置，则回退读取 machine.json，再回退默认配置。
     pub fn new() -> NSResult<Self> {
-        let host_from_global = name_lib::KNOWN_WEB3_BRIDGE_CONFIG
-            .get()
-            .and_then(|m| m.get("bns"))
-            .cloned();
-
-        let resolver_host = host_from_global
-            .or_else(|| {
-                BuckyOSMachineConfig::load_machine_config()
-                    .and_then(|mc| mc.web3_bridge.get("bns").cloned())
-            })
-            .or_else(|| {
-                BuckyOSMachineConfig::default()
-                    .web3_bridge
-                    .get("bns")
-                    .cloned()
-            })
-            .ok_or_else(|| NSError::Failed("web3_bridge.bns not set".to_string()))?;
+        let resolver_host = bns_bridge_host()?;
 
         info!("bns provider using resolver host: {}", resolver_host);
 

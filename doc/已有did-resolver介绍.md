@@ -110,17 +110,19 @@ web_resolver → dns_resolver → sn_resolver
 1. buckyos 在启动后,会针对当前 zone 内的 did,把 zone_resolver 注册在最前面(只接收同 zone did 的查询;对 zone 内它就是权威源,见第 5 节);
 2. 如果 current zone 是 `did:web:xxx`,需要走一个特殊流程:zone 的权威发布面是它自己的 HTTPS 服务,启动完成之前不可达(先有鸡还是先有蛋),Booting 阶段要靠本地已有的 Owner Document + dns_resolver 引导(见第 3 节)。具体流程待展开。
 
-## 8. 与当前实现的对照(2026-07 快照)
+## 8. 与当前实现的对照(2026-07 快照,已按本文对齐)
 
-本文描述的是目标形态,与 name-client 当前代码的差异如下,供对齐时参考:
+name-client 的注册(lib.rs 的 `init_name_lib_ex`)已与第 7 节的目标顺序一致:
 
 | 本文的 resolver | 代码 | 状态 |
 | --- | --- | --- |
-| bns_resolver | `BnsProvider`(bns_provider.rs,薄配置壳,HTTP 细节复用 `BaseHttpProvider`) | 已注册为 did:bns 权威源。公网默认网关目前是 `web3.buckyos.ai`,本文的目标名是 `bns.buckyos.ai` |
-| web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已实现,当前只注册给 did:web;did:bns 的直连补充位空缺,待 WebProvider 支持 did:bns 的名字映射后接入 |
-| dns_resolver | `DnsProvider`(dns_provider.rs) | 已实现,但注册位置与本文不一致:当前它经 `AuthorityReaders` 与 WebProvider 合并为 did:web 权威渠道的读取端,结果按 need_proof = false 处理;本文的目标是降为补充源(DNS 信道无认证)。did:bns 下当前未注册 |
-| sn_resolver | `BaseHttpProvider` 指向 SN host 即可 | 协议能力已具备,默认未注册 |
-| zone_resolver | `BaseHttpProvider` 指向 zone 内服务即可 | 协议能力已具备;buckyos 启动时注册 zone_resolver 的机制待接入 |
+| bns_resolver | `BnsProvider`(bns_provider.rs,薄配置壳,HTTP 细节复用 `BaseHttpProvider`) | 已注册为 did:bns 权威源。公网默认网关仍是 `web3.buckyos.ai`——目标名 `bns.buckyos.ai` 的 DNS 尚未上线,不能先切默认值;上线后改 `BuckyOSMachineConfig::default` 与 `get_default_web3_bridge_config` 两处即可 |
+| web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现,bns_root 与 BNS 网关共用 web3 bridge 配置;一级 bns 名字没有 uppername 回退(那个端点就是 BNS 网关本身,归 bns_resolver 管) |
+| dns_resolver | `DnsProvider`(dns_provider.rs) | 已按本文降为补充源:did:web 与 did:bns 下均注册在 web_resolver 之后,取回结果一律 need_proof 候选。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
+| sn_resolver | `BaseHttpProvider` 指向 SN host | web3 bridge 配置含 `"sn"` 键时,自动注册为 did:web / did:bns 的末位补充源;默认配置不含 sn,即默认未注册 |
+| zone_resolver | `BaseHttpProvider` 指向 zone 内服务 + `NameClient::set_zone_authority(zone_did, provider)` | name-client 侧机制已就绪:zone 读取端只受理同 zone did(zone 自身及其名字层级下的子名字),对这些 did 排在 method 权威源之前,两者按"同一权威渠道多读取端"纪律合并(first-win;Missing 须读取端一致;任一读取端断网而其余给不出回答则整体 unknown)。buckyos 启动时调用 `set_zone_authority` 的接线仍待接入 |
 | smart_resolver(社交版) | 无 | 暂不实现 |
 
 另外:resolver 接口响应里的 buckyos 扩展信封(发布状态等)客户端解析已就绪(`BaseHttpProvider`),服务端尚未实现;在那之前,did:web 的发布状态由主循环把 200 / 404 / 410 归一成 Active / Missing / 负状态。
+
+**dns_resolver 降级的行为变化**:此前 TXT 记录还原出的文档按权威结果(need_proof = false)直接放行;现在它们是普通候选,须通过 expected_owner 一致性与 owner 验签才可见。对第 3 节的 Zone 自举场景,这正是"本地已有 Owner Document,验签在本地闭环"的前提——纯 TXT 发布、又没有任何 owner 绑定来源的 did,将不再能通过 resolve_did 管线解析(这是本文第 3 节要求的安全语义,不是缺陷)。Booting 具体流程仍待展开(第 7 节)。
