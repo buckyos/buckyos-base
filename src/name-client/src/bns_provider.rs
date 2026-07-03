@@ -13,7 +13,7 @@
 协议见 doc/http_did_resolver_api.md。
 */
 
-use crate::{DidDocType, BaseHttpProvider, NameInfo, NsProvider, PublishedState, RecordType};
+use crate::{BaseHttpProvider, DidDocType, NameInfo, NsProvider, PublishedState, RecordType};
 use async_trait::async_trait;
 use buckyos_kit::BuckyOSMachineConfig;
 use log::info;

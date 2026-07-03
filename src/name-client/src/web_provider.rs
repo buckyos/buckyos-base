@@ -102,7 +102,11 @@ impl WebProvider {
     /// 并校验解码结果仍然是 hostname[:port] 的形状。
     fn decode_host(did: &DID, raw_host: &str) -> NSResult<String> {
         let host = percent_decode_str(raw_host).decode_utf8().map_err(|e| {
-            NSError::InvalidDID(format!("invalid did:web host in {}: {}", did.to_string(), e))
+            NSError::InvalidDID(format!(
+                "invalid did:web host in {}: {}",
+                did.to_string(),
+                e
+            ))
         })?;
 
         let (name, port) = match host.split_once(':') {
@@ -490,10 +494,10 @@ mod tests {
     fn rejects_malformed_bns_names() {
         ensure_bns_bridge();
         for bad in [
-            "did:bns:",                // 空名字
-            "did:bns:alice%2Fevil",    // 名字里藏了 "/"
-            "did:bns:alice%3A3000",    // bns 名字没有端口语义
-            "did:bns:alice..evil%00",  // 非法字符
+            "did:bns:",               // 空名字
+            "did:bns:alice%2Fevil",   // 名字里藏了 "/"
+            "did:bns:alice%3A3000",   // bns 名字没有端口语义
+            "did:bns:alice..evil%00", // 非法字符
         ] {
             let did = DID::from_str(bad).unwrap();
             assert!(
@@ -615,7 +619,8 @@ mod tests {
         // did:web / did:bns 之外的 method 一概不受理(key 类 DID 更是在主循环
         // 入口就被拒绝,这里只是 provider 层的兜底)。
         let provider = WebProvider::new();
-        let did = DID::from_str("did:key:z6Mksw4bDmn77uB5iVbQJBALV4CfqUGNoTCJQwdse1dQcvbK").unwrap();
+        let did =
+            DID::from_str("did:key:z6Mksw4bDmn77uB5iVbQJBALV4CfqUGNoTCJQwdse1dQcvbK").unwrap();
         let err = provider.query_did(&did, None, None).await.unwrap_err();
         assert!(matches!(err, NSError::NotFound(_)));
     }

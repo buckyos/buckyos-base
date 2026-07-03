@@ -5,7 +5,9 @@ use crate::addr_rtt_db::{
     PersistencePolicy, RankedAddress, RttDatabase, SortPolicy,
 };
 use crate::dns_provider::DnsProvider;
-use crate::doc_cache::{CacheBackend, CacheEvidence, CacheLookup, DIDDocumentCache, UnauthenticatedInfoCache};
+use crate::doc_cache::{
+    CacheBackend, CacheEvidence, CacheLookup, DIDDocumentCache, UnauthenticatedInfoCache,
+};
 use crate::name_query::{NameQuery, ResolveOutcome};
 use crate::provider::RecordType;
 use crate::{
@@ -184,7 +186,9 @@ impl NameClient {
         method: impl Into<String>,
         provider: Box<dyn NsProvider>,
     ) {
-        self.name_query.add_method_supplement(method, provider).await;
+        self.name_query
+            .add_method_supplement(method, provider)
+            .await;
     }
 
     /// 注册当前 zone 的权威读取端(zone_resolver,介绍文档第 5、7 节)。
@@ -203,7 +207,9 @@ impl NameClient {
 
     /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
     pub async fn set_no_proof_doc_types(&self, method: &str, doc_types: HashSet<DidDocType>) {
-        self.name_query.set_no_proof_doc_types(method, doc_types).await;
+        self.name_query
+            .set_no_proof_doc_types(method, doc_types)
+            .await;
     }
 
     /// 注册普通名字解析(DNS 语义)的 provider。
@@ -1141,7 +1147,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
 
         let authority = MockAuthority::ok(make_doc(now + 10, now + 2000, "fresh"));
-        client.set_method_authority("web", Box::new(authority)).await;
+        client
+            .set_method_authority("web", Box::new(authority))
+            .await;
 
         let resolved = client
             .resolve_did_ex(&did, None, ResolvePolicy::default())
@@ -1194,7 +1202,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
 
         client
-            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Disabled)))
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Disabled)),
+            )
             .await;
 
         let err = client.resolve_did(&did, None).await.unwrap_err();
@@ -1212,7 +1223,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         let authority = MockAuthority::with_mode(AuthorityMode::Disabled);
         let mode = authority.mode_handle();
-        client.set_method_authority("web", Box::new(authority)).await;
+        client
+            .set_method_authority("web", Box::new(authority))
+            .await;
 
         // 第一次:拿到 Revoked,写入负状态。
         let err = client.resolve_did(&did, None).await.unwrap_err();
@@ -1244,7 +1257,8 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let owner_doc = owner.encode(Some(&private_key)).unwrap();
 
         let now = buckyos_get_unix_timestamp();
-        let mut zone = ZoneDocument::new(app_did.clone(), owner_did.clone(), test_owner_public_jwk());
+        let mut zone =
+            ZoneDocument::new(app_did.clone(), owner_did.clone(), test_owner_public_jwk());
         zone.iat = now;
         zone.exp = now + 3600 * 24;
         zone.version_seq = Some(1);
@@ -1261,7 +1275,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         client
             .set_method_authority(
                 "bns",
-                Box::new(MockAuthority::with_mode(AuthorityMode::Missing).with_owner_doc(owner_doc)),
+                Box::new(
+                    MockAuthority::with_mode(AuthorityMode::Missing).with_owner_doc(owner_doc),
+                ),
             )
             .await;
         // 补充源提供签名合法的候选。
@@ -1277,7 +1293,11 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .unwrap_err();
         assert!(matches!(err, NSError::Disabled(_)));
         // 负状态记忆原样保留。
-        assert!(client.doc_cache.lookup(&app_did, None).unwrap().is_negative());
+        assert!(client
+            .doc_cache
+            .lookup(&app_did, None)
+            .unwrap()
+            .is_negative());
     }
 
     #[tokio::test]
@@ -1294,7 +1314,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
 
         client
-            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Down)))
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Down)),
+            )
             .await;
 
         let err = client.resolve_did(&did, None).await.unwrap_err();
@@ -1306,7 +1329,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = mem_client();
         let did = DID::from_str("did:web:revoked2.example").unwrap();
         client
-            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Disabled)))
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Disabled)),
+            )
             .await;
         let _ = client.resolve_did(&did, None).await.unwrap_err();
         assert!(client.doc_cache.lookup(&did, None).unwrap().is_negative());
@@ -1335,7 +1361,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
 
         client
-            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Missing)))
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Missing)),
+            )
             .await;
 
         let err = client.resolve_did(&did, None).await.unwrap_err();
@@ -1357,7 +1386,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
 
         client
-            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Down)))
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Down)),
+            )
             .await;
 
         // 默认策略允许 stale 兜底。
@@ -1398,7 +1430,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
 
         client
-            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Down)))
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Down)),
+            )
             .await;
 
         let err = client.resolve_did(&did, None).await.unwrap_err();
@@ -1415,7 +1450,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let (zone_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "fresh");
 
         let authority = MockAuthority::ok(zone_doc.clone()).with_owner_doc(owner_doc);
-        client.set_method_authority("web", Box::new(authority)).await;
+        client
+            .set_method_authority("web", Box::new(authority))
+            .await;
 
         let first = client
             .resolve_did_ex(&did, None, ResolvePolicy::default())
@@ -1952,7 +1989,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     async fn resolve_ips_uses_cached_finder_device_info_after_discovery() {
         let client = mem_client();
         client
-            .set_method_authority("web", Box::new(MockAuthority::with_mode(AuthorityMode::Missing)))
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Missing)),
+            )
             .await;
 
         let device_did = DID::from_str("did:web:ood1.example").unwrap();

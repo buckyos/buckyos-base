@@ -97,7 +97,11 @@ impl NameQuery {
 
     /// 注册某 method 的权威发布渠道。一个 method 至多一个权威渠道;重复设置视为
     /// 配置错误,保留первый注册者并打警告。
-    pub async fn set_method_authority(&self, method: impl Into<String>, provider: Box<dyn NsProvider>) {
+    pub async fn set_method_authority(
+        &self,
+        method: impl Into<String>,
+        provider: Box<dyn NsProvider>,
+    ) {
         let method = method.into();
         let mut methods = self.methods.write().await;
         let entry = methods.entry(method.clone()).or_default();
@@ -156,7 +160,10 @@ impl NameQuery {
     /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
     pub async fn set_no_proof_doc_types(&self, method: &str, doc_types: HashSet<DidDocType>) {
         let mut methods = self.methods.write().await;
-        methods.entry(method.to_string()).or_default().no_proof_doc_types = doc_types;
+        methods
+            .entry(method.to_string())
+            .or_default()
+            .no_proof_doc_types = doc_types;
     }
 
     /// 该 (method, doc_type) 是否走免验证的 Info 路径(method 契约,不由 provider
@@ -833,21 +840,18 @@ impl NameQuery {
             .for_authority_lookup()
             .descend(expected_owner, &DidDocType::Owner)
             .map_err(CandidateRejection::Failed)?;
-        let owner_outcome = Box::pin(self.query_did_outcome(
-            expected_owner,
-            Some(DidDocType::Owner),
-            next_policy,
-        ))
-        .await
-        .map_err(|err| {
-            CandidateRejection::Failed(NSError::Failed(format!(
-                "resolve owner {} for {}#{} failed: {}",
-                expected_owner.to_string(),
-                did.to_string(),
-                doc_type,
-                err
-            )))
-        })?;
+        let owner_outcome =
+            Box::pin(self.query_did_outcome(expected_owner, Some(DidDocType::Owner), next_policy))
+                .await
+                .map_err(|err| {
+                    CandidateRejection::Failed(NSError::Failed(format!(
+                        "resolve owner {} for {}#{} failed: {}",
+                        expected_owner.to_string(),
+                        did.to_string(),
+                        doc_type,
+                        err
+                    )))
+                })?;
 
         let owner_resolved = match owner_outcome {
             ResolveOutcome::Resolved(resolved) => resolved,
@@ -920,7 +924,9 @@ impl NameQuery {
                 .get_historical_keys()
                 .into_iter()
                 .any(|(_kid, jwk)| match DecodingKey::from_jwk(&jwk) {
-                    Ok(historical_key) => decode_json_from_jwt_with_pk(jwt, &historical_key).is_ok(),
+                    Ok(historical_key) => {
+                        decode_json_from_jwt_with_pk(jwt, &historical_key).is_ok()
+                    }
                     Err(_) => false,
                 });
             if !verified_with_historical_key {
@@ -1297,7 +1303,10 @@ mod tests {
         let provider = DocProvider::new("bns-authority");
         q.set_method_authority("dev", Box::new(provider)).await;
 
-        for did_str in ["did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE", "did:key:z6Mk"] {
+        for did_str in [
+            "did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE",
+            "did:key:z6Mk",
+        ] {
             let did = DID::from_str(did_str).unwrap();
             let err = q
                 .query_did_ex(&did, None, ResolvePolicy::default())
@@ -1318,7 +1327,11 @@ mod tests {
 
         q.set_method_authority(
             "bns",
-            Box::new(DocProvider::new("authority").with_doc(zone_did.clone(), "zone", zone_doc.clone())),
+            Box::new(DocProvider::new("authority").with_doc(
+                zone_did.clone(),
+                "zone",
+                zone_doc.clone(),
+            )),
         )
         .await;
         q.add_method_supplement(
@@ -1443,7 +1456,11 @@ mod tests {
         .await;
         q.add_method_supplement(
             "bns",
-            Box::new(DocProvider::new("supplement").with_doc(app_did.clone(), "zone", app_doc.clone())),
+            Box::new(DocProvider::new("supplement").with_doc(
+                app_did.clone(),
+                "zone",
+                app_doc.clone(),
+            )),
         )
         .await;
 
@@ -1481,9 +1498,11 @@ mod tests {
         .await;
         q.add_method_supplement(
             "bns",
-            Box::new(
-                DocProvider::new("supplement").with_doc(app_did.clone(), "zone", app_doc_by_bob.clone()),
-            ),
+            Box::new(DocProvider::new("supplement").with_doc(
+                app_did.clone(),
+                "zone",
+                app_doc_by_bob.clone(),
+            )),
         )
         .await;
 
@@ -1511,7 +1530,11 @@ mod tests {
         .await;
         q2.add_method_supplement(
             "bns",
-            Box::new(DocProvider::new("supplement").with_doc(app_did.clone(), "zone", app_doc_by_alice)),
+            Box::new(DocProvider::new("supplement").with_doc(
+                app_did.clone(),
+                "zone",
+                app_doc_by_alice,
+            )),
         )
         .await;
 
@@ -1550,7 +1573,11 @@ mod tests {
         .await;
         q.add_method_supplement(
             "bns",
-            Box::new(DocProvider::new("supplement").with_doc(app_did.clone(), "zone", wrong_id_doc)),
+            Box::new(DocProvider::new("supplement").with_doc(
+                app_did.clone(),
+                "zone",
+                wrong_id_doc,
+            )),
         )
         .await;
 
@@ -1625,9 +1652,11 @@ mod tests {
         .await;
         q2.add_method_supplement(
             "bns",
-            Box::new(
-                DocProvider::new("supplement").with_doc(app_did.clone(), "zone", published_doc.clone()),
-            ),
+            Box::new(DocProvider::new("supplement").with_doc(
+                app_did.clone(),
+                "zone",
+                published_doc.clone(),
+            )),
         )
         .await;
         let outcome = resolve(&q2, &app_did, DidDocType::Zone, ResolvePolicy::default())
@@ -1790,13 +1819,18 @@ mod tests {
 
         q.set_method_authority(
             "bns",
-            Box::new(DocProvider::new("authority").with_state(migrated_state(&old_did, "zone", &new_did))),
+            Box::new(
+                DocProvider::new("authority")
+                    .with_state(migrated_state(&old_did, "zone", &new_did)),
+            ),
         )
         .await;
 
         let mut policy = ResolvePolicy::default();
         policy.follow_migration = false;
-        let outcome = resolve(&q, &old_did, DidDocType::Zone, policy).await.unwrap();
+        let outcome = resolve(&q, &old_did, DidDocType::Zone, policy)
+            .await
+            .unwrap();
         match outcome {
             ResolveOutcome::Negative { status, .. } => {
                 assert_eq!(status, DocumentStatus::Migrated);
@@ -1837,8 +1871,13 @@ mod tests {
         let owner_doc = build_owner_doc_with_legacy_key(&owner_did, &new_key);
         // zone 文档用被 rotate 掉的旧 key(mallory key 充当)签名。
         let (legacy_key, _) = mallory_signing_key();
-        let zone_doc =
-            build_zone_doc_signed_by(&zone_did, &owner_did, ts(1000), "legacy-signed", &legacy_key);
+        let zone_doc = build_zone_doc_signed_by(
+            &zone_did,
+            &owner_did,
+            ts(1000),
+            "legacy-signed",
+            &legacy_key,
+        );
 
         q.set_method_authority(
             "bns",
@@ -1851,7 +1890,11 @@ mod tests {
         .await;
         q.add_method_supplement(
             "bns",
-            Box::new(DocProvider::new("supplement").with_doc(zone_did.clone(), "zone", zone_doc.clone())),
+            Box::new(DocProvider::new("supplement").with_doc(
+                zone_did.clone(),
+                "zone",
+                zone_doc.clone(),
+            )),
         )
         .await;
 
@@ -1945,7 +1988,10 @@ mod tests {
             .unwrap();
         match outcome {
             ResolveOutcome::NoAnswer { last_error, .. } => {
-                assert!(last_error.unwrap().to_string().contains("revoke_before_iat"));
+                assert!(last_error
+                    .unwrap()
+                    .to_string()
+                    .contains("revoke_before_iat"));
             }
             other => panic!("expected NoAnswer, got {:?}", other),
         }
@@ -1988,12 +2034,20 @@ mod tests {
         // 第一个补充源给出无签名 JsonLd(契约违规),第二个给出可验证候选。
         q.add_method_supplement(
             "bns",
-            Box::new(DocProvider::new("bad-supplement").with_doc(zone_did.clone(), "zone", unsigned_doc)),
+            Box::new(DocProvider::new("bad-supplement").with_doc(
+                zone_did.clone(),
+                "zone",
+                unsigned_doc,
+            )),
         )
         .await;
         q.add_method_supplement(
             "bns",
-            Box::new(DocProvider::new("good-supplement").with_doc(zone_did.clone(), "zone", good_doc.clone())),
+            Box::new(DocProvider::new("good-supplement").with_doc(
+                zone_did.clone(),
+                "zone",
+                good_doc.clone(),
+            )),
         )
         .await;
 
@@ -2064,7 +2118,13 @@ mod tests {
         .await;
 
         let store = Arc::new(crate::LocalAuthorityOverrideStore::new());
-        store.set(did.clone(), &DidDocType::Zone, override_doc.clone(), "test-env", None);
+        store.set(
+            did.clone(),
+            &DidDocType::Zone,
+            override_doc.clone(),
+            "test-env",
+            None,
+        );
         let policy = ResolvePolicy::default().with_local_authority_override(store);
 
         let outcome = resolve(&q, &did, DidDocType::Zone, policy).await.unwrap();
@@ -2107,14 +2167,20 @@ mod tests {
 
         q.set_method_authority(
             "web",
-            Box::new(
-                DocProvider::new("method-authority").with_doc(device_did.clone(), "zone", method_doc),
-            ),
+            Box::new(DocProvider::new("method-authority").with_doc(
+                device_did.clone(),
+                "zone",
+                method_doc,
+            )),
         )
         .await;
         q.set_zone_authority(
             zone_did,
-            Box::new(DocProvider::new("zone-reader").with_doc(device_did.clone(), "zone", zone_doc.clone())),
+            Box::new(DocProvider::new("zone-reader").with_doc(
+                device_did.clone(),
+                "zone",
+                zone_doc.clone(),
+            )),
         )
         .await;
 
@@ -2147,7 +2213,11 @@ mod tests {
 
         q.set_method_authority(
             "web",
-            Box::new(DocProvider::new("method-authority").with_doc(other_did.clone(), "zone", other_doc.clone())),
+            Box::new(DocProvider::new("method-authority").with_doc(
+                other_did.clone(),
+                "zone",
+                other_doc.clone(),
+            )),
         )
         .await;
         q.set_zone_authority(
@@ -2209,7 +2279,11 @@ mod tests {
 
         q.set_method_authority(
             "web",
-            Box::new(DocProvider::new("method-authority").with_doc(device_did.clone(), "zone", method_doc.clone())),
+            Box::new(DocProvider::new("method-authority").with_doc(
+                device_did.clone(),
+                "zone",
+                method_doc.clone(),
+            )),
         )
         .await;
         q.set_zone_authority(zone_did, Box::new(DownProvider)).await;
@@ -2232,7 +2306,9 @@ mod tests {
 
         q.set_method_authority(
             "web",
-            Box::new(DocProvider::new("method-authority").with_state(missing_state(&device_did, "zone"))),
+            Box::new(
+                DocProvider::new("method-authority").with_state(missing_state(&device_did, "zone")),
+            ),
         )
         .await;
         q.set_zone_authority(zone_did, Box::new(DocProvider::new("zone-reader")))
@@ -2256,7 +2332,8 @@ mod tests {
         let zone_did = DID::new("bns", "alice");
         let device_did = DID::new("bns", "ood1.alice");
 
-        q.set_method_authority("bns", Box::new(DocProvider::new("method-authority"))).await;
+        q.set_method_authority("bns", Box::new(DocProvider::new("method-authority")))
+            .await;
         q.set_zone_authority(
             zone_did,
             Box::new(DocProvider::new("zone-reader").with_state(negative_state(
@@ -2284,10 +2361,15 @@ mod tests {
         let device_did = DID::new("web", "ood1.example.com");
         let info_doc = EncodedDocument::JsonLd(json!({"info": "from-zone"}));
 
-        q.set_method_authority("web", Box::new(DocProvider::new("method-authority"))).await;
+        q.set_method_authority("web", Box::new(DocProvider::new("method-authority")))
+            .await;
         q.set_zone_authority(
             zone_did,
-            Box::new(DocProvider::new("zone-reader").with_doc(device_did.clone(), "info", info_doc.clone())),
+            Box::new(DocProvider::new("zone-reader").with_doc(
+                device_did.clone(),
+                "info",
+                info_doc.clone(),
+            )),
         )
         .await;
 
@@ -2313,7 +2395,8 @@ mod tests {
         let first_doc = build_zone_doc(&device_did, &owner_did, ts(100), "first-reader");
         let second_doc = build_zone_doc(&device_did, &owner_did, ts(200), "second-reader");
 
-        q.set_method_authority("web", Box::new(DocProvider::new("method-authority"))).await;
+        q.set_method_authority("web", Box::new(DocProvider::new("method-authority")))
+            .await;
         q.set_zone_authority(
             zone_did.clone(),
             Box::new(DocProvider::new("first").with_doc(device_did.clone(), "zone", first_doc)),
@@ -2322,7 +2405,11 @@ mod tests {
         // 同一 zone_did 重复注册:取代旧读取端。
         q.set_zone_authority(
             zone_did.clone(),
-            Box::new(DocProvider::new("second").with_doc(device_did.clone(), "zone", second_doc.clone())),
+            Box::new(DocProvider::new("second").with_doc(
+                device_did.clone(),
+                "zone",
+                second_doc.clone(),
+            )),
         )
         .await;
 

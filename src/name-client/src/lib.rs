@@ -105,7 +105,9 @@ pub async fn init_name_lib_ex(
     // alice.{bns_root} 上的 well-known / uppername 双信道)→ dns_resolver
     // (同一映射 host 上的 TXT 记录,need_proof 候选)。
     let bns_provider = BnsProvider::new()?;
-    client.set_method_authority("bns", Box::new(bns_provider)).await;
+    client
+        .set_method_authority("bns", Box::new(bns_provider))
+        .await;
     client
         .add_method_supplement("bns", Box::new(WebProvider::new()))
         .await;
@@ -141,7 +143,9 @@ pub async fn init_name_lib_ex(
     // `NameClient::set_zone_authority` 注册,这里不做默认注册。
 
     // 普通名字解析(resolve / resolve_ip)与 DID 管线独立注册。
-    client.add_dns_provider(Box::new(DnsProvider::new(None))).await;
+    client
+        .add_dns_provider(Box::new(DnsProvider::new(None)))
+        .await;
     // did:dev / did:key 不注册任何 provider:key 类 DID 不是解析入口(简化文档第 6 节)。
     let set_result = GLOBAL_NAME_CLIENT.set(client);
     if set_result.is_err() {

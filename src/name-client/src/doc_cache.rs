@@ -221,11 +221,14 @@ impl DIDDocumentCache {
         let in_ttl = !is_expired(entry.exp());
         if entry.is_negative() {
             let status = entry.meta.negative_status.clone().unwrap_or_default();
-            let message = entry
-                .meta
-                .negative_message
-                .clone()
-                .unwrap_or_else(|| format!("{}#{} is {}", did.to_string(), doc_type_str(doc_type.as_ref()), status));
+            let message = entry.meta.negative_message.clone().unwrap_or_else(|| {
+                format!(
+                    "{}#{} is {}",
+                    did.to_string(),
+                    doc_type_str(doc_type.as_ref()),
+                    status
+                )
+            });
             return Some(CacheLookup::Negative {
                 status,
                 message,
@@ -244,11 +247,15 @@ impl DIDDocumentCache {
     }
 
     /// 兼容读取:只返回正条目 (doc, exp, evidence_rank)。
-    pub fn get(&self, did: &DID, doc_type: Option<DidDocType>) -> Option<(EncodedDocument, u64, i32)> {
+    pub fn get(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+    ) -> Option<(EncodedDocument, u64, i32)> {
         match self.lookup(did, doc_type)? {
-            CacheLookup::Positive { doc, exp, evidence, .. } => {
-                Some((doc, exp, evidence.rank() as i32))
-            }
+            CacheLookup::Positive {
+                doc, exp, evidence, ..
+            } => Some((doc, exp, evidence.rank() as i32)),
             CacheLookup::Negative { .. } => None,
         }
     }
@@ -582,13 +589,21 @@ impl FsStore {
             Ok(content) => match serde_json::from_str::<StoredMeta>(&content) {
                 Ok(meta) => Some(meta),
                 Err(err) => {
-                    warn!("failed to parse did doc meta {}: {}", meta_path.display(), err);
+                    warn!(
+                        "failed to parse did doc meta {}: {}",
+                        meta_path.display(),
+                        err
+                    );
                     None
                 }
             },
             Err(err) => {
                 if err.kind() != std::io::ErrorKind::NotFound {
-                    warn!("failed to read did doc meta {}: {}", meta_path.display(), err);
+                    warn!(
+                        "failed to read did doc meta {}: {}",
+                        meta_path.display(),
+                        err
+                    );
                 }
                 None
             }
@@ -623,7 +638,11 @@ impl FsStore {
         for path in [self.doc_path(key), self.meta_path(key)] {
             if let Err(err) = fs::remove_file(&path) {
                 if err.kind() != std::io::ErrorKind::NotFound {
-                    warn!("failed to remove did cache file {}: {}", path.display(), err);
+                    warn!(
+                        "failed to remove did cache file {}: {}",
+                        path.display(),
+                        err
+                    );
                 }
             }
         }
@@ -707,7 +726,12 @@ impl DbStore {
         })?;
 
         // 旧库的 schema 迁移:补齐新列。
-        for column in ["update_from_remote_time INTEGER", "evidence TEXT", "negative_status TEXT", "negative_message TEXT"] {
+        for column in [
+            "update_from_remote_time INTEGER",
+            "evidence TEXT",
+            "negative_status TEXT",
+            "negative_message TEXT",
+        ] {
             let column_name = column.split(' ').next().unwrap();
             if !Self::has_column(&conn, column_name).map_err(|e| {
                 name_lib::NSError::ReadLocalFileError(format!("inspect table failed: {}", e))
@@ -895,9 +919,7 @@ impl MemStore {
         match self.entries.read() {
             Ok(guard) => guard
                 .keys()
-                .filter(|key| {
-                    key.as_str() == did_key || key.starts_with(&format!("{}#", did_key))
-                })
+                .filter(|key| key.as_str() == did_key || key.starts_with(&format!("{}#", did_key)))
                 .cloned()
                 .collect(),
             Err(_) => Vec::new(),
@@ -1226,12 +1248,30 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         // 负状态屏蔽普通写入(push / 已验证自签名都不行)。
         let newer = build_zone_doc(did, exp + 10, "shadow");
-        assert!(!cache.update(did.clone(), None, newer.clone(), exp + 10, CacheEvidence::Verified));
-        assert!(!cache.update(did.clone(), None, newer.clone(), exp + 10, CacheEvidence::Unverified));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            newer.clone(),
+            exp + 10,
+            CacheEvidence::Verified
+        ));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            newer.clone(),
+            exp + 10,
+            CacheEvidence::Unverified
+        ));
         assert!(cache.lookup(did, None).unwrap().is_negative());
 
         // 只有权威源的新 DR(Published 证据)能翻篇。
-        assert!(cache.update(did.clone(), None, newer.clone(), exp + 10, CacheEvidence::Published));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            newer.clone(),
+            exp + 10,
+            CacheEvidence::Published
+        ));
         assert_eq!(positive_doc(cache, did), newer);
     }
 
@@ -1262,7 +1302,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let exp = now + DEFAULT_EXPIRE_TIME;
 
         let published = build_zone_doc(&did, exp, "published-old");
-        assert!(cache.update(did.clone(), None, published.clone(), exp, CacheEvidence::Published));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            published.clone(),
+            exp,
+            CacheEvidence::Published
+        ));
 
         // 更新鲜的自签名(哪怕 iat 更大)压不过已发布条目。
         let fresher_self_signed = build_zone_doc(&did, exp + 1000, "self-signed-newer");
@@ -1277,7 +1323,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         // 未验证 push 更不行。
         let pushed = build_zone_doc(&did, exp + 2000, "pushed");
-        assert!(!cache.update(did.clone(), None, pushed, exp + 2000, CacheEvidence::Unverified));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            pushed,
+            exp + 2000,
+            CacheEvidence::Unverified
+        ));
 
         // 同级(已发布)才比新旧。
         let newer_published = build_zone_doc(&did, exp + 3000, "published-new");
@@ -1299,19 +1351,37 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let doc_v2 = EncodedDocument::JsonLd(json!({
             "version_seq": 2, "iat": now, "exp": now + DEFAULT_EXPIRE_TIME, "marker": "v2"
         }));
-        assert!(cache.update(did.clone(), None, doc_v2.clone(), now + DEFAULT_EXPIRE_TIME, CacheEvidence::Verified));
+        assert!(cache.update(
+            did.clone(),
+            None,
+            doc_v2.clone(),
+            now + DEFAULT_EXPIRE_TIME,
+            CacheEvidence::Verified
+        ));
 
         // iat 更新但 version_seq 更小:拒绝。
         let doc_v1 = EncodedDocument::JsonLd(json!({
             "version_seq": 1, "iat": now + 10_000, "exp": now + DEFAULT_EXPIRE_TIME + 10_000, "marker": "v1"
         }));
-        assert!(!cache.update(did.clone(), None, doc_v1, now + DEFAULT_EXPIRE_TIME + 10_000, CacheEvidence::Verified));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            doc_v1,
+            now + DEFAULT_EXPIRE_TIME + 10_000,
+            CacheEvidence::Verified
+        ));
 
         // 有版本的条目拒绝无版本的更新。
         let unversioned = EncodedDocument::JsonLd(json!({
             "iat": now + 20_000, "exp": now + DEFAULT_EXPIRE_TIME + 20_000, "marker": "unversioned"
         }));
-        assert!(!cache.update(did.clone(), None, unversioned, now + DEFAULT_EXPIRE_TIME + 20_000, CacheEvidence::Verified));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            unversioned,
+            now + DEFAULT_EXPIRE_TIME + 20_000,
+            CacheEvidence::Verified
+        ));
 
         assert_eq!(positive_doc(&cache, &did), doc_v2);
     }
@@ -1325,12 +1395,24 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let doc_v1 = EncodedDocument::JsonLd(json!({
             "iat": now, "exp": now + DEFAULT_EXPIRE_TIME, "marker": "v1"
         }));
-        cache.insert(did.clone(), None, doc_v1.clone(), now + DEFAULT_EXPIRE_TIME, CacheEvidence::Verified);
+        cache.insert(
+            did.clone(),
+            None,
+            doc_v1.clone(),
+            now + DEFAULT_EXPIRE_TIME,
+            CacheEvidence::Verified,
+        );
 
         let doc_v2 = EncodedDocument::JsonLd(json!({
             "iat": now + 1000, "exp": now + DEFAULT_EXPIRE_TIME + 1000, "marker": "v2"
         }));
-        assert!(!cache.update(did.clone(), None, doc_v2, now + DEFAULT_EXPIRE_TIME + 1000, CacheEvidence::Verified));
+        assert!(!cache.update(
+            did.clone(),
+            None,
+            doc_v2,
+            now + DEFAULT_EXPIRE_TIME + 1000,
+            CacheEvidence::Verified
+        ));
         assert_eq!(positive_doc(&cache, &did), doc_v1);
     }
 
@@ -1341,10 +1423,20 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let (cache, did) = setup_mem_cache();
         let past_exp = buckyos_get_unix_timestamp().saturating_sub(10);
         let doc = build_zone_doc(&did, past_exp, "stale");
-        cache.insert(did.clone(), None, doc.clone(), past_exp, CacheEvidence::Published);
+        cache.insert(
+            did.clone(),
+            None,
+            doc.clone(),
+            past_exp,
+            CacheEvidence::Published,
+        );
 
         match cache.lookup(&did, None).unwrap() {
-            CacheLookup::Positive { doc: loaded, in_ttl, .. } => {
+            CacheLookup::Positive {
+                doc: loaded,
+                in_ttl,
+                ..
+            } => {
                 assert_eq!(loaded, doc);
                 assert!(!in_ttl);
             }
@@ -1465,8 +1557,20 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let host_doc = build_zone_doc(&host_did, exp, "host");
         let path_doc = build_zone_doc(&path_did, exp, "path");
 
-        cache.insert(host_did.clone(), None, host_doc.clone(), exp, CacheEvidence::Published);
-        cache.insert(path_did.clone(), None, path_doc.clone(), exp, CacheEvidence::Published);
+        cache.insert(
+            host_did.clone(),
+            None,
+            host_doc.clone(),
+            exp,
+            CacheEvidence::Published,
+        );
+        cache.insert(
+            path_did.clone(),
+            None,
+            path_doc.clone(),
+            exp,
+            CacheEvidence::Published,
+        );
 
         assert_eq!(cache.get(&host_did, None).unwrap().0, host_doc);
         assert_eq!(cache.get(&path_did, None).unwrap().0, path_doc);
@@ -1514,7 +1618,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         .unwrap();
 
         match cache.lookup(&did, None).unwrap() {
-            CacheLookup::Positive { doc: loaded, evidence, in_ttl, .. } => {
+            CacheLookup::Positive {
+                doc: loaded,
+                evidence,
+                in_ttl,
+                ..
+            } => {
                 assert_eq!(loaded, doc);
                 assert_eq!(evidence, CacheEvidence::Published);
                 assert!(in_ttl, "seed file exp derives from mtime + 24h");
