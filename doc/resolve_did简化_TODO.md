@@ -8,6 +8,10 @@
 > ① 已验证文档缓存 TTL 上限 1 小时(`DOC_CACHE_TTL_SECS`,快路径的吊销盲区 ≤ TTL);
 > ② did:web 的权威渠道 = DNS TXT + `.well-known` 两个委托读取端的 first-win 合并
 > (`AuthorityReaders`,Missing 需两者一致,任一传输失败按 unknown 处理)。
+>
+> **新增(2026-07-03):** P5 记录 Zone Resolver 从 provider / authority
+> 读取端迁移到 cache 层的待办。P0-P4 的 resolver core 已完成,但当前
+> `zone_resolver` 的定位仍需按 P5 调整。
 
 目标：以 [简单介绍resolve-did.md](./简单介绍resolve-did.md) 为准，把现有 `name-client`
 里的 DID 解析逻辑先修正确，再收敛成一条可读的主循环。
@@ -253,3 +257,110 @@ provider 后端可先用现有 `NsProvider` adapter 包住，不要求一次改�
 - [resolve_did重构.md](./resolve_did重构.md) 头部加说明：旧文档中的 trust-level、多 provider 并发、复杂状态机字段以简化文档为准。
 - [http_did_resolver_api.md](./http_did_resolver_api.md) 随 `PublishedState` 裁剪同步字段。
 - 本 TODO 完成后，可以删除旧的“重构 TODO”引用，避免两套任务列表同时指导实现。
+
+## P5. Zone Resolver cache 层化
+
+背景：当前实现把 `zone_resolver` 通过 `NameClient::set_zone_authority`
+注册成 zone 内的权威读取端，并和 method authority 做同一发布渠道的
+first-win 合并。新的定位是：`zone_resolver` 不是 resolver provider，
+而是 cluster-level shared cache / control-plane cache。它的管理面可以由
+BuckyOS 或其它私有 cluster 实现，但 `name-client` 只能假设存在一个可选的本机
+HTTP cache 服务，不能假设 cluster 一定是 BuckyOS。
+
+目标：当 Zone Resolver 启用且服务可用时，`resolve_did` 的结果只从它返回，
+相当于一次 cache 命中；只有 Zone Resolver 服务不可用时，才回落到本机
+local cache 和后续 resolver 流程。这样避免同时合并 zone cache 与 local cache。
+
+### T5.1 启用与配置
+
+- 默认启用 Zone Resolver，默认地址沿用现有本机服务：
+  `http://127.0.0.1:3180/1.0/identifiers/{did}?type={doc_type}`。
+- 增加显式关闭接口，例如 `NameClient::disable_zone_resolver()`；
+  非 BuckyOS 环境、单元测试、离线工具可以关闭它。
+- 增加可配置 endpoint / timeout，例如 `set_zone_resolver_endpoint(...)`。
+- 连接失败、connection refused、超时、明确的 service unavailable 才表示
+  `ZoneUnavailable`；语义上的 `Missing / Revoked / Tombstoned / Unknown`
+  都是 Zone Resolver 的回答，不触发 local cache fallback。
+- 默认启用不能引入明显延迟：本机连接和读取 timeout 必须很短；是否需要短期
+  circuit breaker 可以单独评估，但首版语义仍是“Zone 可用则优先且独占”。
+
+### T5.2 查询顺序
+
+目标查询顺序：
+
+```text
+if zone_resolver.enabled:
+    zone = query_zone_resolver(did, doc_type)
+    if zone.service_available:
+        return zone.answer as CacheStatus::ZoneHit
+
+local cache / local override fast path
+resolver core(authority + supplements)
+stale local cache fallback
+```
+
+- Zone Resolver 可用时，local cache、local override、method authority、
+  supplements 都不参与本次解析。
+- 只有 Zone Resolver 服务不可用时，才使用原有本机 cache 快路径和 resolver core。
+- `update DID cache` 的旧语义保持不变：只写本机 local cache，不写 Zone Resolver。
+- Zone Resolver 返回的结果默认不回写 local cache；否则又会引入两层 cache 合并问题。
+- 关闭 Zone Resolver 后，行为退回当前单机模式。
+
+### T5.3 语义边界与 metadata
+
+- Zone Resolver 是 cache / control-plane 来源，不是全局权威源。它可以返回
+  已发布文档、已验证文档、Info、`Missing`、`Revoked`、`Tombstoned`、
+  `Unknown`，但这些只表达“当前 Zone 内的解析结果”。
+- 解析结果需要明确 provenance：例如新增 `CacheStatus::ZoneHit`、
+  `ResolveWarning::ZoneResolverOverride` 或等价 metadata，避免 UI / 日志把它误判成
+  method authority 的直接回答。
+- `Revoked / Tombstoned` 这类 Zone 内负状态是回答，不是 miss；只要 Zone Resolver
+  可用，本机 local cache 和外部 authority 都不能绕过它。
+- `Missing` 也必须是回答：如果 Zone Resolver 明确说某 DID/doc_type 不存在，
+  不再查 local cache，也不再查外部 resolver。若 Zone 实现希望“没有命中时继续向外查”，
+  应由 Zone Resolver 自己完成外部查询或返回明确的 resolver 结果。
+- `did_in_zone` 过滤不应继续放在 `name-client` 侧。作为 cluster cache，Zone Resolver
+  可以覆盖任意 DID；哪些 DID 属于本 Zone、哪些需要短路、哪些允许出 Zone，应由
+  Zone Resolver 服务内部策略决定。
+
+### T5.4 Cluster 管理与开发旁路
+
+- Zone Resolver 可以承载原先通过 local cache 实现的开发旁路：在集群级注入
+  Document / Info / 负状态，而不是在每台机器上分别写本机 cache。
+- 这类 cluster-level override 必须由 Zone Resolver 的私有管理接口控制；
+  `name-client` 只消费解析接口，不定义管理 API。
+- 与传统 `hosts` 文件相比，Zone Resolver 使用完整 resolver 接口，因此能覆盖
+  DID Document、Info、状态和 metadata，不只模拟 IP 解析。
+- Zone Resolver 可以实现 Zone 内短路：只要它持续返回某个 DID 的结果或负状态，
+  Zone 内客户端就不会把该 DID 请求发送到 Zone 外。
+- 例如 Zone 内“吊销”：即使全局权威源没有真正吊销，只要 Zone Resolver 持续返回
+  `Revoked / Tombstoned`，Zone 内就视为已吊销；metadata 必须表明这是 Zone 内控制结果。
+
+### T5.5 实现步骤
+
+- 新增 `ZoneResolverCache` / `ClusterCache` 客户端抽象，不再把 Zone Resolver 实现成
+  `NsProvider`。
+- 在 `NameClient::resolve_did_ex` 或统一入口接入 Zone Resolver cache 快路径；
+  `NameQuery` 只保留 resolver core，不再感知 zone reader。
+- 废弃或迁移 `set_zone_authority / clear_zone_authority`；若需要兼容旧调用方，
+  先提供 deprecated wrapper，语义改为配置 Zone Resolver cache endpoint / enable 状态。
+- 删除 `merged_authority_answer` 中为 `zone_resolver` 做的 authority-reader 合并逻辑。
+- 更新 `doc/简单介绍resolve-did.md` 第 3、5、7 节：本地覆盖不再是唯一旁路，
+  还存在默认启用的 Zone cache / cluster override 层。
+- 更新 `doc/已有did-resolver介绍.md`：把“zone 内权威源”改成“cluster-level cache /
+  control-plane resolver”。
+
+### T5.6 测试清单
+
+- 默认配置会先查询 `http://127.0.0.1:3180`，Zone Resolver 成功返回时不调用
+  local cache、local override、method authority 或 supplements。
+- `disable_zone_resolver()` 后不查询 Zone Resolver，退回当前单机 cache + resolver 流程。
+- Zone Resolver 服务不可用时，才落回 local cache；local cache 命中返回原有
+  `CacheStatus::Hit`。
+- Zone Resolver 返回 `Revoked / Tombstoned` 时，local positive cache 和外部 authority
+  都不得绕过。
+- Zone Resolver 返回 `Missing` 时，不查 local cache，也不查外部 resolver。
+- `update DID cache` 只影响 local cache；当 Zone Resolver 可用时，Zone 结果仍优先。
+- Zone Resolver 可覆盖非本 zone DID；`name-client` 不再用 `did_in_zone` 阻止查询。
+- Zone 结果的 metadata / warning 能区分 `ZoneHit`、`ZoneOverride`、普通 local cache
+  hit 和 method authority 结果。

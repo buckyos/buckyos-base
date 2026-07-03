@@ -44,6 +44,11 @@ provider 不是应用可扩展的组件——这套机制用来扩展 DID method
 
 真正的"多来源"不在查询路径上，在 Cache 层（第 5 节）。
 
+`zone_resolver` 是一个容易误解的例外：它使用 resolver HTTP 接口，但语义上不是
+resolver-provider。它是**伪装成 resolver 的 zone 内权威 cache**：对 zone 内客户端
+来说，它代表当前 cluster 的解析控制面；对 resolver core 来说，它只是在进入
+provider 链之前的 cache 短路层。
+
 ### 2.3 need_proof：英雄不问出处，但要验证
 
 DID Document JWT 化之后，一份文档从哪儿拿到都行——但 provider 必须诚实标注它的出处：
@@ -88,19 +93,35 @@ expected_owner 必须来自候选文档**之外**，来源只有两个，按优�
 
 ## 3. 主循环：一条路径 + 四个策略点
 
-策略只来自两处：**权威源返回的发布状态**和 **owner_document**（没有 owner_document 时用系统默认）。整个流程里策略恰好有四个使用点，都标在注释里。expected_owner 与候选入场门禁不是策略，是约束——它们决定"用谁验、有没有资格"，没有裁量空间。
+进入 resolver core 之后，策略只来自两处：**权威源返回的发布状态**和
+**owner_document**（没有 owner_document 时用系统默认）。整个流程里策略恰好有四个
+使用点，都标在注释里。expected_owner 与候选入场门禁不是策略，是约束——它们决定
+"用谁验、有没有资格"，没有裁量空间。
+
+resolver core 之前有一层默认启用、可显式关闭的 Zone cache。它通常跑在
+`127.0.0.1:3180`，对外看起来是 resolver 接口，实际定位是 cluster-level cache /
+control plane：只要服务可用，它的回答就是本次解析的 cache 命中；只有服务不可用，
+才进入本机 cache 和下方主循环。
 
 ```python
 def resolve_did(did, doc_type):
-    # ---- 0. 缓存快路径 ----
+    # ---- 0. Zone cache 快路径 ----
+    # zone_resolver 使用 resolver API，但它不是 provider；它是 zone 内权威 cache。
+    # 只有服务不可用才落回本机 cache。Missing/Revoked/Tombstoned 都是回答，不是 miss。
+    if zone_resolver.enabled:
+        zone = zone_resolver.lookup(did, doc_type)
+        if zone.service_available:
+            return zone.answer.with_cache_status("ZoneHit")
+
+    # ---- 1. 本机缓存快路径 ----
     cached = did_cache.lookup(did, doc_type)
-    if cached.is_local_override:      # 开发/测试期的唯一旁路，hosts 语义（第 7 节）
+    if cached.is_local_override:      # 单机开发/测试旁路，hosts 语义（第 7 节）
         return cached
     if cached.in_ttl:
         # 负状态也是缓存条目：命中“已吊销”返回的是错误，不是“查不到”
         return cached if cached.is_positive() else error(cached.status)
 
-    # ---- 1. 查询：一个权威渠道 + 少数补充源，first-win ----
+    # ---- 2. 查询：一个权威渠道 + 少数补充源，first-win ----
     # 每个 method 至多一个权威发布渠道，永远第一；status / doc_hash / owner 绑定只可能来自它。
     # key 类 DID（did:key / did:dev）不会出现在这里——它们不是合法入参（第 6 节）。
     authority, supplements = get_authority(did.method), get_supplements(did.method)
@@ -175,7 +196,7 @@ def resolve_did(did, doc_type):
         did_cache.update(did, doc_type, result)
         return result
 
-    # ---- 2. 查询没有产出可核实的文档（权威源没回答、候选被作废或无资格露面）----
+    # ---- 3. 查询没有产出可核实的文档（权威源没回答、候选被作废或无资格露面）----
     # 负状态记忆屏蔽一切兜底，且不受 TTL 约束：过期的“已吊销”也只能被权威源的新回答翻篇
     if cached.is_negative():
         return error(cached.status)
@@ -222,12 +243,13 @@ def resolve_did(did, doc_type):
 
 > 验签用的 owner 不能由候选 document 单方面决定。Resolver 必须先从权威源（owner 绑定）或 method 定义的名字结构得到 expected_owner，再要求 `doc.owner == expected_owner`，不一致直接拒绝；owner 变更 / 委托必须经权威源发布才能生效。
 
-推论：正常路径被完全锁死之后，开发期想在不动权威源的前提下让新文档生效，唯一的缝隙是查询最前端的缓存短路——见第 7 节。
+推论：正常路径被完全锁死之后，开发期想在不动权威源的前提下让新文档生效，缝隙只能是查询最前端的缓存短路——优先用 Zone cache 做 cluster 级旁路，其次才是本机覆盖，见第 7 节。
 
 ## 5. "英雄不问出处"发生在 Cache 层
 
 主动查询是高度可控的（少数精选 provider、first-win）。真正的多来源在这里：
 
+- Zone Resolver 这个 cluster-level cache / control plane；
 - 别人 push 给你一个 JWT；
 - 通过社交网络拿到一份 DID Document；
 - 主循环自己解析出的结果。
@@ -251,7 +273,11 @@ def did_cache_update(did, doc_type, incoming):
         return REJECT
 ```
 
-两条规则：
+这里要区分两类 cache：**本机 did_cache** 参与本节的 merge；**Zone Resolver** 是
+zone 内权威 cache，使用 resolver 接口返回完整解析结果，但不和本机 did_cache 合并。
+Zone Resolver 服务可用时，它独占本次解析；服务不可用时，本机 cache 才接管。
+
+两条本机 did_cache 的合并规则：
 
 1. **先比证据等级，同级才比 iat / version**。等级从高到低：已发布/已锚定 > 已验证的自签名 > 未验证。“已验证”指通过了含 expected_owner 一致性在内的完整 verify——伪造 owner 的文档永远进不了这一档；
 2. **负状态与本地覆盖屏蔽一切写入**，吊销只能被权威源的新状态翻篇。
@@ -280,13 +306,29 @@ def did_cache_update(did, doc_type, incoming):
 
 **公钥反查（key → 逻辑身份）没有任何标准 provider 提供**；某个部署若提供，也只是**私有接口**，不在 resolve_did 的 provider 管线里（2.2 节的注册模型不为它开口子）。需要"验证一把 key 属于谁"时，是应用层自己拼装两步：① 把 key 交给那个私有接口，得到**候选名字**——这一步不携带任何信任；② 对候选名字走一遍**标准正向解析**，比对返回文档里的公钥与手里的公钥——信任只来自这一步。底层对整个流程不做任何承诺。还有一条边界要认清：比对通过只说明"这个名字当前发布了这把 key"，不证明这个名字的主人控制这把 key（任何人都能在自己的文档里写进别人的公钥），也不存在"这把 key 的规范名字"——公钥到名字不是单射，候选里挑哪一个是应用层语义。
 
-## 7. 开发期旁路：本地覆盖（hosts 语义）
+## 7. 开发期旁路：Zone cache 与本地覆盖
 
-第 4 节锁死了所有正常路径，于是开发/测试期只剩一种办法模拟"已发布"：**手工往 did_cache 写入条目，让查询在最前端短路**。它等价于传统系统的 hosts 文件。因为它短路在权威查询之前、连 REVOKED 都盖得住，三条纪律不可省：
+第 4 节锁死了所有正常路径，于是开发/测试期想模拟"已发布"，只能走查询最前端的
+cache 短路。现在有两层：
+
+1. **Zone cache**：`zone_resolver` 使用完整 resolver 接口，但语义上是 zone 内权威
+   cache。它适合 cluster 级开发旁路、批量注入文档、Zone 内吊销和短路控制；
+2. **本地覆盖**：手工往本机 `did_cache` 写入条目，等价于传统系统的 hosts 文件。
+   它只适合单机测试、CI 或没有 Zone Resolver 的环境。
+
+Zone Resolver 相比 hosts 文件的关键差异是：hosts 通常只能模拟 IP 解析，而
+Zone Resolver 返回完整 DID resolver 结果，可以覆盖 Document、Info、Missing、
+Revoked / Tombstoned 和 metadata。只要它持续返回某个 DID/doc_type 的回答，Zone 内
+客户端就不会把该请求发到 Zone 外。
+
+本地覆盖因为短路在权威查询之前、连 REVOKED 都盖得住，三条纪律不可省：
 
 1. **显式打标**：解析结果必须带 LocalOverride 警告，日志和 UI 可识别；
 2. **带 scope**：machine / test-env / CI，只能由本地管理员或测试框架写入；
 3. **不参与合并与导出**：cache merge 对它拒写，它也永远不进普通缓存、不向外同步。
+
+Zone Resolver 的管理接口是私有 cluster 管理面，不属于 `resolve_did` 的标准 provider
+管线；`name-client` 只消费它伪装出来的 resolver 查询接口。
 
 测试通过后，再执行真正的发布（上链或写入权威渠道）。
 
@@ -299,5 +341,6 @@ def did_cache_update(did, doc_type, incoming):
 5. 验签用的 owner 不由候选文档决定——expected_owner 只来自权威源的 owner 绑定或名字结构；`doc.owner` 与它不一致直接拒绝，推不出 expected_owner 的候选直接出局；owner 变更 / 委托必须经权威源发布；
 6. owner 不要写成独立流程——它只是“need_proof = false 的权威结果”，递归自然终止；
 7. 一份坏 body 只作废它自己（continue），不终止整个解析；
-8. 本地覆盖必须打标、带 scope、不合并不导出；
-9. key 类 DID 永远不是 resolve_did 的入参；公钥反查没有标准 provider（有也是私有接口，应用层自拼）——索引不携带信任，信任只能来自对候选名字的正向解析 + 公钥比对。
+8. Zone Resolver 是伪装成 resolver 的 zone 内权威 cache，服务可用时独占本次解析；只有服务不可用才落回本机 cache 和 provider 链；
+9. 本地覆盖必须打标、带 scope、不合并不导出；
+10. key 类 DID 永远不是 resolve_did 的入参；公钥反查没有标准 provider（有也是私有接口，应用层自拼）——索引不携带信任，信任只能来自对候选名字的正向解析 + 公钥比对。

@@ -1,12 +1,13 @@
 # 系统支持的 DID Resolver 一览
 
-本文列出系统支持的全部 DID resolver:各自的协议、权威性、典型场景,以及每个 DID method 下的注册顺序。这里的 `xxx_resolver` 对应代码里的 `NsProvider` 实现(name-client);注册模型与术语(权威源 / 补充源、need_proof、first-win)见 [简单介绍resolve-did.md](./简单介绍resolve-did.md) 第 2 节,resolver 接口的线上协议见 [http_did_resolver_api.md](./http_did_resolver_api.md)。
+本文列出系统支持的全部 DID resolver:各自的协议、权威性、典型场景,以及每个 DID method 下的注册顺序。除 `zone_resolver` 外,这里的 `xxx_resolver` 对应代码里的 `NsProvider` 实现(name-client);`zone_resolver` 使用同一套 resolver HTTP API,但语义上是 cache 层组件。注册模型与术语(权威源 / 补充源、need_proof、first-win)见 [简单介绍resolve-did.md](./简单介绍resolve-did.md) 第 2 节,resolver 接口的线上协议见 [http_did_resolver_api.md](./http_did_resolver_api.md)。
 
 先记住框架(简介 2.2 / 2.3 节),后面每一节都只是往里填内容:
 
 - 每个 DID method **至多一个权威发布渠道**,加上按优先级排列的**少数补充源**,主动查询 first-win;
 - 权威源能回答**发布状态 + owner 绑定**,取回结果 need_proof = false;补充源永远只产出候选文档,一律 need_proof = true(免验证的 Info 类除外,那是按 doc_type 契约事先声明的);
 - 权威还是补充由**注册位置**决定,不由 provider 自己声明;同一权威渠道可以有多个委托读取端(镜像、网关),它们合并算一个权威源。
+- `zone_resolver` 不进入这个 provider 排序。它是**伪装成 resolver 的 zone 内权威 cache**:协议形态像 resolver,但查询位置在 cache 层。
 
 ## 0. 协议只有两种
 
@@ -64,17 +65,33 @@ GET https://{sn_host}/1.0/identifiers/{did}?type={doc_type}
 
 它的价值是支持 **DeviceDocument / DeviceInfo 的查询**:由跨 NAT 的多台 OOD 组成的 BuckyOS 在启动阶段,OOD 之间直连不可达,可以经 SN 拿到另一台 OOD 的 DeviceDocument 和 DeviceInfo,辅助完成组网。(DeviceDocument 是 need_proof 候选,照常验签;DeviceInfo 属于按契约免验证的 Info 类 doc_type。)
 
-## 5. zone_resolver(zone 内的权威源)
+## 5. zone_resolver(伪装成 resolver 的 zone 内权威 cache)
 
-对 zone 内的 did 来说是权威源;一般是非公开服务,只能 zone 内访问(跑在 `127.0.0.1` 上)。只使用 resolver 接口(不查 well-known):
+zone_resolver 一般是非公开服务,只能 zone 内访问(默认跑在 `127.0.0.1:3180`)。它只使用 resolver 接口(不查 well-known):
 
 ```
 GET http://127.0.0.1:3180/1.0/identifiers/{did}?type={doc_type}
 ```
 
-zone 内 did(设备、应用等)的发布点就是 zone 自己的配置,zone_resolver 是这个发布面的本地直读端。所以"对 zone 内是权威源"与"至多一个权威渠道"不冲突:它和 zone gateway 对外提供的动态解析(web_resolver 的信道 2)读的是同一发布渠道,只是读取端不同。
+它名字里叫 resolver,接口也长得像 resolver,但在 `name-client` 的设计里它不是
+resolver-provider,而是 **cluster-level shared cache / control-plane cache**。换句话说,
+它是"伪装成 resolver 的 zone 内权威 cache":
 
-相比 web_resolver,zone 启动之后通过 zone_resolver 可以获得**更多**的 did-document——比如 zone 内的 device document,这些文档不一定对外发布。
+- 对 zone 内客户端来说,它的结果是当前 cluster 的解析控制结果,可以短路外部 DID resolver 查询;
+- 对 resolver core 来说,它只是进入 provider 链之前的一次 cache 查询,不参与 method authority /
+  supplement 的 first-win 合并;
+- 只有 zone_resolver 服务不可用(连接失败、超时、明确 service unavailable)时,才落回本机 local cache
+  和后续 provider 流程;
+- `Missing / Revoked / Tombstoned / Unknown` 都是它的语义回答,不是 cache miss,不能触发本机 cache
+  或外部 authority 兜底。
+
+zone_resolver 通常会包含本机 cache 的能力,并叠加 cluster host / override / negative
+state 等管理逻辑。相比传统 hosts 文件只能模拟 IP 解析,它返回完整 DID resolver 结果,
+因此可以覆盖 Document、Info、Missing、Revoked / Tombstoned 和 metadata。
+
+相比 web_resolver,zone 启动之后通过 zone_resolver 可以获得**更多**的 did-document——比如
+zone 内的 device document,这些文档不一定对外发布。它也可以实现 Zone 内短路:只要持续返回某个
+DID/doc_type 的结果或负状态,客户端就不会把该请求发送到 Zone 外。
 
 ## 6. smart_resolver(所有 did;暂不实现)
 
@@ -89,13 +106,16 @@ zone 内 did(设备、应用等)的发布点就是 zone 自己的配置,zone_res
 
 按简介第 5 节的框架,"通过社交网络拿文档"这类多来源本来发生在 Cache 层(push / 共享进缓存);smart_resolver 是把它引入主动查询路径的尝试,永远只产出 need_proof 候选。暂不实现。
 
-## 7. resolver-provider 的注册顺序
+## 7. resolver-provider 的注册顺序与 Zone cache
 
 **第一个总是权威源**(简介 2.2 节:权威渠道永远第一;补充源按注册顺序即优先级,first-win,没有读放大。低优先级源拿到比高优先级更新的结果,通常说明哪里配置错了,值得打警告)。
 
-**这个顺序的另一个设计意图是尽量去中心化**:resolve_did 和 DNS 查询一样,是会被海量调用的基础设施。如果注册顺序里有一台全网共用的服务器排在靠前位置,所有解析流量都会汇聚到它——既给它带来巨大的请求压力(单点故障、易被封锁),也让系统事实上重新中心化。现在的顺序保证**不存在指向单台服务器的热路径**:
+Zone cache 位于 provider 顺序之前:默认先查 `http://127.0.0.1:3180`,服务可用时直接返回
+`ZoneHit`;只有服务不可用才进入下面的 provider 注册顺序。
 
-- 排第一的权威源是每个 did **自己的发布面**:did:web 打到目标自己的域名,流量随站点天然分散,与 Web / DNS 本身的去中心化结构同构;zone 内 did 在本地闭环(第 5 节),查询根本不出 zone;
+**provider 顺序的另一个设计意图是尽量去中心化**:resolve_did 和 DNS 查询一样,是会被海量调用的基础设施。如果注册顺序里有一台全网共用的服务器排在靠前位置,所有解析流量都会汇聚到它——既给它带来巨大的请求压力(单点故障、易被封锁),也让系统事实上重新中心化。现在的顺序保证**不存在指向单台服务器的热路径**:
+
+- 排第一的 provider 权威源是每个 did **自己的发布面**:did:web 打到目标自己的域名,流量随站点天然分散,与 Web / DNS 本身的去中心化结构同构;zone 内 did 通常已被前置 Zone cache 短路(第 5 节),查询根本不出 zone;
 - did:bns 的权威渠道是合约,网关只是可替换的读取端:任何域名都能自建网关、且鼓励自建(第 1 节),`bns.buckyos.ai` 只是自建之前的引导默认值,不是全网必经之路;
 - 补充源里,dns_resolver 复用 DNS 自身已分布式部署的基础设施(递归解析 + 缓存),不引入新的集中点;sn_resolver 这类共享服务注册在末位,first-win 意味着只有前面的源都给不出回答时才会打到它——共享基础设施只承接兜底流量,不在热路径上。
 
@@ -113,12 +133,15 @@ web_resolver → dns_resolver → sn_resolver
 
 ### buckyos 内部(zone 场景)
 
-1. buckyos 在启动后,会针对当前 zone 内的 did,把 zone_resolver 注册在最前面(只接收同 zone did 的查询;对 zone 内它就是权威源,见第 5 节);
-2. 如果 current zone 是 `did:web:xxx`,需要走一个特殊流程:zone 的权威发布面是它自己的 HTTPS 服务,启动完成之前不可达(先有鸡还是先有蛋),Booting 阶段要靠本地已有的 Owner Document + dns_resolver 引导(见第 3 节)。具体流程待展开。
+1. name-client 默认启用 zone_resolver cache,默认地址是 `http://127.0.0.1:3180`。它不按 DID 是否属于当前 zone 做客户端侧过滤;覆盖范围、是否允许出 Zone、是否短路,都由 zone_resolver 服务内部策略决定;
+2. 当 zone_resolver 服务可用时,它的回答直接返回,不再查 local cache、method authority 或 supplements;
+3. 当 zone_resolver 服务不可用时,才退回单机模式:local cache / local override 快路径,再进入上面的 provider 顺序;
+4. 如果 current zone 是 `did:web:xxx`,需要走一个特殊流程:zone 的权威发布面是它自己的 HTTPS 服务,启动完成之前不可达。Booting 阶段要靠本地已有的 Owner Document + dns_resolver 引导(见第 3 节)。具体流程待展开。
 
-## 8. 与当前实现的对照(2026-07 快照,已按本文对齐)
+## 8. 与当前实现的对照(2026-07 快照)
 
-name-client 的注册(lib.rs 的 `init_name_lib_ex`)已与第 7 节的目标顺序一致:
+name-client 的 provider 注册(lib.rs 的 `init_name_lib_ex`)已与第 7 节的目标顺序基本一致;
+Zone Resolver 的 cache 层化仍待迁移:
 
 | 本文的 resolver | 代码 | 状态 |
 | --- | --- | --- |
@@ -126,7 +149,7 @@ name-client 的注册(lib.rs 的 `init_name_lib_ex`)已与第 7 节的目标顺�
 | web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现,bns_root 与 BNS 网关共用 web3 bridge 配置;一级 bns 名字没有 uppername 回退(那个端点就是 BNS 网关本身,归 bns_resolver 管) |
 | dns_resolver | `DnsProvider`(dns_provider.rs) | 已按本文降为补充源:did:web 与 did:bns 下均注册在 web_resolver 之后,取回结果一律 need_proof 候选。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
 | sn_resolver | `BaseHttpProvider` 指向 SN host | web3 bridge 配置含 `"sn"` 键时,自动注册为 did:web / did:bns 的末位补充源;默认配置不含 sn,即默认未注册 |
-| zone_resolver | `BaseHttpProvider` 指向 zone 内服务 + `NameClient::set_zone_authority(zone_did, provider)` | name-client 侧机制已就绪:zone 读取端只受理同 zone did(zone 自身及其名字层级下的子名字),对这些 did 排在 method 权威源之前,两者按"同一权威渠道多读取端"纪律合并(first-win;Missing 须读取端一致;任一读取端断网而其余给不出回答则整体 unknown)。buckyos 启动时调用 `set_zone_authority` 的接线仍待接入 |
+| zone_resolver | 目标:独立的 Zone cache 客户端,默认指向 `http://127.0.0.1:3180`;当前代码仍保留 `BaseHttpProvider` + `NameClient::set_zone_authority(zone_did, provider)` 的旧接法 | **待迁移**:旧接法把 zone_resolver 当成 zone 内权威读取端,只受理同 zone did,并和 method authority 合并。新定位要求它脱离 `NsProvider` / authority-reader 合并,作为 cache 层独占命中源:服务可用即返回 `ZoneHit`,服务不可用才落回 local cache 和 provider 链 |
 | smart_resolver(社交版) | 无 | 暂不实现 |
 
 另外:resolver 接口响应里的 buckyos 扩展信封(发布状态等)客户端解析已就绪(`BaseHttpProvider`),服务端尚未实现;在那之前,did:web 的发布状态由主循环把 200 / 404 / 410 归一成 Active / Missing / 负状态。

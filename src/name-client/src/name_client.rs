@@ -604,6 +604,56 @@ impl NameClient {
         }
     }
 
+    fn zone_child_did(zone_did: &DID, device_name: &str) -> Option<DID> {
+        if device_name.is_empty() {
+            return None;
+        }
+        match zone_did.method.as_str() {
+            "web" | "bns" => Some(DID::new(
+                &zone_did.method,
+                &format!("{}.{}", device_name, zone_did.id),
+            )),
+            _ => None,
+        }
+    }
+
+    fn cache_embedded_zone_devices(
+        &self,
+        doc_type: &DidDocType,
+        zone_doc: &EncodedDocument,
+        evidence: CacheEvidence,
+    ) {
+        if *doc_type != DidDocType::Zone {
+            return;
+        }
+
+        let Ok(zone) = ZoneDocument::decode(zone_doc, None) else {
+            return;
+        };
+
+        for (device_name, device_document) in zone.devices.iter() {
+            let Some(device_did) = Self::zone_child_did(&zone.id, device_name) else {
+                continue;
+            };
+            let Ok(device_doc) = serde_json::to_value(device_document)
+                .map(EncodedDocument::JsonLd)
+                .map_err(|err| {
+                    warn!(
+                        "failed to encode embedded device document {} in {}: {}",
+                        device_name,
+                        zone.id.to_string(),
+                        err
+                    )
+                })
+            else {
+                continue;
+            };
+            let exp = Self::cache_ttl_exp(&device_doc);
+            self.doc_cache
+                .update(device_did, None, device_doc, exp, evidence);
+        }
+    }
+
     /// resolve_did 外层(简化文档第 3 节第 0/2 步):
     /// 1. 本地覆盖快路径(hosts 语义);
     /// 2. in-TTL positive cache 快路径(`CacheStatus::Hit`);
@@ -738,6 +788,7 @@ impl NameClient {
                             exp,
                             evidence,
                         );
+                        self.cache_embedded_zone_devices(&doc_type_c, &resolved.document, evidence);
                     }
                 }
                 resolved.resolution_metadata.cache_status = Some(if had_cache {
