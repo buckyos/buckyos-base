@@ -17,8 +17,8 @@
 解析器2. 基于http的did-doc解析器，与0的协议基本相同，但更适合查询did:bns:$objname.$zonename 这种zone内的二级对象
 - "https://{provider}/1.0/identifiers/{did?type=doc_type}", 
 这种URL适合在有明确的provider的情况下查询任意did
-- "https://{hostname}/.well-known/did.json","https://{hostname}/.well-known/doc-type.json","https://{hostname}/{did_inner_path}/did.json"
-这种URL适合在没有provider的情况下，根据来自did的hostname,查询Zone内的did
+- "https://{hostname}/.well-known/did.json","https://{hostname}/.well-known/{doc_type}[.json|.jwt]","https://{hostname}/{did_inner_path}/{doc_type}[.json|.jwt]"
+这种URL适合在没有provider的情况下，根据来自did的hostname,查询Zone内的did；其中did.json是W3C did:web兼容入口(JSON/JSON-LD)，BuckyOS扩展的{doc_type}可以无后缀自动识别JSON/JWT，也可以用.json/.jwt强类型后缀
 解析器3. 基于udp广播的did-doc解析器，通过udp在局域网（或地址范围）广播查询请求，期待任意设备响应并返回
 
 给定一个did,解析器2如何在provider为NULL时解析出did-doc? 

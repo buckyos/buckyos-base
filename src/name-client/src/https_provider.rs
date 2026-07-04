@@ -86,7 +86,16 @@ impl BaseHttpProvider {
             .text()
             .await
             .map_err(|e| NSError::Failed(format!("read resolver response failed: {}", e)))?;
+        Self::parse_response_body(did, status, &body)
+    }
 
+    /// 拆成纯函数（接收已经读出来的 status/body）方便直接用字面量测试，
+    /// 与 `parse_published_state_body` 同一套路。
+    pub(crate) fn parse_response_body(
+        did: &DID,
+        status: StatusCode,
+        body: &str,
+    ) -> NSResult<EncodedDocument> {
         if !status.is_success() {
             return match status {
                 StatusCode::NOT_FOUND => Err(NSError::NotFound(did.to_string())),
@@ -99,7 +108,7 @@ impl BaseHttpProvider {
             };
         }
 
-        if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
             if value
                 .get("didDocumentMetadata")
                 .and_then(|meta| meta.get("deactivated"))
@@ -116,10 +125,16 @@ impl BaseHttpProvider {
                 .get("didDocument")
                 .cloned()
                 .unwrap_or_else(|| value.clone());
-            return Ok(EncodedDocument::JsonLd(doc_value));
+            // 信封里的 JWT 文档以字符串形态出现在 didDocument（zone resolver 对
+            // boot/device 这类 owner-signed JWT 文档同样返回 resolution 信封），
+            // 包成 JsonLd(Value::String) 会让下游 XxxDocument::decode 全部失败。
+            return match doc_value {
+                Value::String(jwt) => Ok(EncodedDocument::Jwt(jwt)),
+                other => Ok(EncodedDocument::JsonLd(other)),
+            };
         }
 
-        EncodedDocument::from_str(body)
+        EncodedDocument::from_str(body.to_string())
             .map_err(|e| NSError::Failed(format!("parse resolver response failed: {}", e)))
     }
 
@@ -340,6 +355,56 @@ impl NsProvider for BaseHttpProvider {
 mod tests {
     use super::*;
     use name_lib::DID;
+
+    // ------------------------ query_did 响应解析 ------------------------
+
+    #[test]
+    fn parse_response_body_unwraps_envelope_documents_by_shape() {
+        let did = DID::from_str("did:web:ood1.example.com").unwrap();
+
+        // 信封里的 JSON 文档
+        let body = serde_json::json!({
+            "didDocument": {"marker": "doc"},
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "active"}}
+        })
+        .to_string();
+        let doc = BaseHttpProvider::parse_response_body(&did, StatusCode::OK, &body).unwrap();
+        assert_eq!(
+            doc,
+            EncodedDocument::JsonLd(serde_json::json!({"marker": "doc"}))
+        );
+
+        // 信封里的 JWT 文档（字符串形态）必须还原成 Jwt，而不是 JsonLd(String)
+        let body = serde_json::json!({
+            "didDocument": "header.payload.sig",
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "active"}}
+        })
+        .to_string();
+        let doc = BaseHttpProvider::parse_response_body(&did, StatusCode::OK, &body).unwrap();
+        assert_eq!(doc, EncodedDocument::Jwt("header.payload.sig".to_string()));
+
+        // 裸 JWT body（静态发布面 / 旧形态）仍然可解析
+        let doc =
+            BaseHttpProvider::parse_response_body(&did, StatusCode::OK, "header.payload.sig")
+                .unwrap();
+        assert_eq!(doc, EncodedDocument::Jwt("header.payload.sig".to_string()));
+
+        // 裸 JSON 文档（无信封）整体即文档
+        let doc = BaseHttpProvider::parse_response_body(&did, StatusCode::OK, r#"{"bare":1}"#)
+            .unwrap();
+        assert_eq!(doc, EncodedDocument::JsonLd(serde_json::json!({"bare": 1})));
+
+        // deactivated 信封仍然拒绝
+        let body = serde_json::json!({
+            "didDocument": "a.b.c",
+            "didDocumentMetadata": {"deactivated": true}
+        })
+        .to_string();
+        assert!(matches!(
+            BaseHttpProvider::parse_response_body(&did, StatusCode::OK, &body),
+            Err(NSError::Disabled(_))
+        ));
+    }
 
     // ------------------------ resolve_published_state 信封解析 ------------------------
     // 按 doc/http_did_resolver_api.md 的信封直接构造字面量 status/body 测试纯解析函数，

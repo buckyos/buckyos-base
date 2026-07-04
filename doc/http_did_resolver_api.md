@@ -1,10 +1,10 @@
 # HTTP DID Resolver API（草案）
 
 > 面向读者：任何想在 HTTP 上实现一个符合 BuckyOS `resolve_did` 状态机语义的 did-resolver 的团队
->（bns-server 是第一个、也是目前唯一一个实现方，但协议本身**与 did:method 无关**——did:web 的
-> canonical endpoint、未来任何新 did:method 的 resolver，都可以照这份协议实现，`resolve_did`
-> 那一侧不需要为每个 method 单独写一套解析逻辑）；以及未来在 `name-client` 里实现对应 HTTP 客户端
-> 的维护者。
+>（bns-server 是第一个、也是目前唯一一个实现方，但协议本身**与 did:method 无关**——did:web 域名上
+> 额外部署的动态 resolver endpoint、未来任何新 did:method 的 resolver，都可以照这份协议实现，
+> `resolve_did` 那一侧不需要为每个 method 单独写一套解析逻辑）；以及未来在 `name-client` 里实现
+> 对应 HTTP 客户端的维护者。
 >
 > **协议层面定位**：BuckyOS 目前（[resolve-did.md](./resolve-did.md)）有两类 did-resolver：
 > 1）**基于 HTTP 的**（本文档）——method-agnostic，只要 resolver 能在 HTTP 上按本文档的约定应答，
@@ -56,8 +56,8 @@ GET https://{provider}/1.0/identifiers/{did}?type={doc_type}
 `web3_bridge.bns` 配置的 host），只是众多可能的具体部署之一。
 
 **本协议不新增端点，也不区分 did:method**，而是让同一个 `GET /1.0/identifiers/{did}?type={doc_type}`
-端点在响应体里携带 `PublishedState` 需要的状态信息——不管这个端点背后是 BNS 合约索引、did:web 自己
-的 canonical host，还是未来某个新 method 的 resolver。理由：
+端点在响应体里携带 `PublishedState` 需要的状态信息——不管这个端点背后是 BNS 合约索引、did:web
+域名额外部署的动态 resolver，还是未来某个新 method 的 resolver。理由：
 
 1. 避免每个 resolver 实现方维护两套查询路径（拿文档一套、拿状态另一套）导致的不一致。
 2. `HttpsProvider::parse_response`（[https_provider.rs:75-116](../src/name-client/src/https_provider.rs#L75-L116)）
@@ -71,11 +71,53 @@ GET https://{provider}/1.0/identifiers/{did}?type={doc_type}
    而不是接口本身区分 method），协议层保持一致，未来加新 method 不需要改协议、
    只需要新增一个实现方。
 
+### 1.1 与静态 `/.well-known/*` 发布面的边界
+
+本文档定义的是 BuckyOS 的 HTTP resolver API：`/1.0/identifiers/{did}`。它可以返回 W3C DID
+Resolution Result 信封，并在 `didDocumentMetadata.buckyos` 里放 BuckyOS 的发布状态扩展。
+
+它**不是** W3C `did:web` 的静态发布路径。`did:web:example.com` 对应的
+`https://example.com/.well-known/did.json` 必须返回裸 DID Document（JSON/JSON-LD 的 DID 文档本体），
+不能返回包含 `didResolutionMetadata` / `didDocument` / `didDocumentMetadata` 的 resolution result
+信封；否则标准 `did:web` resolver 会把根对象当成 DID Document 解析，进而失败。带路径的
+`did:web:example.com:user:alice` 同理，对应 `https://example.com/user/alice/did.json`，也应返回裸
+DID Document。这条 `did.json` 路径是 W3C 兼容基线，保持 JSON/JSON-LD，不用 JWT 替代。
+
+BuckyOS 在同一个静态发布目录下扩展 `{doc_type}` 文件名，并允许文档 body 有 JSON/JSON-LD 或 JWT 两种
+表示。路径格式是：
+
+```text
+https://{hostname}/.well-known/{doc_type}[.{representation}]
+https://{hostname}/{did_path}/{doc_type}[.{representation}]
+
+representation = json | jwt
+```
+
+- 无后缀的 `{doc_type}` 是自动识别入口，服务端可以返回 JSON/JSON-LD 或 JWT。
+- `{doc_type}.json` 是强类型 JSON/JSON-LD 入口。
+- `{doc_type}.jwt` 是强类型 JWT 入口。
+- `doc_type` 本身只能使用 `[A-Za-z0-9_-]` 这类安全 token，不能包含 `.` 或 `/`，这样后缀解析没有歧义。
+- BuckyOS client 不能只依赖 `Content-Type`；需要按 body 自动识别 JSON/JSON-LD 与 JWT。当前
+  `EncodedDocument` 本身已经有 `JsonLd` / `Jwt` 两种表示，静态发布面和 resolver 信封里的
+  `didDocument` 都遵循同一套识别规则。
+
+同一个服务可以同时提供两类入口：
+
+| 入口 | 用途 | 响应体 |
+| --- | --- | --- |
+| `/.well-known/did.json`、`/{did_path}/did.json` | W3C `did:web` 兼容入口 | JSON/JSON-LD 裸 DID Document |
+| `/.well-known/{doc_type}[.json|.jwt]`、`/{did_path}/{doc_type}[.json|.jwt]` | BuckyOS 静态发布面 | 裸文档 body，JSON/JSON-LD 或 JWT，客户端自动识别 |
+| `/1.0/identifiers/{did}?type={doc_type}` | BuckyOS / 通用 HTTP DID resolver API | DID Resolution Result 信封；必要时带 `didDocumentMetadata.buckyos` |
+
+BuckyOS 扩展的 `/.well-known/{doc_type}*` 仍然属于静态发布面：它只能返回某个 doc_type 的文档本体，
+不要把 §3 的状态信封塞到这里。需要 `Missing` / `Revoked` / `Tombstoned` / `Migrated` 这类状态语义时，
+走 `/1.0/identifiers/{did}?type={doc_type}`。
+
 ## 2. 请求
 
 ```
 GET {resolver_base}/1.0/identifiers/{did}?type={doc_type}&iat={unix_timestamp}
-Accept: application/did-resolution+json
+Accept: application/did-resolution
 ```
 
 - `{did}`：完整 DID 字符串（如 `did:bns:waterflier`），**不做 percent-encode 处理内部的 `:`**，与
@@ -84,6 +126,10 @@ Accept: application/did-resolution+json
 - `iat`：可选 query 参数，Unix 秒级时间戳。省略时查询"当前状态"（第 3-4 节）；携带时查询
   "在这个时间点生效的状态"，目前只用于 `type=owner`，见第 7 节。其它 `doc_type` 暂不要求支持这个
   参数（没有历史一致性校验的需求）。
+- `Accept`：推荐使用 W3C DID Resolution 的 `application/did-resolution`，表示调用方希望拿到完整
+  resolution result 信封，而不是只拿裸 DID Document。为了兼容当前 `name-client` 的实现，服务端实现
+  BuckyOS 发布状态时，不能只依赖 `Accept` 才返回信封；在未携带 `Accept` 的 `/1.0/identifiers` 请求上，
+  也应返回同样的信封（`query_did` 会自动拆出其中的 `didDocument`）。
 - 幂等、无副作用，可以被 CDN/网关缓存（但 resolver 实现方自己要通过合适的 `Cache-Control` 控制 TTL，
   不能让 Revoked/Tombstoned 之后的旧响应被缓存层继续放出去；带 `iat` 的历史查询理论上可以被永久
   缓存，因为同一个 `iat` 的答案不应该再变化——除非 §7 描述的"退化成当前 owner"这条路径被触发）。
