@@ -58,6 +58,10 @@ pub enum NSError {
     InvalidState(String),
     #[error("Owner conflict: {0}")]
     OwnerConflict(String),
+    /// `verify_did_document_jwt` 的结构化失败:`code` 是需求文档错误表中的稳定
+    /// 错误码(如 `DetachedOwnerRejected`),调用方按 code 分支,不要解析 detail。
+    #[error("verify did document jwt failed: {code}: {detail}")]
+    VerifyDidJwtFailed { code: String, detail: String },
 }
 
 pub type NSResult<T> = Result<T, NSError>;

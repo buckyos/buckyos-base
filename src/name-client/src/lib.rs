@@ -13,6 +13,7 @@ mod name_query;
 mod profile_resolver;
 mod provider;
 mod utility;
+mod verify_did_jwt;
 mod web_provider;
 mod zone_resolver;
 
@@ -30,6 +31,7 @@ pub use name_query::*;
 pub use profile_resolver::*;
 pub use provider::*;
 pub use utility::*;
+pub use verify_did_jwt::*;
 pub use web_provider::*;
 pub use zone_resolver::*;
 
@@ -241,6 +243,12 @@ pub fn record_connection_outcome(
     client.record_connection_outcome(local_ip, remote, outcome)
 }
 
+/// 解析这个 DID **自己**的 auth key。
+///
+/// 注意:它不能用于 DID Document JWT 的 owner binding 验证——不要用
+/// `payload.owner` / `payload.iss` 调本函数来验一份外部 DID Document JWT,
+/// 那只能证明"JWT 能被它自己声明的 owner 验过"。权限主体认证场景必须使用
+/// [`verify_did_document_jwt`](doc/verify-did-document-jwt.md)。
 pub async fn resolve_auth_key(did: &DID, kid: Option<&str>) -> NSResult<DecodingKey> {
     let ed25519_auth_key = did.get_ed25519_auth_key();
     if ed25519_auth_key.is_some() {
@@ -329,6 +337,34 @@ pub async fn resolve_did_ex(
     client.resolve_did_ex(did, doc_type, policy).await
 }
 
+/// 验证一份外部传入的 DID Document JWT(doc/verify-did-document-jwt.md)。
+/// 权限主体认证场景必须用它,不要用 `payload.owner`/`payload.iss` 调
+/// `resolve_auth_key` 验 DID Document JWT——那只能证明"JWT 能被它自己声明的
+/// owner 验过"。
+pub async fn verify_did_document_jwt(
+    did: &DID,
+    doc_type: DidDocType,
+    jwt: &str,
+    options: VerifyDidDocumentJwtOptions,
+) -> NSResult<VerifiedDidDocument> {
+    let client = get_name_client()
+        .ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client
+        .verify_did_document_jwt(did, doc_type, jwt, options)
+        .await
+}
+
+/// `verify_did_document_jwt` 的 DeviceDocument typed wrapper(RTCP 迁移入口)。
+pub async fn verify_device_document_jwt(
+    did: &DID,
+    jwt: &str,
+    options: VerifyDidDocumentJwtOptions,
+) -> NSResult<(DeviceDocument, VerifiedDidDocument)> {
+    let client = get_name_client()
+        .ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client.verify_device_document_jwt(did, jwt, options).await
+}
+
 pub async fn resolve_owner_document(did: &DID) -> NSResult<OwnerDocument> {
     let client = get_name_client();
     if client.is_none() {
@@ -356,6 +392,9 @@ pub async fn owner_is_bound_to_zone(did: &DID, zone_did: &DID) -> NSResult<bool>
     client.unwrap().owner_is_bound_to_zone(did, zone_did).await
 }
 
+/// 旁路的**未验证**缓存写入(`CacheEvidence::Unverified`),不能提升文档信任
+/// 等级。应用层通过 `verify_did_document_jwt` 验证成功后不要再调它保存
+/// "已验证文档"——受控缓存写入由 verify 入口按证据等级自己完成。
 pub async fn update_did_cache(
     did: DID,
     doc_type: Option<DidDocType>,

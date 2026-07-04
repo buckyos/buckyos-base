@@ -573,6 +573,31 @@ impl NameQuery {
         }
     }
 
+    /// `verify_did_document_jwt` 的权威阶段入口:对 (did, doc_type) 运行一次
+    /// 权威渠道查询并归一化。`Err(NotFound)` = method 未注册;`Ok(None)` = 该
+    /// method 没有注册权威渠道(发布状态不可知,外部候选只能按 NeedProof 验证);
+    /// `Ok(Some(..))` = 权威读取端的回答(Dr)或"没有得到回答"(Unknown)。
+    pub(crate) async fn authority_answer_for(
+        &self,
+        did: &DID,
+        doc_type: &DidDocType,
+    ) -> NSResult<Option<ProviderResolveResult>> {
+        let methods = self.methods.read().await;
+        let Some(method_providers) = methods.get(&did.method) else {
+            return Err(NSError::NotFound(format!(
+                "DID method not supported: {}",
+                did.method
+            )));
+        };
+        let Some(authority) = method_providers.authority.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.authority_answer(authority.as_ref(), did, doc_type)
+                .await,
+        ))
+    }
+
     async fn query_provider_body(
         &self,
         provider: &dyn NsProvider,

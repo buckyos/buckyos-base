@@ -67,9 +67,9 @@ impl Default for NameClientConfig {
 }
 
 pub struct NameClient {
-    name_query: NameQuery,
-    config: NameClientConfig,
-    doc_cache: DIDDocumentCache,
+    pub(crate) name_query: NameQuery,
+    pub(crate) config: NameClientConfig,
+    pub(crate) doc_cache: DIDDocumentCache,
     addr_rtt_db: Arc<RttDatabase>,
     _addr_rtt_auto_flush: Option<AutoFlushHandle>,
     cached_local_ips: StdRwLock<Vec<IpAddr>>,
@@ -624,7 +624,7 @@ impl NameClient {
 
     /// 缓存条目的 TTL:文档自身 exp 与 `DOC_CACHE_TTL_SECS` 取小。TTL 只决定
     /// 快路径的新鲜度,不代表文档作废时间。
-    fn cache_ttl_exp(doc: &EncodedDocument) -> u64 {
+    pub(crate) fn cache_ttl_exp(doc: &EncodedDocument) -> u64 {
         let now = buckyos_get_unix_timestamp();
         let doc_exp = Self::extract_exp(doc).unwrap_or_else(|| now + DEFAULT_EXPIRE_TIME);
         doc_exp.min(now + DOC_CACHE_TTL_SECS)
