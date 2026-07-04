@@ -45,11 +45,10 @@ pub struct NameClientConfig {
     pub local_cache_dir: Option<String>,
     pub cache_backend: CacheBackend,
     pub rtt_db_config: AddrRttDbConfig,
-    /// Zone Resolver cache 快路径(cluster-level cache,简化文档第 3 节第 0 步)。
-    /// 默认启用:服务可用时它的回答独占本次解析;服务不可用(连接失败/超时)
-    /// 才落回本机 cache 与 resolver core,非 BuckyOS 环境下代价只是一次即时
-    /// 失败的本机连接。单元测试、离线工具应显式关闭,避免打到开发机上真实
-    /// 运行的 zone 服务。
+    /// Zone Resolver L1 cache(cluster-level cache,简化文档第 3 节第 0 步)。
+    /// 默认启用:明确回答时命中;返回 unknown 或传输失败时落回本机 cache
+    /// 与 resolver core。单元测试、离线工具应显式关闭,避免打到开发机上
+    /// 真实运行的 zone 服务。
     pub enable_zone_resolver: bool,
     pub zone_resolver: ZoneResolverConfig,
 }
@@ -160,10 +159,7 @@ impl NameClient {
     }
 
     fn zone_resolver_snapshot(&self) -> Option<Arc<ZoneResolverClient>> {
-        self.zone_resolver
-            .read()
-            .ok()
-            .and_then(|zone| zone.clone())
+        self.zone_resolver.read().ok().and_then(|zone| zone.clone())
     }
 
     /// 写入本地测试/运维 override(简化文档第 7 节,类似 hosts 文件)。只应由本地
@@ -722,7 +718,7 @@ impl NameClient {
     }
 
     /// resolve_did 外层(简化文档第 3 节第 0/2 步):
-    /// 0. Zone Resolver cache 快路径(cluster-level cache,服务可用即独占);
+    /// 0. Zone Resolver L1 cache 快路径(明确回答即命中,unknown 继续 L2);
     /// 1. 本地覆盖快路径(hosts 语义);
     /// 2. in-TTL positive cache 快路径(`CacheStatus::Hit`);
     /// 3. in-TTL negative cache 快路径(直接报错);
@@ -747,11 +743,12 @@ impl NameClient {
         let allow_stale_cache = policy.allow_stale_cache;
         let doc_type_c = doc_type.clone().unwrap_or_default();
 
-        // 0. Zone Resolver cache 快路径(T5.2):服务可用时它的回答独占本次解析
+        // 0. Zone Resolver L1 cache 快路径(T5.2):明确回答时命中
         // (`CacheStatus::ZoneHit`),local override、本机 cache、method authority、
-        // supplements 都不参与;Missing / 负状态 / unknown 都是回答,不触发
-        // fallback。结果不回写本机 cache(避免两层 cache 合并)。不做 did_in_zone
-        // 客户端过滤:覆盖范围由 Zone Resolver 服务内部策略决定(T5.3)。
+        // supplements 都不参与;Missing / 负状态是回答。Zone 返回 unknown
+        // 时按 L1 miss 继续 L2 本机 cache 与 resolver core。Zone 结果不回写
+        // 本机 cache(避免两级 cache entry 合并)。不做 did_in_zone 客户端过滤:
+        // 覆盖范围由 Zone Resolver 服务内部策略决定(T5.3)。
         // policy 可按调用关闭(`use_zone_resolver = false`):zone-resolver-server
         // 内部用 resolve_did 完成对外查询,必须跳过这里,否则查询到自己造成递归。
         if policy.use_zone_resolver {
@@ -762,9 +759,9 @@ impl NameClient {
                     .await;
                 match zone.lookup(did, &doc_type_c, no_proof).await {
                     ZoneLookup::Answered(result) => return result,
-                    ZoneLookup::Unavailable(err) => {
+                    ZoneLookup::Unknown(err) => {
                         debug!(
-                            "zone resolver unavailable for {}#{}, falling back to local flow: {}",
+                            "zone resolver unknown for {}#{}, falling back to local cache: {}",
                             did.to_string(),
                             doc_type_c,
                             err
@@ -1263,7 +1260,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     /// 极小的 zone resolver HTTP stub:对任意请求返回固定 status + body,
     /// 记录请求次数。返回 (endpoint, hits)。
-    async fn spawn_zone_stub(status_line: &'static str, body: String) -> (String, Arc<AtomicUsize>) {
+    async fn spawn_zone_stub(
+        status_line: &'static str,
+        body: String,
+    ) -> (String, Arc<AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1365,10 +1365,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             resolved.resolution_metadata.cache_status,
             Some(CacheStatus::ZoneHit)
         );
-        assert_eq!(
-            resolved.document_metadata.buckyos.document_version,
-            Some(3)
-        );
+        assert_eq!(resolved.document_metadata.buckyos.document_version, Some(3));
         assert!(resolved
             .resolution_metadata
             .resolver_id
@@ -1435,11 +1432,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         // 关闭 zone 的调用:不触碰 stub,走本机 cache。
         let resolved = client
-            .resolve_did_ex(
-                &did,
-                None,
-                ResolvePolicy::default().without_zone_resolver(),
-            )
+            .resolve_did_ex(&did, None, ResolvePolicy::default().without_zone_resolver())
             .await
             .unwrap();
         assert_eq!(resolved.document, cached);
@@ -1449,7 +1442,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
-        // 默认 policy 的调用仍由 Zone 独占。
+        // 默认 policy 的调用仍优先命中 Zone L1。
         let resolved = client
             .resolve_did_ex(&did, None, ResolvePolicy::default())
             .await
@@ -1463,7 +1456,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     #[tokio::test]
     async fn zone_unavailable_falls_back_to_local_cache_hit() {
-        // T5.6:服务不可用(connection refused)时才落回 local cache,
+        // T5.6:服务不可用(connection refused)是 Zone unknown,落回 local cache,
         // 命中返回原有 CacheStatus::Hit。
         let client = mem_client();
         client.set_zone_resolver_endpoint(free_endpoint().await);
@@ -1488,6 +1481,42 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             resolved.resolution_metadata.cache_status,
             Some(CacheStatus::Hit)
         );
+    }
+
+    #[tokio::test]
+    async fn zone_unknown_answer_falls_back_to_local_cache_hit() {
+        // 裸 404 表示 Zone L1 cache 不知道,继续走 L2 本机 cache。
+        let (endpoint, hits) = spawn_zone_stub("404 Not Found", String::new()).await;
+        let client = mem_client();
+        client.set_zone_resolver_endpoint(&endpoint);
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let cached = make_doc(now, now + 1000, "local-cache");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            cached.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+        let authority = MockAuthority::ok(make_doc(now, now + 2000, "from-authority"));
+        let calls_probe = &authority.calls as *const AtomicUsize;
+        client
+            .set_method_authority("web", Box::new(authority))
+            .await;
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, cached);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(unsafe { (*calls_probe).load(Ordering::SeqCst) }, 0);
     }
 
     #[tokio::test]
@@ -1530,8 +1559,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     #[tokio::test]
     async fn zone_missing_answer_blocks_local_cache_and_external_resolvers() {
-        // T5.6:Zone 返回 Missing(404)时,不查 local cache,也不查外部 resolver。
-        let (endpoint, hits) = spawn_zone_stub("404 Not Found", String::new()).await;
+        // T5.6:Zone 明确返回 Missing 时,不查 local cache,也不查外部 resolver。
+        let body = serde_json::json!({
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "missing"}}
+        })
+        .to_string();
+        let (endpoint, hits) = spawn_zone_stub("404 Not Found", body).await;
         let client = mem_client();
         client.set_zone_resolver_endpoint(&endpoint);
 
@@ -1617,7 +1650,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
     #[tokio::test]
     async fn zone_serves_info_doc_type_with_unproof_evidence() {
-        // Info 契约的请求同样由 Zone 独占,证据按契约打 UnproofInfo,
+        // Info 契约的请求同样可由 Zone L1 明确命中,证据按契约打 UnproofInfo,
         // 且不写 UnauthenticatedInfoCache(zone 结果不回写任何本机缓存)。
         let body = serde_json::json!({"didDocument": {"info": "zone-info"}}).to_string();
         let (endpoint, _hits) = spawn_zone_stub("200 OK", body).await;

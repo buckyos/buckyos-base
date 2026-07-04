@@ -5,15 +5,12 @@ zone_resolver 使用标准 resolver HTTP 接口,但它**不是** resolver-provid
 它是 cluster-level shared cache / control-plane cache("伪装成 resolver 的
 zone 内权威 cache")。因此这里不实现 `NsProvider`,而是一个独立的 cache 层
 客户端,由 `NameClient::resolve_did_ex` 在进入本机 cache 与 resolver core
-之前查询:
+之前查询。cache 分两级:Zone Resolver 是 L1,本机 did_cache 是 L2。
 
-- 服务可用时,它的回答就是本次解析的结果(`CacheStatus::ZoneHit`),
+- 明确命中时,它的回答就是本次解析的结果(`CacheStatus::ZoneHit`),
   本机 cache、local override、method authority、supplements 都不参与;
-- `Missing / Revoked / Tombstoned / Unknown` 都是回答,不是 cache miss,
-  不触发任何 fallback;Zone 实现若希望"没有命中时继续向外查",应由服务
-  自己完成外部查询后作为 resolver 结果返回;
-- 只有服务不可用(连接失败、超时、明确的 service unavailable)才落回
-  本机 cache 快路径和 resolver core;
+- `Missing / Revoked / Tombstoned` 是明确回答,不是 cache miss;
+- `Unknown` 表示 L1 cache 没有答案,继续走本机 cache 快路径和 resolver core;
 - 不做 `did_in_zone` 客户端过滤:哪些 DID 属于本 Zone、哪些短路、哪些允许
   出 Zone,由 Zone Resolver 服务内部策略决定;
 - 管理面(cluster override、Zone 内吊销等)是 Zone Resolver 的私有接口,
@@ -39,8 +36,7 @@ pub const DEFAULT_ZONE_RESOLVER_ENDPOINT: &str = "http://127.0.0.1:3180";
 pub struct ZoneResolverConfig {
     pub endpoint: String,
     pub connect_timeout: Duration,
-    /// 整个请求(含读取)的超时。Zone Resolver 可能代理外部查询,给出比
-    /// connect_timeout 宽松的预算;超时视为服务不可用。
+    /// 整个请求(含读取)的超时。超时视为 Zone L1 cache unknown。
     pub request_timeout: Duration,
 }
 
@@ -54,13 +50,12 @@ impl Default for ZoneResolverConfig {
     }
 }
 
-/// 一次 Zone Resolver 查询的产出。界线是**服务可用性**,不是"有没有拿到文档":
-/// 服务给出的 `Missing / Revoked / Tombstoned / Unknown` 都落在 `Answered`
-/// (以对应的 NSError 表达),只有传输层失败与明确的 unavailable 才是
-/// `Unavailable`——那才允许落回本机 cache 与 resolver core。
+/// 一次 Zone Resolver 查询的产出。`Answered` 是 L1 cache 的明确结果
+/// (包含 Missing / Revoked / Tombstoned 这类负状态);`Unknown` 是 L1
+/// cache 没有答案,允许继续落回本机 cache 与 resolver core。
 pub enum ZoneLookup {
     Answered(NSResult<ResolvedDocument>),
-    Unavailable(NSError),
+    Unknown(NSError),
 }
 
 pub struct ZoneResolverClient {
@@ -107,10 +102,10 @@ impl ZoneResolverClient {
         let url = self.build_url(did, doc_type);
         let response = match self.client.get(&url).send().await {
             Ok(response) => response,
-            // 传输层失败(refused / 超时 / 连接中断)= 服务不可用。
+            // 传输层失败(refused / 超时 / 连接中断)= L1 cache unknown。
             Err(err) => {
-                return ZoneLookup::Unavailable(NSError::Failed(format!(
-                    "zone resolver {} unreachable: {}",
+                return ZoneLookup::Unknown(NSError::Failed(format!(
+                    "zone resolver {} unknown: {}",
                     self.config.endpoint, err
                 )));
             }
@@ -119,8 +114,8 @@ impl ZoneResolverClient {
         let body = match response.text().await {
             Ok(body) => body,
             Err(err) => {
-                return ZoneLookup::Unavailable(NSError::Failed(format!(
-                    "read zone resolver {} response failed: {}",
+                return ZoneLookup::Unknown(NSError::Failed(format!(
+                    "read zone resolver {} response unknown: {}",
                     self.config.endpoint, err
                 )));
             }
@@ -128,7 +123,7 @@ impl ZoneResolverClient {
         Self::interpret_response(did, doc_type, no_proof, &self.resolver_id(), status, &body)
     }
 
-    /// 把 HTTP 响应解释成 Zone 回答或"服务不可用"。纯函数,便于用字面量
+    /// 把 HTTP 响应解释成 Zone 明确回答或 L1 unknown。纯函数,便于用字面量
     /// status/body 写单测。响应信封与 resolver 接口一致
     /// (doc/http_did_resolver_api.md):`didDocument` + `didDocumentMetadata.buckyos`。
     fn interpret_response(
@@ -139,14 +134,14 @@ impl ZoneResolverClient {
         status: StatusCode,
         body: &str,
     ) -> ZoneLookup {
-        // 网关层的"服务不可用"与传输失败同档:这是 T5.1 列表里唯一由
-        // HTTP 状态码表达的 unavailable。
+        // 网关层的"服务不可用"与传输失败同档:它们是 Zone L1 cache
+        // 的 unknown,允许继续查本机 cache。
         if status == StatusCode::SERVICE_UNAVAILABLE
             || status == StatusCode::BAD_GATEWAY
             || status == StatusCode::GATEWAY_TIMEOUT
         {
-            return ZoneLookup::Unavailable(NSError::Failed(format!(
-                "zone resolver {} unavailable: {}",
+            return ZoneLookup::Unknown(NSError::Failed(format!(
+                "zone resolver {} unknown: {}",
                 resolver_id, status
             )));
         }
@@ -192,33 +187,53 @@ impl ZoneResolverClient {
                     doc_type
                 ))));
             }
+
+            let resolution_error = value
+                .get("didResolutionMetadata")
+                .and_then(|meta| meta.get("error"))
+                .filter(|err| !err.is_null());
+            if let Some(error) = resolution_error {
+                return ZoneLookup::Unknown(NSError::Failed(format!(
+                    "zone resolver answered unknown for {}#{}: {}",
+                    did.to_string(),
+                    doc_type,
+                    error
+                )));
+            }
         }
 
         match status {
-            StatusCode::OK => {
-                ZoneLookup::Answered(Self::document_answer(
-                    did, doc_type, no_proof, resolver_id, envelope, body,
-                ))
+            StatusCode::OK => ZoneLookup::Answered(Self::document_answer(
+                did,
+                doc_type,
+                no_proof,
+                resolver_id,
+                envelope,
+                body,
+            )),
+            // 裸 404 表示 Zone L1 cache 没有答案;明确 Missing 必须由
+            // didDocumentMetadata.buckyos.documentStatus = "missing" 表达。
+            StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => {
+                ZoneLookup::Unknown(NSError::NotFound(format!(
+                    "zone resolver answered unknown for {}#{}: status {}",
+                    did.to_string(),
+                    doc_type,
+                    status
+                )))
             }
-            // Missing 是回答:Zone 明确说不存在,不落回本机 cache 或外部 resolver。
-            StatusCode::NOT_FOUND => ZoneLookup::Answered(Err(NSError::NotFound(format!(
-                "zone resolver answered: {}#{} not found",
-                did.to_string(),
-                doc_type
-            )))),
             StatusCode::GONE => ZoneLookup::Answered(Err(NSError::Disabled(format!(
                 "zone resolver answered: {}#{} is gone",
                 did.to_string(),
                 doc_type
             )))),
-            // 其余状态码(500 等):服务可达但没能给出解析结果,是 Zone 的
-            // "unknown"回答——同样独占本次解析,不允许绕过 Zone 向外查。
-            other => ZoneLookup::Answered(Err(NSError::Failed(format!(
+            // 其余状态码(500 等):服务可达但没给出明确 cache 结果,视为
+            // Zone L1 unknown,继续走本机 cache。
+            other => ZoneLookup::Unknown(NSError::Failed(format!(
                 "zone resolver answered unknown for {}#{}: status {}",
                 did.to_string(),
                 doc_type,
                 other
-            )))),
+            ))),
         }
     }
 
@@ -234,7 +249,10 @@ impl ZoneResolverClient {
         let document = match envelope.as_ref() {
             Some(value) => {
                 // resolver 信封:didDocument 字段;非信封的裸 JSON 文档整体即文档。
-                let doc_value = value.get("didDocument").cloned().unwrap_or_else(|| value.clone());
+                let doc_value = value
+                    .get("didDocument")
+                    .cloned()
+                    .unwrap_or_else(|| value.clone());
                 match doc_value {
                     Value::String(jwt) => EncodedDocument::Jwt(jwt),
                     Value::Null => {
@@ -253,8 +271,7 @@ impl ZoneResolverClient {
             None => {
                 let trimmed = body.trim();
                 let mut segments = trimmed.split('.');
-                let jwt_shaped = segments.by_ref().take(3).filter(|s| !s.is_empty()).count()
-                    == 3
+                let jwt_shaped = segments.by_ref().take(3).filter(|s| !s.is_empty()).count() == 3
                     && segments.next().is_none();
                 if !jwt_shaped {
                     return Err(NSError::Failed(format!(
@@ -365,10 +382,7 @@ mod tests {
             resolved.resolution_metadata.evidence,
             Some(BodyEvidence::Anchored)
         );
-        assert_eq!(
-            resolved.document_metadata.buckyos.document_version,
-            Some(7)
-        );
+        assert_eq!(resolved.document_metadata.buckyos.document_version, Some(7));
     }
 
     #[test]
@@ -403,19 +417,31 @@ mod tests {
     }
 
     #[test]
-    fn missing_is_an_answer_not_unavailable() {
-        // 裸 404 与带信封 missing 都是回答(NotFound),不允许 fallback。
-        let ZoneLookup::Answered(Err(NSError::NotFound(msg))) = interpret(StatusCode::NOT_FOUND, "")
-        else {
-            panic!("expected answered not-found");
-        };
-        assert!(msg.contains("zone resolver"));
-
+    fn missing_status_is_an_answer_but_bare_404_is_unknown() {
+        // 明确 Missing 必须由 buckyos documentStatus 表达;裸 404 表示
+        // Zone L1 cache 不知道,允许 fallback 到本机 cache。
         let body = json!({
             "didDocumentMetadata": {"buckyos": {"documentStatus": "missing"}}
         })
         .to_string();
         let ZoneLookup::Answered(Err(NSError::NotFound(_))) = interpret(StatusCode::OK, &body)
+        else {
+            panic!("expected answered not-found");
+        };
+
+        let ZoneLookup::Unknown(NSError::NotFound(msg)) = interpret(StatusCode::NOT_FOUND, "")
+        else {
+            panic!("expected unknown not-found");
+        };
+        assert!(msg.contains("unknown"));
+
+        let body = json!({
+            "didResolutionMetadata": {"error": "notFound"},
+            "didDocumentMetadata": {"buckyos": {"documentStatus": "missing"}}
+        })
+        .to_string();
+        let ZoneLookup::Answered(Err(NSError::NotFound(_))) =
+            interpret(StatusCode::NOT_FOUND, &body)
         else {
             panic!("expected answered not-found");
         };
@@ -441,35 +467,46 @@ mod tests {
     }
 
     #[test]
-    fn server_error_is_zone_unknown_answer_not_fallback() {
-        let ZoneLookup::Answered(Err(NSError::Failed(msg))) =
+    fn server_error_is_zone_unknown_and_falls_back() {
+        let ZoneLookup::Unknown(NSError::Failed(msg)) =
             interpret(StatusCode::INTERNAL_SERVER_ERROR, "boom")
         else {
-            panic!("expected answered failed");
+            panic!("expected unknown failed");
         };
-        assert!(msg.contains("zone resolver"));
+        assert!(msg.contains("unknown"));
     }
 
     #[test]
-    fn service_unavailable_status_falls_back() {
+    fn resolution_metadata_error_is_zone_unknown() {
+        let body = json!({
+            "didResolutionMetadata": {"error": "notFound"}
+        })
+        .to_string();
+        let ZoneLookup::Unknown(NSError::Failed(msg)) = interpret(StatusCode::OK, &body) else {
+            panic!("expected unknown failed");
+        };
+        assert!(msg.contains("notFound"));
+    }
+
+    #[test]
+    fn service_unavailable_status_is_unknown() {
         assert!(matches!(
             interpret(StatusCode::SERVICE_UNAVAILABLE, ""),
-            ZoneLookup::Unavailable(_)
+            ZoneLookup::Unknown(_)
         ));
         assert!(matches!(
             interpret(StatusCode::BAD_GATEWAY, ""),
-            ZoneLookup::Unavailable(_)
+            ZoneLookup::Unknown(_)
         ));
         assert!(matches!(
             interpret(StatusCode::GATEWAY_TIMEOUT, ""),
-            ZoneLookup::Unavailable(_)
+            ZoneLookup::Unknown(_)
         ));
     }
 
     #[test]
     fn ok_with_unparsable_body_is_zone_answer_error() {
-        // 服务可达但响应坏掉:是 Zone 的回答(错误),不是 unavailable——
-        // 不允许因服务 bug 绕过 Zone 控制面向外查询。
+        // 200 但响应坏掉:服务声称给出了文档,这是坏回答,不是 cache miss。
         let ZoneLookup::Answered(Err(NSError::Failed(_))) =
             interpret(StatusCode::OK, "not json and not jwt")
         else {

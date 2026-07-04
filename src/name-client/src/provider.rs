@@ -374,9 +374,9 @@ pub enum CacheStatus {
     Refresh,
     Fallback,
     UnauthenticatedInfoHit,
-    /// Zone Resolver(cluster-level cache)独占回答的命中(简化文档第 3 节
+    /// Zone Resolver(cluster-level L1 cache)明确命中的结果(简化文档第 3 节
     /// 第 0 步)。与本机 cache 的 `Hit` 和 method authority 的 `Miss/Refresh`
-    /// 相区分,UI / 日志不应把它当成 method authority 的直接回答。
+    /// 相区分;Zone unknown 会继续落回本机 cache,不会返回 `ZoneHit`。
     ZoneHit,
 }
 

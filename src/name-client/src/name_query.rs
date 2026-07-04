@@ -230,7 +230,9 @@ impl NameQuery {
         // 免验证的 Info 类 doc_type 按 method 契约事先声明,走独立轻量路径,
         // 结果只进入 UnauthenticatedInfoCache(T1.3 保留资产)。
         if method_providers.no_proof_doc_types.contains(&doc_type) {
-            return self.resolve_unproof_info(method_providers, did, &doc_type).await;
+            return self
+                .resolve_unproof_info(method_providers, did, &doc_type)
+                .await;
         }
 
         // 本地覆盖(hosts 语义,简化文档第 7 节):短路在权威查询之前,连 REVOKED
@@ -267,7 +269,10 @@ impl NameQuery {
         // 查询(T5.5)。
         let mut authority_body = None;
         if let Some(authority) = method_providers.authority.as_ref() {
-            match self.authority_answer(authority.as_ref(), did, &doc_type).await {
+            match self
+                .authority_answer(authority.as_ref(), did, &doc_type)
+                .await
+            {
                 // 二分法:unknown = 没得到回答。权威源没回答要记下来:候选的
                 // "已验证"资格取决于它(2.1 节 → 策略点③)。
                 ProviderResolveResult::Unknown(err) => {

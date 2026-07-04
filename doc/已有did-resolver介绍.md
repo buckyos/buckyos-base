@@ -80,10 +80,9 @@ resolver-provider,而是 **cluster-level shared cache / control-plane cache**。
 - 对 zone 内客户端来说,它的结果是当前 cluster 的解析控制结果,可以短路外部 DID resolver 查询;
 - 对 resolver core 来说,它只是进入 provider 链之前的一次 cache 查询,不参与 method authority /
   supplement 的 first-win 合并;
-- 只有 zone_resolver 服务不可用(连接失败、超时、明确 service unavailable)时,才落回本机 local cache
-  和后续 provider 流程;
-- `Missing / Revoked / Tombstoned / Unknown` 都是它的语义回答,不是 cache miss,不能触发本机 cache
-  或外部 authority 兜底。
+- `Missing / Revoked / Tombstoned` 是它的明确回答,不是 cache miss,不能触发本机 cache
+  或外部 authority 兜底;
+- `Unknown` 表示 Zone L1 cache 不知道这个条目,继续落回本机 local cache 和后续 provider 流程。
 
 zone_resolver 通常会包含本机 cache 的能力,并叠加 cluster host / override / negative
 state 等管理逻辑。相比传统 hosts 文件只能模拟 IP 解析,它返回完整 DID resolver 结果,
@@ -115,8 +114,8 @@ DID/doc_type 的结果或负状态,客户端就不会把该请求发送到 Zone 
 
 **第一个总是权威源**(简介 2.2 节:权威渠道永远第一;补充源按注册顺序即优先级,first-win,没有读放大。低优先级源拿到比高优先级更新的结果,通常说明哪里配置错了,值得打警告)。
 
-Zone cache 位于 provider 顺序之前:默认先查 `http://127.0.0.1:3180`,服务可用时直接返回
-`ZoneHit`;只有服务不可用才进入下面的 provider 注册顺序。
+Zone cache 位于 provider 顺序之前:默认先查 `http://127.0.0.1:3180`,明确命中时直接返回
+`ZoneHit`;返回 unknown 时才进入本机 cache 和下面的 provider 注册顺序。
 
 **provider 顺序的另一个设计意图是尽量去中心化**:resolve_did 和 DNS 查询一样,是会被海量调用的基础设施。如果注册顺序里有一台全网共用的服务器排在靠前位置,所有解析流量都会汇聚到它——既给它带来巨大的请求压力(单点故障、易被封锁),也让系统事实上重新中心化。现在的顺序保证**不存在指向单台服务器的热路径**:
 
@@ -139,8 +138,8 @@ web_resolver → dns_resolver → sn_resolver
 ### buckyos 内部(zone 场景)
 
 1. name-client 默认启用 zone_resolver cache,默认地址是 `http://127.0.0.1:3180`。它不按 DID 是否属于当前 zone 做客户端侧过滤;覆盖范围、是否允许出 Zone、是否短路,都由 zone_resolver 服务内部策略决定;
-2. 当 zone_resolver 服务可用时,它的回答直接返回,不再查 local cache、method authority 或 supplements;
-3. 当 zone_resolver 服务不可用时,才退回单机模式:local cache / local override 快路径,再进入上面的 provider 顺序;
+2. 当 zone_resolver 明确命中时,它的回答直接返回,不再查 local cache、method authority 或 supplements;
+3. 当 zone_resolver 返回 unknown 时,才退回单机模式:local cache / local override 快路径,再进入上面的 provider 顺序;
 4. 如果 current zone 是 `did:web:xxx`,需要走一个特殊流程:zone 的权威发布面是它自己的 HTTPS 服务,启动完成之前不可达。Booting 阶段要靠本地已有的 Owner Document + dns_resolver 引导(见第 3 节)。具体流程待展开。
 
 ## 8. 与当前实现的对照(2026-07 快照)
@@ -154,7 +153,7 @@ Zone Resolver 的 cache 层化已完成(2026-07-03):
 | web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现,bns_root 与 BNS 网关共用 web3 bridge 配置;一级 bns 名字没有 uppername 回退(那个端点就是 BNS 网关本身,归 bns_resolver 管) |
 | dns_resolver | `DnsProvider`(dns_provider.rs) | 已按本文降为补充源:did:web 与 did:bns 下均注册在 web_resolver 之后,取回结果一律 need_proof 候选。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
 | sn_resolver | `BaseHttpProvider` 指向 SN host | web3 bridge 配置含 `"sn"` 键时,自动注册为 did:web / did:bns 的末位补充源;默认配置不含 sn,即默认未注册 |
-| zone_resolver | `ZoneResolverClient`(zone_resolver.rs,独立 cache 客户端,不是 `NsProvider`),默认启用、默认指向 `http://127.0.0.1:3180`,`NameClient::resolve_did_ex` 第 0 步查询 | **已迁移**:服务可用即独占返回 `CacheStatus::ZoneHit`(负状态 / Missing / unknown 都是回答,不触发 fallback);服务不可用(连接失败/超时/502/503/504)才落回 local cache 和 provider 链。旧的 `set_zone_authority` 接法与 `did_in_zone` 客户端过滤已删除;`disable_zone_resolver()` / `set_zone_resolver_endpoint(...)` 控制启停与地址,zone 回答不回写本机 cache |
+| zone_resolver | `ZoneResolverClient`(zone_resolver.rs,独立 cache 客户端,不是 `NsProvider`),默认启用、默认指向 `http://127.0.0.1:3180`,`NameClient::resolve_did_ex` 第 0 步查询 | **已迁移**:明确命中时返回 `CacheStatus::ZoneHit`(正结果、Missing、Revoked/Tombstoned 都是命中);unknown 时落回 local cache 和 provider 链。裸 404、500、502/503/504、连接失败/超时都按 unknown 处理;明确 Missing 需通过 `documentStatus: "missing"` 表达。旧的 `set_zone_authority` 接法与 `did_in_zone` 客户端过滤已删除;`disable_zone_resolver()` / `set_zone_resolver_endpoint(...)` 控制启停与地址,zone 回答不回写本机 cache |
 | smart_resolver(社交版) | 无 | 暂不实现 |
 
 另外:resolver 接口响应里的 buckyos 扩展信封(发布状态等)客户端解析已就绪(`BaseHttpProvider`),服务端尚未实现;在那之前,did:web 的发布状态由主循环把 200 / 404 / 410 归一成 Active / Missing / 负状态。

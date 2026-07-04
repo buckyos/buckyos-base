@@ -15,8 +15,10 @@
 > cache 层客户端接入 `NameClient::resolve_did_ex` 第 0 步;
 > `set_zone_authority / clear_zone_authority`、`did_in_zone` 过滤与
 > `merged_authority_answer` 的 zone 合并逻辑已删除(仓库内无调用方,未留
-> deprecated wrapper)。实现说明:502/503/504 与传输失败同档视为
-> `ZoneUnavailable`;其余 HTTP 回答(含 500)都是 Zone 的语义回答,独占返回。
+> deprecated wrapper)。实现调整(2026-07-04):cache 分两级,Zone Resolver 是 L1,
+> 本机 did_cache 是 L2。Zone 明确命中时返回 `ZoneHit`;Zone unknown
+> (裸 404、500、502/503/504、连接失败/超时等)时继续走本机 cache 和 resolver core。
+> 明确 Missing 需通过 `documentStatus: "missing"` 表达。
 > 另增 `ResolvePolicy::use_zone_resolver`(默认 true,便捷方法
 > `without_zone_resolver()`):zone-resolver-server 内部实现同样用 resolve_did
 > 完成对外查询,必须按调用跳过 Zone 快路径,否则查询到自己造成递归。
@@ -275,9 +277,10 @@ first-win 合并。新的定位是：`zone_resolver` 不是 resolver provider，
 BuckyOS 或其它私有 cluster 实现，但 `name-client` 只能假设存在一个可选的本机
 HTTP cache 服务，不能假设 cluster 一定是 BuckyOS。
 
-目标：当 Zone Resolver 启用且服务可用时，`resolve_did` 的结果只从它返回，
-相当于一次 cache 命中；只有 Zone Resolver 服务不可用时，才回落到本机
-local cache 和后续 resolver 流程。这样避免同时合并 zone cache 与 local cache。
+目标：cache 分两级。Zone Resolver 是 L1，local cache 是 L2。Zone Resolver
+明确命中时，`resolve_did` 的结果直接从它返回，相当于一次 cache 命中；
+Zone Resolver 返回 unknown 时，才回落到本机 local cache 和后续 resolver 流程。
+这样 Zone 服务可以只管理自己知道的条目，不需要把整个外部 resolver 行为都代理完。
 
 ### T5.1 启用与配置
 
@@ -286,11 +289,13 @@ local cache 和后续 resolver 流程。这样避免同时合并 zone cache 与 
 - 增加显式关闭接口，例如 `NameClient::disable_zone_resolver()`；
   非 BuckyOS 环境、单元测试、离线工具可以关闭它。
 - 增加可配置 endpoint / timeout，例如 `set_zone_resolver_endpoint(...)`。
-- 连接失败、connection refused、超时、明确的 service unavailable 才表示
-  `ZoneUnavailable`；语义上的 `Missing / Revoked / Tombstoned / Unknown`
-  都是 Zone Resolver 的回答，不触发 local cache fallback。
+- 连接失败、connection refused、超时、502/503/504、500、裸 404 等都表示
+  `ZoneUnknown`，会触发 local cache fallback。
+- 语义上的 `Missing / Revoked / Tombstoned` 是 Zone Resolver 的明确回答，
+  不触发 local cache fallback；明确 Missing 必须通过响应体里的
+  `documentStatus: "missing"` 表达，裸 404 只表示 L1 unknown。
 - 默认启用不能引入明显延迟：本机连接和读取 timeout 必须很短；是否需要短期
-  circuit breaker 可以单独评估，但首版语义仍是“Zone 可用则优先且独占”。
+  circuit breaker 可以单独评估；首版语义是“Zone 明确命中则优先，unknown 则走 L2”。
 
 ### T5.2 查询顺序
 
@@ -299,34 +304,36 @@ local cache 和后续 resolver 流程。这样避免同时合并 zone cache 与 
 ```text
 if zone_resolver.enabled:
     zone = query_zone_resolver(did, doc_type)
-    if zone.service_available:
+    if zone.is_answered:
         return zone.answer as CacheStatus::ZoneHit
+    # zone.is_unknown -> fall through
 
 local cache / local override fast path
 resolver core(authority + supplements)
 stale local cache fallback
 ```
 
-- Zone Resolver 可用时，local cache、local override、method authority、
+- Zone Resolver 明确命中时，local cache、local override、method authority、
   supplements 都不参与本次解析。
-- 只有 Zone Resolver 服务不可用时，才使用原有本机 cache 快路径和 resolver core。
+- 只有 Zone Resolver 返回 unknown 时，才使用原有本机 cache 快路径和 resolver core。
 - `update DID cache` 的旧语义保持不变：只写本机 local cache，不写 Zone Resolver。
-- Zone Resolver 返回的结果默认不回写 local cache；否则又会引入两层 cache 合并问题。
+- Zone Resolver 返回的明确结果默认不回写 local cache；两级 cache 只做
+  L1 unknown -> L2 的简单合并，不做 entry 之间的证据等级比较。
 - 关闭 Zone Resolver 后，行为退回当前单机模式。
 
 ### T5.3 语义边界与 metadata
 
 - Zone Resolver 是 cache / control-plane 来源，不是全局权威源。它可以返回
-  已发布文档、已验证文档、Info、`Missing`、`Revoked`、`Tombstoned`、
-  `Unknown`，但这些只表达“当前 Zone 内的解析结果”。
+  已发布文档、已验证文档、Info、`Missing`、`Revoked`、`Tombstoned`，
+  但这些只表达“当前 Zone 内的解析结果”；`Unknown` 表示 L1 没有答案。
 - 解析结果需要明确 provenance：例如新增 `CacheStatus::ZoneHit`、
   `ResolveWarning::ZoneResolverOverride` 或等价 metadata，避免 UI / 日志把它误判成
   method authority 的直接回答。
 - `Revoked / Tombstoned` 这类 Zone 内负状态是回答，不是 miss；只要 Zone Resolver
-  可用，本机 local cache 和外部 authority 都不能绕过它。
+  明确返回，本机 local cache 和外部 authority 都不能绕过它。
 - `Missing` 也必须是回答：如果 Zone Resolver 明确说某 DID/doc_type 不存在，
-  不再查 local cache，也不再查外部 resolver。若 Zone 实现希望“没有命中时继续向外查”，
-  应由 Zone Resolver 自己完成外部查询或返回明确的 resolver 结果。
+  不再查 local cache，也不再查外部 resolver。Zone Resolver 若只是不知道某个条目，
+  应返回 unknown，而不是 Missing。
 - `did_in_zone` 过滤不应继续放在 `name-client` 侧。作为 cluster cache，Zone Resolver
   可以覆盖任意 DID；哪些 DID 属于本 Zone、哪些需要短路、哪些允许出 Zone，应由
   Zone Resolver 服务内部策略决定。
@@ -363,11 +370,12 @@ stale local cache fallback
 - 默认配置会先查询 `http://127.0.0.1:3180`，Zone Resolver 成功返回时不调用
   local cache、local override、method authority 或 supplements。
 - `disable_zone_resolver()` 后不查询 Zone Resolver，退回当前单机 cache + resolver 流程。
-- Zone Resolver 服务不可用时，才落回 local cache；local cache 命中返回原有
-  `CacheStatus::Hit`。
+- Zone Resolver 返回 unknown 时落回 local cache；local cache 命中返回原有
+  `CacheStatus::Hit`。unknown 覆盖连接失败、超时、502/503/504、500、裸 404。
 - Zone Resolver 返回 `Revoked / Tombstoned` 时，local positive cache 和外部 authority
   都不得绕过。
-- Zone Resolver 返回 `Missing` 时，不查 local cache，也不查外部 resolver。
+- Zone Resolver 明确返回 `Missing` 时，不查 local cache，也不查外部 resolver；
+  裸 404 不是 Missing，而是 unknown fallback。
 - `update DID cache` 只影响 local cache；当 Zone Resolver 可用时，Zone 结果仍优先。
 - Zone Resolver 可覆盖非本 zone DID；`name-client` 不再用 `did_in_zone` 阻止查询。
 - Zone 结果的 metadata / warning 能区分 `ZoneHit`、`ZoneOverride`、普通 local cache

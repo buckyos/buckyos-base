@@ -100,18 +100,20 @@ expected_owner 必须来自候选文档**之外**，来源只有两个，按优�
 
 resolver core 之前有一层默认启用、可显式关闭的 Zone cache。它通常跑在
 `127.0.0.1:3180`，对外看起来是 resolver 接口，实际定位是 cluster-level cache /
-control plane：只要服务可用，它的回答就是本次解析的 cache 命中；只有服务不可用，
-才进入本机 cache 和下方主循环。
+control plane。cache 分两级：Zone Resolver 是 L1，本机 did_cache 是 L2。Zone
+明确回答时就是本次解析的 cache 命中；Zone 返回 unknown 时，才进入本机 cache 和下方
+主循环。
 
 ```python
 def resolve_did(did, doc_type):
     # ---- 0. Zone cache 快路径 ----
     # zone_resolver 使用 resolver API，但它不是 provider；它是 zone 内权威 cache。
-    # 只有服务不可用才落回本机 cache。Missing/Revoked/Tombstoned 都是回答，不是 miss。
+    # Missing/Revoked/Tombstoned 都是明确回答；unknown 表示 L1 不知道，继续查 L2。
     if zone_resolver.enabled:
         zone = zone_resolver.lookup(did, doc_type)
-        if zone.service_available:
+        if zone.is_answered:
             return zone.answer.with_cache_status("ZoneHit")
+        # zone.is_unknown: fall through to local did_cache
 
     # ---- 1. 本机缓存快路径 ----
     cached = did_cache.lookup(did, doc_type)
@@ -273,9 +275,9 @@ def did_cache_update(did, doc_type, incoming):
         return REJECT
 ```
 
-这里要区分两类 cache：**本机 did_cache** 参与本节的 merge；**Zone Resolver** 是
-zone 内权威 cache，使用 resolver 接口返回完整解析结果，但不和本机 did_cache 合并。
-Zone Resolver 服务可用时，它独占本次解析；服务不可用时，本机 cache 才接管。
+这里要区分两类 cache：**Zone Resolver** 是 L1，使用 resolver 接口返回完整解析结果；
+**本机 did_cache** 是 L2，参与本节的 merge。两级之间不做复杂 entry 比较：Zone
+明确命中就返回；Zone unknown 才查本机 did_cache。
 
 两条本机 did_cache 的合并规则：
 
@@ -318,8 +320,9 @@ cache 短路。现在有两层：
 
 Zone Resolver 相比 hosts 文件的关键差异是：hosts 通常只能模拟 IP 解析，而
 Zone Resolver 返回完整 DID resolver 结果，可以覆盖 Document、Info、Missing、
-Revoked / Tombstoned 和 metadata。只要它持续返回某个 DID/doc_type 的回答，Zone 内
-客户端就不会把该请求发到 Zone 外。
+Revoked / Tombstoned 和 metadata。只要它持续返回某个 DID/doc_type 的明确回答，Zone
+内客户端就不会把该请求发到 Zone 外；它返回 unknown 时，则表示这个条目不由 L1 管理，
+继续走本机 cache 和标准解析。
 
 本地覆盖因为短路在权威查询之前、连 REVOKED 都盖得住，三条纪律不可省：
 
@@ -341,6 +344,6 @@ Zone Resolver 的管理接口是私有 cluster 管理面，不属于 `resolve_di
 5. 验签用的 owner 不由候选文档决定——expected_owner 只来自权威源的 owner 绑定或名字结构；`doc.owner` 与它不一致直接拒绝，推不出 expected_owner 的候选直接出局；owner 变更 / 委托必须经权威源发布；
 6. owner 不要写成独立流程——它只是“need_proof = false 的权威结果”，递归自然终止；
 7. 一份坏 body 只作废它自己（continue），不终止整个解析；
-8. Zone Resolver 是伪装成 resolver 的 zone 内权威 cache，服务可用时独占本次解析；只有服务不可用才落回本机 cache 和 provider 链；
+8. Zone Resolver 是伪装成 resolver 的 zone 内权威 L1 cache；明确回答时返回 `ZoneHit`，unknown 时才落回本机 cache 和 provider 链；
 9. 本地覆盖必须打标、带 scope、不合并不导出；
 10. key 类 DID 永远不是 resolve_did 的入参；公钥反查没有标准 provider（有也是私有接口，应用层自拼）——索引不携带信任，信任只能来自对候选名字的正向解析 + 公钥比对。
