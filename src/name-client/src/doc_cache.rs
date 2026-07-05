@@ -349,7 +349,7 @@ impl DIDDocumentCache {
 
         let key = combine_key(&did, doc_type.as_ref());
         if let Some(current) = self.load_union(&key) {
-            if !merge_allows(&did, &current, &doc, evidence) {
+            if !merge_allows(&did, doc_type.as_ref(), &current, &doc, evidence) {
                 return false;
             }
         }
@@ -389,7 +389,13 @@ impl DIDDocumentCache {
 
         // Observed 命名空间内部仍按同级 merge 规则去重(version_seq / iat)。
         if let Some(current) = self.load_ns(CacheNamespace::Unverified, &key) {
-            if !merge_allows(&did, &current, &doc, CacheEvidence::Unverified) {
+            if !merge_allows(
+                &did,
+                doc_type.as_ref(),
+                &current,
+                &doc,
+                CacheEvidence::Unverified,
+            ) {
                 return false;
             }
         }
@@ -511,7 +517,13 @@ impl DIDDocumentCache {
             return false;
         }
         if let Some(current) = self.load_ns(CacheNamespace::Verified, &key) {
-            if !merge_allows(did, &current, &doc, CacheEvidence::Verified) {
+            if !merge_allows(
+                did,
+                doc_type.as_ref(),
+                &current,
+                &doc,
+                CacheEvidence::Verified,
+            ) {
                 self.remove_ns(CacheNamespace::Unverified, &key);
                 return false;
             }
@@ -677,6 +689,7 @@ impl DIDDocumentCache {
 /// 证据)能翻篇;否则先比证据等级,同级才比 version_seq / iat。
 fn merge_allows(
     did: &DID,
+    doc_type: Option<&DidDocType>,
     current: &StoredEntry,
     new_doc: &EncodedDocument,
     new_evidence: CacheEvidence,
@@ -692,6 +705,20 @@ fn merge_allows(
     let new_rank = new_evidence.rank();
     if new_rank != current_rank {
         return new_rank > current_rank;
+    }
+
+    // Info documents carry runtime observations such as DeviceInfo.all_ip. Their
+    // embedded DeviceDocument can keep a stable version_seq while update_time
+    // advances, so runtime freshness must win before the generic document merge.
+    if doc_type == Some(&DidDocType::Info) {
+        let current_update_time = extract_timestamp(current_doc, "update_time");
+        let new_update_time = extract_timestamp(new_doc, "update_time");
+        match (current_update_time, new_update_time) {
+            (Some(current), Some(new)) => return new >= current,
+            (None, Some(_)) => return true,
+            (Some(_), None) => return false,
+            (None, None) => {}
+        }
     }
 
     // 同级:比 version_seq,没有 version_seq 时比 iat(保持既有语义,包括
@@ -1125,8 +1152,8 @@ struct UnauthenticatedInfoEntry {
 }
 
 /// 只保存免验证 Info 类结果(例如 DeviceInfo、运行时地址)。它不参与 owner 验签,
-/// 不受 `Missing`/`revoke_before_iat` 等 Document 门禁间接门控,只按 ttl 判断可用性;
-/// 与 `DIDDocumentCache`(verified cache 的角色)完全隔离,不参与它的持久化/合并逻辑。
+/// 不受 `Missing`/`revoke_before_iat` 等 Document 门禁间接门控,只按 ttl 判断可用性。
+/// 这是进程内热缓存;跨进程共享由 `DIDDocumentCache` 的 unverified Info 条目承担。
 pub struct UnauthenticatedInfoCache {
     entries: RwLock<HashMap<String, UnauthenticatedInfoEntry>>,
 }

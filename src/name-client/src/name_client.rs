@@ -348,6 +348,7 @@ impl NameClient {
             EncodedDocument::JsonLd(serde_json::to_value(&device_info).map_err(|e| {
                 NSError::Failed(format!("serialize device info cache failed: {}", e))
             })?);
+        Self::quick_check_observed_document(&did, &doc)?;
         let seen_at = if device_info.update_time == 0 {
             buckyos_get_unix_timestamp()
         } else {
@@ -357,10 +358,14 @@ impl NameClient {
         self.unauthenticated_info_cache.insert(
             &did,
             Some(DidDocType::Info),
-            doc,
+            doc.clone(),
             exp,
             DEFAULT_PROVIDER_TRUST_LEVEL,
         );
+        if self.config.enable_cache {
+            self.doc_cache
+                .update_observed(did, Some(DidDocType::Info), doc, exp, None);
+        }
         Ok(())
     }
 
@@ -676,6 +681,28 @@ impl NameClient {
             .and_then(|value| value.get("exp").and_then(|ts| ts.as_u64()))
     }
 
+    fn extract_update_time(doc: &EncodedDocument) -> Option<u64> {
+        doc.clone()
+            .to_json_value()
+            .ok()
+            .and_then(|value| value.get("update_time").and_then(|ts| ts.as_u64()))
+    }
+
+    fn info_doc_is_at_least_as_fresh(
+        candidate: &EncodedDocument,
+        current: &EncodedDocument,
+    ) -> bool {
+        match (
+            Self::extract_update_time(candidate),
+            Self::extract_update_time(current),
+        ) {
+            (Some(candidate), Some(current)) => candidate >= current,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => true,
+        }
+    }
+
     /// 缓存条目的 TTL:文档自身 exp 与 `DOC_CACHE_TTL_SECS` 取小。TTL 只决定
     /// 快路径的新鲜度,不代表文档作废时间。
     pub(crate) fn cache_ttl_exp(doc: &EncodedDocument) -> u64 {
@@ -825,7 +852,7 @@ impl NameClient {
             }
         }
 
-        // Info 契约走独立轻量路径 + UnauthenticatedInfoCache 隔离。
+        // Info 契约走独立轻量路径:进程内热缓存 + 本机 unverified 持久化观察。
         if self
             .name_query
             .is_no_proof_doc_type(&did.method, &doc_type_c)
@@ -1100,8 +1127,8 @@ impl NameClient {
         }
     }
 
-    /// Info 契约的轻量路径:in-TTL 命中 UnauthenticatedInfoCache 即返回,否则查询
-    /// 后写回。该缓存与 doc_cache(verified cache)完全隔离。
+    /// Info 契约的轻量路径:先查进程内 UnauthenticatedInfoCache,再查本机
+    /// `did_cache/unverified` 的跨进程观察结果,否则查询后写回进程内缓存。
     async fn resolve_unproof_info_with_cache(
         &self,
         did: &DID,
@@ -1110,9 +1137,39 @@ impl NameClient {
         policy: ResolvePolicy,
     ) -> NSResult<ResolvedDocument> {
         if self.config.enable_cache {
-            if let Some((doc, exp, _rank)) =
-                self.unauthenticated_info_cache.get(did, doc_type.clone())
+            let mut selected = self
+                .unauthenticated_info_cache
+                .get(did, doc_type.clone())
+                .map(|(doc, exp, _rank)| (doc, exp, false));
+
+            if let Some(CacheLookup::Positive {
+                doc,
+                exp,
+                in_ttl: true,
+                ..
+            }) = self.doc_cache.lookup(did, doc_type.clone())
             {
+                let use_persisted = selected
+                    .as_ref()
+                    .map(|(current_doc, _, _)| {
+                        Self::info_doc_is_at_least_as_fresh(&doc, current_doc)
+                    })
+                    .unwrap_or(true);
+                if use_persisted {
+                    selected = Some((doc, exp, true));
+                }
+            }
+
+            if let Some((doc, exp, from_persisted)) = selected {
+                if from_persisted {
+                    self.unauthenticated_info_cache.insert(
+                        did,
+                        doc_type.clone(),
+                        doc.clone(),
+                        exp,
+                        DEFAULT_PROVIDER_TRUST_LEVEL,
+                    );
+                }
                 return Ok(ResolvedDocument::from_cache(
                     doc,
                     did,
@@ -2319,7 +2376,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .warnings
             .contains(&ResolveWarning::UnauthenticatedInfoCache));
 
-        // Info 结果只进入 UnauthenticatedInfoCache,与 doc_cache 完全隔离。
+        // provider 返回的 Info 结果只进入 UnauthenticatedInfoCache,不回写 doc_cache。
         assert!(client.doc_cache.get(&did, Some(DidDocType::Info)).is_none());
     }
 
@@ -2756,7 +2813,88 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert!(client
             .doc_cache
             .get(&device_did, Some(DidDocType::Info))
-            .is_none());
+            .is_some());
+    }
+
+    fn build_discovered_device_info(
+        device_did: &DID,
+        endpoint_ip: IpAddr,
+        update_time: u64,
+    ) -> DeviceInfo {
+        let mut discovered_doc = DeviceDocument::new(
+            "ood1",
+            "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE".to_string(),
+        );
+        discovered_doc.id = device_did.clone();
+        discovered_doc.zone_did = Some(DID::new("bns", "alice"));
+        discovered_doc.owner = DID::new("bns", "alice");
+
+        let mut device_info = DeviceInfo::from_device_doc(&discovered_doc);
+        device_info.arch.clear();
+        device_info.os.clear();
+        device_info.update_time = update_time;
+        device_info.all_ip.push(endpoint_ip);
+        device_info
+    }
+
+    #[tokio::test]
+    async fn device_info_cache_is_shared_across_processes() {
+        let tmp_dir = tempdir().unwrap();
+        let cache_dir = tmp_dir.path().to_string_lossy().to_string();
+        let new_client = || {
+            NameClient::new(NameClientConfig {
+                enable_cache: true,
+                local_cache_dir: Some(cache_dir.clone()),
+                cache_backend: CacheBackend::Filesystem,
+                enable_zone_resolver: false,
+                ..Default::default()
+            })
+        };
+        let writer = new_client();
+        let reader = new_client();
+
+        let device_did = DID::from_str("did:web:ood1.example").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let first_ip: IpAddr = "192.168.1.20".parse().unwrap();
+        let first_info = build_discovered_device_info(&device_did, first_ip, now);
+        let first_doc = EncodedDocument::JsonLd(serde_json::to_value(&first_info).unwrap());
+        writer
+            .update_did_cache(
+                device_did.clone(),
+                Some(DidDocType::Info),
+                first_doc,
+                Some(UpdateSource::UdpDiscovery),
+            )
+            .unwrap();
+
+        let first_resolved = reader.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(first_resolved, vec![first_ip]);
+
+        let second_ip: IpAddr = "192.168.1.21".parse().unwrap();
+        let second_info = build_discovered_device_info(&device_did, second_ip, now + 1);
+        writer
+            .add_device_info_cache(device_did.clone(), second_info)
+            .unwrap();
+
+        let second_resolved = reader.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(second_resolved, vec![second_ip]);
+
+        let resolved_info = reader
+            .resolve_did_ex(
+                &device_did,
+                Some(DidDocType::Info),
+                ResolvePolicy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved_info.resolution_metadata.cache_status,
+            Some(CacheStatus::UnauthenticatedInfoHit)
+        );
+        assert!(resolved_info
+            .resolution_metadata
+            .warnings
+            .contains(&ResolveWarning::UnauthenticatedInfoCache));
     }
 
     // ---- doc/update-did-cache.md 测试要求:Observed / lazy verify / promote ----
