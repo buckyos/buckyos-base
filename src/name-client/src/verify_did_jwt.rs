@@ -208,6 +208,55 @@ fn same_document(authority_body: &EncodedDocument, external: &EncodedDocument) -
     }
 }
 
+/// lazy verify(verify_and_promote)的产物(doc/update-did-cache.md"API 草案")。
+#[derive(Debug)]
+pub enum VerifyPromoteOutcome {
+    /// 验证通过,文件已从 unverified 移动(promote)到 verified,可以按 Verified
+    /// 返回。极小概率的并发窗口里 verified 已出现更优记录时源文件同样被清理,
+    /// 刚验证过的这份文档仍按 Verified 返回。
+    Promoted(EncodedDocument),
+    /// 验证明确失败(owner 冒充、签名不对、被 owner policy 吊销……)。
+    /// unverified 条目已被删除,避免同一份坏数据反复触发验证开销。
+    Rejected(NSError),
+    /// 验证所需条件暂不可用(owner document 拿不到、网络不可达)。
+    /// unverified 条目保留,不删除、不 promote;strict 语义下等同 cache miss,
+    /// `ResolvePolicy::allow_unverified_cache_when_unavailable` 决定是否可以在
+    /// resolve_did_ex 的宽松模式露面。
+    Unavailable(NSError),
+}
+
+/// 共用验证核心的失败分类:`Definite` 表示候选本身有问题或被权威源明确否定
+/// (重试同一份候选没有意义,对应 promote 的 Rejected);`Unavailable` 表示
+/// 信任链暂时评估不了(权威没回答、owner 文档拿不到,对应 promote 的
+/// Unavailable)。`verify_did_document_jwt` 把两者原样映射回现有错误码,
+/// 行为不变。
+enum CandidateVerifyFailure {
+    Definite(NSError),
+    Unavailable(NSError),
+}
+
+impl CandidateVerifyFailure {
+    fn into_error(self) -> NSError {
+        match self {
+            Self::Definite(err) | Self::Unavailable(err) => err,
+        }
+    }
+}
+
+/// 共用验证核心的成功报告:`verify_did_document_jwt` 用它组装
+/// `VerifiedDidDocument`,`verify_and_promote` 只关心通过与否。
+struct CandidateTrustReport {
+    structural_owner: Option<DID>,
+    authority_owner: Option<DID>,
+    expected_owner: Option<DID>,
+    authority_status: Option<DocumentStatus>,
+    authority_seq: Option<u64>,
+    published_version: Option<u64>,
+    membership_proven: bool,
+    detached: bool,
+    warnings: Vec<VerifyWarning>,
+}
+
 impl NameClient {
     /// 验证一份外部传入的 DID Document JWT(需求文档"校验流程")。
     ///
@@ -396,318 +445,33 @@ impl NameClient {
             }
         }
 
-        // ---- 3. 查询权威状态(PublishedState 语义)----
-        // 注:zone resolver(cluster L1 cache)暂不参与本入口;它的回答不携带
-        // owner 绑定,留待 zone 服务落地后再扩展。
-        let mut authority_owner: Option<DID> = None;
-        let mut authority_status: Option<DocumentStatus> = None;
-        let mut authority_seq: Option<u64> = None;
-        let mut published_version: Option<u64> = None;
-        let mut doc_hash: Option<String> = None;
-        let mut authority_body: Option<EncodedDocument> = None;
-
-        match self.name_query.authority_answer_for(did, &doc_type).await? {
-            // method 没有注册权威渠道:发布状态与 owner 绑定不可知,外部 JWT
-            // 只能按 NeedProof 候选走完整 owner 验证(expected_owner 只能来自
-            // 名字结构)。
-            None => {}
-            // 权威渠道存在却没回答(断网/超时):当前发布集合验证不了——就算
-            // 验签通过,也可能正顶掉一份已发布甚至已吊销的结果(策略点③同款)。
-            Some(ProviderResolveResult::Unknown(err)) => {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::NotCurrentActive,
-                    format!(
-                        "method authority did not answer for {}#{}; \
-                         current publication set cannot be verified: {}",
-                        did.to_string(),
-                        doc_type,
-                        err
-                    ),
-                ));
-            }
-            Some(ProviderResolveResult::Dr(answer)) => {
-                authority_owner = answer.owner_binding.clone();
-                if let Some(published) = answer.published.as_ref() {
-                    authority_seq = published.authority_seq;
-                    published_version = published.document_version;
-                }
-                authority_status = answer.status.clone();
-                match answer.status {
-                    Some(DocumentStatus::Revoked) | Some(DocumentStatus::Tombstoned) => {
-                        let status = authority_status.clone().unwrap();
-                        let message = format!(
-                            "{}#{} is {:?} in method authority",
-                            did.to_string(),
-                            doc_type,
-                            status
-                        );
-                        // 权威负状态更新 negative cache 并屏蔽后续 fallback
-                        // (需求文档"Cache 行为"第 6 条)。
-                        if self.config.enable_cache {
-                            self.doc_cache.replace_with_negative(
-                                did,
-                                Some(doc_type.clone()),
-                                &status,
-                                &message,
-                            );
-                        }
-                        return Err(verify_err(
-                            VerifyDidJwtErrorCode::NotCurrentActive,
-                            message,
-                        ));
-                    }
-                    Some(DocumentStatus::Migrated) => {
-                        if self.config.enable_cache {
-                            self.doc_cache.delete(did.clone(), Some(doc_type.clone()));
-                        }
-                        let target = answer
-                            .migration_target
-                            .map(|target| target.to_string())
-                            .unwrap_or_else(|| "unknown target".to_string());
-                        return Err(verify_err(
-                            VerifyDidJwtErrorCode::NotCurrentActive,
-                            format!(
-                                "{}#{} is Migrated to {} in method authority",
-                                did.to_string(),
-                                doc_type,
-                                target
-                            ),
-                        ));
-                    }
-                    Some(DocumentStatus::Missing) | Some(DocumentStatus::Expired) => {
-                        return Err(verify_err(
-                            VerifyDidJwtErrorCode::NotCurrentActive,
-                            format!(
-                                "{}#{} is {:?} in method authority",
-                                did.to_string(),
-                                doc_type,
-                                authority_status.clone().unwrap()
-                            ),
-                        ));
-                    }
-                    Some(DocumentStatus::Active) | None => {
-                        doc_hash = answer.doc_hash.clone();
-                        authority_body = answer.body.map(|body| body.document);
-                    }
-                }
-            }
-        }
-
-        // ---- 7. 当前发布集合 membership ----
-        // 权威源锚定了 doc_hash 或给出了当前 body 时,外部 JWT 必须属于/等于它,
-        // 匹配成功即提升为 Anchored 证据;权威源只回答 Active 而给不出锚点时
-        // membership 未知,外部 JWT 保持 NeedProof 候选档。
-        let mut membership_proven = false;
-        if let Some(hash) = doc_hash.as_deref() {
-            if !content_hash_matches(hash, &document) {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::NotCurrentActive,
-                    format!(
-                        "external JWT does not match authority doc_hash for {}#{}",
-                        did.to_string(),
-                        doc_type
-                    ),
-                ));
-            }
-            membership_proven = true;
-        } else if let Some(current_body) = authority_body.as_ref() {
-            if !same_document(current_body, &document) {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::NotCurrentActive,
-                    format!(
-                        "method authority serves a different current document for {}#{}",
-                        did.to_string(),
-                        doc_type
-                    ),
-                ));
-            }
-            membership_proven = true;
-        }
-
-        // ---- 4. expected_owner:只能来自权威绑定或名字结构,绝不来自 payload ----
-        let expected_owner = authority_owner.clone().or_else(|| structural.clone());
-
-        // ---- 5. 默认主体策略 ----
-        let detached = matches!(
-            (structural.as_ref(), authority_owner.as_ref()),
-            (Some(structural), Some(authority)) if structural != authority
-        );
-        if options.purpose == VerifyPurpose::AuthSubject {
-            if detached {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::DetachedOwnerRejected,
-                    format!(
-                        "authority owner {} differs from structural owner {} for {}#{}; \
-                         detached owner cannot be an auth subject",
-                        authority_owner.as_ref().unwrap().to_string(),
-                        structural.as_ref().unwrap().to_string(),
-                        did.to_string(),
-                        doc_type
-                    ),
-                ));
-            }
-            if expected_owner.is_none() {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::OwnerBindingUnavailable,
-                    format!(
-                        "no authority owner binding and no structural owner for {}#{}; \
-                         a first-level name needs an authority binding to be a subject",
-                        did.to_string(),
-                        doc_type
-                    ),
-                ));
-            }
-        }
-
-        let mut warnings: Vec<VerifyWarning> = Vec::new();
-
-        if doc_type == DidDocType::Owner {
-            // ---- 递归基:OwnerDocument ----
-            // owner 不能自己给自己作保(get_iss() == None):外部 Owner JWT 的
-            // 可信性只能来自权威源的 anchored/current membership;文档自带 key
-            // 的自签校验只做完整性自检,不构成信任来源。
-            if !membership_proven {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::NotCurrentActive,
-                    format!(
-                        "external OwnerDocument JWT for {} is not anchored to the current \
-                         publication set; an owner document cannot vouch for itself",
-                        did.to_string()
-                    ),
-                ));
-            }
-            let Some((self_key, _jwk)) = parsed.get_auth_key(None) else {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::InvalidJwtDocument,
-                    "owner document has no usable auth key",
-                ));
-            };
-            if let Err(err) = decode_json_from_jwt_with_pk(jwt, &self_key) {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::SignatureVerificationFailed,
-                    format!("owner document self-signature verification failed: {}", err),
-                ));
-            }
-        } else if let Some(expected) = expected_owner.as_ref() {
-            // ---- 6. declared_owner 一致性:自声明 owner 必须等于 expected_owner ----
-            match declared_owner.as_ref() {
-                None => {
-                    return Err(verify_err(
-                        VerifyDidJwtErrorCode::DeclaredOwnerMismatch,
-                        format!(
-                            "document declares no owner but expected owner is {}",
-                            expected.to_string()
-                        ),
-                    ));
-                }
-                Some(declared) if declared != expected => {
-                    return Err(verify_err(
-                        VerifyDidJwtErrorCode::DeclaredOwnerMismatch,
-                        format!(
-                            "{}#{} declares owner {} but expected owner is {}",
-                            did.to_string(),
-                            doc_type,
-                            declared.to_string(),
-                            expected.to_string()
-                        ),
-                    ));
-                }
-                _ => {}
-            }
-
-            // ---- 8. 解析 expected_owner 的 OwnerDocument ----
-            // 递归入口是 expected_owner,绝不是 declared_owner;
-            // for_authority_lookup():不允许 Missing 自签名入场、不允许 stale cache,
-            // 权威负状态生效;descend() 做深度/环路检查。
-            let owner_policy = ResolvePolicy::default()
-                .for_authority_lookup()
-                .descend(expected, &DidDocType::Owner)
-                .map_err(|err| {
-                    verify_err(VerifyDidJwtErrorCode::OwnerDocumentUnavailable, err.to_string())
-                })?;
-            let owner_resolved = self
-                .resolve_did_ex(expected, Some(DidDocType::Owner), owner_policy)
-                .await
-                .map_err(|err| {
-                    verify_err(
-                        VerifyDidJwtErrorCode::OwnerDocumentUnavailable,
-                        format!(
-                            "resolve owner document {} for {}#{} failed: {}",
-                            expected.to_string(),
-                            did.to_string(),
-                            doc_type,
-                            err
-                        ),
-                    )
-                })?;
-            let owner_document =
-                OwnerDocument::decode(&owner_resolved.document, None).map_err(|err| {
-                    verify_err(
-                        VerifyDidJwtErrorCode::OwnerDocumentUnavailable,
-                        format!(
-                            "owner document {} is not a valid OwnerDocument: {}",
-                            expected.to_string(),
-                            err
-                        ),
-                    )
-                })?;
-
-            // ---- 10. revoke / replay guard:valid_iat + mini_version_seq 统一应用 ----
-            owner_document
-                .validate_jwt_revocation(doc_type.as_str(), &document)
-                .map_err(|err| {
-                    verify_err(VerifyDidJwtErrorCode::RevokedByOwnerPolicy, err.to_string())
-                })?;
-
-            // ---- 9. 用 owner 默认 key 验签,失败后按现有策略尝试历史 key ----
-            let Some((decoding_key, _jwk)) = owner_document.get_auth_key(None) else {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::OwnerDocumentUnavailable,
-                    format!(
-                        "owner document {} has no usable auth key",
-                        expected.to_string()
-                    ),
-                ));
-            };
-            if decode_json_from_jwt_with_pk(jwt, &decoding_key).is_err() {
-                let verified_with_historical_key = owner_document
-                    .get_historical_keys()
-                    .into_iter()
-                    .any(|(_kid, jwk)| match DecodingKey::from_jwk(&jwk) {
-                        Ok(historical_key) => {
-                            decode_json_from_jwt_with_pk(jwt, &historical_key).is_ok()
-                        }
-                        Err(_) => false,
-                    });
-                if !verified_with_historical_key {
-                    return Err(verify_err(
-                        VerifyDidJwtErrorCode::SignatureVerificationFailed,
-                        format!(
-                            "{}#{} signature verification failed against owner {}",
-                            did.to_string(),
-                            doc_type,
-                            expected.to_string()
-                        ),
-                    ));
-                }
-                warnings.push(ResolveWarning::SignedByHistoricalKey);
-            }
-        } else {
-            // expected_owner 推不出(只有 ObjectDocument 能走到这里):只有当
-            // 权威信道已经证明外部 JWT 就是当前 body 时,才能返回"非授权主体"
-            // 结果(校验流程 4 第 3 条);否则 NeedProof 候选彻底没有验证依据。
-            if !membership_proven {
-                return Err(verify_err(
-                    VerifyDidJwtErrorCode::OwnerBindingUnavailable,
-                    format!(
-                        "no owner binding, no structural owner, and no current-publication \
-                         membership proof for {}#{}",
-                        did.to_string(),
-                        doc_type
-                    ),
-                ));
-            }
-        }
+        // ---- 3-10. 共用验证核心(doc/update-did-cache.md):权威状态 + 当前
+        // 发布集合 membership + expected_owner 判定 + owner 验签 + revoke/replay
+        // guard。verify_and_promote 复用同一份实现;失败分类(Definite /
+        // Unavailable)在这里原样展开回现有错误码,行为不变。
+        let report = self
+            .verify_candidate_document_trust(
+                did,
+                &doc_type,
+                &document,
+                parsed.as_ref(),
+                declared_owner.as_ref(),
+                options.purpose,
+                &ResolvePolicy::default(),
+            )
+            .await
+            .map_err(CandidateVerifyFailure::into_error)?;
+        let CandidateTrustReport {
+            structural_owner: structural,
+            authority_owner,
+            expected_owner,
+            authority_status,
+            authority_seq,
+            published_version,
+            membership_proven,
+            detached,
+            warnings,
+        } = report;
 
         // ---- 结果组装与受控缓存写入(需求文档"Cache 行为"第 1-4 条)----
         let body_evidence = if membership_proven {
@@ -793,6 +557,607 @@ impl NameClient {
             ))
         })?;
         Ok((device_document, verified))
+    }
+
+    /// 候选文档的统一信任判定核心(doc/update-did-cache.md"与现有 API 的关系"):
+    /// 权威状态查询 + 当前发布集合 membership + expected_owner 判定 + owner 验签
+    /// + revoke/replay guard。`verify_did_document_jwt`(外部 JWT)与
+    /// `verify_and_promote`(cache 里的 Observed 候选)共享这一份实现,两个入口
+    /// 各自负责"候选从哪来"和"结果如何落盘"的差异部分。
+    ///
+    /// 失败分两类:候选自身有问题或被权威源明确否定(`Definite`,promote 侧对应
+    /// 删除候选)与信任链暂时评估不了(`Unavailable`,对应"owner document 拿不到、
+    /// 网络不可达",候选保留)。
+    ///
+    /// `policy` 是 owner 递归的起点 policy:从 resolve 路径进来时必须传当前
+    /// 调用的 policy,让 `descend()` 的深度/环路检查跨 verify_and_promote 与
+    /// resolve_did_ex 的相互调用生效;顶层入口(verify_did_document_jwt)传
+    /// `ResolvePolicy::default()`。
+    async fn verify_candidate_document_trust(
+        &self,
+        did: &DID,
+        doc_type: &DidDocType,
+        document: &EncodedDocument,
+        parsed: &(dyn DIDDocumentTrait + Send + Sync),
+        declared_owner: Option<&DID>,
+        purpose: VerifyPurpose,
+        policy: &ResolvePolicy,
+    ) -> Result<CandidateTrustReport, CandidateVerifyFailure> {
+        use CandidateVerifyFailure::{Definite, Unavailable};
+
+        // structural_owner:来自 method 名字结构,应用层不得字符串截取。
+        let structural = structural_owner(did);
+
+        // ---- 查询权威状态(PublishedState 语义)----
+        // 注:zone resolver(cluster L1 cache)暂不参与本入口;它的回答不携带
+        // owner 绑定,留待 zone 服务落地后再扩展。
+        let mut authority_owner: Option<DID> = None;
+        let mut authority_status: Option<DocumentStatus> = None;
+        let mut authority_seq: Option<u64> = None;
+        let mut published_version: Option<u64> = None;
+        let mut doc_hash: Option<String> = None;
+        let mut authority_body: Option<EncodedDocument> = None;
+
+        let authority_answer = self
+            .name_query
+            .authority_answer_for(did, doc_type)
+            .await
+            // method 未注册等注册面问题:信任链暂时评估不了,不是候选的错。
+            .map_err(Unavailable)?;
+        match authority_answer {
+            // method 没有注册权威渠道:发布状态与 owner 绑定不可知,候选只能按
+            // NeedProof 走完整 owner 验证(expected_owner 只能来自名字结构)。
+            None => {}
+            // 权威渠道存在却没回答(断网/超时):当前发布集合验证不了——就算
+            // 验签通过,也可能正顶掉一份已发布甚至已吊销的结果(策略点③同款)。
+            Some(ProviderResolveResult::Unknown(err)) => {
+                return Err(Unavailable(verify_err(
+                    VerifyDidJwtErrorCode::NotCurrentActive,
+                    format!(
+                        "method authority did not answer for {}#{}; \
+                         current publication set cannot be verified: {}",
+                        did.to_string(),
+                        doc_type,
+                        err
+                    ),
+                )));
+            }
+            Some(ProviderResolveResult::Dr(answer)) => {
+                authority_owner = answer.owner_binding.clone();
+                if let Some(published) = answer.published.as_ref() {
+                    authority_seq = published.authority_seq;
+                    published_version = published.document_version;
+                }
+                authority_status = answer.status.clone();
+                match answer.status {
+                    Some(DocumentStatus::Revoked) | Some(DocumentStatus::Tombstoned) => {
+                        let status = authority_status.clone().unwrap();
+                        let message = format!(
+                            "{}#{} is {:?} in method authority",
+                            did.to_string(),
+                            doc_type,
+                            status
+                        );
+                        // 权威负状态更新 negative cache 并屏蔽后续 fallback
+                        // (verify-did-document-jwt.md"Cache 行为"第 6 条)。
+                        if self.config.enable_cache {
+                            self.doc_cache.replace_with_negative(
+                                did,
+                                Some(doc_type.clone()),
+                                &status,
+                                &message,
+                            );
+                        }
+                        return Err(Definite(verify_err(
+                            VerifyDidJwtErrorCode::NotCurrentActive,
+                            message,
+                        )));
+                    }
+                    Some(DocumentStatus::Migrated) => {
+                        if self.config.enable_cache {
+                            self.doc_cache.delete(did.clone(), Some(doc_type.clone()));
+                        }
+                        let target = answer
+                            .migration_target
+                            .map(|target| target.to_string())
+                            .unwrap_or_else(|| "unknown target".to_string());
+                        return Err(Definite(verify_err(
+                            VerifyDidJwtErrorCode::NotCurrentActive,
+                            format!(
+                                "{}#{} is Migrated to {} in method authority",
+                                did.to_string(),
+                                doc_type,
+                                target
+                            ),
+                        )));
+                    }
+                    Some(DocumentStatus::Missing) | Some(DocumentStatus::Expired) => {
+                        return Err(Definite(verify_err(
+                            VerifyDidJwtErrorCode::NotCurrentActive,
+                            format!(
+                                "{}#{} is {:?} in method authority",
+                                did.to_string(),
+                                doc_type,
+                                authority_status.clone().unwrap()
+                            ),
+                        )));
+                    }
+                    Some(DocumentStatus::Active) | None => {
+                        doc_hash = answer.doc_hash.clone();
+                        authority_body = answer.body.map(|body| body.document);
+                    }
+                }
+            }
+        }
+
+        // ---- 当前发布集合 membership ----
+        // 权威源锚定了 doc_hash 或给出了当前 body 时,候选必须属于/等于它,
+        // 匹配成功即提升为 Anchored 证据;权威源只回答 Active 而给不出锚点时
+        // membership 未知,候选保持 NeedProof 档。
+        let mut membership_proven = false;
+        if let Some(hash) = doc_hash.as_deref() {
+            if !content_hash_matches(hash, document) {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::NotCurrentActive,
+                    format!(
+                        "candidate does not match authority doc_hash for {}#{}",
+                        did.to_string(),
+                        doc_type
+                    ),
+                )));
+            }
+            membership_proven = true;
+        } else if let Some(current_body) = authority_body.as_ref() {
+            if !same_document(current_body, document) {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::NotCurrentActive,
+                    format!(
+                        "method authority serves a different current document for {}#{}",
+                        did.to_string(),
+                        doc_type
+                    ),
+                )));
+            }
+            membership_proven = true;
+        }
+
+        // ---- expected_owner:只能来自权威绑定或名字结构,绝不来自 payload ----
+        let expected_owner = authority_owner.clone().or_else(|| structural.clone());
+
+        // ---- 默认主体策略 ----
+        let detached = matches!(
+            (structural.as_ref(), authority_owner.as_ref()),
+            (Some(structural), Some(authority)) if structural != authority
+        );
+        if purpose == VerifyPurpose::AuthSubject {
+            if detached {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::DetachedOwnerRejected,
+                    format!(
+                        "authority owner {} differs from structural owner {} for {}#{}; \
+                         detached owner cannot be an auth subject",
+                        authority_owner.as_ref().unwrap().to_string(),
+                        structural.as_ref().unwrap().to_string(),
+                        did.to_string(),
+                        doc_type
+                    ),
+                )));
+            }
+            if expected_owner.is_none() {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::OwnerBindingUnavailable,
+                    format!(
+                        "no authority owner binding and no structural owner for {}#{}; \
+                         a first-level name needs an authority binding to be a subject",
+                        did.to_string(),
+                        doc_type
+                    ),
+                )));
+            }
+        }
+
+        let mut warnings: Vec<VerifyWarning> = Vec::new();
+        let jwt = document.to_string();
+
+        if *doc_type == DidDocType::Owner {
+            // ---- 递归基:OwnerDocument ----
+            // owner 不能自己给自己作保(get_iss() == None):Owner 候选的可信性
+            // 只能来自权威源的 anchored/current membership;文档自带 key 的自签
+            // 校验只做完整性自检,不构成信任来源。
+            if !membership_proven {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::NotCurrentActive,
+                    format!(
+                        "OwnerDocument candidate for {} is not anchored to the current \
+                         publication set; an owner document cannot vouch for itself",
+                        did.to_string()
+                    ),
+                )));
+            }
+            if !document.is_proof() {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::SignatureVerificationFailed,
+                    "owner document candidate is not a signed JWT; \
+                     self-signature cannot be verified",
+                )));
+            }
+            let Some((self_key, _jwk)) = parsed.get_auth_key(None) else {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::InvalidJwtDocument,
+                    "owner document has no usable auth key",
+                )));
+            };
+            if let Err(err) = decode_json_from_jwt_with_pk(&jwt, &self_key) {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::SignatureVerificationFailed,
+                    format!("owner document self-signature verification failed: {}", err),
+                )));
+            }
+        } else if let Some(expected) = expected_owner.as_ref() {
+            // ---- declared_owner 一致性:自声明 owner 必须等于 expected_owner ----
+            match declared_owner {
+                None => {
+                    return Err(Definite(verify_err(
+                        VerifyDidJwtErrorCode::DeclaredOwnerMismatch,
+                        format!(
+                            "document declares no owner but expected owner is {}",
+                            expected.to_string()
+                        ),
+                    )));
+                }
+                Some(declared) if declared != expected => {
+                    return Err(Definite(verify_err(
+                        VerifyDidJwtErrorCode::DeclaredOwnerMismatch,
+                        format!(
+                            "{}#{} declares owner {} but expected owner is {}",
+                            did.to_string(),
+                            doc_type,
+                            declared.to_string(),
+                            expected.to_string()
+                        ),
+                    )));
+                }
+                _ => {}
+            }
+
+            // need_proof 语义上必须能验证:JsonLd 结构上不可能携带签名。
+            if !document.is_proof() {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::SignatureVerificationFailed,
+                    format!(
+                        "{}#{} candidate is not a signed JWT; \
+                         owner signature cannot be verified",
+                        did.to_string(),
+                        doc_type
+                    ),
+                )));
+            }
+
+            // ---- 解析 expected_owner 的 OwnerDocument ----
+            // 递归入口是 expected_owner,绝不是 declared_owner;
+            // for_authority_lookup():不允许 Missing 自签名入场、不允许 stale
+            // cache、不允许 Unverified 露面,权威负状态生效;descend() 做深度/
+            // 环路检查(对 verify_and_promote 与 resolve_did_ex 的相互递归同样
+            // 生效,防止互为 owner 的两份 Observed 候选造成无限验证)。
+            let owner_policy = policy
+                .for_authority_lookup()
+                .descend(expected, &DidDocType::Owner)
+                .map_err(|err| {
+                    Definite(verify_err(
+                        VerifyDidJwtErrorCode::OwnerDocumentUnavailable,
+                        err.to_string(),
+                    ))
+                })?;
+            let owner_resolved =
+                Box::pin(self.resolve_did_ex(expected, Some(DidDocType::Owner), owner_policy))
+                    .await
+                    .map_err(|err| {
+                        // "owner document 拿不到"属于验证条件暂不可用:候选本身
+                        // 未被否定,保留待条件恢复(doc/update-did-cache.md)。
+                        Unavailable(verify_err(
+                            VerifyDidJwtErrorCode::OwnerDocumentUnavailable,
+                            format!(
+                                "resolve owner document {} for {}#{} failed: {}",
+                                expected.to_string(),
+                                did.to_string(),
+                                doc_type,
+                                err
+                            ),
+                        ))
+                    })?;
+            let owner_document =
+                OwnerDocument::decode(&owner_resolved.document, None).map_err(|err| {
+                    Unavailable(verify_err(
+                        VerifyDidJwtErrorCode::OwnerDocumentUnavailable,
+                        format!(
+                            "owner document {} is not a valid OwnerDocument: {}",
+                            expected.to_string(),
+                            err
+                        ),
+                    ))
+                })?;
+
+            // ---- revoke / replay guard:valid_iat + mini_version_seq 统一应用 ----
+            owner_document
+                .validate_jwt_revocation(doc_type.as_str(), document)
+                .map_err(|err| {
+                    Definite(verify_err(
+                        VerifyDidJwtErrorCode::RevokedByOwnerPolicy,
+                        err.to_string(),
+                    ))
+                })?;
+
+            // ---- 用 owner 默认 key 验签,失败后按现有策略尝试历史 key ----
+            let Some((decoding_key, _jwk)) = owner_document.get_auth_key(None) else {
+                return Err(Unavailable(verify_err(
+                    VerifyDidJwtErrorCode::OwnerDocumentUnavailable,
+                    format!(
+                        "owner document {} has no usable auth key",
+                        expected.to_string()
+                    ),
+                )));
+            };
+            if decode_json_from_jwt_with_pk(&jwt, &decoding_key).is_err() {
+                let verified_with_historical_key = owner_document
+                    .get_historical_keys()
+                    .into_iter()
+                    .any(|(_kid, jwk)| match DecodingKey::from_jwk(&jwk) {
+                        Ok(historical_key) => {
+                            decode_json_from_jwt_with_pk(&jwt, &historical_key).is_ok()
+                        }
+                        Err(_) => false,
+                    });
+                if !verified_with_historical_key {
+                    return Err(Definite(verify_err(
+                        VerifyDidJwtErrorCode::SignatureVerificationFailed,
+                        format!(
+                            "{}#{} signature verification failed against owner {}",
+                            did.to_string(),
+                            doc_type,
+                            expected.to_string()
+                        ),
+                    )));
+                }
+                warnings.push(ResolveWarning::SignedByHistoricalKey);
+            }
+        } else {
+            // expected_owner 推不出(只有 ObjectDocument 能走到这里):只有当
+            // 权威信道已经证明候选就是当前 body 时,才能返回"非授权主体"结果;
+            // 否则 NeedProof 候选彻底没有验证依据。
+            if !membership_proven {
+                return Err(Definite(verify_err(
+                    VerifyDidJwtErrorCode::OwnerBindingUnavailable,
+                    format!(
+                        "no owner binding, no structural owner, and no current-publication \
+                         membership proof for {}#{}",
+                        did.to_string(),
+                        doc_type
+                    ),
+                )));
+            }
+        }
+
+        Ok(CandidateTrustReport {
+            structural_owner: structural,
+            authority_owner,
+            expected_owner,
+            authority_status,
+            authority_seq,
+            published_version,
+            membership_proven,
+            detached,
+            warnings,
+        })
+    }
+
+    /// verify_and_promote 的 purpose 默认规则表(doc/update-did-cache.md
+    /// "未决问题 4"的实施决定):主体类文档(zone/owner/device/user/boot 及
+    /// 默认槽位)按 `AuthSubject` 的严格语义验证(detached owner 直接拒绝);
+    /// 客体类文档(did-object 与自定义类型)按 `ObjectDocument`,允许权威
+    /// owner 与结构 owner 不同。误判方向是"更严格、不 promote",不会放宽信任。
+    fn default_verify_purpose(doc_type: &DidDocType) -> VerifyPurpose {
+        match doc_type {
+            DidDocType::DidObject | DidDocType::Custom(_) => VerifyPurpose::ObjectDocument,
+            _ => VerifyPurpose::AuthSubject,
+        }
+    }
+
+    /// 对 `unverified/` cache 里 (did, doc_type) 当前的候选文档做一次 lazy verify
+    /// (doc/update-did-cache.md)。复用 `verify_did_document_jwt` 的核心判定
+    /// (expected_owner + owner 验签 + revoke/replay guard),但输入是 cache 条目
+    /// 而不是外部传入的 jwt 字符串;`validity` 等价于 CurrentActive。
+    ///
+    /// 触发时机只有一处:`resolve_did_ex` 在本机 cache 命中且证据等级为
+    /// `Unverified` 时,在使用它之前调用。不做后台批量扫描/预热。
+    ///
+    /// 不管 unverified 条目是被谁、用什么工具、以什么格式写进来的,这里都重新
+    /// 做归一化解析和信任判定——文件存在不等于合法输入。
+    pub(crate) async fn verify_and_promote(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+        policy: &ResolvePolicy,
+    ) -> NSResult<VerifyPromoteOutcome> {
+        let Some((document, _exp, _source)) =
+            self.doc_cache.observed_candidate(did, doc_type.clone())
+        else {
+            return Err(NSError::NotFound(format!(
+                "no observed candidate for {}#{}",
+                did.to_string(),
+                doc_type.unwrap_or_default()
+            )));
+        };
+
+        // key 类 DID 不是名字系统入口(resolve 侧有同样的硬门禁,这里防手工文件)。
+        if is_key_class_method(&did.method) {
+            return Ok(self.reject_observed(
+                did,
+                doc_type,
+                verify_err(
+                    VerifyDidJwtErrorCode::InvalidJwtDocument,
+                    format!(
+                        "key-class DID {} cannot be a verification subject",
+                        did.to_string()
+                    ),
+                ),
+            ));
+        }
+
+        // 归一化解析:解析失败 / 自述身份不符都是明确失败,删除候选。
+        let parsed = match parse_did_doc(document.clone()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return Ok(self.reject_observed(
+                    did,
+                    doc_type,
+                    verify_err(
+                        VerifyDidJwtErrorCode::InvalidJwtDocument,
+                        format!(
+                            "observed candidate is not a recognizable DID document: {}",
+                            err
+                        ),
+                    ),
+                ));
+            }
+        };
+        if parsed.get_id() != *did {
+            return Ok(self.reject_observed(
+                did,
+                doc_type,
+                verify_err(
+                    VerifyDidJwtErrorCode::DocumentIdMismatch,
+                    format!(
+                        "observed candidate id {} does not match cache slot {}",
+                        parsed.get_id().to_string(),
+                        did.to_string()
+                    ),
+                ),
+            ));
+        }
+
+        // 有效 doc_type:槽位声明的类型优先;默认槽位由文档自述类型决定。
+        // 槽位与文档自述类型不符(张冠李戴)是明确失败。
+        let effective_doc_type = match doc_type.as_ref() {
+            Some(slot) => {
+                if parsed.get_doc_type() != *slot {
+                    return Ok(self.reject_observed(
+                        did,
+                        doc_type.clone(),
+                        verify_err(
+                            VerifyDidJwtErrorCode::InvalidJwtDocument,
+                            format!(
+                                "document body is a {} document, cache slot is {}",
+                                parsed.get_doc_type(),
+                                slot
+                            ),
+                        ),
+                    ));
+                }
+                slot.clone()
+            }
+            None => parsed.get_doc_type(),
+        };
+
+        // Info 契约类 doc_type 免验证、没有 owner 信任链,不存在 promote 语义
+        // (它们走 UnauthenticatedInfoCache,不应该出现在这里)。
+        if self
+            .name_query
+            .is_no_proof_doc_type(&did.method, &effective_doc_type)
+            .await
+        {
+            return Ok(self.reject_observed(
+                did,
+                doc_type,
+                verify_err(
+                    VerifyDidJwtErrorCode::InvalidJwtDocument,
+                    format!(
+                        "doc_type {} is an unauthenticated info contract; \
+                         it has no owner trust chain to verify",
+                        effective_doc_type
+                    ),
+                ),
+            ));
+        }
+
+        // CurrentActive:文档自声明已过期的候选不可能是"当前合法"。
+        let now = buckyos_get_unix_timestamp();
+        if let Some(exp) = parsed.get_exp() {
+            if exp <= now {
+                return Ok(self.reject_observed(
+                    did,
+                    doc_type,
+                    verify_err(
+                        VerifyDidJwtErrorCode::NotCurrentActive,
+                        format!("document self-expired at {} (now {})", exp, now),
+                    ),
+                ));
+            }
+        }
+
+        let declared_owner = match parsed.get_iss() {
+            None => None,
+            Some(iss) => match DID::from_str(&iss) {
+                Ok(declared) => Some(declared),
+                Err(err) => {
+                    return Ok(self.reject_observed(
+                        did,
+                        doc_type,
+                        verify_err(
+                            VerifyDidJwtErrorCode::InvalidJwtDocument,
+                            format!("declared owner {} is not a valid DID: {}", iss, err),
+                        ),
+                    ));
+                }
+            },
+        };
+
+        let purpose = Self::default_verify_purpose(&effective_doc_type);
+        match self
+            .verify_candidate_document_trust(
+                did,
+                &effective_doc_type,
+                &document,
+                parsed.as_ref(),
+                declared_owner.as_ref(),
+                purpose,
+                policy,
+            )
+            .await
+        {
+            Ok(_report) => {
+                // Observed → Trusted 的唯一合法路径:文件从 unverified 移动到
+                // verified,证据打 Verified。merge 撞上更优 verified 记录时源
+                // 文件同样被清理;刚验证过的这份文档仍按 Verified 返回。
+                let exp = Self::cache_ttl_exp(&document);
+                self.doc_cache.promote_observed(did, doc_type, exp);
+                Ok(VerifyPromoteOutcome::Promoted(document))
+            }
+            Err(CandidateVerifyFailure::Definite(err)) => {
+                Ok(self.reject_observed(did, doc_type, err))
+            }
+            Err(CandidateVerifyFailure::Unavailable(err)) => Ok(
+                VerifyPromoteOutcome::Unavailable(NSError::VerifyAndPromoteUnavailable(
+                    err.to_string(),
+                )),
+            ),
+        }
+    }
+
+    /// lazy verify 明确失败的落盘动作:删除 unverified 候选(避免同一份坏数据
+    /// 反复触发验证开销),错误按 `VerifyAndPromoteRejected { code, detail }`
+    /// 结构化返回,code 复用 verify_did_document_jwt 的稳定错误码集合。
+    fn reject_observed(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+        err: NSError,
+    ) -> VerifyPromoteOutcome {
+        self.doc_cache.delete_unverified(did, doc_type);
+        let (code, detail) = match &err {
+            NSError::VerifyDidJwtFailed { code, detail } => (code.clone(), detail.clone()),
+            other => ("VerifyFailed".to_string(), other.to_string()),
+        };
+        VerifyPromoteOutcome::Rejected(NSError::VerifyAndPromoteRejected { code, detail })
     }
 }
 

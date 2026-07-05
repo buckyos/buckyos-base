@@ -378,6 +378,64 @@ pub enum CacheStatus {
     /// 第 0 步)。与本机 cache 的 `Hit` 和 method authority 的 `Miss/Refresh`
     /// 相区分;Zone unknown 会继续落回本机 cache,不会返回 `ZoneHit`。
     ZoneHit,
+    /// 宽松模式下返回的 `Unverified` 观察缓存(doc/update-did-cache.md):
+    /// lazy verify 因条件不可用没能完成,策略显式允许打标露面。strict 解析
+    /// 永远不会产出这个状态。
+    ObservedFallback,
+}
+
+/// lazy verify 的结果性质(doc/update-did-cache.md"resolve_did_ex 新增
+/// metadata 字段")。只在 cache 命中路径上有意义;主循环产出的新鲜结果为 None。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerificationStatus {
+    /// 已通过验证(Published 天然满足,或 Verified 已完成 lazy verify)。
+    Passed,
+    /// 曾尝试 lazy verify,明确失败。
+    Failed,
+    /// 验证所需条件暂不可用(owner document 拿不到、网络不可达)。
+    Unavailable,
+    /// 未尝试验证(strict 模式下命中 Unverified 直接当 miss 处理,不返回给调用方,
+    /// 因此这个状态只会出现在显式选择宽松模式、且策略决定不触发验证的路径里)。
+    NotAttempted,
+}
+
+/// Observed 事件的观察来源(doc/update-did-cache.md)。只用于日志、诊断和未来
+/// `smart_resolver` 式的动态拓扑记录,绝不参与信任等级判定——判定只看目录位置
+/// + 验证结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateSource {
+    UdpDiscovery,
+    Gossip,
+    Push,
+    LocalFile,
+    Authority,
+    ZoneResolver,
+}
+
+impl UpdateSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UpdateSource::UdpDiscovery => "UdpDiscovery",
+            UpdateSource::Gossip => "Gossip",
+            UpdateSource::Push => "Push",
+            UpdateSource::LocalFile => "LocalFile",
+            UpdateSource::Authority => "Authority",
+            UpdateSource::ZoneResolver => "ZoneResolver",
+        }
+    }
+
+    /// 从 meta 文件字符串还原;未知值(手工文件乱写)一律当作 None,不报错。
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "UdpDiscovery" => Some(UpdateSource::UdpDiscovery),
+            "Gossip" => Some(UpdateSource::Gossip),
+            "Push" => Some(UpdateSource::Push),
+            "LocalFile" => Some(UpdateSource::LocalFile),
+            "Authority" => Some(UpdateSource::Authority),
+            "ZoneResolver" => Some(UpdateSource::ZoneResolver),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +515,14 @@ pub struct DidResolutionMetadata {
     /// 结果 body 的证据等级(按取回信道打标,简化文档 2.3 节)。
     pub evidence: Option<BodyEvidence>,
     pub cache_status: Option<CacheStatus>,
+    /// lazy verify 的结果性质(doc/update-did-cache.md)。cache 命中路径打标;
+    /// 其余路径为 None。
+    #[serde(default)]
+    pub verification_status: Option<VerificationStatus>,
+    /// 结果的观察来源(仅诊断用)。命中 `verified/`/`Published` 结果时通常为
+    /// None 或 Authority/ZoneResolver。
+    #[serde(default)]
+    pub source: Option<UpdateSource>,
     pub warnings: Vec<ResolveWarning>,
     pub error: Option<DidResolutionError>,
 }
@@ -469,6 +535,8 @@ impl Default for DidResolutionMetadata {
             resolver_id: None,
             evidence: None,
             cache_status: None,
+            verification_status: None,
+            source: None,
             warnings: Vec::new(),
             error: None,
         }
@@ -541,6 +609,8 @@ impl ResolvedDocument {
                 resolver_id,
                 evidence: Some(evidence),
                 cache_status: Some(CacheStatus::Miss),
+                verification_status: None,
+                source: None,
                 warnings: Vec::new(),
                 error: None,
             },
@@ -621,6 +691,16 @@ impl ResolvedDocument {
         self
     }
 
+    pub fn with_verification_status(mut self, verification_status: VerificationStatus) -> Self {
+        self.resolution_metadata.verification_status = Some(verification_status);
+        self
+    }
+
+    pub fn with_source(mut self, source: Option<UpdateSource>) -> Self {
+        self.resolution_metadata.source = source;
+        self
+    }
+
     pub fn with_discovered_documents(
         mut self,
         discovered_documents: Vec<DiscoveredDocument>,
@@ -637,8 +717,15 @@ pub struct ResolvePolicy {
     /// 入场不豁免 expected_owner 一致性与验签。
     pub allow_self_signed_when_missing: bool,
     /// 策略点④:查询没有产出可核实文档、且没有负状态屏蔽时,是否允许用
-    /// "过期但未作废"的缓存兜底。
+    /// "过期但未作废"的缓存兜底。兜底对象只有 `Published`/`Verified` 条目,
+    /// `Unverified` 观察缓存永远没有兜底资格(doc/update-did-cache.md)。
     pub allow_stale_cache: bool,
+    /// 宽松开关(doc/update-did-cache.md,默认 false):命中 `Unverified` 观察
+    /// 缓存且 lazy verify 因条件不可用(owner 拿不到、网络不可达)没能完成时,
+    /// 是否允许把它以 `cache_status = ObservedFallback` +
+    /// `verification_status = Unavailable` 打标返回。strict(默认)等同 miss。
+    /// 验证明确失败(Rejected)时不论开关如何都不返回。
+    pub allow_unverified_cache_when_unavailable: bool,
     /// 本次解析是否允许走 Zone Resolver cache 快路径(简化文档第 3 节第 0 步)。
     /// 默认允许(是否真的查询还取决于 NameClient 级的启用状态)。设为 false
     /// 的典型调用方是 zone-resolver-server 自己:它的内部实现用 resolve_did
@@ -659,6 +746,7 @@ impl Default for ResolvePolicy {
             follow_migration: true,
             allow_self_signed_when_missing: false,
             allow_stale_cache: true,
+            allow_unverified_cache_when_unavailable: false,
             use_zone_resolver: true,
             max_depth: 8,
             local_authority_override: None,
@@ -685,11 +773,12 @@ impl ResolvePolicy {
     }
 
     /// owner 递归使用的收紧 policy:owner 文档只信权威渠道,关闭 Missing 自签名
-    /// 入场和 stale cache 兜底。
+    /// 入场、stale cache 兜底与 Unverified 观察缓存露面。
     pub fn for_authority_lookup(&self) -> Self {
         let mut policy = self.clone();
         policy.allow_self_signed_when_missing = false;
         policy.allow_stale_cache = false;
+        policy.allow_unverified_cache_when_unavailable = false;
         policy
     }
 

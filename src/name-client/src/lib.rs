@@ -392,20 +392,26 @@ pub async fn owner_is_bound_to_zone(did: &DID, zone_did: &DID) -> NSResult<bool>
     client.unwrap().owner_is_bound_to_zone(did, zone_did).await
 }
 
-/// 旁路的**未验证**缓存写入(`CacheEvidence::Unverified`),不能提升文档信任
-/// 等级。应用层通过 `verify_did_document_jwt` 验证成功后不要再调它保存
-/// "已验证文档"——受控缓存写入由 verify 入口按证据等级自己完成。
+/// "观察到 DID Document"的松写入入口(doc/update-did-cache.md):旁路的
+/// **未验证**缓存写入(`CacheEvidence::Unverified`,落 `unverified/` 目录),
+/// 不能提升文档信任等级。它是文件系统旁路协议的进程内薄封装——任何人往
+/// `unverified/` 目录里放约定格式的文件,效果与调用本函数完全等价。
+///
+/// `source` 描述观察链路(UDP 发现 / gossip / push……),仅诊断用。应用层通过
+/// `verify_did_document_jwt` 验证成功后不要再调它保存"已验证文档"——受控
+/// 缓存写入由 verify 入口按证据等级自己完成。
 pub async fn update_did_cache(
     did: DID,
     doc_type: Option<DidDocType>,
     doc: EncodedDocument,
+    source: Option<UpdateSource>,
 ) -> NSResult<()> {
     let client = get_name_client();
     if client.is_none() {
         return Err(NSError::NotFound("Name client not found".to_string()));
     }
     let client = client.unwrap();
-    client.update_did_cache(did, doc_type, doc)
+    client.update_did_cache(did, doc_type, doc, source)
 }
 
 pub async fn add_device_info_cache(did: DID, device_info: DeviceInfo) -> NSResult<()> {
@@ -486,7 +492,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_did_nameinfo() {
+    async fn test_update_did_cache_is_observed_not_trusted() {
+        // doc/update-did-cache.md 核心原则:系统收到过 != 系统信任它。
+        // update_did_cache 只产生 Observed 事件;strict 的 resolve_did 不能把
+        // 未通过验证的旁路文档当成解析结果返回。
         let did = DID::from_str("did:web:example.com").unwrap();
         let doc = EncodedDocument::JsonLd(serde_json::json!({
             "exp": buckyos_get_unix_timestamp() + 600,
@@ -515,10 +524,17 @@ mod tests {
             let _ = IS_NAME_LIB_INITED.set(true);
         }
 
-        update_did_cache(did.clone(), None, doc.clone())
+        update_did_cache(did.clone(), None, doc.clone(), Some(UpdateSource::Push))
             .await
             .unwrap();
-        let did_doc = resolve_did(&did, None).await.unwrap();
-        assert_eq!(did_doc, doc);
+        // 观察缓存里可见(Unverified)。
+        let client = GLOBAL_NAME_CLIENT.get().unwrap();
+        assert!(client.doc_cache.get(&did, None).is_some());
+
+        // strict resolve:lazy verify 无法把这份无签名 JsonLd 变成可信文档,
+        // 视为 cache miss 继续主循环;没有权威渠道兜底时解析失败,而不是把
+        // 未验证内容返回给调用方。
+        let result = resolve_did(&did, None).await;
+        assert!(result.is_err(), "unverified push must not resolve: {:?}", result);
     }
 }

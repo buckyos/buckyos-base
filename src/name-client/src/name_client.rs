@@ -10,11 +10,12 @@ use crate::doc_cache::{
 };
 use crate::name_query::{NameQuery, ResolveOutcome};
 use crate::provider::RecordType;
+use crate::verify_did_jwt::VerifyPromoteOutcome;
 use crate::zone_resolver::{ZoneLookup, ZoneResolverClient, ZoneResolverConfig};
 use crate::{
     is_key_class_method, BodyEvidence, CacheStatus, DidDocType, DiscoveredDocument, DocumentStatus,
     LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy, ResolveWarning,
-    ResolvedDocument,
+    ResolvedDocument, UpdateSource, VerificationStatus,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
@@ -91,12 +92,6 @@ impl NameClient {
             .map(|dir| PathBuf::from(dir));
 
         let doc_cache = match config.cache_backend {
-            CacheBackend::Sqlite => {
-                DIDDocumentCache::new_db(doc_cache_dir.clone()).unwrap_or_else(|e| {
-                    warn!("init sqlite cache failed ({}), fallback to fs cache", e);
-                    DIDDocumentCache::new(doc_cache_dir.clone())
-                })
-            }
             CacheBackend::Filesystem => DIDDocumentCache::new(doc_cache_dir),
             CacheBackend::Memory => DIDDocumentCache::new_mem(),
         };
@@ -261,17 +256,76 @@ impl NameClient {
 
     // ---- 缓存旁路写入 ----
 
-    /// push / 社交网络等旁路拿到的文档从这里进入缓存,证据等级按"未验证"对待:
-    /// 它压不过已发布/已验证条目,也翻不了负状态(简化文档第 5 节)。
+    /// "观察到 DID Document"的松写入入口(doc/update-did-cache.md):UDP 发现、
+    /// gossip、push、文件投递拿到的文档从这里进入 `unverified` cache。这是
+    /// Observed 事件,不是信任入口:产物恒为 `CacheEvidence::Unverified`,落
+    /// `unverified/` 命名空间;它压不过已发布/已验证条目,也翻不了负状态。
+    /// strict 解析在首次使用时做 lazy verify(verify_and_promote),验证通过
+    /// 才会返回给调用方。
+    ///
+    /// 本函数只是文件系统旁路协议的薄封装(省一次文件 IO,语义完全等价,不享受
+    /// 任何额外信任):写入前做一次快速校验,校验不过不产生任何写入。
+    /// `source` 只描述链路来源(诊断用),不接受写入方自报的信任等级。
     pub fn update_did_cache(
         &self,
         did: DID,
         doc_type: Option<DidDocType>,
         doc: EncodedDocument,
+        source: Option<UpdateSource>,
     ) -> NSResult<()> {
+        Self::quick_check_observed_document(&did, &doc)?;
         let exp = Self::cache_ttl_exp(&doc);
-        self.doc_cache
-            .update(did, doc_type, doc, exp, CacheEvidence::Unverified);
+        self.doc_cache.update_observed(
+            did,
+            doc_type,
+            doc,
+            exp,
+            source.map(|s| s.as_str().to_string()),
+        );
+        Ok(())
+    }
+
+    /// 写入 `unverified/` 前的快速校验(doc/update-did-cache.md"写入协议"):
+    /// **不是**完整验证——不检查签名、不检查 owner、不提升信任等级,只挡住
+    /// 格式明显损坏或张冠李戴的数据:
+    /// - JWT 形式必须能被 `parse_did_doc` 归一化解析(内含"JWT 必须带
+    ///   version_seq"的现有硬规则),且解析出的 id 与调用方声明的 did 一致;
+    /// - JsonLd 形式若自带 `id` 字段,必须与声明的 did 一致。
+    fn quick_check_observed_document(did: &DID, doc: &EncodedDocument) -> NSResult<()> {
+        match doc {
+            EncodedDocument::Jwt(_) => {
+                let parsed = parse_did_doc(doc.clone()).map_err(|err| {
+                    NSError::UnverifiedCacheWriteRejected(format!(
+                        "document is not a recognizable DID document: {}",
+                        err
+                    ))
+                })?;
+                if parsed.get_id() != *did {
+                    return Err(NSError::UnverifiedCacheWriteRejected(format!(
+                        "document id {} does not match declared did {}",
+                        parsed.get_id().to_string(),
+                        did.to_string()
+                    )));
+                }
+            }
+            EncodedDocument::JsonLd(value) => {
+                if let Some(id_value) = value.get("id").and_then(|v| v.as_str()) {
+                    let doc_id = DID::from_str(id_value).map_err(|err| {
+                        NSError::UnverifiedCacheWriteRejected(format!(
+                            "document id {} is not a valid DID: {}",
+                            id_value, err
+                        ))
+                    })?;
+                    if doc_id != *did {
+                        return Err(NSError::UnverifiedCacheWriteRejected(format!(
+                            "document id {} does not match declared did {}",
+                            doc_id.to_string(),
+                            did.to_string()
+                        )));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -812,33 +866,117 @@ impl NameClient {
         }
 
         // 2. in-TTL positive 快路径。owner replay guard 对缓存命中同样生效。
+        //    读路径按证据等级分流(doc/update-did-cache.md):Published/Verified
+        //    直接返回;Unverified(Observed)必须先过一次 lazy verify——系统
+        //    收到过 != 系统信任它,resolver 的默认返回不能不问出处。
         if let Some(CacheLookup::Positive {
             doc,
             exp,
             evidence,
             in_ttl: true,
+            source,
         }) = &cached
         {
-            match self.validate_doc_replay_guard(did, doc_type.clone(), doc) {
-                Ok(()) => {
-                    return Ok(ResolvedDocument::from_cache(
-                        doc.clone(),
-                        did,
-                        &doc_type_c,
-                        *exp,
-                        evidence.to_body_evidence(),
-                        CacheStatus::Hit,
-                    ));
+            let doc = doc.clone();
+            let exp = *exp;
+            let evidence = *evidence;
+            let source = source.as_deref().and_then(UpdateSource::from_str);
+            match evidence {
+                CacheEvidence::Published | CacheEvidence::Verified => {
+                    match self.validate_doc_replay_guard(did, doc_type.clone(), &doc) {
+                        Ok(()) => {
+                            return Ok(ResolvedDocument::from_cache(
+                                doc,
+                                did,
+                                &doc_type_c,
+                                exp,
+                                evidence.to_body_evidence(),
+                                CacheStatus::Hit,
+                            )
+                            .with_verification_status(VerificationStatus::Passed));
+                        }
+                        Err(err) => {
+                            info!(
+                                "cached did:{}#{} rejected by owner replay guard: {}",
+                                did.to_string(),
+                                doc_type_c,
+                                err
+                            );
+                            self.doc_cache.delete(did.clone(), doc_type.clone());
+                            cached = None;
+                        }
+                    }
                 }
-                Err(err) => {
-                    info!(
-                        "cached did:{}#{} rejected by owner replay guard: {}",
-                        did.to_string(),
-                        doc_type_c,
-                        err
-                    );
-                    self.doc_cache.delete(did.clone(), doc_type.clone());
-                    cached = None;
+                CacheEvidence::Unverified => {
+                    // 首次使用时 lazy verify。Rejected(候选已删除)与 strict
+                    // 下的 Unavailable 都等同 cache miss 继续主循环,与 owner
+                    // replay guard 失败的处理方式完全对称。
+                    match self.verify_and_promote(did, doc_type.clone(), &policy).await {
+                        Ok(VerifyPromoteOutcome::Promoted(promoted_doc)) => {
+                            return Ok(ResolvedDocument::from_cache(
+                                promoted_doc,
+                                did,
+                                &doc_type_c,
+                                exp,
+                                CacheEvidence::Verified.to_body_evidence(),
+                                CacheStatus::Hit,
+                            )
+                            .with_verification_status(VerificationStatus::Passed)
+                            .with_source(source));
+                        }
+                        Ok(VerifyPromoteOutcome::Rejected(err)) => {
+                            info!(
+                                "observed did:{}#{} rejected by lazy verify: {}",
+                                did.to_string(),
+                                doc_type_c,
+                                err
+                            );
+                            cached = None;
+                        }
+                        Ok(VerifyPromoteOutcome::Unavailable(err)) => {
+                            if policy.allow_unverified_cache_when_unavailable
+                                && self
+                                    .validate_doc_replay_guard(did, doc_type.clone(), &doc)
+                                    .is_ok()
+                            {
+                                // 显式宽松模式:打标露面,绝不冒充已验证结果。
+                                info!(
+                                    "observed did:{}#{} served as ObservedFallback \
+                                     (verification unavailable): {}",
+                                    did.to_string(),
+                                    doc_type_c,
+                                    err
+                                );
+                                return Ok(ResolvedDocument::from_cache(
+                                    doc,
+                                    did,
+                                    &doc_type_c,
+                                    exp,
+                                    CacheEvidence::Unverified.to_body_evidence(),
+                                    CacheStatus::ObservedFallback,
+                                )
+                                .with_verification_status(VerificationStatus::Unavailable)
+                                .with_source(source));
+                            }
+                            debug!(
+                                "observed did:{}#{} lazy verify unavailable, \
+                                 strict resolve treats it as cache miss: {}",
+                                did.to_string(),
+                                doc_type_c,
+                                err
+                            );
+                            cached = None;
+                        }
+                        Err(err) => {
+                            debug!(
+                                "lazy verify for observed did:{}#{} failed to run: {}",
+                                did.to_string(),
+                                doc_type_c,
+                                err
+                            );
+                            cached = None;
+                        }
+                    }
                 }
             }
         }
@@ -931,13 +1069,16 @@ impl NameClient {
                         ))
                     }));
                 }
-                // 策略点④:过期但未作废的缓存兜底。
+                // 策略点④:过期但未作废的缓存兜底。兜底资格只属于
+                // Published/Verified 条目:Unverified 观察缓存从未通过验证,
+                // 连降级露面都必须走显式的 ObservedFallback 打标路径
+                // (doc/update-did-cache.md),不能混进普通 stale 兜底。
                 if allow_stale_cache {
                     if let Some(CacheLookup::Positive {
                         doc, exp, evidence, ..
                     }) = cached
                     {
-                        if !Self::doc_self_expired(&doc) {
+                        if evidence != CacheEvidence::Unverified && !Self::doc_self_expired(&doc) {
                             info!(
                                 "resolve did:{}#{} falls back to stale cache",
                                 did.to_string(),
@@ -1604,7 +1745,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let pushed = make_doc(now, now + 1000, "pushed");
         client
-            .update_did_cache(did.clone(), None, pushed.clone())
+            .update_did_cache(did.clone(), None, pushed.clone(), None)
             .unwrap();
         // push 进的是本机 cache。
         assert_eq!(client.doc_cache.get(&did, None).unwrap().0, pushed);
@@ -1921,7 +2062,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         // push(update_did_cache)写不进去,负状态仍在。
         let now = buckyos_get_unix_timestamp();
         client
-            .update_did_cache(did.clone(), None, make_doc(now, now + 1000, "pushed"))
+            .update_did_cache(
+                did.clone(),
+                None,
+                make_doc(now, now + 1000, "pushed"),
+                Some(UpdateSource::Push),
+            )
             .unwrap();
         assert!(client.doc_cache.lookup(&did, None).unwrap().is_negative());
         assert!(client.doc_cache.get(&did, None).is_none());
@@ -2611,5 +2757,445 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .doc_cache
             .get(&device_did, Some(DidDocType::Info))
             .is_none());
+    }
+
+    // ---- doc/update-did-cache.md 测试要求:Observed / lazy verify / promote ----
+
+    /// bns 二级名字的可验证候选链:owner alice + 由 alice 签名、声明 owner 为
+    /// alice 的 app zone 文档。
+    fn build_owned_zone_and_owner(
+        app_did: &DID,
+        owner_did: &DID,
+        iat: u64,
+        marker: &str,
+    ) -> (EncodedDocument, EncodedDocument) {
+        let private_key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        let jwk = test_owner_public_jwk();
+
+        let mut owner = OwnerDocument::new(
+            owner_did.clone(),
+            "alice".to_string(),
+            "alice@test".to_string(),
+            jwk.clone(),
+        );
+        owner.version_seq = Some(0);
+        let owner_doc = owner.encode(Some(&private_key)).unwrap();
+
+        let mut zone = ZoneDocument::new(app_did.clone(), owner_did.clone(), jwk);
+        zone.iat = iat;
+        zone.exp = iat + 3600 * 24 * 365;
+        zone.version_seq = Some(1);
+        zone.extra_info
+            .insert("marker".to_string(), serde_json::json!(marker));
+        let zone_doc = zone.encode(Some(&private_key)).unwrap();
+
+        (zone_doc, owner_doc)
+    }
+
+    // 测试要求 3:Observed 候选通过 verify_and_promote 后,原条目从 unverified
+    // 消失、verified 出现对应条目(证据 Verified);第二次 resolve_did 是普通
+    // cache hit,不再重复触发验证(权威源零调用)。
+    #[tokio::test]
+    async fn lazy_verify_promotes_observed_candidate_then_plain_hit() {
+        let app_did = DID::new("bns", "app1.alice");
+        let now = buckyos_get_unix_timestamp();
+        let (zone_doc, owner_doc) =
+            build_owned_zone_and_owner(&app_did, &DID::new("bns", "alice"), now, "observed");
+
+        let client = mem_client();
+        let authority = MockAuthority::ok(zone_doc.clone()).with_owner_doc(owner_doc);
+        let calls_probe = &authority.calls as *const AtomicUsize;
+        client
+            .set_method_authority("bns", Box::new(authority))
+            .await;
+
+        client
+            .update_did_cache(
+                app_did.clone(),
+                None,
+                zone_doc.clone(),
+                Some(UpdateSource::UdpDiscovery),
+            )
+            .unwrap();
+        match client.doc_cache.lookup(&app_did, None).unwrap() {
+            CacheLookup::Positive { evidence, .. } => {
+                assert_eq!(evidence, CacheEvidence::Unverified)
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+
+        // 首次 resolve:触发 lazy verify,promote 成功。
+        let first = client
+            .resolve_did_ex(&app_did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(first.document, zone_doc);
+        assert_eq!(
+            first.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+        assert_eq!(
+            first.resolution_metadata.verification_status,
+            Some(VerificationStatus::Passed)
+        );
+        assert_eq!(
+            first.resolution_metadata.source,
+            Some(UpdateSource::UdpDiscovery)
+        );
+
+        // 条目已从 unverified 移动到 verified,证据为 Verified。
+        assert!(client.doc_cache.observed_candidate(&app_did, None).is_none());
+        match client.doc_cache.lookup(&app_did, None).unwrap() {
+            CacheLookup::Positive { evidence, .. } => {
+                assert_eq!(evidence, CacheEvidence::Verified)
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+
+        // 第二次 resolve:普通 cache hit,不再触发任何权威源调用。
+        let calls_before = unsafe { (*calls_probe).load(Ordering::SeqCst) };
+        let second = client
+            .resolve_did_ex(&app_did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(second.document, zone_doc);
+        assert_eq!(
+            second.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+        assert_eq!(unsafe { (*calls_probe).load(Ordering::SeqCst) }, calls_before);
+    }
+
+    // 测试要求 4:lazy verify 明确失败(owner 冒充)时,unverified 条目被删除,
+    // 不会反复触发验证开销。
+    #[tokio::test]
+    async fn lazy_verify_rejects_owner_impersonation_and_deletes_candidate() {
+        let app_did = DID::new("bns", "app1.alice");
+        let bob = DID::new("bns", "bob");
+        let now = buckyos_get_unix_timestamp();
+        // 候选由 bob 签名、声明 owner 为 bob,但名字结构决定 expected_owner
+        // 是 alice —— owner 冒充。
+        let (impersonated_doc, _bob_owner) =
+            build_owned_zone_and_owner(&app_did, &bob, now, "impersonated");
+        let (_zone, alice_owner_doc) = build_owned_zone_and_owner(
+            &app_did,
+            &DID::new("bns", "alice"),
+            now,
+            "alice-owner",
+        );
+
+        let client = mem_client();
+        // 权威源:把这份冒充文档当作当前 body 返回(membership 满足),让验证
+        // 走到 declared_owner 一致性检查;owner 文档正常可取。
+        client
+            .set_method_authority(
+                "bns",
+                Box::new(MockAuthority::ok(impersonated_doc.clone()).with_owner_doc(alice_owner_doc)),
+            )
+            .await;
+
+        client
+            .update_did_cache(app_did.clone(), None, impersonated_doc, Some(UpdateSource::Gossip))
+            .unwrap();
+        assert!(client.doc_cache.observed_candidate(&app_did, None).is_some());
+
+        let outcome = client
+            .verify_and_promote(&app_did, None, &ResolvePolicy::default())
+            .await
+            .unwrap();
+        match outcome {
+            VerifyPromoteOutcome::Rejected(NSError::VerifyAndPromoteRejected { code, .. }) => {
+                assert_eq!(code, "DeclaredOwnerMismatch");
+            }
+            other => panic!("expected rejected, got {:?}", other),
+        }
+        // 候选已删除:第二次调用没有可验证对象,不会重复烧验证成本。
+        assert!(client.doc_cache.observed_candidate(&app_did, None).is_none());
+        assert!(client
+            .verify_and_promote(&app_did, None, &ResolvePolicy::default())
+            .await
+            .is_err());
+    }
+
+    // 测试要求 5:验证条件不可用(权威源断网)时,strict 视为 miss;显式宽松
+    // 模式返回 evidence=Unverified(NeedProof)+ verification_status=Unavailable
+    // 的打标结果,且 unverified 条目保留。
+    #[tokio::test]
+    async fn lazy_verify_unavailable_strict_miss_lax_tagged_result() {
+        let app_did = DID::new("bns", "app1.alice");
+        let now = buckyos_get_unix_timestamp();
+        let (zone_doc, _owner_doc) =
+            build_owned_zone_and_owner(&app_did, &DID::new("bns", "alice"), now, "unavailable");
+
+        let client = mem_client();
+        client
+            .set_method_authority(
+                "bns",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Down)),
+            )
+            .await;
+
+        client
+            .update_did_cache(app_did.clone(), None, zone_doc.clone(), Some(UpdateSource::Push))
+            .unwrap();
+
+        // strict(默认):等同 cache miss,主循环也拿不到结果时报错,但绝不把
+        // 未验证文档返回给调用方。
+        let err = client
+            .resolve_did_ex(&app_did, None, ResolvePolicy::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
+        // Unavailable 不删除候选。
+        assert!(client.doc_cache.observed_candidate(&app_did, None).is_some());
+
+        // 显式宽松模式:打标露面。
+        let mut lax = ResolvePolicy::default();
+        lax.allow_unverified_cache_when_unavailable = true;
+        let resolved = client
+            .resolve_did_ex(&app_did, None, lax)
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, zone_doc);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::ObservedFallback)
+        );
+        assert_eq!(
+            resolved.resolution_metadata.verification_status,
+            Some(VerificationStatus::Unavailable)
+        );
+        assert_eq!(
+            resolved.resolution_metadata.evidence,
+            Some(BodyEvidence::NeedProof)
+        );
+        assert_eq!(resolved.resolution_metadata.source, Some(UpdateSource::Push));
+        // 候选仍保留在 unverified,等待条件恢复后真正验证。
+        assert!(client.doc_cache.observed_candidate(&app_did, None).is_some());
+    }
+
+    // 测试要求 1 + 7:手工往 unverified/ 目录放文件与调用 update_did_cache 完全
+    // 等价("目录即协议");格式合法但验证不过的文件,strict resolve 不返回它、
+    // 也不因它报错——视为 miss 继续主循环,拿到权威源结果。
+    #[tokio::test]
+    async fn hand_placed_unverified_file_is_miss_not_error_for_strict_resolve() {
+        let tmp = tempdir().unwrap();
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: true,
+            local_cache_dir: Some(tmp.path().to_string_lossy().to_string()),
+            cache_backend: CacheBackend::Filesystem,
+            enable_zone_resolver: false,
+            ..Default::default()
+        });
+
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let (authority_doc, owner_doc) = build_self_owned_zone_and_owner(&did, now, "authority");
+        client
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::ok(authority_doc.clone()).with_owner_doc(owner_doc)),
+            )
+            .await;
+
+        // 手工投递:格式合法(可解析)但未经验证、与权威结果不同的文档。
+        let key = did.to_filename();
+        let hand_placed = make_doc(now, now + 1000, "hand-placed");
+        let unverified_doc_path = tmp
+            .path()
+            .join("unverified")
+            .join(format!("{}.doc.json", key));
+        std::fs::write(&unverified_doc_path, hand_placed.to_string()).unwrap();
+        // 与 update_did_cache 等价:立即被观察到。
+        assert!(client.doc_cache.observed_candidate(&did, None).is_some());
+
+        // strict resolve:不返回手工文件、不报错,继续主循环拿权威结果。
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, authority_doc);
+        // 明确失败的候选被清理,不会反复触发验证。
+        assert!(!unverified_doc_path.exists());
+        assert!(client.doc_cache.observed_candidate(&did, None).is_none());
+    }
+
+    // 测试要求 7(promote 形态):手工放进 unverified/ 的可验证候选与
+    // update_did_cache 行为一致——resolve 时被 lazy verify 转正,文件物理移动
+    // 到 verified/;meta 自称的 evidence 不被信任。
+    #[tokio::test]
+    async fn hand_placed_verifiable_file_promotes_like_update_did_cache() {
+        let tmp = tempdir().unwrap();
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: true,
+            local_cache_dir: Some(tmp.path().to_string_lossy().to_string()),
+            cache_backend: CacheBackend::Filesystem,
+            enable_zone_resolver: false,
+            ..Default::default()
+        });
+
+        let app_did = DID::new("bns", "app1.alice");
+        let now = buckyos_get_unix_timestamp();
+        let (zone_doc, owner_doc) =
+            build_owned_zone_and_owner(&app_did, &DID::new("bns", "alice"), now, "hand-promote");
+        client
+            .set_method_authority(
+                "bns",
+                Box::new(MockAuthority::ok(zone_doc.clone()).with_owner_doc(owner_doc)),
+            )
+            .await;
+
+        // 手工写 doc + meta(meta 自称 Published,必须被忽略;source 仅诊断)。
+        let key = app_did.to_filename();
+        let unverified_dir = tmp.path().join("unverified");
+        std::fs::write(
+            unverified_dir.join(format!("{}.doc.json", key)),
+            zone_doc.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            unverified_dir.join(format!("{}.meta.json", key)),
+            "{\"evidence\":\"Published\",\"source\":\"LocalFile\"}",
+        )
+        .unwrap();
+
+        // 自称的 Published 不被信任:读出即 Unverified。
+        match client.doc_cache.lookup(&app_did, None).unwrap() {
+            CacheLookup::Positive { evidence, .. } => {
+                assert_eq!(evidence, CacheEvidence::Unverified)
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+
+        let resolved = client
+            .resolve_did_ex(&app_did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, zone_doc);
+        assert_eq!(
+            resolved.resolution_metadata.verification_status,
+            Some(VerificationStatus::Passed)
+        );
+        assert_eq!(
+            resolved.resolution_metadata.source,
+            Some(UpdateSource::LocalFile)
+        );
+
+        // 文件已物理移动:unverified/ 清空,verified/ 出现对应文件。
+        assert!(!unverified_dir.join(format!("{}.doc.json", key)).exists());
+        assert!(tmp
+            .path()
+            .join("verified")
+            .join(format!("{}.doc.json", key))
+            .exists());
+        match client.doc_cache.lookup(&app_did, None).unwrap() {
+            CacheLookup::Positive { evidence, .. } => {
+                assert_eq!(evidence, CacheEvidence::Verified)
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    // 测试要求 2:verified/ 已有 Published 记录时,unverified/ 出现新文件不
+    // 影响 resolve_did 的返回结果(也不触发验证)。
+    #[tokio::test]
+    async fn observed_file_does_not_affect_resolve_when_published_exists() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        let published = make_doc(now, now + 1000, "published");
+        client.doc_cache.insert(
+            did.clone(),
+            None,
+            published.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+
+        // Observed 事件被记录,但查询永远优先命中 verified。
+        client
+            .update_did_cache(
+                did.clone(),
+                None,
+                make_doc(now + 10, now + 5000, "observed-later"),
+                Some(UpdateSource::Push),
+            )
+            .unwrap();
+        assert!(client.doc_cache.observed_candidate(&did, None).is_some());
+
+        let resolved = client
+            .resolve_did_ex(&did, None, ResolvePolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.document, published);
+        assert_eq!(
+            resolved.resolution_metadata.cache_status,
+            Some(CacheStatus::Hit)
+        );
+        assert_eq!(
+            resolved.resolution_metadata.verification_status,
+            Some(VerificationStatus::Passed)
+        );
+    }
+
+    // 测试要求 6:快速校验——声明 did:web:a 但文档 id 是 did:web:b 时,
+    // unverified/ 目录不产生任何文件。
+    #[tokio::test]
+    async fn quick_check_rejects_mismatched_document_id_without_writing() {
+        let tmp = tempdir().unwrap();
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: true,
+            local_cache_dir: Some(tmp.path().to_string_lossy().to_string()),
+            cache_backend: CacheBackend::Filesystem,
+            enable_zone_resolver: false,
+            ..Default::default()
+        });
+
+        let declared = DID::from_str("did:web:a").unwrap();
+        let mismatched = EncodedDocument::JsonLd(serde_json::json!({
+            "id": "did:web:b",
+            "exp": buckyos_get_unix_timestamp() + 1000,
+        }));
+        let err = client
+            .update_did_cache(declared.clone(), None, mismatched, Some(UpdateSource::Push))
+            .unwrap_err();
+        assert!(matches!(err, NSError::UnverifiedCacheWriteRejected(_)));
+
+        // 目录里没有任何文件。
+        let entries: Vec<_> = std::fs::read_dir(tmp.path().join("unverified"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_file())
+            .collect();
+        assert!(entries.is_empty(), "no file should be written: {:?}", entries);
+        assert!(client.doc_cache.observed_candidate(&declared, None).is_none());
+    }
+
+    // 补充:Unverified 观察缓存没有 stale 兜底资格——TTL 过期的 Observed 条目
+    // 在权威源 unknown 时不能冒充 CacheFallback 结果。
+    #[tokio::test]
+    async fn expired_observed_entry_is_not_stale_fallback_material() {
+        let client = mem_client();
+        let did = DID::from_str("did:web:observed-stale.example").unwrap();
+        let now = buckyos_get_unix_timestamp();
+        // 直接以过期 exp 写入 Observed 条目(绕过 update_did_cache 的 TTL 计算)。
+        client.doc_cache.update_observed(
+            did.clone(),
+            None,
+            make_doc_without_exp("observed-stale"),
+            now.saturating_sub(10),
+            None,
+        );
+
+        client
+            .set_method_authority(
+                "web",
+                Box::new(MockAuthority::with_mode(AuthorityMode::Down)),
+            )
+            .await;
+
+        // 默认策略允许 stale 兜底,但 Unverified 没有兜底资格。
+        let err = client.resolve_did(&did, None).await.unwrap_err();
+        assert!(matches!(err, NSError::Failed(_)));
     }
 }

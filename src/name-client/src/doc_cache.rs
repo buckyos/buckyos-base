@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::UNIX_EPOCH;
 
@@ -9,7 +10,6 @@ use buckyos_kit::{
 };
 use log::{debug, error, info, warn};
 use name_lib::{DIDDocumentTrait, EncodedDocument, OwnerDocument, DEFAULT_EXPIRE_TIME, DID};
-use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::{BodyEvidence, DidDocType, DocumentStatus};
@@ -18,13 +18,12 @@ use crate::{BodyEvidence, DidDocType, DocumentStatus};
 /// (只有权威源的新回答能翻篇),但在权威源没回答时它仍然屏蔽一切兜底。
 const NEGATIVE_STATE_TTL_SECS: u64 = 3600;
 
-/// 支持三种存储后端的 DID 文档缓存。后端只是 KV(load/store/remove/scan),
-/// 证据等级、负状态屏蔽、version/iat 比较、owner replay guard 全部在统一层实现
-/// (简化 TODO T2.3)。
+/// 本机 DID 文档缓存的存储后端。SQL 后端已删除(doc/update-did-cache.md 目标 1):
+/// 真正需要结构化查询能力的场景走 zone-did-resolve,本机 `did_cache` 只保留
+/// Filesystem(生产默认)与 Memory(测试默认)。
 #[derive(Clone, Copy, Debug)]
 pub enum CacheBackend {
     Filesystem,
-    Sqlite,
     Memory,
 }
 
@@ -36,7 +35,7 @@ pub enum CacheEvidence {
     Published,
     /// 通过了含 expected_owner 一致性在内的完整 verify 的自签名候选。
     Verified,
-    /// 未经验证(push、update_did_cache 等旁路写入)。
+    /// 未经验证的旁路写入(update_did_cache / 文件系统协议)。
     Unverified,
 }
 
@@ -66,14 +65,41 @@ impl CacheEvidence {
     }
 }
 
+/// 目录即证据(doc/update-did-cache.md):`unverified/` 是任何本机进程都可写的
+/// Observed 命名空间,`verified/` 只有 name-client 受控写入。落在 `unverified/`
+/// 的条目不论 meta 自称什么证据等级,读出时一律钳制为 `Unverified`;`verified/`
+/// 的 meta 才被信任(写权限已经先做了一次身份过滤)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheNamespace {
+    Unverified,
+    Verified,
+}
+
+impl CacheNamespace {
+    fn dir_name(&self) -> &'static str {
+        match self {
+            CacheNamespace::Unverified => "unverified",
+            CacheNamespace::Verified => "verified",
+        }
+    }
+}
+
+fn namespace_for_evidence(evidence: CacheEvidence) -> CacheNamespace {
+    match evidence {
+        CacheEvidence::Unverified => CacheNamespace::Unverified,
+        _ => CacheNamespace::Verified,
+    }
+}
+
 fn default_cache_evidence() -> CacheEvidence {
     // 旧版缓存条目没有证据字段:它们都是老验证路径写入的结果,按已发布档对待,
-    // 保持与旧行为最接近的合并偏好。
+    // 保持与旧行为最接近的合并偏好(只对 verified/ 命名空间生效)。
     CacheEvidence::Published
 }
 
 /// 统一的持久化条目:正条目(带 doc)或负条目(带 negative_status)。
-/// 字段全部带 serde default,旧版 meta 文件/表可以直接读出。
+/// 字段全部带 serde default,旧版 meta 文件可以直接读出;未知字段被忽略,
+/// 因此外部写入方 meta 里的 `hint_doc_type` 等诊断字段不会破坏解析。
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct StoredMeta {
     #[serde(default = "default_cache_evidence")]
@@ -86,6 +112,13 @@ struct StoredMeta {
     exp: Option<u64>,
     #[serde(default)]
     update_from_remote_time: Option<u64>,
+    /// Observed 事件的观察来源(doc/update-did-cache.md)。仅诊断用,
+    /// 绝不参与信任判定。promote 时原样保留。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    /// 写入方本地时间戳,仅诊断/排障用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at: Option<u64>,
 }
 
 impl Default for CacheEvidence {
@@ -119,6 +152,8 @@ pub enum CacheLookup {
         exp: u64,
         evidence: CacheEvidence,
         in_ttl: bool,
+        /// Observed 条目的观察来源(仅诊断);verified 命中通常为 None。
+        source: Option<String>,
     },
     Negative {
         status: String,
@@ -139,7 +174,6 @@ pub struct DIDDocumentCache {
 
 enum Backend {
     Fs(FsStore),
-    Db(DbStore),
     Mem(MemStore),
 }
 
@@ -151,14 +185,8 @@ impl DIDDocumentCache {
         }
     }
 
-    /// 显式创建 SQLite 缓存。
-    pub fn new_db(cache_dir: Option<PathBuf>) -> name_lib::NSResult<Self> {
-        Ok(Self {
-            backend: Backend::Db(DbStore::new(cache_dir)?),
-        })
-    }
-
-    /// 显式创建 Memory 缓存(测试用)。
+    /// 显式创建 Memory 缓存(测试用)。进程内用两个命名空间模拟
+    /// `unverified/`/`verified/` 目录,行为满足"目录即证据"语义。
     pub fn new_mem() -> Self {
         Self {
             backend: Backend::Mem(MemStore::new()),
@@ -177,39 +205,71 @@ impl DIDDocumentCache {
         get_buckyos_system_etc_dir().join("did_docs")
     }
 
-    // ---- 后端 KV 转发 ----
+    // ---- 后端 KV 转发(命名空间感知) ----
 
-    fn load(&self, key: &str) -> Option<StoredEntry> {
+    fn load_ns(&self, ns: CacheNamespace, key: &str) -> Option<StoredEntry> {
+        let mut entry = match &self.backend {
+            Backend::Fs(store) => store.load(ns, key),
+            Backend::Mem(store) => store.load(ns, key),
+        }?;
+        if ns == CacheNamespace::Unverified {
+            // 目录即证据:unverified/ 里内容自称的证据等级不被信任;
+            // 自称的负状态更不被信任(否则任何人放一个 meta 文件就能屏蔽解析)。
+            if entry.is_negative() || entry.doc.is_none() {
+                return None;
+            }
+            entry.meta.evidence = CacheEvidence::Unverified;
+        }
+        Some(entry)
+    }
+
+    /// 联合视图:`verified/` 永远优先命中(不论 TTL);没有 verified 条目时才
+    /// 露出 unverified 的 Observed 候选。
+    fn load_union(&self, key: &str) -> Option<StoredEntry> {
+        self.load_ns(CacheNamespace::Verified, key)
+            .or_else(|| self.load_ns(CacheNamespace::Unverified, key))
+    }
+
+    fn store(&self, key: &str, entry: &StoredEntry) {
+        let ns = if entry.is_negative() {
+            CacheNamespace::Verified
+        } else {
+            namespace_for_evidence(entry.meta.evidence)
+        };
         match &self.backend {
-            Backend::Fs(store) => store.load(key),
-            Backend::Db(store) => store.load(key),
-            Backend::Mem(store) => store.load(key),
+            Backend::Fs(store) => store.store(ns, key, entry),
+            Backend::Mem(store) => store.store(ns, key, entry),
         }
     }
 
-    fn store(&self, did: &DID, key: &str, entry: &StoredEntry) {
+    fn remove_ns(&self, ns: CacheNamespace, key: &str) {
         match &self.backend {
-            Backend::Fs(store) => store.store(key, entry),
-            Backend::Db(store) => store.store(did, key, entry),
-            Backend::Mem(store) => store.store(key, entry),
+            Backend::Fs(store) => store.remove(ns, key),
+            Backend::Mem(store) => store.remove(ns, key),
         }
     }
 
     fn remove(&self, key: &str) {
-        match &self.backend {
-            Backend::Fs(store) => store.remove(key),
-            Backend::Db(store) => store.remove(key),
-            Backend::Mem(store) => store.remove(key),
-        }
+        self.remove_ns(CacheNamespace::Verified, key);
+        self.remove_ns(CacheNamespace::Unverified, key);
     }
 
     fn keys_for_did(&self, did: &DID) -> Vec<String> {
         let did_key = did_cache_key(did);
-        match &self.backend {
-            Backend::Fs(store) => store.keys_with_prefix(&did_key),
-            Backend::Db(store) => store.keys_for_did(&did_key),
-            Backend::Mem(store) => store.keys_with_prefix(&did_key),
+        let mut keys = match &self.backend {
+            Backend::Fs(store) => store.keys_with_prefix(CacheNamespace::Verified, &did_key),
+            Backend::Mem(store) => store.keys_with_prefix(CacheNamespace::Verified, &did_key),
+        };
+        let observed = match &self.backend {
+            Backend::Fs(store) => store.keys_with_prefix(CacheNamespace::Unverified, &did_key),
+            Backend::Mem(store) => store.keys_with_prefix(CacheNamespace::Unverified, &did_key),
+        };
+        for key in observed {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
         }
+        keys
     }
 
     // ---- 统一层逻辑 ----
@@ -217,7 +277,7 @@ impl DIDDocumentCache {
     /// 查询条目(不做任何删除;过期条目保留给策略点④的 stale 兜底判断)。
     pub fn lookup(&self, did: &DID, doc_type: Option<DidDocType>) -> Option<CacheLookup> {
         let key = combine_key(did, doc_type.as_ref());
-        let entry = self.load(&key)?;
+        let entry = self.load_union(&key)?;
         let in_ttl = !is_expired(entry.exp());
         if entry.is_negative() {
             let status = entry.meta.negative_status.clone().unwrap_or_default();
@@ -237,12 +297,14 @@ impl DIDDocumentCache {
         }
         let exp = entry.exp();
         let evidence = entry.meta.evidence;
+        let source = entry.meta.source.clone();
         let doc = entry.doc?;
         Some(CacheLookup::Positive {
             doc,
             exp,
             evidence,
             in_ttl,
+            source,
         })
     }
 
@@ -263,6 +325,9 @@ impl DIDDocumentCache {
     /// 合并写入(简化文档第 5 节的 did_cache_update):
     /// 负状态与本地覆盖屏蔽一切合并写入(本地覆盖根本不进这里);
     /// 先比证据等级,同级才比 version_seq / iat。
+    ///
+    /// `Unverified` 证据的写入走 Observed 旁路语义(doc/update-did-cache.md):
+    /// 落 `unverified/` 命名空间,永远压不过 `verified/` 里的条目。
     pub fn update(
         &self,
         did: DID,
@@ -270,6 +335,41 @@ impl DIDDocumentCache {
         doc: EncodedDocument,
         exp: u64,
         evidence: CacheEvidence,
+    ) -> bool {
+        if evidence == CacheEvidence::Unverified {
+            return self.update_observed(did, doc_type, doc, exp, None);
+        }
+
+        if self
+            .validate_owner_revocation(&did, doc_type.clone(), &doc)
+            .is_err()
+        {
+            return false;
+        }
+
+        let key = combine_key(&did, doc_type.as_ref());
+        if let Some(current) = self.load_union(&key) {
+            if !merge_allows(&did, &current, &doc, evidence) {
+                return false;
+            }
+        }
+        self.write_positive(&did, &key, doc_type.as_ref(), doc, exp, evidence);
+        true
+    }
+
+    /// Observed 旁路写入(doc/update-did-cache.md):产物固定落 `unverified/`
+    /// 命名空间、证据恒为 `Unverified`,`source` 只做诊断记录。
+    ///
+    /// 返回值表示"这条观察是否成为当前查询可见的条目":`verified/` 已有同 key
+    /// 条目时观察仍会被记录,但返回 false(查询永远优先命中 verified/)。
+    /// 负状态屏蔽一切写入——此时连 unverified 文件都不产生。
+    pub fn update_observed(
+        &self,
+        did: DID,
+        doc_type: Option<DidDocType>,
+        doc: EncodedDocument,
+        exp: u64,
+        source: Option<String>,
     ) -> bool {
         if self
             .validate_owner_revocation(&did, doc_type.clone(), &doc)
@@ -279,17 +379,39 @@ impl DIDDocumentCache {
         }
 
         let key = combine_key(&did, doc_type.as_ref());
-        if let Some(current) = self.load(&key) {
-            if !merge_allows(&did, &current, &doc, evidence) {
+        let verified_current = self.load_ns(CacheNamespace::Verified, &key);
+        if let Some(current) = &verified_current {
+            if current.is_negative() {
+                // 负状态是"回答",Observed 事件翻不了篇,也不值得记录。
                 return false;
             }
         }
-        self.write_positive(&did, &key, doc_type.as_ref(), doc, exp, evidence);
-        true
+
+        // Observed 命名空间内部仍按同级 merge 规则去重(version_seq / iat)。
+        if let Some(current) = self.load_ns(CacheNamespace::Unverified, &key) {
+            if !merge_allows(&did, &current, &doc, CacheEvidence::Unverified) {
+                return false;
+            }
+        }
+
+        let entry = StoredEntry {
+            doc: Some(doc),
+            meta: StoredMeta {
+                evidence: CacheEvidence::Unverified,
+                negative_status: None,
+                negative_message: None,
+                exp: Some(exp),
+                update_from_remote_time: Some(buckyos_get_unix_timestamp()),
+                source,
+                observed_at: Some(buckyos_get_unix_timestamp()),
+            },
+        };
+        self.store(&key, &entry);
+        verified_current.is_none()
     }
 
     /// 无条件写入(种子/测试/本地运维用):跳过合并比较,但 owner replay guard
-    /// 与吊销联动清理仍然生效。
+    /// 与吊销联动清理仍然生效。命名空间由证据等级决定(目录即证据)。
     pub fn insert(
         &self,
         did: DID,
@@ -317,7 +439,13 @@ impl DIDDocumentCache {
         exp: u64,
         evidence: CacheEvidence,
     ) {
-        let owner_document = parse_owner_document_doc(doc_type, &doc);
+        let owner_document = if evidence == CacheEvidence::Unverified {
+            // 未验证的 owner 文档没有资格触发吊销联动清理:否则任何人喊一声
+            // update_did_cache 就能用伪造 owner 文档驱逐已验证条目。
+            None
+        } else {
+            parse_owner_document_doc(doc_type, &doc)
+        };
         let entry = StoredEntry {
             doc: Some(doc),
             meta: StoredMeta {
@@ -326,9 +454,11 @@ impl DIDDocumentCache {
                 negative_message: None,
                 exp: Some(exp),
                 update_from_remote_time: Some(buckyos_get_unix_timestamp()),
+                source: None,
+                observed_at: None,
             },
         };
-        self.store(did, key, &entry);
+        self.store(key, &entry);
 
         // 新 owner 文档落地时,联动清理被它的 replay guard 判定吊销的旧文档。
         if let Some(owner_document) = owner_document {
@@ -336,8 +466,93 @@ impl DIDDocumentCache {
         }
     }
 
+    /// Observed 候选(`unverified/` 命名空间)的原样读取,供 lazy verify 使用。
+    /// 不做联合视图:resolve 端必须对这里的内容重新做归一化解析和信任判定。
+    pub(crate) fn observed_candidate(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+    ) -> Option<(EncodedDocument, u64, Option<String>)> {
+        let key = combine_key(did, doc_type.as_ref());
+        let entry = self.load_ns(CacheNamespace::Unverified, &key)?;
+        let exp = entry.exp();
+        let source = entry.meta.source.clone();
+        entry.doc.map(|doc| (doc, exp, source))
+    }
+
+    /// 验证转正(doc/update-did-cache.md):把 `unverified/` 候选移动进
+    /// `verified/`,证据打 `Verified`。文件系统层面是一次原子移动(rename),
+    /// 不是读出重写。仍然要过一次 merge_allows(可能撞上已有的 Published/更高
+    /// version 的 Verified);移动失败时原 unverified 文件被删除——它已经被
+    /// 验证过一次并且证明"验证通过但不是更优版本",没有继续保留的价值。
+    ///
+    /// 返回 true 表示条目已进入 `verified/`。调用方(verify_and_promote)负责
+    /// 在此之前完成真正的验证;本函数只做落盘与合并纪律。
+    pub(crate) fn promote_observed(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+        exp: u64,
+    ) -> bool {
+        let key = combine_key(did, doc_type.as_ref());
+        let Some(entry) = self.load_ns(CacheNamespace::Unverified, &key) else {
+            return false;
+        };
+        let Some(doc) = entry.doc else {
+            self.remove_ns(CacheNamespace::Unverified, &key);
+            return false;
+        };
+
+        if self
+            .validate_owner_revocation(did, doc_type.clone(), &doc)
+            .is_err()
+        {
+            self.remove_ns(CacheNamespace::Unverified, &key);
+            return false;
+        }
+        if let Some(current) = self.load_ns(CacheNamespace::Verified, &key) {
+            if !merge_allows(did, &current, &doc, CacheEvidence::Verified) {
+                self.remove_ns(CacheNamespace::Unverified, &key);
+                return false;
+            }
+        }
+
+        let promoted = StoredEntry {
+            doc: Some(doc.clone()),
+            meta: StoredMeta {
+                evidence: CacheEvidence::Verified,
+                negative_status: None,
+                negative_message: None,
+                exp: Some(exp),
+                update_from_remote_time: Some(buckyos_get_unix_timestamp()),
+                source: entry.meta.source.clone(),
+                observed_at: entry.meta.observed_at,
+            },
+        };
+        let moved = match &self.backend {
+            Backend::Fs(store) => store.promote(&key, &promoted),
+            Backend::Mem(store) => store.promote(&key, &promoted),
+        };
+        if !moved {
+            return false;
+        }
+
+        // 与 write_positive 的联动一致:已验证的 owner 文档落地时清理被吊销文档。
+        if let Some(owner_document) = parse_owner_document_doc(doc_type.as_ref(), &doc) {
+            self.evict_revoked_docs(did, doc_type.as_ref(), &owner_document);
+        }
+        true
+    }
+
+    /// 删除 Observed 候选(lazy verify 明确失败后调用,避免同一份坏数据反复
+    /// 触发验证开销)。
+    pub(crate) fn delete_unverified(&self, did: &DID, doc_type: Option<DidDocType>) {
+        let key = combine_key(did, doc_type.as_ref());
+        self.remove_ns(CacheNamespace::Unverified, &key);
+    }
+
     /// 策略点①的缓存动作:删除 positive、写入负状态条目、屏蔽后续 fallback。
-    /// 负状态是"回答",不是 cache miss。
+    /// 负状态是"回答",不是 cache miss。同 key 的 Observed 候选一并清理。
     pub fn replace_with_negative(
         &self,
         did: &DID,
@@ -354,9 +569,12 @@ impl DIDDocumentCache {
                 negative_message: Some(message.to_string()),
                 exp: Some(buckyos_get_unix_timestamp() + NEGATIVE_STATE_TTL_SECS),
                 update_from_remote_time: Some(buckyos_get_unix_timestamp()),
+                source: None,
+                observed_at: None,
             },
         };
-        self.store(did, &key, &entry);
+        self.store(&key, &entry);
+        self.remove_ns(CacheNamespace::Unverified, &key);
     }
 
     pub fn delete(&self, did: DID, doc_type: Option<DidDocType>) {
@@ -383,12 +601,16 @@ impl DIDDocumentCache {
                 negative_message: Some(message.to_string()),
                 exp: Some(buckyos_get_unix_timestamp().saturating_sub(10)),
                 update_from_remote_time: Some(buckyos_get_unix_timestamp()),
+                source: None,
+                observed_at: None,
             },
         };
-        self.store(did, &key, &entry);
+        self.store(&key, &entry);
     }
 
     /// owner 文档声明的 replay guard(valid_iat / mini_version_seq)对读写两侧生效。
+    /// guard 的依据只能来自 `verified/` 命名空间的 owner 文档:Observed 命名空间
+    /// 里自称的 owner 文档未经验证,没有资格吊销任何条目。
     pub fn validate_owner_revocation(
         &self,
         did: &DID,
@@ -407,7 +629,7 @@ impl DIDDocumentCache {
     fn load_cached_owner_document(&self, did: &DID) -> Option<OwnerDocument> {
         let load_positive = |doc_type: Option<&DidDocType>| -> Option<EncodedDocument> {
             let key = combine_key(did, doc_type);
-            let entry = self.load(&key)?;
+            let entry = self.load_ns(CacheNamespace::Verified, &key)?;
             if entry.is_negative() {
                 return None;
             }
@@ -432,7 +654,7 @@ impl DIDDocumentCache {
             if same_doc_type(doc_type.as_ref(), owner_doc_type) {
                 continue;
             }
-            let Some(entry) = self.load(&key) else {
+            let Some(entry) = self.load_union(&key) else {
                 continue;
             };
             if entry.is_negative() {
@@ -494,9 +716,20 @@ fn merge_allows(
 
 // ------------------------ 文件系统后端(纯 KV) ------------------------
 //
-// 磁盘布局保持旧格式:`{key}.doc.json` 存文档原文(负条目没有这个文件),
-// `{key}.meta.json` 存 StoredMeta。旧版 meta 缺证据字段时按 serde default 读出;
-// 只有 doc 文件没有 meta 的手工放置文件按"从未从远端更新过"的本地种子对待。
+// 磁盘布局(doc/update-did-cache.md"文件系统协议"):
+//
+// ```text
+// {did_cache_root}/
+//   unverified/{key}.doc.json + {key}.meta.json   # 任何本机进程可写(Observed)
+//   verified/{key}.doc.json + {key}.meta.json     # 只有 name-client 受控写入
+// ```
+//
+// 所有写入都是"写 .tmp/ 临时文件 + rename 进目标目录"的两段式,保证目标目录里
+// 出现的文件始终是完整的;promote 对 doc 文件是一次真正的 rename 移动。
+// 旧版根目录平铺布局在启动时做一次性迁移(按 meta 证据分流;没有 meta 的
+// 手工文件按 Observed 对待)。
+
+static TMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 struct FsStore {
     cache_dir: PathBuf,
@@ -506,51 +739,163 @@ impl FsStore {
     fn new(cache_dir: Option<PathBuf>) -> Self {
         let cache_dir = cache_dir.unwrap_or_else(DIDDocumentCache::get_default_cache_dir);
         info!("doc cache directory: {}", cache_dir.display());
-        if let Err(err) = fs::create_dir_all(&cache_dir) {
-            error!(
-                "Failed to prepare doc cache directory {}: {}",
-                cache_dir.display(),
-                err
-            );
+        let store = Self { cache_dir };
+        for ns in [CacheNamespace::Unverified, CacheNamespace::Verified] {
+            if let Err(err) = fs::create_dir_all(store.tmp_dir(ns)) {
+                error!(
+                    "Failed to prepare doc cache directory {}: {}",
+                    store.ns_dir(ns).display(),
+                    err
+                );
+            }
         }
-        Self { cache_dir }
+        store.migrate_legacy_layout();
+        store
     }
 
-    fn doc_path(&self, key: &str) -> PathBuf {
-        self.cache_dir.join(format!("{}.doc.json", key))
+    fn ns_dir(&self, ns: CacheNamespace) -> PathBuf {
+        self.cache_dir.join(ns.dir_name())
     }
 
-    fn meta_path(&self, key: &str) -> PathBuf {
-        self.cache_dir.join(format!("{}.meta.json", key))
+    fn tmp_dir(&self, ns: CacheNamespace) -> PathBuf {
+        self.ns_dir(ns).join(".tmp")
     }
 
-    fn load(&self, key: &str) -> Option<StoredEntry> {
-        let meta = self.load_meta(key);
-        let doc = self.load_doc(key);
+    fn doc_path(&self, ns: CacheNamespace, key: &str) -> PathBuf {
+        self.ns_dir(ns).join(format!("{}.doc.json", key))
+    }
+
+    fn meta_path(&self, ns: CacheNamespace, key: &str) -> PathBuf {
+        self.ns_dir(ns).join(format!("{}.meta.json", key))
+    }
+
+    /// 旧版平铺布局({cache_dir}/{key}.doc.json)一次性迁移到命名空间目录。
+    /// meta 声明 Unverified 或根本没有 meta(手工放置)的进 unverified/,
+    /// 其余进 verified/。迁移失败只记日志,不阻塞启动。
+    fn migrate_legacy_layout(&self) {
+        let entries = match fs::read_dir(&self.cache_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        let mut keys = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.path().is_file() {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            for suffix in [".doc.json", ".meta.json"] {
+                if let Some(key) = file_name.strip_suffix(suffix) {
+                    if !keys.contains(&key.to_string()) {
+                        keys.push(key.to_string());
+                    }
+                }
+            }
+        }
+        for key in keys {
+            let legacy_meta = self.cache_dir.join(format!("{}.meta.json", key));
+            let meta = fs::read_to_string(&legacy_meta)
+                .ok()
+                .and_then(|content| serde_json::from_str::<StoredMeta>(&content).ok());
+            let ns = match &meta {
+                Some(meta) if meta.evidence != CacheEvidence::Unverified => {
+                    CacheNamespace::Verified
+                }
+                // Unverified meta 或手工放置(无 meta):按 Observed 对待。
+                _ => CacheNamespace::Unverified,
+            };
+            info!(
+                "migrating legacy did cache entry {} to {}/",
+                key,
+                ns.dir_name()
+            );
+            for suffix in [".doc.json", ".meta.json"] {
+                let from = self.cache_dir.join(format!("{}{}", key, suffix));
+                if !from.exists() {
+                    continue;
+                }
+                let to = self.ns_dir(ns).join(format!("{}{}", key, suffix));
+                if let Err(err) = fs::rename(&from, &to) {
+                    warn!(
+                        "migrate legacy did cache file {} failed: {}",
+                        from.display(),
+                        err
+                    );
+                }
+            }
+        }
+    }
+
+    /// 两段式原子写:先写同命名空间下 .tmp/ 里的临时文件,再 rename 进目标位置,
+    /// 避免并发读者看到半写文件。临时文件名带 PID + 进程内序号,规避并发命名冲突。
+    fn write_atomic(&self, ns: CacheNamespace, target: &Path, content: &str) -> std::io::Result<()> {
+        let tmp_dir = self.tmp_dir(ns);
+        if !tmp_dir.exists() {
+            fs::create_dir_all(&tmp_dir)?;
+        }
+        let file_name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "entry".to_string());
+        let tmp_path = tmp_dir.join(format!(
+            "{}.{}.{}",
+            file_name,
+            std::process::id(),
+            TMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&tmp_path, content)?;
+        match fs::rename(&tmp_path, target) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
+    }
+
+    fn load(&self, ns: CacheNamespace, key: &str) -> Option<StoredEntry> {
+        let meta = self.load_meta(ns, key);
+        let doc = self.load_doc(ns, key);
 
         match (doc, meta) {
-            (doc, Some(meta)) => {
+            (doc, Some(mut meta)) => {
                 if meta.negative_status.is_none() && doc.is_none() {
                     return None;
+                }
+                // 文件系统协议里写入方 meta 只允许 source/observed_at/
+                // hint_doc_type,不含 exp:unverified 条目缺 exp 时按文件
+                // 修改时间 + 24h 兜底,与 doc-only 手工投递一致。
+                if ns == CacheNamespace::Unverified && meta.exp.is_none() && doc.is_some() {
+                    meta.exp = fs::metadata(self.doc_path(ns, key))
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() + 3600 * 24);
                 }
                 Some(StoredEntry { doc, meta })
             }
             (Some(doc), None) => {
-                // 手工放置的本地种子文件:没有 meta,视为"从未从远端更新过",
-                // 过期时间退化为文件修改时间 + 24h。
-                let default_exp = fs::metadata(self.doc_path(key))
+                // 手工放置的文件:没有 meta,过期时间退化为文件修改时间 + 24h。
+                // 证据等级由命名空间钳制(统一层),这里给出该命名空间的默认档。
+                let default_exp = fs::metadata(self.doc_path(ns, key))
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() + 3600 * 24);
+                let evidence = match ns {
+                    CacheNamespace::Unverified => CacheEvidence::Unverified,
+                    // verified/ 的写权限已经过滤了写者,doc-only 视为受控本地种子。
+                    CacheNamespace::Verified => default_cache_evidence(),
+                };
                 Some(StoredEntry {
                     doc: Some(doc),
                     meta: StoredMeta {
-                        evidence: default_cache_evidence(),
+                        evidence,
                         negative_status: None,
                         negative_message: None,
                         exp: default_exp,
                         update_from_remote_time: None,
+                        source: None,
+                        observed_at: None,
                     },
                 })
             }
@@ -558,8 +903,8 @@ impl FsStore {
         }
     }
 
-    fn load_doc(&self, key: &str) -> Option<EncodedDocument> {
-        let file_path = self.doc_path(key);
+    fn load_doc(&self, ns: CacheNamespace, key: &str) -> Option<EncodedDocument> {
+        let file_path = self.doc_path(ns, key);
         match fs::read_to_string(&file_path) {
             Ok(content) => match EncodedDocument::from_str(content) {
                 Ok(doc) => Some(doc),
@@ -583,8 +928,8 @@ impl FsStore {
         }
     }
 
-    fn load_meta(&self, key: &str) -> Option<StoredMeta> {
-        let meta_path = self.meta_path(key);
+    fn load_meta(&self, ns: CacheNamespace, key: &str) -> Option<StoredMeta> {
+        let meta_path = self.meta_path(ns, key);
         match fs::read_to_string(&meta_path) {
             Ok(content) => match serde_json::from_str::<StoredMeta>(&content) {
                 Ok(meta) => Some(meta),
@@ -610,11 +955,11 @@ impl FsStore {
         }
     }
 
-    fn store(&self, key: &str, entry: &StoredEntry) {
+    fn store(&self, ns: CacheNamespace, key: &str, entry: &StoredEntry) {
         match entry.doc.as_ref() {
             Some(doc) => {
-                let file_path = self.doc_path(key);
-                if let Err(err) = fs::write(&file_path, doc.to_string()) {
+                let file_path = self.doc_path(ns, key);
+                if let Err(err) = self.write_atomic(ns, &file_path, &doc.to_string()) {
                     error!(
                         "write did doc to local cache failed: {}, {}",
                         file_path.display(),
@@ -624,18 +969,18 @@ impl FsStore {
             }
             None => {
                 // 负条目没有 doc 文件。
-                let _ = fs::remove_file(self.doc_path(key));
+                let _ = fs::remove_file(self.doc_path(ns, key));
             }
         }
         if let Ok(content) = serde_json::to_string(&entry.meta) {
-            if let Err(err) = fs::write(self.meta_path(key), content) {
+            if let Err(err) = self.write_atomic(ns, &self.meta_path(ns, key), &content) {
                 warn!("write did doc meta to local cache failed: {}", err);
             }
         }
     }
 
-    fn remove(&self, key: &str) {
-        for path in [self.doc_path(key), self.meta_path(key)] {
+    fn remove(&self, ns: CacheNamespace, key: &str) {
+        for path in [self.doc_path(ns, key), self.meta_path(ns, key)] {
             if let Err(err) = fs::remove_file(&path) {
                 if err.kind() != std::io::ErrorKind::NotFound {
                     warn!(
@@ -648,8 +993,40 @@ impl FsStore {
         }
     }
 
-    fn keys_with_prefix(&self, did_key: &str) -> Vec<String> {
-        let entries = match fs::read_dir(&self.cache_dir) {
+    /// promote:doc 文件从 unverified/ rename 到 verified/(本地文件系统上的
+    /// 原子移动,不读出重写),meta 由验证结果重新生成后原子写入。
+    fn promote(&self, key: &str, entry: &StoredEntry) -> bool {
+        let from = self.doc_path(CacheNamespace::Unverified, key);
+        let to = self.doc_path(CacheNamespace::Verified, key);
+        if let Err(err) = fs::rename(&from, &to) {
+            warn!(
+                "promote did cache doc {} -> {} failed: {}",
+                from.display(),
+                to.display(),
+                err
+            );
+            return false;
+        }
+        match serde_json::to_string(&entry.meta) {
+            Ok(content) => {
+                if let Err(err) = self.write_atomic(
+                    CacheNamespace::Verified,
+                    &self.meta_path(CacheNamespace::Verified, key),
+                    &content,
+                ) {
+                    warn!("write promoted did doc meta failed: {}", err);
+                }
+            }
+            Err(err) => {
+                warn!("serialize promoted did doc meta failed: {}", err);
+            }
+        }
+        let _ = fs::remove_file(self.meta_path(CacheNamespace::Unverified, key));
+        true
+    }
+
+    fn keys_with_prefix(&self, ns: CacheNamespace, did_key: &str) -> Vec<String> {
+        let entries = match fs::read_dir(self.ns_dir(ns)) {
             Ok(entries) => entries,
             Err(err) => {
                 warn!("read did cache directory failed: {}", err);
@@ -673,250 +1050,61 @@ impl FsStore {
     }
 }
 
-// ------------------------ SQLite 后端(纯 KV) ------------------------
-
-struct DbStore {
-    db_path: PathBuf,
-}
-
-impl DbStore {
-    fn new(cache_dir: Option<PathBuf>) -> name_lib::NSResult<Self> {
-        let base_dir = cache_dir.unwrap_or_else(|| get_buckyos_service_local_data_dir("did_docs"));
-        if let Err(err) = fs::create_dir_all(&base_dir) {
-            return Err(name_lib::NSError::ReadLocalFileError(format!(
-                "prepare sqlite cache dir failed: {}",
-                err
-            )));
-        }
-        let store = Self {
-            db_path: base_dir.join("did_docs.sqlite"),
-        };
-        store.init_schema()?;
-        Ok(store)
-    }
-
-    fn open_conn(&self) -> rusqlite::Result<Connection> {
-        Connection::open_with_flags(
-            &self.db_path,
-            OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )
-    }
-
-    fn init_schema(&self) -> name_lib::NSResult<()> {
-        let conn = self.open_conn().map_err(|e| {
-            name_lib::NSError::ReadLocalFileError(format!("open sqlite failed: {}", e))
-        })?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS did_docs (
-                doc_key TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                doc_type TEXT NOT NULL,
-                doc TEXT NOT NULL,
-                exp INTEGER NOT NULL,
-                trust_level INTEGER NOT NULL DEFAULT 0,
-                update_from_remote_time INTEGER,
-                evidence TEXT,
-                negative_status TEXT,
-                negative_message TEXT
-            )",
-            [],
-        )
-        .map_err(|e| {
-            name_lib::NSError::ReadLocalFileError(format!("create table failed: {}", e))
-        })?;
-
-        // 旧库的 schema 迁移:补齐新列。
-        for column in [
-            "update_from_remote_time INTEGER",
-            "evidence TEXT",
-            "negative_status TEXT",
-            "negative_message TEXT",
-        ] {
-            let column_name = column.split(' ').next().unwrap();
-            if !Self::has_column(&conn, column_name).map_err(|e| {
-                name_lib::NSError::ReadLocalFileError(format!("inspect table failed: {}", e))
-            })? {
-                conn.execute(&format!("ALTER TABLE did_docs ADD COLUMN {}", column), [])
-                    .map_err(|e| {
-                        name_lib::NSError::ReadLocalFileError(format!(
-                            "migrate table failed: {}",
-                            e
-                        ))
-                    })?;
-            }
-        }
-        Ok(())
-    }
-
-    fn has_column(conn: &Connection, column: &str) -> rusqlite::Result<bool> {
-        let mut stmt = conn.prepare("PRAGMA table_info(did_docs)")?;
-        let column_iter = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for col_name in column_iter.flatten() {
-            if col_name == column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn load(&self, key: &str) -> Option<StoredEntry> {
-        let conn = self.open_conn().ok()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT doc, exp, update_from_remote_time, evidence, negative_status, negative_message
-                 FROM did_docs WHERE doc_key = ?1",
-            )
-            .ok()?;
-        let row = stmt
-            .query_row(params![key], |row| {
-                let doc_str: String = row.get(0)?;
-                let exp: i64 = row.get(1)?;
-                let update_from_remote_time: Option<i64> = row.get(2).unwrap_or(None);
-                let evidence: Option<String> = row.get(3).unwrap_or(None);
-                let negative_status: Option<String> = row.get(4).unwrap_or(None);
-                let negative_message: Option<String> = row.get(5).unwrap_or(None);
-                Ok((
-                    doc_str,
-                    exp as u64,
-                    update_from_remote_time.map(|v| v as u64),
-                    evidence,
-                    negative_status,
-                    negative_message,
-                ))
-            })
-            .ok()?;
-
-        let (doc_str, exp, update_from_remote_time, evidence, negative_status, negative_message) =
-            row;
-        let evidence = evidence
-            .and_then(|value| serde_json::from_value(serde_json::Value::String(value)).ok())
-            .unwrap_or_else(default_cache_evidence);
-        let doc = if doc_str.is_empty() {
-            None
-        } else {
-            EncodedDocument::from_str(doc_str).ok()
-        };
-        if negative_status.is_none() && doc.is_none() {
-            return None;
-        }
-        Some(StoredEntry {
-            doc,
-            meta: StoredMeta {
-                evidence,
-                negative_status,
-                negative_message,
-                exp: Some(exp),
-                update_from_remote_time,
-            },
-        })
-    }
-
-    fn store(&self, did: &DID, key: &str, entry: &StoredEntry) {
-        let conn = match self.open_conn() {
-            Ok(c) => c,
-            Err(err) => {
-                warn!("open sqlite cache failed: {}", err);
-                return;
-            }
-        };
-        let doc_type = key
-            .strip_prefix(&format!("{}#", did_cache_key(did)))
-            .unwrap_or("")
-            .to_string();
-        let evidence = serde_json::to_value(entry.meta.evidence)
-            .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "Published".to_string());
-        if let Err(err) = conn.execute(
-            "INSERT INTO did_docs (doc_key, did, doc_type, doc, exp, trust_level, update_from_remote_time, evidence, negative_status, negative_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(doc_key) DO UPDATE SET doc = excluded.doc, exp = excluded.exp,
-                 update_from_remote_time = excluded.update_from_remote_time,
-                 evidence = excluded.evidence,
-                 negative_status = excluded.negative_status,
-                 negative_message = excluded.negative_message",
-            params![
-                key,
-                did_cache_key(did),
-                doc_type,
-                entry
-                    .doc
-                    .as_ref()
-                    .map(|doc| doc.to_string())
-                    .unwrap_or_default(),
-                entry.exp() as i64,
-                entry.meta.evidence.rank() as i32,
-                entry.meta.update_from_remote_time.map(|v| v as i64),
-                evidence,
-                entry.meta.negative_status,
-                entry.meta.negative_message,
-            ],
-        ) {
-            warn!("write did doc sqlite cache failed: {}", err);
-        }
-    }
-
-    fn remove(&self, key: &str) {
-        let conn = match self.open_conn() {
-            Ok(c) => c,
-            Err(err) => {
-                warn!("open sqlite cache failed when delete: {}", err);
-                return;
-            }
-        };
-        if let Err(err) = conn.execute("DELETE FROM did_docs WHERE doc_key = ?1", params![key]) {
-            warn!("delete did doc sqlite cache failed: {}", err);
-        }
-    }
-
-    fn keys_for_did(&self, did_key: &str) -> Vec<String> {
-        let conn = match self.open_conn() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        let mut stmt = match conn.prepare("SELECT doc_key FROM did_docs WHERE did = ?1") {
-            Ok(stmt) => stmt,
-            Err(_) => return Vec::new(),
-        };
-        let rows = match stmt.query_map(params![did_key], |row| row.get::<_, String>(0)) {
-            Ok(rows) => rows,
-            Err(_) => return Vec::new(),
-        };
-        rows.flatten().collect()
-    }
-}
-
 // ------------------------ 内存后端(纯 KV,测试用) ------------------------
+//
+// 单机/测试环境不要求两个物理目录:同一进程内用两个命名空间模拟,行为满足
+// "目录即证据"的语义(doc/update-did-cache.md 非目标第 6 条)。
 
 struct MemStore {
-    entries: std::sync::Arc<RwLock<HashMap<String, StoredEntry>>>,
+    unverified: std::sync::Arc<RwLock<HashMap<String, StoredEntry>>>,
+    verified: std::sync::Arc<RwLock<HashMap<String, StoredEntry>>>,
 }
 
 impl MemStore {
     fn new() -> Self {
         Self {
-            entries: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            unverified: std::sync::Arc::new(RwLock::new(HashMap::new())),
+            verified: std::sync::Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    fn load(&self, key: &str) -> Option<StoredEntry> {
-        self.entries.read().ok()?.get(key).cloned()
+    fn entries(&self, ns: CacheNamespace) -> &RwLock<HashMap<String, StoredEntry>> {
+        match ns {
+            CacheNamespace::Unverified => &self.unverified,
+            CacheNamespace::Verified => &self.verified,
+        }
     }
 
-    fn store(&self, key: &str, entry: &StoredEntry) {
-        if let Ok(mut guard) = self.entries.write() {
+    fn load(&self, ns: CacheNamespace, key: &str) -> Option<StoredEntry> {
+        self.entries(ns).read().ok()?.get(key).cloned()
+    }
+
+    fn store(&self, ns: CacheNamespace, key: &str, entry: &StoredEntry) {
+        if let Ok(mut guard) = self.entries(ns).write() {
             guard.insert(key.to_string(), entry.clone());
         }
     }
 
-    fn remove(&self, key: &str) {
-        if let Ok(mut guard) = self.entries.write() {
+    fn remove(&self, ns: CacheNamespace, key: &str) {
+        if let Ok(mut guard) = self.entries(ns).write() {
             guard.remove(key);
         }
     }
 
-    fn keys_with_prefix(&self, did_key: &str) -> Vec<String> {
-        match self.entries.read() {
+    fn promote(&self, key: &str, entry: &StoredEntry) -> bool {
+        let removed = match self.entries(CacheNamespace::Unverified).write() {
+            Ok(mut guard) => guard.remove(key).is_some(),
+            Err(_) => false,
+        };
+        if !removed {
+            return false;
+        }
+        self.store(CacheNamespace::Verified, key, entry);
+        true
+    }
+
+    fn keys_with_prefix(&self, ns: CacheNamespace, did_key: &str) -> Vec<String> {
+        match self.entries(ns).read() {
             Ok(guard) => guard
                 .keys()
                 .filter(|key| key.as_str() == did_key || key.starts_with(&format!("{}#", did_key)))
@@ -1078,9 +1266,7 @@ fn doc_type_from_cache_key(did_key: &str, key: &str) -> Option<Option<DidDocType
 mod tests {
     use super::*;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-    use name_lib::{
-        DIDDocumentTrait, NSError, OwnerDocument, ZoneBootDocument, DEFAULT_EXPIRE_TIME,
-    };
+    use name_lib::{DIDDocumentTrait, OwnerDocument, ZoneBootDocument, DEFAULT_EXPIRE_TIME};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -1099,13 +1285,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     fn setup_fs_cache() -> (tempfile::TempDir, DIDDocumentCache, DID) {
         let tmp_dir = tempdir().unwrap();
         let cache = DIDDocumentCache::new(Some(tmp_dir.path().to_path_buf()));
-        let did = DID::from_str("did:web:example.com").unwrap();
-        (tmp_dir, cache, did)
-    }
-
-    fn setup_db_cache() -> (tempfile::TempDir, DIDDocumentCache, DID) {
-        let tmp_dir = tempdir().unwrap();
-        let cache = DIDDocumentCache::new_db(Some(tmp_dir.path().to_path_buf())).unwrap();
         let did = DID::from_str("did:web:example.com").unwrap();
         (tmp_dir, cache, did)
     }
@@ -1185,7 +1364,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         }
     }
 
-    // ---- 基本读写(三种后端) ----
+    // ---- 基本读写(两种后端) ----
 
     fn assert_roundtrip_with_evidence(cache: &DIDDocumentCache, did: &DID) {
         let now = buckyos_get_unix_timestamp();
@@ -1198,6 +1377,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 exp: loaded_exp,
                 evidence,
                 in_ttl,
+                ..
             } => {
                 assert_eq!(loaded, doc);
                 assert_eq!(loaded_exp, exp);
@@ -1211,12 +1391,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     #[test]
     fn fs_roundtrip_preserves_evidence() {
         let (_tmp, cache, did) = setup_fs_cache();
-        assert_roundtrip_with_evidence(&cache, &did);
-    }
-
-    #[test]
-    fn db_roundtrip_preserves_evidence() {
-        let (_tmp, cache, did) = setup_db_cache();
         assert_roundtrip_with_evidence(&cache, &did);
     }
 
@@ -1263,6 +1437,8 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             CacheEvidence::Unverified
         ));
         assert!(cache.lookup(did, None).unwrap().is_negative());
+        // Observed 命名空间同样不产生条目(负状态屏蔽一切写入)。
+        assert!(cache.observed_candidate(did, None).is_none());
 
         // 只有权威源的新 DR(Published 证据)能翻篇。
         assert!(cache.update(
@@ -1278,12 +1454,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     #[test]
     fn fs_negative_state_blocks_and_flips() {
         let (_tmp, cache, did) = setup_fs_cache();
-        assert_negative_state_blocks_and_flips(&cache, &did);
-    }
-
-    #[test]
-    fn db_negative_state_blocks_and_flips() {
-        let (_tmp, cache, did) = setup_db_cache();
         assert_negative_state_blocks_and_flips(&cache, &did);
     }
 
@@ -1321,15 +1491,17 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         ));
         assert_eq!(positive_doc(&cache, &did), published);
 
-        // 未验证 push 更不行。
+        // 未验证 push 更不行:它被记录为 Observed,但查询仍然命中 verified 条目。
         let pushed = build_zone_doc(&did, exp + 2000, "pushed");
         assert!(!cache.update(
             did.clone(),
             None,
-            pushed,
+            pushed.clone(),
             exp + 2000,
             CacheEvidence::Unverified
         ));
+        assert_eq!(positive_doc(&cache, &did), published);
+        assert_eq!(cache.observed_candidate(&did, None).unwrap().0, pushed);
 
         // 同级(已发布)才比新旧。
         let newer_published = build_zone_doc(&did, exp + 3000, "published-new");
@@ -1522,20 +1694,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[test]
-    fn db_owner_update_evicts_revoked_docs() -> Result<(), NSError> {
-        let (_tmp_dir, cache, did) = setup_db_cache();
-        assert_owner_update_evicts_revoked_docs(&cache, &did);
-        Ok(())
-    }
-
-    #[test]
-    fn db_owner_policy_rejects_new_revoked_doc() -> Result<(), NSError> {
-        let (_tmp_dir, cache, did) = setup_db_cache();
-        assert_owner_policy_rejects_new_revoked_doc(&cache, &did);
-        Ok(())
-    }
-
-    #[test]
     fn mem_owner_update_evicts_revoked_docs() {
         let (cache, did) = setup_mem_cache();
         assert_owner_update_evicts_revoked_docs(&cache, &did);
@@ -1545,6 +1703,200 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     fn mem_owner_policy_rejects_new_revoked_doc() {
         let (cache, did) = setup_mem_cache();
         assert_owner_policy_rejects_new_revoked_doc(&cache, &did);
+    }
+
+    // ---- 目录即证据(doc/update-did-cache.md) ----
+
+    /// unverified/ 目录下的 meta 自称 Published 也一律按 Unverified 对待。
+    #[test]
+    fn fs_unverified_dir_clamps_self_claimed_evidence() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let now = buckyos_get_unix_timestamp();
+        let doc = build_zone_doc(&did, now + 1000, "self-claimed");
+        let key = did_cache_key(&did);
+        let unverified_dir = tmp_dir.path().join("unverified");
+        fs::write(
+            unverified_dir.join(format!("{}.doc.json", key)),
+            doc.to_string(),
+        )
+        .unwrap();
+        fs::write(
+            unverified_dir.join(format!("{}.meta.json", key)),
+            format!("{{\"evidence\":\"Published\",\"exp\":{}}}", now + 1000),
+        )
+        .unwrap();
+
+        match cache.lookup(&did, None).unwrap() {
+            CacheLookup::Positive { evidence, .. } => {
+                assert_eq!(evidence, CacheEvidence::Unverified);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    /// unverified/ 目录下手工放置的负状态 meta 不被信任(否则任何人都能屏蔽解析)。
+    #[test]
+    fn fs_unverified_dir_ignores_self_claimed_negative_state() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let key = did_cache_key(&did);
+        fs::write(
+            tmp_dir
+                .path()
+                .join("unverified")
+                .join(format!("{}.meta.json", key)),
+            "{\"negative_status\":\"Revoked\",\"negative_message\":\"fake\"}",
+        )
+        .unwrap();
+        assert!(cache.lookup(&did, None).is_none());
+    }
+
+    /// 手工往 unverified/ 丢一个 doc 文件(无 meta)等价于一次 update_did_cache:
+    /// 可被观察到,证据 Unverified("目录即协议")。
+    #[test]
+    fn fs_hand_placed_doc_in_unverified_dir_is_observed() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let now = buckyos_get_unix_timestamp();
+        let doc = build_zone_doc(&did, now + 100, "hand-placed");
+        fs::write(
+            tmp_dir
+                .path()
+                .join("unverified")
+                .join(format!("{}.doc.json", did_cache_key(&did))),
+            doc.to_string(),
+        )
+        .unwrap();
+
+        match cache.lookup(&did, None).unwrap() {
+            CacheLookup::Positive {
+                doc: loaded,
+                evidence,
+                in_ttl,
+                ..
+            } => {
+                assert_eq!(loaded, doc);
+                assert_eq!(evidence, CacheEvidence::Unverified);
+                assert!(in_ttl, "hand-placed file exp derives from mtime + 24h");
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        assert_eq!(cache.observed_candidate(&did, None).unwrap().0, doc);
+    }
+
+    /// verified/ 已有 Published 记录时,unverified/ 出现新文件不影响查询结果。
+    #[test]
+    fn fs_observed_file_never_shadows_verified_entry() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let now = buckyos_get_unix_timestamp();
+        let published = build_zone_doc(&did, now + 1000, "published");
+        cache.insert(
+            did.clone(),
+            None,
+            published.clone(),
+            now + 1000,
+            CacheEvidence::Published,
+        );
+
+        let observed = build_zone_doc(&did, now + 5000, "observed-later");
+        fs::write(
+            tmp_dir
+                .path()
+                .join("unverified")
+                .join(format!("{}.doc.json", did_cache_key(&did))),
+            observed.to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(positive_doc(&cache, &did), published);
+        // Observed 候选仍然可见(供 lazy verify / 诊断),但查询永远优先 verified。
+        assert_eq!(cache.observed_candidate(&did, None).unwrap().0, observed);
+    }
+
+    /// promote:文件从 unverified/ 移动到 verified/,证据打 Verified,source 保留。
+    #[test]
+    fn fs_promote_moves_files_between_directories() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let now = buckyos_get_unix_timestamp();
+        let doc = build_zone_doc(&did, now + 1000, "to-promote");
+        assert!(cache.update_observed(
+            did.clone(),
+            None,
+            doc.clone(),
+            now + 1000,
+            Some("UdpDiscovery".to_string()),
+        ));
+        let key = did_cache_key(&did);
+        assert!(tmp_dir
+            .path()
+            .join("unverified")
+            .join(format!("{}.doc.json", key))
+            .exists());
+
+        assert!(cache.promote_observed(&did, None, now + 1000));
+
+        assert!(!tmp_dir
+            .path()
+            .join("unverified")
+            .join(format!("{}.doc.json", key))
+            .exists());
+        assert!(!tmp_dir
+            .path()
+            .join("unverified")
+            .join(format!("{}.meta.json", key))
+            .exists());
+        assert!(tmp_dir
+            .path()
+            .join("verified")
+            .join(format!("{}.doc.json", key))
+            .exists());
+        match cache.lookup(&did, None).unwrap() {
+            CacheLookup::Positive {
+                doc: loaded,
+                evidence,
+                source,
+                ..
+            } => {
+                assert_eq!(loaded, doc);
+                assert_eq!(evidence, CacheEvidence::Verified);
+                assert_eq!(source.as_deref(), Some("UdpDiscovery"));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    /// promote 阶段 merge_allows 失败(verified/ 已有更优记录)时,unverified/
+    /// 源文件被清理,不会无限堆积(测试要求 9)。
+    fn assert_promote_merge_reject_cleans_observed(cache: &DIDDocumentCache, did: &DID) {
+        let now = buckyos_get_unix_timestamp();
+        let published = build_zone_doc(did, now + 2000, "published-better");
+        cache.insert(
+            did.clone(),
+            None,
+            published.clone(),
+            now + 2000,
+            CacheEvidence::Published,
+        );
+        let observed = build_zone_doc(did, now + 1000, "observed-worse");
+        cache.update_observed(did.clone(), None, observed, now + 1000, None);
+        assert!(cache.observed_candidate(did, None).is_some());
+
+        assert!(!cache.promote_observed(did, None, now + 1000));
+        assert!(
+            cache.observed_candidate(did, None).is_none(),
+            "rejected observed candidate should be cleaned up"
+        );
+        assert_eq!(positive_doc(cache, did), published);
+    }
+
+    #[test]
+    fn fs_promote_merge_reject_cleans_observed() {
+        let (_tmp, cache, did) = setup_fs_cache();
+        assert_promote_merge_reject_cleans_observed(&cache, &did);
+    }
+
+    #[test]
+    fn mem_promote_merge_reject_cleans_observed() {
+        let (cache, did) = setup_mem_cache();
+        assert_promote_merge_reject_cleans_observed(&cache, &did);
     }
 
     // ---- key 布局 ----
@@ -1585,15 +1937,9 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_eq!(did_cache_key(&path_did), "example.com%2Fabc%2Fbcd");
         assert!(tmp_dir
             .path()
+            .join("verified")
             .join(format!("{}.doc.json", did_cache_key(&path_did)))
             .exists());
-    }
-
-    #[test]
-    fn db_cache_uses_filename_key_for_path_did() -> Result<(), NSError> {
-        let (_tmp_dir, cache, _) = setup_db_cache();
-        assert_path_did_does_not_collide_with_host_did(&cache);
-        Ok(())
     }
 
     #[test]
@@ -1602,48 +1948,26 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert_path_did_does_not_collide_with_host_did(&cache);
     }
 
-    // ---- 兼容:手工放置/旧格式 ----
+    // ---- 兼容:旧平铺布局迁移 ----
 
     #[test]
-    fn fs_hand_placed_doc_without_meta_is_local_seed() {
-        let (tmp_dir, cache, did) = setup_fs_cache();
+    fn fs_legacy_flat_layout_is_migrated_by_meta_evidence() {
+        let tmp_dir = tempdir().unwrap();
+        let did = DID::from_str("did:web:example.com").unwrap();
+        let observed_did = DID::from_str("did:web:observed.example").unwrap();
         let now = buckyos_get_unix_timestamp();
-        let doc = build_zone_doc(&did, now + 100, "seed");
-        fs::write(
-            tmp_dir
-                .path()
-                .join(format!("{}.doc.json", did_cache_key(&did))),
-            doc.to_string(),
-        )
-        .unwrap();
 
-        match cache.lookup(&did, None).unwrap() {
-            CacheLookup::Positive {
-                doc: loaded,
-                evidence,
-                in_ttl,
-                ..
-            } => {
-                assert_eq!(loaded, doc);
-                assert_eq!(evidence, CacheEvidence::Published);
-                assert!(in_ttl, "seed file exp derives from mtime + 24h");
-            }
-            other => panic!("unexpected {:?}", other),
-        }
-    }
-
-    #[test]
-    fn fs_legacy_meta_without_evidence_defaults_to_published() {
-        let (tmp_dir, cache, did) = setup_fs_cache();
-        let now = buckyos_get_unix_timestamp();
-        let doc = build_zone_doc(&did, now + 1000, "legacy");
+        // 旧版根目录平铺文件:带 Published meta 的、带 Unverified meta 的、
+        // 以及没有 meta 的手工种子。
+        let published_doc = build_zone_doc(&did, now + 1000, "legacy-published");
         let key = did_cache_key(&did);
         fs::write(
             tmp_dir.path().join(format!("{}.doc.json", key)),
-            doc.to_string(),
+            published_doc.to_string(),
         )
         .unwrap();
-        // 旧版 meta 格式:只有 trust_level / exp / update_from_remote_time。
+        // 旧版 meta 格式:只有 trust_level / exp / update_from_remote_time,
+        // 缺证据字段按 serde default(Published)读出。
         fs::write(
             tmp_dir.path().join(format!("{}.meta.json", key)),
             format!(
@@ -1654,10 +1978,68 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         )
         .unwrap();
 
+        let observed_doc = build_zone_doc(&observed_did, now + 1000, "legacy-observed");
+        let observed_key = did_cache_key(&observed_did);
+        fs::write(
+            tmp_dir.path().join(format!("{}.doc.json", observed_key)),
+            observed_doc.to_string(),
+        )
+        .unwrap();
+
+        let cache = DIDDocumentCache::new(Some(tmp_dir.path().to_path_buf()));
+
+        // Published meta → verified/,证据保持 Published。
+        assert!(tmp_dir
+            .path()
+            .join("verified")
+            .join(format!("{}.doc.json", key))
+            .exists());
         match cache.lookup(&did, None).unwrap() {
             CacheLookup::Positive { evidence, exp, .. } => {
                 assert_eq!(evidence, CacheEvidence::Published);
                 assert_eq!(exp, now + 1000);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+
+        // 手工种子(无 meta)→ unverified/,证据钳制为 Unverified。
+        assert!(tmp_dir
+            .path()
+            .join("unverified")
+            .join(format!("{}.doc.json", observed_key))
+            .exists());
+        match cache.lookup(&observed_did, None).unwrap() {
+            CacheLookup::Positive { evidence, .. } => {
+                assert_eq!(evidence, CacheEvidence::Unverified);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    /// verified/ 目录里 doc-only(无 meta)按受控本地种子(Published 档)对待:
+    /// 能写 verified/ 的都是受控写者,"谁写的"由部署方权限配置负责,
+    /// doc_cache 自身不在应用层重新校验(测试要求 8)。
+    #[test]
+    fn fs_verified_dir_trusts_hand_placed_meta_by_design() {
+        let (tmp_dir, cache, did) = setup_fs_cache();
+        let now = buckyos_get_unix_timestamp();
+        let doc = build_zone_doc(&did, now + 1000, "op-seed");
+        let key = did_cache_key(&did);
+        let verified_dir = tmp_dir.path().join("verified");
+        fs::write(
+            verified_dir.join(format!("{}.doc.json", key)),
+            doc.to_string(),
+        )
+        .unwrap();
+        fs::write(
+            verified_dir.join(format!("{}.meta.json", key)),
+            format!("{{\"evidence\":\"Published\",\"exp\":{}}}", now + 1000),
+        )
+        .unwrap();
+
+        match cache.lookup(&did, None).unwrap() {
+            CacheLookup::Positive { evidence, .. } => {
+                assert_eq!(evidence, CacheEvidence::Published);
             }
             other => panic!("unexpected {:?}", other),
         }
