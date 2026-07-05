@@ -586,7 +586,13 @@ impl DeviceInfo {
         sys.refresh_all();
 
         let discovered_ips = collect_reachable_ip_addrs();
-        self.all_ip = discovered_ips.clone();
+        // all_ip is meant to complement device_doc.ips (together they form the full ip set),
+        // so avoid storing ips that are already present in device_doc.ips.
+        self.all_ip = discovered_ips
+            .iter()
+            .filter(|ip| !self.device_doc.ips.contains(ip))
+            .cloned()
+            .collect();
         for ip in discovered_ips {
             push_unique_ip(&mut self.device_doc.ips, ip);
         }
