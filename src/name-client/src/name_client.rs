@@ -436,9 +436,21 @@ impl NameClient {
     }
 
     pub async fn resolve_ips(&self, name: &str) -> NSResult<Vec<IpAddr>> {
-        if let Some(ips) = self.resolve_device_document_ips(name).await? {
-            return self.sort_resolved_ips(&ips);
-        }
+        // Document 固定 IP 只是优先级最高的一条信道:它解析失败(权威渠道断网、
+        // 网关返回损坏内容等)不能终结整个 resolve_ips,nameinfo / device-info
+        // 仍可能给出可用地址。该错误只在所有信道都落空时作为兜底错误报出。
+        let device_document_error = match self.resolve_device_document_ips(name).await {
+            Ok(Some(ips)) => return self.sort_resolved_ips(&ips),
+            Ok(None) => None,
+            Err(err) => {
+                debug!(
+                    "resolve_ips({}): device document channel failed, \
+                     falling back to nameinfo/device-info: {}",
+                    name, err
+                );
+                Some(err)
+            }
+        };
 
         let mut merged_ips = Vec::new();
         let mut first_error = None;
@@ -461,7 +473,9 @@ impl NameClient {
             return self.sort_resolved_ips(&merged_ips);
         }
 
-        Err(first_error.unwrap_or_else(|| NSError::NotFound("A record not found".to_string())))
+        Err(first_error
+            .or(device_document_error)
+            .unwrap_or_else(|| NSError::NotFound("A record not found".to_string())))
     }
 
     pub async fn resolve_with_local_ip(
@@ -2772,6 +2786,60 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 "192.0.2.30".parse::<IpAddr>().unwrap(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_ips_falls_back_when_device_document_resolution_fails() {
+        // 权威读取端拿回损坏内容(如网关把错误页当文档返回)时,resolve_did
+        // 以非 NotFound 错误落空。这只作废 Document 固定 IP 信道,不能终结
+        // resolve_ips:nameinfo 信道仍要照常给出地址。
+        struct GarbageAuthority;
+
+        #[async_trait]
+        impl NsProvider for GarbageAuthority {
+            fn get_id(&self) -> String {
+                "garbage-authority".to_string()
+            }
+
+            async fn query(
+                &self,
+                _name: &str,
+                _record_type: Option<RecordType>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<NameInfo> {
+                Err(NSError::NotFound("no nameinfo".into()))
+            }
+
+            async fn query_did(
+                &self,
+                _did: &DID,
+                _doc_type: Option<DidDocType>,
+                _from_ip: Option<std::net::IpAddr>,
+            ) -> NSResult<EncodedDocument> {
+                Err(NSError::DecodeJWTError(
+                    "Failed: parts.len != 3".to_string(),
+                ))
+            }
+        }
+
+        let client = NameClient::new(NameClientConfig {
+            enable_cache: false,
+            cache_backend: CacheBackend::Memory,
+            enable_zone_resolver: false,
+            ..Default::default()
+        });
+        client
+            .set_method_authority("web", Box::new(GarbageAuthority))
+            .await;
+        let name_provider = build_device_provider(
+            Vec::new(),
+            Vec::new(),
+            vec!["192.0.2.10".parse().unwrap()],
+        );
+        client.add_dns_provider(Box::new(name_provider)).await;
+
+        let resolved = client.resolve_ips("did:web:ood1.example").await.unwrap();
+        assert_eq!(resolved, vec!["192.0.2.10".parse::<IpAddr>().unwrap()]);
     }
 
     #[tokio::test]
