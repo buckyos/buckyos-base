@@ -6,7 +6,7 @@
    did:dev 是 key 类 DID,不是 resolve_did 的合法入参(简化文档第 6 节),
    任何 provider 都不再受理它。
 
-`BnsProvider` 就是本文件唯一该有的"Bns"命名：一个指向 web3_bridge.bns host 的薄配置壳。
+`BnsProvider` 就是本文件唯一该有的"Bns"命名：一个指向 BNS resolver host 的薄配置壳。
 所有实际的 HTTP 请求/响应解析——包括 `query_did` 和 `resolve_published_state`——都转发给
 `HttpsProvider`（见 https_provider.rs），因为那才是真正 method-agnostic 的 HTTP DID resolver
 客户端；状态机的复杂度在 resolver-server 那一侧的实现，`BnsProvider` 这里不重新实现一遍。
@@ -26,24 +26,15 @@ use std::net::IpAddr;
 /// 见 doc/已有did-resolver介绍.md 第 1、2 节)——两个用途必须读同一份配置,
 /// WebProvider 的 did:bns 信道与 BnsProvider 共用本函数。
 /// 优先级:全局 `KNOWN_WEB3_BRIDGE_CONFIG` → machine.json → 默认配置。
-/// 默认值目前是 `web3.buckyos.ai`;文档的目标名 `bns.buckyos.ai` 的 DNS
-/// 尚未上线,上线后只需改 BuckyOSMachineConfig::default 一处。
+/// 默认值为 machine config 的 `bns.{sn_host}`,当前是 `bns.buckyos.ai`。
 pub(crate) fn bns_bridge_host() -> NSResult<String> {
-    name_lib::KNOWN_WEB3_BRIDGE_CONFIG
+    let host = name_lib::KNOWN_WEB3_BRIDGE_CONFIG
         .get()
         .and_then(|m| m.get("bns"))
         .cloned()
-        .or_else(|| {
-            BuckyOSMachineConfig::load_machine_config()
-                .and_then(|mc| mc.web3_bridge.get("bns").cloned())
-        })
-        .or_else(|| {
-            BuckyOSMachineConfig::default()
-                .web3_bridge
-                .get("bns")
-                .cloned()
-        })
-        .ok_or_else(|| NSError::Failed("web3_bridge.bns not set".to_string()))
+        .or_else(|| BuckyOSMachineConfig::load_machine_config().map(|mc| mc.bns_resolver_host()))
+        .unwrap_or_else(|| BuckyOSMachineConfig::default().bns_resolver_host());
+    Ok(host)
 }
 
 /// 基于 web3 bridge 的 BNS DID 解析器(bns method 的权威渠道委托读取端),
@@ -65,14 +56,10 @@ impl BnsProvider {
         })
     }
 
-    /// 便捷构造：接收 JSON 配置，允许外部显式指定 web3 bridge。
+    /// 便捷构造：接收 JSON 配置，允许外部显式指定 web3 bridge 或 sn_host。
     pub fn new_with_config(config: Value) -> NSResult<Self> {
         let mc = serde_json::from_value::<BuckyOSMachineConfig>(config).unwrap_or_default();
-        let host = mc
-            .web3_bridge
-            .get("bns")
-            .cloned()
-            .ok_or_else(|| NSError::Failed("web3_bridge.bns not set".to_string()))?;
+        let host = mc.bns_resolver_host();
         Ok(Self {
             inner: BaseHttpProvider::new(host.as_str()),
         })

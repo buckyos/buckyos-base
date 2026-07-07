@@ -26,7 +26,9 @@ did:bns 的权威发布渠道是 BNS 智能合约,bns_resolver 是这个渠道�
 
 1. 基本上任何域名都可以配置成 BNS 网关;
 2. 我们一般鼓励用户在自己所处的网络环境(境内)自建一个——自建网关读的仍是同一条合约渠道,属于同一权威渠道的另一个读取端,不破坏"至多一个权威渠道";
-3. 在自建之前,先用公网的 `bns.buckyos.ai`。
+3. 在自建之前,先用公网的 `bns.buckyos.ai`。默认 host 由 machine config
+   的可选 `sn_host` 派生为 `bns.{sn_host}`;未配置时 `sn_host` 默认为
+   `buckyos.ai`。
 
 ## 2. web_resolver(did:web 的权威源;did:bns 的补充源)
 
@@ -149,7 +151,7 @@ Zone Resolver 的 cache 层化已完成(2026-07-03):
 
 | 本文的 resolver | 代码 | 状态 |
 | --- | --- | --- |
-| bns_resolver | `BnsProvider`(bns_provider.rs,薄配置壳,HTTP 细节复用 `BaseHttpProvider`) | 已注册为 did:bns 权威源。公网默认网关仍是 `web3.buckyos.ai`——目标名 `bns.buckyos.ai` 的 DNS 尚未上线,不能先切默认值;上线后改 `BuckyOSMachineConfig::default` 与 `get_default_web3_bridge_config` 两处即可 |
+| bns_resolver | `BnsProvider`(bns_provider.rs,薄配置壳,HTTP 细节复用 `BaseHttpProvider`) | 已注册为 did:bns 权威源。公网默认网关是 `bns.buckyos.ai`;默认值由 machine config 的可选 `sn_host` 派生为 `bns.{sn_host}`,显式 `web3_bridge.bns` 会覆盖该派生值 |
 | web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现,bns_root 与 BNS 网关共用 web3 bridge 配置;一级 bns 名字没有 uppername 回退(那个端点就是 BNS 网关本身,归 bns_resolver 管) |
 | dns_resolver | `DnsProvider`(dns_provider.rs) | 已按本文降为补充源:did:web 与 did:bns 下均注册在 web_resolver 之后,取回结果一律 need_proof 候选。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
 | sn_resolver | `BaseHttpProvider` 指向 SN host | web3 bridge 配置含 `"sn"` 键时,自动注册为 did:web / did:bns 的末位补充源;默认配置不含 sn,即默认未注册 |

@@ -35,6 +35,7 @@ pub use verify_did_jwt::*;
 pub use web_provider::*;
 pub use zone_resolver::*;
 
+use buckyos_kit::BuckyOSMachineConfig;
 use log::*;
 use name_lib::*;
 use once_cell::sync::OnceCell;
@@ -52,14 +53,12 @@ static NAME_LIB_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 
 /// 默认 web3 bridge 配置。键的含义:
 /// - "bns":BNS 网关 host,同时是 did:bns 名字的规范 host 映射根
-///   (`did:bns:alice` ↔ `alice.{bns_root}`)。目标名是 `bns.buckyos.ai`
-///   (介绍文档第 1 节),其 DNS 上线前默认仍指向 `web3.buckyos.ai`;
-///   与 BuckyOSMachineConfig::default 保持一致,切换时两处同改。
+///   (`did:bns:alice` ↔ `alice.{bns_root}`)。默认由 machine config 的
+///   `sn_host` 派生为 `bns.{sn_host}`,当前为 `bns.buckyos.ai`;
+///   与 BuckyOSMachineConfig::default 保持一致。
 /// - "sn":可选,SN 网关 host,配置后注册 sn_resolver 补充源(第 4 节)。
 pub fn get_default_web3_bridge_config() -> HashMap<String, String> {
-    let mut web3_bridge_config = HashMap::new();
-    web3_bridge_config.insert("bns".to_string(), "web3.buckyos.ai".to_string());
-    web3_bridge_config
+    BuckyOSMachineConfig::default().web3_bridge
 }
 
 //name lib 是系统最基础的库，应尽量在进程启动时完成初始化
