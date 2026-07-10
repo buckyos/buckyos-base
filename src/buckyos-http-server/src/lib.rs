@@ -155,8 +155,6 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
         }
     };
 
-    log::debug!("|==>recv kRPC req: {}", body_str);
-
     let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
         Ok(rpc_request) => rpc_request,
         Err(e) => {
@@ -166,6 +164,8 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
             )?);
         }
     };
+
+    log::debug!("|==>recv kRPC req: method={}", rpc_request.method);
 
     let rpc_seq = rpc_request.seq;
     let rpc_trace_id = rpc_request.trace_id.clone();

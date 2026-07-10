@@ -2,7 +2,7 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{ed25519::signature::SignerMut, SigningKey};
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::ToSocketAddrs;
@@ -260,6 +260,14 @@ const BUC_KEY_PURPOSE: u32 = 9777;
 const BUC_KEY_COIN: u32 = 0;
 
 type HmacSha512 = Hmac<Sha512>;
+
+pub fn generate_buckyos_mnemonic() -> NSResult<String> {
+    let mut entropy = [0u8; 16];
+    OsRng.fill_bytes(&mut entropy);
+    Mnemonic::from_entropy_in(Language::English, &entropy)
+        .map(|mnemonic| mnemonic.to_string())
+        .map_err(|e| NSError::Failed(format!("Failed to generate mnemonic: {}", e)))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BuckyMnemonicKey {
@@ -552,6 +560,13 @@ mod test {
     use crate::DID;
 
     use super::*;
+
+    #[test]
+    fn test_generate_buckyos_mnemonic_is_valid_twelve_words() {
+        let mnemonic = generate_buckyos_mnemonic().unwrap();
+        assert_eq!(mnemonic.split_whitespace().count(), 12);
+        Mnemonic::parse_in_normalized(Language::English, &mnemonic).unwrap();
+    }
 
     #[test]
     fn test_generate_x25519_key_pair_share_secret() {
