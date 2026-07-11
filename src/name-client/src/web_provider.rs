@@ -248,7 +248,12 @@ impl WebProvider {
         }
     }
 
-    async fn fetch_document(&self, did: &DID, url: &str) -> NSResult<EncodedDocument> {
+    async fn fetch_document(
+        &self,
+        did: &DID,
+        doc_type: Option<&DidDocType>,
+        url: &str,
+    ) -> NSResult<EncodedDocument> {
         debug!("web provider querying {}", url);
         let resp = self
             .client
@@ -258,7 +263,7 @@ impl WebProvider {
             .map_err(|e| NSError::Failed(format!("request {} failed: {}", url, e)))?;
         // 响应解析(404/410/deactivated 与 JsonLd/Jwt 归一,含 resolver 信封拆包)
         // 是 method-agnostic 的,统一复用 BaseHttpProvider。
-        BaseHttpProvider::parse_response(did, resp).await
+        BaseHttpProvider::parse_response(did, doc_type, "web-provider", resp).await
     }
 
     /// 两个取回信道都失败时的错误合并:unknown(传输失败等)优先于 NotFound。
@@ -313,7 +318,10 @@ impl NsProvider for WebProvider {
 
         // 信道 1:well-known 静态 URL(静态部署优先,域名运营者不需要动态服务)。
         let well_known_url = self.build_url(did, doc_type.as_ref())?;
-        let well_known_err = match self.fetch_document(did, &well_known_url).await {
+        let well_known_err = match self
+            .fetch_document(did, doc_type.as_ref(), &well_known_url)
+            .await
+        {
             Ok(doc) => return Ok(doc),
             // 410/deactivated 是权威负回答,直接终止,不再回退。
             Err(NSError::Disabled(msg)) => return Err(NSError::Disabled(msg)),
@@ -333,7 +341,10 @@ impl NsProvider for WebProvider {
             well_known_err,
             resolver_url
         );
-        match self.fetch_document(did, &resolver_url).await {
+        match self
+            .fetch_document(did, doc_type.as_ref(), &resolver_url)
+            .await
+        {
             Ok(doc) => Ok(doc),
             Err(NSError::Disabled(msg)) => Err(NSError::Disabled(msg)),
             Err(upper_err) => Err(Self::merge_fetch_errors(well_known_err, upper_err)),
