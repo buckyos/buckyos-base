@@ -53,8 +53,8 @@ static NAME_LIB_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 
 /// 默认 web3 bridge 配置。键的含义:
 /// - "bns":BNS 网关 host,同时是 did:bns 名字的规范 host 映射根
-///   (`did:bns:alice` ↔ `alice.{bns_root}`)。默认由 machine config 的
-///   `sn_host` 派生为 `bns.{sn_host}`,当前为 `bns.buckyos.ai`;
+///   (`did:bns:alice` ↔ `alice.{bns_root}`)。默认使用 machine config 的
+///   `bns_host`,当前为 `bns.buckyos.ai`;
 ///   与 BuckyOSMachineConfig::default 保持一致。
 /// - "sn":可选,SN 网关 host,配置后注册 sn_resolver 补充源(第 4 节)。
 pub fn get_default_web3_bridge_config() -> HashMap<String, String> {

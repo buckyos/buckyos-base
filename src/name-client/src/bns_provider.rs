@@ -26,7 +26,7 @@ use std::net::IpAddr;
 /// 见 doc/已有did-resolver介绍.md 第 1、2 节)——两个用途必须读同一份配置,
 /// WebProvider 的 did:bns 信道与 BnsProvider 共用本函数。
 /// 优先级:全局 `KNOWN_WEB3_BRIDGE_CONFIG` → machine.json → 默认配置。
-/// 默认值为 machine config 的 `bns.{sn_host}`,当前是 `bns.buckyos.ai`。
+/// 默认值为 machine config 的 `bns_host`,当前是 `bns.buckyos.ai`。
 pub(crate) fn bns_bridge_host() -> NSResult<String> {
     let host = name_lib::KNOWN_WEB3_BRIDGE_CONFIG
         .get()
@@ -56,7 +56,7 @@ impl BnsProvider {
         })
     }
 
-    /// 便捷构造：接收 JSON 配置，允许外部显式指定 web3 bridge 或 sn_host。
+    /// 便捷构造：接收 JSON 配置，允许外部显式指定 web3 bridge 或 bns_host。
     pub fn new_with_config(config: Value) -> NSResult<Self> {
         let mc = serde_json::from_value::<BuckyOSMachineConfig>(config).unwrap_or_default();
         let host = mc.bns_resolver_host();

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 
-const DEFAULT_SN_HOST: &str = "buckyos.ai";
+const DEFAULT_BNS_HOST: &str = "bns.buckyos.ai";
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct BuckyOSMachineConfig {
@@ -14,7 +14,7 @@ pub struct BuckyOSMachineConfig {
     #[serde(default = "default_force_https")]
     pub force_https: bool,
     #[serde(default)]
-    pub sn_host: Option<String>,
+    pub bns_host: Option<String>,
 
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
@@ -32,37 +32,33 @@ fn default_trust_did() -> Vec<String> {
     ]
 }
 
-fn default_bns_resolver_host(sn_host: &str) -> String {
-    format!("bns.{}", sn_host.trim())
-}
-
 impl Default for BuckyOSMachineConfig {
     fn default() -> Self {
-        let sn_host = DEFAULT_SN_HOST.to_string();
+        let bns_host = DEFAULT_BNS_HOST.to_string();
         let mut web3_bridge = HashMap::new();
-        web3_bridge.insert("bns".to_string(), default_bns_resolver_host(&sn_host));
+        web3_bridge.insert("bns".to_string(), bns_host.clone());
 
         Self {
             web3_bridge,
             trust_did: default_trust_did(),
             force_https: default_force_https(),
-            sn_host: Some(sn_host),
+            bns_host: Some(bns_host),
             extra_info: HashMap::new(),
         }
     }
 }
 
 impl BuckyOSMachineConfig {
-    pub fn sn_host_or_default(&self) -> &str {
-        self.sn_host
+    pub fn bns_host_or_default(&self) -> &str {
+        self.bns_host
             .as_deref()
             .map(str::trim)
             .filter(|host| !host.is_empty())
-            .unwrap_or(DEFAULT_SN_HOST)
+            .unwrap_or(DEFAULT_BNS_HOST)
     }
 
     pub fn default_bns_resolver_host(&self) -> String {
-        default_bns_resolver_host(self.sn_host_or_default())
+        self.bns_host_or_default().to_string()
     }
 
     pub fn bns_resolver_host(&self) -> String {
@@ -96,10 +92,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn default_bns_resolver_uses_default_sn_host() {
+    fn default_bns_resolver_uses_default_bns_host() {
         let config = BuckyOSMachineConfig::default();
 
-        assert_eq!(config.sn_host.as_deref(), Some("buckyos.ai"));
+        assert_eq!(config.bns_host.as_deref(), Some("bns.buckyos.ai"));
         assert_eq!(config.bns_resolver_host(), "bns.buckyos.ai");
         assert_eq!(
             config.web3_bridge.get("bns").map(String::as_str),
@@ -108,33 +104,33 @@ mod tests {
     }
 
     #[test]
-    fn bns_resolver_falls_back_to_sn_host_when_bridge_missing() {
+    fn bns_resolver_falls_back_to_bns_host_when_bridge_missing() {
         let mut config = BuckyOSMachineConfig::default();
         config.web3_bridge.remove("bns");
-        config.sn_host = Some("example.org".to_string());
-
-        assert_eq!(config.bns_resolver_host(), "bns.example.org");
-    }
-
-    #[test]
-    fn explicit_bns_bridge_overrides_sn_host_default() {
-        let mut config = BuckyOSMachineConfig::default();
-        config
-            .web3_bridge
-            .insert("bns".to_string(), "resolver.example.org".to_string());
-        config.sn_host = Some("example.org".to_string());
+        config.bns_host = Some("resolver.example.org".to_string());
 
         assert_eq!(config.bns_resolver_host(), "resolver.example.org");
     }
 
     #[test]
-    fn partial_machine_config_can_set_sn_host_only() {
+    fn explicit_bns_bridge_overrides_bns_host_default() {
+        let mut config = BuckyOSMachineConfig::default();
+        config
+            .web3_bridge
+            .insert("bns".to_string(), "resolver.example.org".to_string());
+        config.bns_host = Some("bns.example.org".to_string());
+
+        assert_eq!(config.bns_resolver_host(), "resolver.example.org");
+    }
+
+    #[test]
+    fn partial_machine_config_can_set_bns_host_only() {
         let config = serde_json::from_value::<BuckyOSMachineConfig>(json!({
-            "sn_host": "example.org"
+            "bns_host": "resolver.example.org"
         }))
         .unwrap();
 
-        assert_eq!(config.bns_resolver_host(), "bns.example.org");
+        assert_eq!(config.bns_resolver_host(), "resolver.example.org");
         assert!(config.force_https);
         assert_eq!(config.trust_did, default_trust_did());
     }

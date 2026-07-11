@@ -53,7 +53,7 @@ GET https://{provider}/1.0/identifiers/{did}?type={doc_type}
 请求，对 `did:web` / `did:key` / `did:bns` 等任意 method 都适用（只负责拿到文档本身，`query_did`，
 不带状态语义）；`BnsProvider::query_did` 目前是转发给 `HttpsProvider`
 （[bns_provider.rs](../src/name-client/src/bns_provider.rs)，指向 `machine.json` 里
-`web3_bridge.bns` 配置的 host；未配置时由可选 `sn_host` 派生为 `bns.{sn_host}`），
+`web3_bridge.bns` 配置的 host；未配置时使用可选 `bns_host`），
 只是众多可能的具体部署之一。
 
 **本协议不新增端点，也不区分 did:method**，而是让同一个 `GET /1.0/identifiers/{did}?type={doc_type}`
