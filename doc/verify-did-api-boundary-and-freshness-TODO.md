@@ -507,92 +507,92 @@ pub async fn resolve_verify_and_cache_did_document(...)
 
 ### Phase 0：固化术语和 API 契约
 
-- [ ] 给所有 name-client DID verify/resolve/cache 入口列出 I/O、副作用和 cache 行为。
+- [x] 给所有 name-client DID verify/resolve/cache 入口列出 I/O、副作用和 cache 行为。
       清单必须包含 verify 中不受 `cache_result` 控制的写入：权威负状态写入 negative cache、
       Migrated 触发删除、in-TTL 快路径 replay-guard 失败触发删除。
-- [ ] 固定 `ResolveSourcePolicy`，特别是 LocalOnly、LocalAndZone、RemoteAuthority 的边界。
-- [ ] 明确 `VerifiedDidDocument` 是验证报告，不是 cache capability。
-- [ ] 明确 authority current 只来自本次 Remote Authority Resolve；现有 cache hit 不自动升级。
-- [ ] 明确通用 `verify-jwt` 是否在范围内；默认只改 DID Document verify 家族。
+- [x] 固定 `ResolveSourcePolicy`，特别是 LocalOnly、LocalAndZone、RemoteAuthority 的边界。
+- [x] 明确 `VerifiedDidDocument` 是验证报告，不是 cache capability。
+- [x] 明确 authority current 只来自本次 Remote Authority Resolve；现有 cache hit 不自动升级。
+- [x] 明确通用 `verify-jwt` 是否在范围内；默认只改 DID Document verify 家族。
 
 ### Phase 1：整理 local file cache 与 Zone Resolver 的证据能力
 
-- [ ] 列出现有 local file StoredMeta 能提供和不能提供的字段。
-- [ ] 列出现有 Zone Resolver wire metadata 能提供和不能提供的字段。
-- [ ] 引入统一只读 `VerifyContextSnapshot`，但不强行统一两种存储后端。
-- [ ] snapshot 携带 source、scope、generation、checked_at 和可用的 valid_until。
-- [ ] Zone 客户端停止丢弃 wire 已定义的 `docHash` / `migrationTarget`
+- [x] 列出现有 local file StoredMeta 能提供和不能提供的字段。
+- [x] 列出现有 Zone Resolver wire metadata 能提供和不能提供的字段。
+- [x] 引入统一只读 `VerifyContextSnapshot`，但不强行统一两种存储后端。
+- [x] snapshot 携带 source、scope、generation、checked_at 和可用的 valid_until。
+- [x] Zone 客户端停止丢弃 wire 已定义的 `docHash` / `migrationTarget`
       （`published_state_from_envelope` 当前将两者置 None），保留进 snapshot 供
       candidate hash 绑定与 freshness 比较使用。
-- [ ] 扩展 `http_did_resolver_api.md` 的 `buckyos` 块：新增 `checkedAt` / `validUntil`
+- [x] 扩展 `http_did_resolver_api.md` 的 `buckyos` 块：新增 `checkedAt` / `validUntil`
       时间维度字段（需 resolver/zone server 侧配合，先固定协议字段再排实现）。
-- [ ] 固定 wire `documentVersion` 的取值语义 = 当前发布文档的 iat（documentVersion =
+- [x] 固定 wire `documentVersion` 的取值语义 = 当前发布文档的 iat（documentVersion =
       document_iat），同步修订 `http_did_resolver_api.md` 与 resolver/zone server 侧实现。
-- [ ] ZoneHit 只进入 Zone local freshness/validity evidence，不返回 AuthorityCurrent。
-- [ ] 旧 Published/Anchored cache 只保留 body evidence 含义。
+- [x] ZoneHit 只进入 Zone local freshness/validity evidence，不返回 AuthorityCurrent。
+- [x] 旧 Published/Anchored cache 只保留 body evidence 含义。
 
 ### Phase 2：拆出真正的本地 verifier
 
-- [ ] 从现有 `verify_did_document_jwt` 拆出无网络、无写入、只消费 snapshot 的核心。
-- [ ] 保留 expected owner、签名、historical key、exp、valid_iat 规则；`mini_version_seq`
+- [x] 从现有 `verify_did_document_jwt` 拆出无网络、无写入、只消费 snapshot 的核心。
+- [x] 保留 expected owner、签名、historical key、exp、valid_iat 规则；`mini_version_seq`
       guard 退役（兼容期只警告）。
-- [ ] 把现有 verify 路径的写副作用移出纯 verify：权威负状态学习归 resolve 的缓存回填，
+- [x] 把现有 verify 路径的写副作用移出纯 verify：权威负状态学习归 resolve 的缓存回填，
       Migrated / replay-guard 触发的条目删除归 cache 层读写卫生或 resolve 路径。
-- [ ] 新增 `VerifyError::RejectedByNegativeState { scope, status }`：terminal 负状态硬失败；
+- [x] 新增 `VerifyError::RejectedByNegativeState { scope, status }`：terminal 负状态硬失败；
       Missing/Expired/Migrated 不进 VerifyError，转为 freshness/validity 事实。
-- [ ] 自过期（`exp <= now`）归入 validity 失败（`InvalidDocument`），不再混入
+- [x] 自过期（`exp <= now`）归入 validity 失败（`InvalidDocument`），不再混入
       `NotCurrentActive` 一类 freshness 语义。
-- [ ] snapshot 的 owner 材料证据门槛：Observed/Unverified 不得作为验签依据。
-- [ ] 提供 snapshot 构建 helper（从 local cache / Zone 查询 / Remote receipt 组装），
+- [x] snapshot 的 owner 材料证据门槛：Observed/Unverified 不得作为验签依据。
+- [x] 提供 snapshot 构建 helper（从 local cache / Zone 查询 / Remote receipt 组装），
       上游不必手工拼装。
-- [ ] 重构 `verify_and_promote` 为“按 resolve policy 构建 snapshot → 纯 verify → promote
+- [x] 重构 `verify_and_promote` 为“按 resolve policy 构建 snapshot → 纯 verify → promote
       落盘”，对外行为等价；它属于 resolve 的缓存回填路径，不违反 verify 无写入边界。
-- [ ] 增加 provider/Zone spy，断言纯 verify 永远不发起查询。
-- [ ] 断言纯 verify 不修改 verified、unverified 和 negative cache（含负状态/replay-guard
+- [x] 增加 provider/Zone spy，断言纯 verify 永远不发起查询。
+- [x] 断言纯 verify 不修改 verified、unverified 和 negative cache（含负状态/replay-guard
       触发的删除）。
 
 ### Phase 3：返回 validity、revision 和 freshness 事实
 
-- [ ] 引入 `ValidityEvidence`、`DocumentRevision`、`LocalFreshness` 和
+- [x] 引入 `ValidityEvidence`、`DocumentRevision`、`LocalFreshness` 和
   `AuthorityFreshness`。
-- [ ] revision 只用 `iat` + content hash；同 iat 不同 hash 表达为稳定 conflict。
-- [ ] `version_seq` 退出流程：JWT 强制项从 `ensure_version_seq_for_jwt` 改为“必须能得出
+- [x] revision 只用 `iat` + content hash；同 iat 不同 hash 表达为稳定 conflict。
+- [x] `version_seq` 退出流程：JWT 强制项从 `ensure_version_seq_for_jwt` 改为“必须能得出
       iat（iat 直接存在，或由 exp 补充推导）”；原有 version_seq 字段按用户自定义扩展
       原样透传，不参与比较与 guard。
-- [ ] 固定 JWT/JsonLd content hash 契约（serde_json 键字典序序列化；加防护测试锁定
+- [x] 固定 JWT/JsonLd content hash 契约（serde_json 键字典序序列化；加防护测试锁定
       workspace 不启用 `preserve_order`）。
-- [ ] `AuthorityFreshness` 携带 `document_iat`（= wire `documentVersion`）；候选 iat 小于
+- [x] `AuthorityFreshness` 携带 `document_iat`（= wire `documentVersion`）；候选 iat 小于
       权威当前发布 iat 判定为 `NotCurrent(Superseded)`。`PublishedState.document_version`
       与 `ResolvedDocument` 的 version_id / buckyos.document_version 语义同步为文档 iat
       （`from_document` 的 `.or(version_seq)` 兜底相应改为 `.or(doc.iat)`）。
-- [ ] 所有 DID Document verify 成功结果携带 validity/freshness。
-- [ ] 增加独立 `evaluate_freshness` policy，不把 freshness rejection 混入 VerifyError。
+- [x] 所有 DID Document verify 成功结果携带 validity/freshness。
+- [x] 增加独立 `evaluate_freshness` policy，不把 freshness rejection 混入 VerifyError。
 
 ### Phase 4：固定 add_cache 与文件系统协议
 
-- [ ] 将现有 `update_did_cache` 的公开语义统一为 add observed。
-- [ ] 明确函数写入与直接文件投递具有相同 namespace 语义。
-- [ ] verified/Published 写入权限由目录权限和受控进程保证。
-- [ ] cache 写入返回结构化 `CacheWriteOutcome`。
-- [ ] `merge_allows` 从现状“version_seq 优先、iat 兜底”迁移为 iat-only 规则（**方向翻转**，
+- [x] 将现有 `update_did_cache` 的公开语义统一为 add observed。
+- [x] 明确函数写入与直接文件投递具有相同 namespace 语义。
+- [x] verified/Published 写入权限由目录权限和受控进程保证。
+- [x] cache 写入返回结构化 `CacheWriteOutcome`。
+- [x] `merge_allows` 从现状“version_seq 优先、iat 兜底”迁移为 iat-only 规则（**方向翻转**，
       需评估旧条目兼容）：同证据级比 iat；同 iat 同 hash → `AlreadyPresent`；同 iat 不同
       hash → `RejectedConflict`；更高证据等级仍按 rank 直接胜出（权威结果永远能翻案）。
-- [ ] 在 iat-only 规则下保留命名对象（`is_named_obj_id`）“不可替换”保护的等价语义。
-- [ ] Info doc_type 的 `update_time` 合并规则独立保留，明确排除在 DocumentRevision 契约外
+- [x] 在 iat-only 规则下保留命名对象（`is_named_obj_id`）“不可替换”保护的等价语义。
+- [x] Info doc_type 的 `update_time` 合并规则独立保留，明确排除在 DocumentRevision 契约外
       （Info 走 UnproofInfo/免验证信道，不属于 verify 家族）。
 
 ### Phase 5：组合 API 与兼容迁移
 
-- [ ] 将当前隐式 resolve/cache 的 verify 入口重命名或 deprecated。
-- [ ] 增加显式 `resolve_and_verify` 和 `resolve_verify_and_cache`。
-- [ ] 移除或废弃 `VerifyDidDocumentJwtOptions.cache_result`。
-- [ ] 明确 `ResolveSourcePolicy` 与现有 `ResolvePolicy` 字段（use_zone_resolver /
+- [x] 将当前隐式 resolve/cache 的 verify 入口重命名或 deprecated。
+- [x] 增加显式 `resolve_and_verify` 和 `resolve_verify_and_cache`。
+- [x] 移除或废弃 `VerifyDidDocumentJwtOptions.cache_result`。
+- [x] 明确 `ResolveSourcePolicy` 与现有 `ResolvePolicy` 字段（use_zone_resolver /
       allow_stale_cache / allow_self_signed_when_missing / local_authority_override /
       follow_migration / max_depth）的映射与归属，避免两套 policy 长期并行。
-- [ ] 把 `CurrentActive` 拆成 validity evidence、freshness facts 和 requirement。
-- [ ] 更新 `verify-did-document-jwt.md`、`update-did-cache.md` 和 resolve-did 文档
+- [x] 把 `CurrentActive` 拆成 validity evidence、freshness facts 和 requirement。
+- [x] 更新 `verify-did-document-jwt.md`、`update-did-cache.md` 和 resolve-did 文档
       （含 version_seq / mini_version_seq 退役的同步修订）。
-- [ ] 给 RTCP 等上游提供组合示例，但不在本仓库实现其锁/high-water 逻辑。
+- [x] 给 RTCP 等上游提供组合示例，但不在本仓库实现其锁/high-water 逻辑。
 
 ## 测试要求
 
@@ -693,17 +693,17 @@ RTCP 的并发 high-water/session 授权测试不属于本仓库验收范围。
 
 ## 验收标准
 
-- [ ] 调用者只看函数名、options 和类型，就能判断是否可能访问 Zone/Remote、是否写 cache。
-- [ ] verify 无网络、无写入，只验证调用方给出的确切文档和 snapshot。
-- [ ] 返回值分别表达 validity、本地已知 freshness 和 Remote Authority freshness。
-- [ ] 没有显式 Remote Authority Resolve 时，结果不会声称 authority current。
-- [ ] local file cache 与 Zone Resolver 的能力差异被保留并结构化表达。
-- [ ] revision 只以 iat + content hash 判定，version_seq 不参与流程，同 iat 冲突不会被隐藏。
-- [ ] 应用可以独立选择 AnyValid、本地防回滚或权威当前性策略。
-- [ ] add_cache 是显式动作，安全边界与文件系统 namespace 权限一致。
-- [ ] 任意外部输入不能通过纯 verify 自动触发 authority 查询。
-- [ ] 组合便捷 API 保留，但名字/options 明确暴露 resolve/cache 行为。
-- [ ] RTCP 等上游能用这些事实实现自己的握手锁、high-water 和授权策略，而 name-client
+- [x] 调用者只看函数名、options 和类型，就能判断是否可能访问 Zone/Remote、是否写 cache。
+- [x] verify 无网络、无写入，只验证调用方给出的确切文档和 snapshot。
+- [x] 返回值分别表达 validity、本地已知 freshness 和 Remote Authority freshness。
+- [x] 没有显式 Remote Authority Resolve 时，结果不会声称 authority current。
+- [x] local file cache 与 Zone Resolver 的能力差异被保留并结构化表达。
+- [x] revision 只以 iat + content hash 判定，version_seq 不参与流程，同 iat 冲突不会被隐藏。
+- [x] 应用可以独立选择 AnyValid、本地防回滚或权威当前性策略。
+- [x] add_cache 是显式动作，安全边界与文件系统 namespace 权限一致。
+- [x] 任意外部输入不能通过纯 verify 自动触发 authority 查询。
+- [x] 组合便捷 API 保留，但名字/options 明确暴露 resolve/cache 行为。
+- [x] RTCP 等上游能用这些事实实现自己的握手锁、high-water 和授权策略，而 name-client
   不越权承担这些状态机责任。
 
 ## 相关文档与实现
@@ -712,8 +712,40 @@ RTCP 的并发 high-water/session 授权测试不属于本仓库验收范围。
 - [`update-did-cache.md`](./update-did-cache.md)
 - [`简单介绍resolve-did.md`](./简单介绍resolve-did.md)
 - [`resolve_did简化_TODO.md`](./resolve_did简化_TODO.md)
-- [`src/name-client/src/verify_did_jwt.rs`](../src/name-client/src/verify_did_jwt.rs)
+- [`src/name-client/src/verify_context.rs`](../src/name-client/src/verify_context.rs)(纯 verify)
+- [`src/name-client/src/verify.rs`](../src/name-client/src/verify.rs)(snapshot 构建与组合 API)
 - [`src/name-client/src/name_client.rs`](../src/name-client/src/name_client.rs)
 - [`src/name-client/src/doc_cache.rs`](../src/name-client/src/doc_cache.rs)
 - [`src/name-client/src/name_query.rs`](../src/name-client/src/name_query.rs)
 - [`src/name-client/src/zone_resolver.rs`](../src/name-client/src/zone_resolver.rs)
+
+## 实现补记(2026-07-17)
+
+除按上文契约落地外,实现相对草案有三处显式扩展(均为"至少区分"允许的加细,不改变任何已列规则):
+
+1. **`AuthorityFreshness::ActiveUnanchored`**:权威回答 Active 但没有给出可绑定候选的锚点
+   (无 doc_hash、无当前 body、`documentVersion` 也无法判定新旧)。它不是 `Current`
+   (Current 必须绑定候选 hash/body),也不是 `NotCurrent`(权威未否定候选),等价于旧流程
+   "权威 Active 下的 NeedProof 候选"档;`evaluate_freshness` 的 `RequireAuthorityCurrent`
+   拒绝它。`verify_and_promote` 对它保持旧行为:owner 验签通过即可转正。
+2. **`VerifyError::DetachedOwnerRejected` / `OwnerBindingUnavailable`**:AuthSubject 下的
+   detached-owner 拒绝与"权威已答/无权威渠道仍推不出 expected_owner"的确定性缺失,与
+   `MissingDependency`(resolve 可能补上材料)严格区分。
+3. **`CacheWriteOutcome::SkippedByPolicy`**:按既有策略跳过写入(detached-owner 的
+   ObjectDocument 结果不落普通 cache;cache 关闭)。
+
+其它口径说明:
+
+- `ResolveSourcePolicy` 作为 `ResolvePolicy.source` 字段落地(一套 policy,不并行):
+  `use_zone_resolver` 保留为 Zone 信道的额外开关(zone-resolver-server 自递归保护);
+  owner 材料解析用 `for_owner_lookup()`(RemoteAuthority 主体约束不放大 owner 的权威往返,
+  LocalOnly/LocalAndZone 原样传播)。
+- 旧 `verify_did_document_jwt` 不保留 deprecated 兼容层(本版本 breaking):对照表见
+  [`verify-did-document-jwt.md`](./verify-did-document-jwt.md) 的重构补记。
+- `checkedAt` / `validUntil` 已固定进 wire 协议并被客户端解析消费
+  ([`http_did_resolver_api.md`](./http_did_resolver_api.md));resolver/zone server 侧的
+  产生端实现仍按原计划另行排期(客户端对缺省有完备兜底)。
+- `mini_version_seq` 兼容期行为:读到时打 deprecation warning,不执行(name-lib
+  `validate_jwt_revocation`)。
+- 测试要求 1-20 全部落地(`verify.rs` / `verify_context.rs` / `doc_cache.rs` /
+  `name_client.rs` / name-lib 各测试模块;serde_json 键字典序防护测试在 `provider.rs`)。

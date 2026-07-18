@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::zone::{default_device_context, ServiceNode, VerificationMethodNode};
 use crate::{
-    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, ensure_version_seq_for_jwt,
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, ensure_jwt_iat_derivable,
     get_x_from_jwk, DIDContext, DIDDocumentTrait, DidDocType, EncodedDocument, NSError, NSResult,
     OODDescriptionString, DEFAULT_EXPIRE_TIME, DID,
 };
@@ -351,7 +351,7 @@ impl DIDDocumentTrait for DeviceDocument {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
-        ensure_version_seq_for_jwt("DeviceDocument", self.version_seq)?;
+        ensure_jwt_iat_derivable("DeviceDocument", Some(self.iat), Some(self.exp))?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
@@ -376,7 +376,7 @@ impl DIDDocumentTrait for DeviceDocument {
                     serde_json::from_value(json_result).map_err(|error| {
                         NSError::Failed(format!("Failed to decode device document:{}", error))
                     })?;
-                ensure_version_seq_for_jwt("DeviceDocument", result.version_seq)?;
+                ensure_jwt_iat_derivable("DeviceDocument", Some(result.iat), Some(result.exp))?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {

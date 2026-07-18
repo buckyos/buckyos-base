@@ -1,5 +1,25 @@
 # update_did_cache 升级需求
 
+> **2026-07 API 边界重构补记**(doc/verify-did-api-boundary-and-freshness-TODO.md,已实现):
+>
+> - 公开入口更名为 **`add_observed_cache`**(add_cache 动词的 Observed 入口),语义不变:
+>   快速操作、本地校验、恒为 `Unverified`、落 `unverified/`;新增受控入口
+>   **`add_verified_cache`**(显式写 `verified/`,安全边界仍是目录 OS 权限)。
+> - cache 写入返回结构化 **`CacheWriteOutcome`**(Inserted / ReplacedOlder / AlreadyPresent /
+>   IgnoredOlder / RejectedConflict / BlockedByNegativeState / PermissionDenied / SkippedByPolicy),
+>   不再只有 `Ok(())`。
+> - merge 规则迁移为 **iat-only**(方向翻转):同证据级只比 revision(`iat` + content hash),
+>   同 iat 同 hash → `AlreadyPresent`,同 iat 不同 hash → `RejectedConflict`;`version_seq`
+>   整体退出流程(用户自定义扩展,不参与比较);命名对象(`is_named_obj_id`)同级不可替换的
+>   保护保留;Info doc_type 的 `update_time` 合并规则独立保留(排除在 DocumentRevision 契约外)。
+> - 快速校验中"JWT 必须带 version_seq"改为"**必须能得出 iat**"(iat 直接存在,或由
+>   `exp - DEFAULT_EXPIRE_TIME` 推导);owner replay guard 只剩 `valid_iat`
+>   (`mini_version_seq` 退役,读到只警告)。
+> - `verify_and_promote` 重构为"按 `RemoteAuthority` 构建 snapshot → 纯 verify
+>   (`verify_did_document`)→ promote 落盘",对外行为等价。
+>
+> 下文保留原始设计论证;涉及上述条目处以本补记为准。
+
 ## 背景
 
 `update_did_cache` 目前是 `name-client` 暴露给上层的旁路缓存写入口:任何拿到一份
@@ -115,9 +135,9 @@ Rust API,经 `lib.rs` 转发给全局 `NameClient` 单例)。任何想触发"我
 
 ```text
 CacheEvidence: Published > Verified > Unverified(doc_cache.rs)
-merge 规则: 先比证据等级,同级才比 version_seq/iat;负状态与本地覆盖屏蔽一切写入
-owner replay guard: valid_iat / mini_version_seq,读写两侧统一应用
-verify_did_document_jwt: expected_owner 判定 + owner 验签 + revoke/replay guard 的完整实现
+merge 规则: 先比证据等级,同级只比 revision(iat + content hash);负状态与本地覆盖屏蔽一切写入
+owner replay guard: valid_iat(mini_version_seq 已退役,读到只警告),读写两侧统一应用
+verify 家族(verify_did_document + build_verify_context): expected_owner 判定 + owner 验签 + revoke/replay guard 的完整实现
 ```
 
 现有实现的两个明确缺口,是本文要解决的问题:
@@ -365,11 +385,12 @@ JSON-LD 序列化结果)。`{key}.meta.json` 收紧为写入方**只被允许提
 2. **写入前做一次快速校验**,校验不通过则不产生任何 `unverified/` 文件:
    - 文档能被 `EncodedDocument::from_str`/`parse_did_doc` 正常解析;
    - 解析出的 `id` 与调用方声明的 `did` 一致(避免明显的错放);
-   - JWT 形式的文档必须带 `version_seq`(现有 `ensure_version_seq_for_jwt`
-     规则)。
+   - JWT 形式的文档必须能得出 revision `iat`(`iat` 直接存在,或由
+     `exp - DEFAULT_EXPIRE_TIME` 推导;`ensure_jwt_iat_derivable` 规则——
+     旧的"必须带 version_seq"强制项已随 version_seq 退出流程)。
    这一步**不是**完整验证,不检查签名、不检查 owner——它只挡住格式明显损坏或
    张冠李戴的数据,不提升信任等级。
-3. **进程内 `update_did_cache` 调用是这个协议的薄封装**:它跳过一次真实的
+3. **进程内 `add_observed_cache` 调用是这个协议的薄封装**:它跳过一次真实的
    文件系统往返(直接写入内存/文件后端),但产出的落盘结果、meta 字段、
    `Unverified` 证据等级,与"外部进程往目录里丢文件"完全等价。
 
@@ -499,21 +520,21 @@ def resolve_did_cache_fast_path(did, doc_type, strict):
 
 ## Cache 合并与落盘规则
 
-`doc_cache.rs` 现有的 `merge_allows`(先比证据等级,同级才比 `version_seq`/
-`iat`;负状态与本地覆盖屏蔽一切写入)不需要改变算法,只需要把它的执行对象从
-"同一个 KV 命名空间里的记录"改成"跨 `unverified/`/`verified/` 两个目录的联合
-视图":
+`doc_cache.rs` 的 `merge_verdict`(先比证据等级,同级只比 revision——`iat` +
+content hash,version_seq 已退出流程;负状态与本地覆盖屏蔽一切写入,结果按
+`CacheWriteOutcome` 结构化返回)的执行对象是"跨 `unverified/`/`verified/`
+两个目录的联合视图":
 
-1. 写入 `unverified/` 目录(`update_did_cache` 或直接文件投递)之前,不需要
+1. 写入 `unverified/` 目录(`add_observed_cache` 或直接文件投递)之前,不需要
    跟 `verified/` 目录里的同 key 条目比较——按定义 `Unverified` 永远打不过
    `verified/` 里的任何条目;如果 `verified/` 已有同 key 的 `Published`/
    `Verified` 记录,`unverified/` 里出现的新文件仅仅是被观察到、被记录,但
    查询时永远优先命中 `verified/`。
 2. `verify_and_promote` 把 `unverified/` 条目移动进 `verified/` 时,仍然要走
-   一次 `merge_allows` 比较(新条目的证据等级是 `Verified`,可能撞上已有的
-   `Published`/更高 `version_seq` 的 `Verified`),移动失败(`merge_allows`
-   返回 false)时,原 `unverified/` 文件应被删除——它已经被验证过一次并且
-   证明"验证通过但不是更优版本",没有继续保留的价值。
+   一次 `merge_verdict` 比较(新条目的证据等级是 `Verified`,可能撞上已有的
+   `Published`/更新 revision 的 `Verified`),合并被拒时原 `unverified/` 文件
+   应被删除——它已经被验证过一次并且证明"验证通过但不是更优版本",没有继续
+   保留的价值。
 3. `verified/` 目录内部的合并规则、负状态屏蔽、owner replay guard 联动清理
    (`evict_revoked_docs`),与现状完全一致,不做修改。
 

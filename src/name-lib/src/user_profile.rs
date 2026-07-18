@@ -5,7 +5,7 @@ use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::{
-    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, ensure_version_seq_for_jwt,
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, ensure_jwt_iat_derivable,
     EncodedDocument, NSError, NSResult, DID,
 };
 
@@ -438,9 +438,10 @@ impl UserProfile {
                 } else {
                     decode_jwt_claim_without_verify(jwt_str)?
                 };
-                ensure_version_seq_for_jwt(
+                ensure_jwt_iat_derivable(
                     "UserProfile",
-                    value.get("version_seq").and_then(|value| value.as_u64()),
+                    value.get("iat").and_then(|value| value.as_u64()),
+                    value.get("exp").and_then(|value| value.as_u64()),
                 )?;
                 value
             }

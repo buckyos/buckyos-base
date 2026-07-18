@@ -9,10 +9,10 @@ use buckyos_kit::{
     buckyos_get_unix_timestamp, get_buckyos_service_local_data_dir, get_buckyos_system_etc_dir,
 };
 use log::{debug, error, info, warn};
-use name_lib::{DIDDocumentTrait, EncodedDocument, OwnerDocument, DEFAULT_EXPIRE_TIME, DID};
+use name_lib::{DIDDocumentTrait, EncodedDocument, OwnerDocument, DID};
 use serde::{Deserialize, Serialize};
 
-use crate::{BodyEvidence, DidDocType, DocumentStatus};
+use crate::{document_content_hash, document_iat, BodyEvidence, DidDocType, DocumentStatus};
 
 /// 负状态条目的重查间隔:in-TTL 内快路径直接报错;过期后允许重新询问权威源
 /// (只有权威源的新回答能翻篇),但在权威源没回答时它仍然屏蔽一切兜底。
@@ -35,7 +35,7 @@ pub enum CacheEvidence {
     Published,
     /// 通过了含 expected_owner 一致性在内的完整 verify 的自签名候选。
     Verified,
-    /// 未经验证的旁路写入(update_did_cache / 文件系统协议)。
+    /// 未经验证的旁路写入(add_observed_cache / 文件系统协议)。
     Unverified,
 }
 
@@ -143,6 +143,45 @@ impl StoredEntry {
     }
 }
 
+/// cache 写入的结构化结果(doc/verify-did-api-boundary-and-freshness-TODO.md
+/// Phase 4):写入不能只有 `Ok(())`,调用方必须能区分插入、替换、重复、被更新
+/// 内容压制、同 revision 冲突与负状态屏蔽。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheWriteOutcome {
+    /// 该 key 原本没有条目,已写入。
+    Inserted,
+    /// 已替换一条更旧(iat 更小)或证据等级更低的条目。
+    ReplacedOlder,
+    /// 同 iat 同 content hash:同一份编码文档已存在,无需写入。
+    AlreadyPresent,
+    /// 现有条目更新(iat 更大)或证据等级更高,本次写入被忽略。
+    IgnoredOlder,
+    /// 同 iat 不同 content hash(同 revision 冲突),或命名对象
+    /// (`is_named_obj_id`)的不可替换保护:拒绝写入,不悄悄选一个。
+    RejectedConflict,
+    /// 该 key 存在负状态记忆(权威源的"回答"),屏蔽本次写入;只有权威源的
+    /// 新已发布回答(Published 证据)能翻篇。
+    BlockedByNegativeState,
+    /// 目标命名空间不可写(文件系统权限/IO 失败)。verified/ 的信任边界正是
+    /// 目录写权限,此结果表示调用进程不具备该身份。
+    PermissionDenied,
+    /// 按既有策略跳过写入(如 detached-owner 的 ObjectDocument 结果:现有
+    /// cache 条目无法记录 purpose,固定不落普通 cache)。
+    SkippedByPolicy,
+}
+
+impl CacheWriteOutcome {
+    /// 本次调用后,这份内容是否已存在于目标命名空间(新写入或本就相同)。
+    pub fn stored(&self) -> bool {
+        matches!(
+            self,
+            CacheWriteOutcome::Inserted
+                | CacheWriteOutcome::ReplacedOlder
+                | CacheWriteOutcome::AlreadyPresent
+        )
+    }
+}
+
 /// 统一层的查询结果。负状态"命中"不受 TTL 约束地存在:in_ttl 只影响快路径,
 /// 过期的负状态仍然屏蔽兜底,只能被权威源的新回答翻篇。
 #[derive(Clone, Debug)]
@@ -230,7 +269,7 @@ impl DIDDocumentCache {
             .or_else(|| self.load_ns(CacheNamespace::Unverified, key))
     }
 
-    fn store(&self, key: &str, entry: &StoredEntry) {
+    fn store(&self, key: &str, entry: &StoredEntry) -> bool {
         let ns = if entry.is_negative() {
             CacheNamespace::Verified
         } else {
@@ -324,7 +363,7 @@ impl DIDDocumentCache {
 
     /// 合并写入(简化文档第 5 节的 did_cache_update):
     /// 负状态与本地覆盖屏蔽一切合并写入(本地覆盖根本不进这里);
-    /// 先比证据等级,同级才比 version_seq / iat。
+    /// 先比证据等级,同级只比 revision(iat + content hash,version_seq 已退出流程)。
     ///
     /// `Unverified` 证据的写入走 Observed 旁路语义(doc/update-did-cache.md):
     /// 落 `unverified/` 命名空间,永远压不过 `verified/` 里的条目。
@@ -335,7 +374,7 @@ impl DIDDocumentCache {
         doc: EncodedDocument,
         exp: u64,
         evidence: CacheEvidence,
-    ) -> bool {
+    ) -> CacheWriteOutcome {
         if evidence == CacheEvidence::Unverified {
             return self.update_observed(did, doc_type, doc, exp, None);
         }
@@ -344,25 +383,33 @@ impl DIDDocumentCache {
             .validate_owner_revocation(&did, doc_type.clone(), &doc)
             .is_err()
         {
-            return false;
+            return CacheWriteOutcome::RejectedConflict;
         }
 
         let key = combine_key(&did, doc_type.as_ref());
-        if let Some(current) = self.load_union(&key) {
-            if !merge_allows(&did, doc_type.as_ref(), &current, &doc, evidence) {
-                return false;
-            }
+        let verdict = match self.load_union(&key) {
+            Some(current) => merge_verdict(&did, doc_type.as_ref(), &current, &doc, evidence),
+            None => CacheWriteOutcome::Inserted,
+        };
+        if !matches!(
+            verdict,
+            CacheWriteOutcome::Inserted | CacheWriteOutcome::ReplacedOlder
+        ) {
+            return verdict;
         }
-        self.write_positive(&did, &key, doc_type.as_ref(), doc, exp, evidence);
-        true
+        if !self.write_positive(&did, &key, doc_type.as_ref(), doc, exp, evidence) {
+            return CacheWriteOutcome::PermissionDenied;
+        }
+        verdict
     }
 
     /// Observed 旁路写入(doc/update-did-cache.md):产物固定落 `unverified/`
     /// 命名空间、证据恒为 `Unverified`,`source` 只做诊断记录。
     ///
-    /// 返回值表示"这条观察是否成为当前查询可见的条目":`verified/` 已有同 key
-    /// 条目时观察仍会被记录,但返回 false(查询永远优先命中 verified/)。
-    /// 负状态屏蔽一切写入——此时连 unverified 文件都不产生。
+    /// 返回的 outcome 描述 Observed 命名空间内部的合并结果;`verified/` 已有同
+    /// key 条目时观察仍会被记录(查询永远优先命中 verified/,读侧自然遮蔽)。
+    /// 负状态屏蔽一切写入——此时连 unverified 文件都不产生
+    /// (`BlockedByNegativeState`)。
     pub fn update_observed(
         &self,
         did: DID,
@@ -370,34 +417,38 @@ impl DIDDocumentCache {
         doc: EncodedDocument,
         exp: u64,
         source: Option<String>,
-    ) -> bool {
+    ) -> CacheWriteOutcome {
         if self
             .validate_owner_revocation(&did, doc_type.clone(), &doc)
             .is_err()
         {
-            return false;
+            return CacheWriteOutcome::RejectedConflict;
         }
 
         let key = combine_key(&did, doc_type.as_ref());
-        let verified_current = self.load_ns(CacheNamespace::Verified, &key);
-        if let Some(current) = &verified_current {
+        if let Some(current) = self.load_ns(CacheNamespace::Verified, &key) {
             if current.is_negative() {
                 // 负状态是"回答",Observed 事件翻不了篇,也不值得记录。
-                return false;
+                return CacheWriteOutcome::BlockedByNegativeState;
             }
         }
 
-        // Observed 命名空间内部仍按同级 merge 规则去重(version_seq / iat)。
-        if let Some(current) = self.load_ns(CacheNamespace::Unverified, &key) {
-            if !merge_allows(
+        // Observed 命名空间内部仍按同级 merge 规则去重(iat + content hash)。
+        let verdict = match self.load_ns(CacheNamespace::Unverified, &key) {
+            Some(current) => merge_verdict(
                 &did,
                 doc_type.as_ref(),
                 &current,
                 &doc,
                 CacheEvidence::Unverified,
-            ) {
-                return false;
-            }
+            ),
+            None => CacheWriteOutcome::Inserted,
+        };
+        if !matches!(
+            verdict,
+            CacheWriteOutcome::Inserted | CacheWriteOutcome::ReplacedOlder
+        ) {
+            return verdict;
         }
 
         let entry = StoredEntry {
@@ -412,8 +463,10 @@ impl DIDDocumentCache {
                 observed_at: Some(buckyos_get_unix_timestamp()),
             },
         };
-        self.store(&key, &entry);
-        verified_current.is_none()
+        if !self.store(&key, &entry) {
+            return CacheWriteOutcome::PermissionDenied;
+        }
+        verdict
     }
 
     /// 无条件写入(种子/测试/本地运维用):跳过合并比较,但 owner replay guard
@@ -444,10 +497,10 @@ impl DIDDocumentCache {
         doc: EncodedDocument,
         exp: u64,
         evidence: CacheEvidence,
-    ) {
+    ) -> bool {
         let owner_document = if evidence == CacheEvidence::Unverified {
             // 未验证的 owner 文档没有资格触发吊销联动清理:否则任何人喊一声
-            // update_did_cache 就能用伪造 owner 文档驱逐已验证条目。
+            // add_observed_cache 就能用伪造 owner 文档驱逐已验证条目。
             None
         } else {
             parse_owner_document_doc(doc_type, &doc)
@@ -464,12 +517,50 @@ impl DIDDocumentCache {
                 observed_at: None,
             },
         };
-        self.store(key, &entry);
+        if !self.store(key, &entry) {
+            return false;
+        }
 
         // 新 owner 文档落地时,联动清理被它的 replay guard 判定吊销的旧文档。
         if let Some(owner_document) = owner_document {
             self.evict_revoked_docs(did, doc_type, &owner_document);
         }
+        true
+    }
+
+    /// `verified/` 命名空间的受信条目读取(snapshot 构建用):只返回正条目,
+    /// 证据必为 Published/Verified。Observed/Unverified 条目**不会**从这里露出
+    /// ——它们没有资格作为 owner 验签依据,也不能推进 latest-known baseline。
+    pub(crate) fn verified_entry(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+    ) -> Option<(EncodedDocument, u64, CacheEvidence)> {
+        let key = combine_key(did, doc_type.as_ref());
+        let entry = self.load_ns(CacheNamespace::Verified, &key)?;
+        if entry.is_negative() {
+            return None;
+        }
+        let exp = entry.exp();
+        let evidence = entry.meta.evidence;
+        entry.doc.map(|doc| (doc, exp, evidence))
+    }
+
+    /// `verified/` 命名空间记忆的负状态(snapshot 构建用)。
+    /// 现状负缓存只记录 terminal 状态(Revoked/Tombstoned)。
+    pub(crate) fn negative_memory(
+        &self,
+        did: &DID,
+        doc_type: Option<DidDocType>,
+    ) -> Option<(String, String)> {
+        let key = combine_key(did, doc_type.as_ref());
+        let entry = self.load_ns(CacheNamespace::Verified, &key)?;
+        if !entry.is_negative() {
+            return None;
+        }
+        let status = entry.meta.negative_status.clone().unwrap_or_default();
+        let message = entry.meta.negative_message.clone().unwrap_or_default();
+        Some((status, message))
     }
 
     /// Observed 候选(`unverified/` 命名空间)的原样读取,供 lazy verify 使用。
@@ -517,12 +608,16 @@ impl DIDDocumentCache {
             return false;
         }
         if let Some(current) = self.load_ns(CacheNamespace::Verified, &key) {
-            if !merge_allows(
+            let verdict = merge_verdict(
                 did,
                 doc_type.as_ref(),
                 &current,
                 &doc,
                 CacheEvidence::Verified,
+            );
+            if !matches!(
+                verdict,
+                CacheWriteOutcome::Inserted | CacheWriteOutcome::ReplacedOlder
             ) {
                 self.remove_ns(CacheNamespace::Unverified, &key);
                 return false;
@@ -685,60 +780,92 @@ impl DIDDocumentCache {
     }
 }
 
-/// merge 规则(简化文档第 5 节):负状态屏蔽一切,只有权威源的新 DR(Published
-/// 证据)能翻篇;否则先比证据等级,同级才比 version_seq / iat。
-fn merge_allows(
+/// merge 规则(iat-only,doc/verify-did-api-boundary-and-freshness-TODO.md
+/// Phase 4;version_seq 已整体退出流程,不参与任何比较):
+///
+/// 1. 负状态屏蔽一切,只有权威源的新 DR(Published 证据)能翻篇;
+/// 2. 更高证据等级直接胜出(权威结果永远能翻案),更低等级被忽略;
+/// 3. Info doc_type 的 `update_time` 合并规则独立保留(运行时观察信道,明确
+///    排除在 DocumentRevision 契约外);
+/// 4. 命名对象(`is_named_obj_id`)同级不可替换:同 hash 视为已存在,不同内容
+///    一律冲突;
+/// 5. 同级按 revision:`iat` 不同以 iat 决定新旧;同 iat 同 hash 为同一份文档
+///    (`AlreadyPresent`);同 iat 不同 hash 为同 revision 冲突
+///    (`RejectedConflict`),不悄悄选一个。缺 iat 的文档按 `exp` 补充推导;
+///    仍推不出时排在任何带 iat 的文档之前(None < Some)。
+fn merge_verdict(
     did: &DID,
     doc_type: Option<&DidDocType>,
     current: &StoredEntry,
     new_doc: &EncodedDocument,
     new_evidence: CacheEvidence,
-) -> bool {
+) -> CacheWriteOutcome {
     if current.is_negative() {
-        return new_evidence == CacheEvidence::Published;
+        return if new_evidence == CacheEvidence::Published {
+            CacheWriteOutcome::ReplacedOlder
+        } else {
+            CacheWriteOutcome::BlockedByNegativeState
+        };
     }
     let Some(current_doc) = current.doc.as_ref() else {
-        return true;
+        return CacheWriteOutcome::Inserted;
     };
 
     let current_rank = current.meta.evidence.rank();
     let new_rank = new_evidence.rank();
     if new_rank != current_rank {
-        return new_rank > current_rank;
+        return if new_rank > current_rank {
+            CacheWriteOutcome::ReplacedOlder
+        } else {
+            CacheWriteOutcome::IgnoredOlder
+        };
     }
 
-    // Info documents carry runtime observations such as DeviceInfo.all_ip. Their
-    // embedded DeviceDocument can keep a stable version_seq while update_time
-    // advances, so runtime freshness must win before the generic document merge.
+    // Info documents carry runtime observations such as DeviceInfo.all_ip with
+    // their own update_time axis. Runtime freshness wins before the generic
+    // revision merge; the Info channel is outside the DocumentRevision contract.
     if doc_type == Some(&DidDocType::Info) {
         let current_update_time = extract_timestamp(current_doc, "update_time");
         let new_update_time = extract_timestamp(new_doc, "update_time");
         match (current_update_time, new_update_time) {
-            (Some(current), Some(new)) => return new >= current,
-            (None, Some(_)) => return true,
-            (Some(_), None) => return false,
+            (Some(current), Some(new)) => {
+                return if new >= current {
+                    CacheWriteOutcome::ReplacedOlder
+                } else {
+                    CacheWriteOutcome::IgnoredOlder
+                };
+            }
+            (None, Some(_)) => return CacheWriteOutcome::ReplacedOlder,
+            (Some(_), None) => return CacheWriteOutcome::IgnoredOlder,
             (None, None) => {}
         }
     }
 
-    // 同级:比 version_seq,没有 version_seq 时比 iat(保持既有语义,包括
-    // did:dev 命名对象"无版本则不可替换"的保护)。
-    let current_version_seq = get_doc_version_seq(current_doc);
-    let new_version_seq = get_doc_version_seq(new_doc);
-    match (current_version_seq, new_version_seq) {
-        (Some(current), Some(new)) => return new > current,
-        (Some(_), None) => return false,
-        (None, Some(_)) => return true,
-        (None, None) => {}
-    }
+    let same_content = document_content_hash(current_doc) == document_content_hash(new_doc);
 
     if did.is_named_obj_id() {
-        return false;
+        // 命名对象内容即身份:同级永远不可替换。
+        return if same_content {
+            CacheWriteOutcome::AlreadyPresent
+        } else {
+            CacheWriteOutcome::RejectedConflict
+        };
     }
 
-    let new_iat = get_doc_iat(new_doc);
-    let current_iat = get_doc_iat(current_doc);
-    new_iat > current_iat
+    let new_iat = document_iat(new_doc);
+    let current_iat = document_iat(current_doc);
+    if new_iat == current_iat {
+        return if same_content {
+            CacheWriteOutcome::AlreadyPresent
+        } else {
+            CacheWriteOutcome::RejectedConflict
+        };
+    }
+    if new_iat > current_iat {
+        CacheWriteOutcome::ReplacedOlder
+    } else {
+        CacheWriteOutcome::IgnoredOlder
+    }
 }
 
 // ------------------------ 文件系统后端(纯 KV) ------------------------
@@ -982,7 +1109,8 @@ impl FsStore {
         }
     }
 
-    fn store(&self, ns: CacheNamespace, key: &str, entry: &StoredEntry) {
+    fn store(&self, ns: CacheNamespace, key: &str, entry: &StoredEntry) -> bool {
+        let mut ok = true;
         match entry.doc.as_ref() {
             Some(doc) => {
                 let file_path = self.doc_path(ns, key);
@@ -992,6 +1120,7 @@ impl FsStore {
                         file_path.display(),
                         err
                     );
+                    ok = false;
                 }
             }
             None => {
@@ -1002,8 +1131,10 @@ impl FsStore {
         if let Ok(content) = serde_json::to_string(&entry.meta) {
             if let Err(err) = self.write_atomic(ns, &self.meta_path(ns, key), &content) {
                 warn!("write did doc meta to local cache failed: {}", err);
+                ok = false;
             }
         }
+        ok
     }
 
     fn remove(&self, ns: CacheNamespace, key: &str) {
@@ -1106,10 +1237,12 @@ impl MemStore {
         self.entries(ns).read().ok()?.get(key).cloned()
     }
 
-    fn store(&self, ns: CacheNamespace, key: &str, entry: &StoredEntry) {
+    fn store(&self, ns: CacheNamespace, key: &str, entry: &StoredEntry) -> bool {
         if let Ok(mut guard) = self.entries(ns).write() {
             guard.insert(key.to_string(), entry.clone());
+            return true;
         }
+        false
     }
 
     fn remove(&self, ns: CacheNamespace, key: &str) {
@@ -1204,24 +1337,6 @@ impl UnauthenticatedInfoCache {
 
 fn is_expired(exp_ts: u64) -> bool {
     exp_ts <= buckyos_get_unix_timestamp()
-}
-
-fn get_doc_version_seq(doc: &EncodedDocument) -> Option<u64> {
-    extract_timestamp(doc, "version_seq")
-}
-
-fn get_doc_iat(doc: &EncodedDocument) -> Option<u64> {
-    let iat = extract_timestamp(doc, "iat");
-    if iat.is_some() {
-        return iat;
-    }
-    let exp = extract_timestamp(doc, "exp");
-    if exp.is_some() {
-        let exp_ts = exp.unwrap();
-        let iat_ts = exp_ts - DEFAULT_EXPIRE_TIME;
-        return Some(iat_ts);
-    }
-    None
 }
 
 fn extract_timestamp(doc: &EncodedDocument, field: &str) -> Option<u64> {
@@ -1397,7 +1512,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let exp = now + DEFAULT_EXPIRE_TIME;
         let doc = build_zone_doc(did, exp, "roundtrip");
-        assert!(cache.update(did.clone(), None, doc.clone(), exp, CacheEvidence::Verified));
+        assert_eq!(
+            cache.update(did.clone(), None, doc.clone(), exp, CacheEvidence::Verified),
+            CacheWriteOutcome::Inserted
+        );
         match cache.lookup(did, None).unwrap() {
             CacheLookup::Positive {
                 doc: loaded,
@@ -1433,7 +1551,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let exp = now + DEFAULT_EXPIRE_TIME;
         let doc = build_zone_doc(did, exp, "pre-revoke");
-        assert!(cache.update(did.clone(), None, doc, exp, CacheEvidence::Published));
+        assert_eq!(
+            cache.update(did.clone(), None, doc, exp, CacheEvidence::Published),
+            CacheWriteOutcome::Inserted
+        );
 
         cache.replace_with_negative(did, None, &DocumentStatus::Revoked, "revoked by authority");
 
@@ -1447,34 +1568,43 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         }
         assert!(cache.get(did, None).is_none());
 
-        // 负状态屏蔽普通写入(push / 已验证自签名都不行)。
+        // 负状态屏蔽普通写入(push / 已验证自签名都不行),写入结果结构化区分。
         let newer = build_zone_doc(did, exp + 10, "shadow");
-        assert!(!cache.update(
-            did.clone(),
-            None,
-            newer.clone(),
-            exp + 10,
-            CacheEvidence::Verified
-        ));
-        assert!(!cache.update(
-            did.clone(),
-            None,
-            newer.clone(),
-            exp + 10,
-            CacheEvidence::Unverified
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                newer.clone(),
+                exp + 10,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::BlockedByNegativeState
+        );
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                newer.clone(),
+                exp + 10,
+                CacheEvidence::Unverified
+            ),
+            CacheWriteOutcome::BlockedByNegativeState
+        );
         assert!(cache.lookup(did, None).unwrap().is_negative());
         // Observed 命名空间同样不产生条目(负状态屏蔽一切写入)。
         assert!(cache.observed_candidate(did, None).is_none());
 
         // 只有权威源的新 DR(Published 证据)能翻篇。
-        assert!(cache.update(
-            did.clone(),
-            None,
-            newer.clone(),
-            exp + 10,
-            CacheEvidence::Published
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                newer.clone(),
+                exp + 10,
+                CacheEvidence::Published
+            ),
+            CacheWriteOutcome::ReplacedOlder
+        );
         assert_eq!(positive_doc(cache, did), newer);
     }
 
@@ -1499,94 +1629,179 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let exp = now + DEFAULT_EXPIRE_TIME;
 
         let published = build_zone_doc(&did, exp, "published-old");
-        assert!(cache.update(
-            did.clone(),
-            None,
-            published.clone(),
-            exp,
-            CacheEvidence::Published
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                published.clone(),
+                exp,
+                CacheEvidence::Published
+            ),
+            CacheWriteOutcome::Inserted
+        );
 
         // 更新鲜的自签名(哪怕 iat 更大)压不过已发布条目。
         let fresher_self_signed = build_zone_doc(&did, exp + 1000, "self-signed-newer");
-        assert!(!cache.update(
-            did.clone(),
-            None,
-            fresher_self_signed,
-            exp + 1000,
-            CacheEvidence::Verified
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                fresher_self_signed,
+                exp + 1000,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::IgnoredOlder
+        );
         assert_eq!(positive_doc(&cache, &did), published);
 
-        // 未验证 push 更不行:它被记录为 Observed,但查询仍然命中 verified 条目。
+        // 未验证 push 被记录为 Observed(命名空间内 Inserted),但查询仍然
+        // 命中 verified 条目(读侧遮蔽)。
         let pushed = build_zone_doc(&did, exp + 2000, "pushed");
-        assert!(!cache.update(
-            did.clone(),
-            None,
-            pushed.clone(),
-            exp + 2000,
-            CacheEvidence::Unverified
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                pushed.clone(),
+                exp + 2000,
+                CacheEvidence::Unverified
+            ),
+            CacheWriteOutcome::Inserted
+        );
         assert_eq!(positive_doc(&cache, &did), published);
         assert_eq!(cache.observed_candidate(&did, None).unwrap().0, pushed);
 
         // 同级(已发布)才比新旧。
         let newer_published = build_zone_doc(&did, exp + 3000, "published-new");
-        assert!(cache.update(
-            did.clone(),
-            None,
-            newer_published.clone(),
-            exp + 3000,
-            CacheEvidence::Published
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                newer_published.clone(),
+                exp + 3000,
+                CacheEvidence::Published
+            ),
+            CacheWriteOutcome::ReplacedOlder
+        );
         assert_eq!(positive_doc(&cache, &did), newer_published);
     }
 
     #[test]
-    fn same_rank_prefers_version_seq_over_iat() {
+    fn same_rank_compares_iat_only_version_seq_ignored() {
+        // revision 只以 iat 为序(方向翻转):version_seq 视作用户自定义扩展,
+        // 不参与任何比较——iat 顺序与 version_seq 顺序相反的文档对按 iat 判定
+        // (测试要求 12)。
         let (cache, did) = setup_mem_cache();
         let now = buckyos_get_unix_timestamp();
 
         let doc_v2 = EncodedDocument::JsonLd(json!({
             "version_seq": 2, "iat": now, "exp": now + DEFAULT_EXPIRE_TIME, "marker": "v2"
         }));
-        assert!(cache.update(
-            did.clone(),
-            None,
-            doc_v2.clone(),
-            now + DEFAULT_EXPIRE_TIME,
-            CacheEvidence::Verified
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                doc_v2.clone(),
+                now + DEFAULT_EXPIRE_TIME,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::Inserted
+        );
 
-        // iat 更新但 version_seq 更小:拒绝。
+        // iat 更新、version_seq 更小:iat 胜出,替换。
         let doc_v1 = EncodedDocument::JsonLd(json!({
             "version_seq": 1, "iat": now + 10_000, "exp": now + DEFAULT_EXPIRE_TIME + 10_000, "marker": "v1"
         }));
-        assert!(!cache.update(
-            did.clone(),
-            None,
-            doc_v1,
-            now + DEFAULT_EXPIRE_TIME + 10_000,
-            CacheEvidence::Verified
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                doc_v1.clone(),
+                now + DEFAULT_EXPIRE_TIME + 10_000,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::ReplacedOlder
+        );
+        assert_eq!(positive_doc(&cache, &did), doc_v1);
 
-        // 有版本的条目拒绝无版本的更新。
+        // iat 更旧、version_seq 更大:仍被忽略。
+        let older_bigger_seq = EncodedDocument::JsonLd(json!({
+            "version_seq": 9, "iat": now + 5_000, "exp": now + DEFAULT_EXPIRE_TIME + 5_000, "marker": "older"
+        }));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                older_bigger_seq,
+                now + DEFAULT_EXPIRE_TIME + 5_000,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::IgnoredOlder
+        );
+
+        // 无 version_seq 的更新文档同样按 iat 胜出。
         let unversioned = EncodedDocument::JsonLd(json!({
             "iat": now + 20_000, "exp": now + DEFAULT_EXPIRE_TIME + 20_000, "marker": "unversioned"
         }));
-        assert!(!cache.update(
-            did.clone(),
-            None,
-            unversioned,
-            now + DEFAULT_EXPIRE_TIME + 20_000,
-            CacheEvidence::Verified
-        ));
-
-        assert_eq!(positive_doc(&cache, &did), doc_v2);
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                unversioned.clone(),
+                now + DEFAULT_EXPIRE_TIME + 20_000,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::ReplacedOlder
+        );
+        assert_eq!(positive_doc(&cache, &did), unversioned);
     }
 
     #[test]
-    fn named_obj_without_version_is_immutable() {
+    fn same_iat_distinguishes_already_present_and_conflict() {
+        // 同 iat 同 hash → AlreadyPresent;同 iat 不同 hash → RejectedConflict,
+        // 不悄悄选一个(测试要求 15)。
+        let (cache, did) = setup_mem_cache();
+        let now = buckyos_get_unix_timestamp();
+        let doc_a = EncodedDocument::JsonLd(json!({
+            "iat": now, "exp": now + DEFAULT_EXPIRE_TIME, "marker": "a"
+        }));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                doc_a.clone(),
+                now + DEFAULT_EXPIRE_TIME,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::Inserted
+        );
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                doc_a.clone(),
+                now + DEFAULT_EXPIRE_TIME,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::AlreadyPresent
+        );
+        let doc_b = EncodedDocument::JsonLd(json!({
+            "iat": now, "exp": now + DEFAULT_EXPIRE_TIME, "marker": "b"
+        }));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                doc_b,
+                now + DEFAULT_EXPIRE_TIME,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::RejectedConflict
+        );
+        assert_eq!(positive_doc(&cache, &did), doc_a);
+    }
+
+    #[test]
+    fn named_obj_is_immutable_at_same_rank() {
         let (cache, _) = setup_mem_cache();
         let did = DID::from_str("did:dev:5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE").unwrap();
         let now = buckyos_get_unix_timestamp();
@@ -1605,13 +1820,16 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let doc_v2 = EncodedDocument::JsonLd(json!({
             "iat": now + 1000, "exp": now + DEFAULT_EXPIRE_TIME + 1000, "marker": "v2"
         }));
-        assert!(!cache.update(
-            did.clone(),
-            None,
-            doc_v2,
-            now + DEFAULT_EXPIRE_TIME + 1000,
-            CacheEvidence::Verified
-        ));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                doc_v2,
+                now + DEFAULT_EXPIRE_TIME + 1000,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::RejectedConflict
+        );
         assert_eq!(positive_doc(&cache, &did), doc_v1);
     }
 
@@ -1777,7 +1995,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert!(cache.lookup(&did, None).is_none());
     }
 
-    /// 手工往 unverified/ 丢一个 doc 文件(无 meta)等价于一次 update_did_cache:
+    /// 手工往 unverified/ 丢一个 doc 文件(无 meta)等价于一次 add_observed_cache:
     /// 可被观察到,证据 Unverified("目录即协议")。
     #[test]
     fn fs_hand_placed_doc_in_unverified_dir_is_observed() {
@@ -1844,13 +2062,16 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let (tmp_dir, cache, did) = setup_fs_cache();
         let now = buckyos_get_unix_timestamp();
         let doc = build_zone_doc(&did, now + 1000, "to-promote");
-        assert!(cache.update_observed(
-            did.clone(),
-            None,
-            doc.clone(),
-            now + 1000,
-            Some("UdpDiscovery".to_string()),
-        ));
+        assert_eq!(
+            cache.update_observed(
+                did.clone(),
+                None,
+                doc.clone(),
+                now + 1000,
+                Some("UdpDiscovery".to_string()),
+            ),
+            CacheWriteOutcome::Inserted
+        );
         let key = did_cache_key(&did);
         assert!(tmp_dir
             .path()

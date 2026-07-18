@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, default_agent_context,
-    ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait, DidDocType, EncodedDocument, NSError,
+    ensure_jwt_iat_derivable, DIDContext, DIDDocumentTrait, DidDocType, EncodedDocument, NSError,
     NSResult, ServiceNode, VerificationMethodNode, DID,
 };
 
@@ -246,7 +246,7 @@ impl DIDDocumentTrait for AgentDocument {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
-        ensure_version_seq_for_jwt("AgentDocument", self.version_seq)?;
+        ensure_jwt_iat_derivable("AgentDocument", Some(self.iat), Some(self.exp))?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None;
@@ -271,7 +271,7 @@ impl DIDDocumentTrait for AgentDocument {
                     serde_json::from_value(json_result).map_err(|error| {
                         NSError::Failed(format!("Failed to decode agent doc:{}", error))
                     })?;
-                ensure_version_seq_for_jwt("AgentDocument", result.version_seq)?;
+                ensure_jwt_iat_derivable("AgentDocument", Some(result.iat), Some(result.exp))?;
                 Ok(result)
             }
             EncodedDocument::JsonLd(json_value) => {

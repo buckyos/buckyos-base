@@ -13,7 +13,8 @@ mod name_query;
 mod profile_resolver;
 mod provider;
 mod utility;
-mod verify_did_jwt;
+mod verify;
+mod verify_context;
 mod web_provider;
 mod zone_resolver;
 
@@ -31,7 +32,8 @@ pub use name_query::*;
 pub use profile_resolver::*;
 pub use provider::*;
 pub use utility::*;
-pub use verify_did_jwt::*;
+pub use verify::*;
+pub use verify_context::*;
 pub use web_provider::*;
 pub use zone_resolver::*;
 
@@ -247,7 +249,7 @@ pub fn record_connection_outcome(
 /// 注意:它不能用于 DID Document JWT 的 owner binding 验证——不要用
 /// `payload.owner` / `payload.iss` 调本函数来验一份外部 DID Document JWT,
 /// 那只能证明"JWT 能被它自己声明的 owner 验过"。权限主体认证场景必须使用
-/// [`verify_did_document_jwt`](doc/verify-did-document-jwt.md)。
+/// verify 家族(`resolve_and_verify_did_document_jwt`,doc/verify-did-document-jwt.md)。
 pub async fn resolve_auth_key(did: &DID, kid: Option<&str>) -> NSResult<DecodingKey> {
     let ed25519_auth_key = did.get_ed25519_auth_key();
     if ed25519_auth_key.is_some() {
@@ -336,32 +338,54 @@ pub async fn resolve_did_ex(
     client.resolve_did_ex(did, doc_type, policy).await
 }
 
-/// 验证一份外部传入的 DID Document JWT(doc/verify-did-document-jwt.md)。
-/// 权限主体认证场景必须用它,不要用 `payload.owner`/`payload.iss` 调
+/// 组合便捷 API:resolve(按 `options.policy` 的来源范围)+ 纯 verify 一份
+/// 外部传入的 DID Document JWT(doc/verify-did-document-jwt.md)。**不写 cache**。
+/// 权限主体认证场景必须用 verify 家族,不要用 `payload.owner`/`payload.iss` 调
 /// `resolve_auth_key` 验 DID Document JWT——那只能证明"JWT 能被它自己声明的
 /// owner 验过"。
-pub async fn verify_did_document_jwt(
+pub async fn resolve_and_verify_did_document_jwt(
     did: &DID,
     doc_type: DidDocType,
     jwt: &str,
-    options: VerifyDidDocumentJwtOptions,
-) -> NSResult<VerifiedDidDocument> {
-    let client = get_name_client()
-        .ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    options: &ResolveVerifyOptions,
+) -> std::result::Result<VerifiedDidDocument, ResolveVerifyError> {
+    let client = get_name_client().ok_or_else(|| {
+        ResolveVerifyError::Resolve(NSError::NotFound("Name client not found".to_string()))
+    })?;
     client
-        .verify_did_document_jwt(did, doc_type, jwt, options)
+        .resolve_and_verify_did_document_jwt(did, doc_type, jwt, options)
         .await
 }
 
-/// `verify_did_document_jwt` 的 DeviceDocument typed wrapper(RTCP 迁移入口)。
-pub async fn verify_device_document_jwt(
+/// `resolve_and_verify_did_document_jwt` 的 DeviceDocument typed wrapper
+/// (RTCP 迁移入口)。
+pub async fn resolve_and_verify_device_document_jwt(
     did: &DID,
     jwt: &str,
-    options: VerifyDidDocumentJwtOptions,
-) -> NSResult<(DeviceDocument, VerifiedDidDocument)> {
-    let client = get_name_client()
-        .ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
-    client.verify_device_document_jwt(did, jwt, options).await
+    options: &ResolveVerifyOptions,
+) -> std::result::Result<(DeviceDocument, VerifiedDidDocument), ResolveVerifyError> {
+    let client = get_name_client().ok_or_else(|| {
+        ResolveVerifyError::Resolve(NSError::NotFound("Name client not found".to_string()))
+    })?;
+    client
+        .resolve_and_verify_device_document_jwt(did, jwt, options)
+        .await
+}
+
+/// 组合便捷 API:resolve + verify + 显式写 verified cache
+/// (`resolve_verify_and_cache_did_document` 的全局包装)。
+pub async fn resolve_verify_and_cache_did_document(
+    did: &DID,
+    doc_type: DidDocType,
+    candidate: &EncodedDocument,
+    options: &ResolveVerifyOptions,
+) -> std::result::Result<(VerifiedDidDocument, CacheWriteOutcome), ResolveVerifyError> {
+    let client = get_name_client().ok_or_else(|| {
+        ResolveVerifyError::Resolve(NSError::NotFound("Name client not found".to_string()))
+    })?;
+    client
+        .resolve_verify_and_cache_did_document(did, doc_type, candidate, options)
+        .await
 }
 
 pub async fn resolve_owner_document(did: &DID) -> NSResult<OwnerDocument> {
@@ -391,26 +415,29 @@ pub async fn owner_is_bound_to_zone(did: &DID, zone_did: &DID) -> NSResult<bool>
     client.unwrap().owner_is_bound_to_zone(did, zone_did).await
 }
 
-/// "观察到 DID Document"的松写入入口(doc/update-did-cache.md):旁路的
+/// add_cache 动词的 Observed 入口(doc/update-did-cache.md):旁路的
 /// **未验证**缓存写入(`CacheEvidence::Unverified`,落 `unverified/` 目录),
 /// 不能提升文档信任等级。它是文件系统旁路协议的进程内薄封装——任何人往
 /// `unverified/` 目录里放约定格式的文件,效果与调用本函数完全等价。
+/// 快速操作:本地解析 + id 一致性检查,**不**触发联网 resolve;深度验证留给
+/// resolve 时的 lazy verify(`verify_and_promote`)。
 ///
-/// `source` 描述观察链路(UDP 发现 / gossip / push……),仅诊断用。应用层通过
-/// `verify_did_document_jwt` 验证成功后不要再调它保存"已验证文档"——受控
-/// 缓存写入由 verify 入口按证据等级自己完成。
-pub async fn update_did_cache(
+/// `source` 描述观察链路(UDP 发现 / gossip / push……),仅诊断用。应用层完成
+/// 验证与最终接受后要保存"已验证文档",用组合 API
+/// `resolve_verify_and_cache_did_document`(或受控进程内的 `add_verified_cache`),
+/// 不要再经过 Observed 旁路。
+pub fn add_observed_cache(
     did: DID,
     doc_type: Option<DidDocType>,
     doc: EncodedDocument,
     source: Option<UpdateSource>,
-) -> NSResult<()> {
+) -> NSResult<CacheWriteOutcome> {
     let client = get_name_client();
     if client.is_none() {
         return Err(NSError::NotFound("Name client not found".to_string()));
     }
     let client = client.unwrap();
-    client.update_did_cache(did, doc_type, doc, source)
+    client.add_observed_cache(did, doc_type, doc, source)
 }
 
 pub async fn add_device_info_cache(did: DID, device_info: DeviceInfo) -> NSResult<()> {
@@ -491,9 +518,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_did_cache_is_observed_not_trusted() {
+    async fn test_add_observed_cache_is_observed_not_trusted() {
         // doc/update-did-cache.md 核心原则:系统收到过 != 系统信任它。
-        // update_did_cache 只产生 Observed 事件;strict 的 resolve_did 不能把
+        // add_observed_cache 只产生 Observed 事件;strict 的 resolve_did 不能把
         // 未通过验证的旁路文档当成解析结果返回。
         let did = DID::from_str("did:web:example.com").unwrap();
         let doc = EncodedDocument::JsonLd(serde_json::json!({
@@ -523,9 +550,7 @@ mod tests {
             let _ = IS_NAME_LIB_INITED.set(true);
         }
 
-        update_did_cache(did.clone(), None, doc.clone(), Some(UpdateSource::Push))
-            .await
-            .unwrap();
+        add_observed_cache(did.clone(), None, doc.clone(), Some(UpdateSource::Push)).unwrap();
         // 观察缓存里可见(Unverified)。
         let client = GLOBAL_NAME_CLIENT.get().unwrap();
         assert!(client.doc_cache.get(&did, None).is_some());

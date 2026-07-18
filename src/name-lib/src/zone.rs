@@ -25,7 +25,7 @@ use crate::{
     decode_json_from_jwt_with_default_pk, decode_json_from_jwt_with_pk,
     decode_jwt_claim_without_verify,
 };
-use crate::{ensure_version_seq_for_jwt, DIDDocumentTrait, DidDocType, EncodedDocument};
+use crate::{ensure_jwt_iat_derivable, DIDDocumentTrait, DidDocType, EncodedDocument};
 use crate::{NSError, NSResult};
 
 // Helper function for serde skip_serializing_if
@@ -801,7 +801,7 @@ impl DIDDocumentTrait for ZoneDocument {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
-        ensure_version_seq_for_jwt("ZoneDocument", self.version_seq)?;
+        ensure_jwt_iat_derivable("ZoneDocument", Some(self.iat), Some(self.exp))?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
@@ -827,7 +827,7 @@ impl DIDDocumentTrait for ZoneDocument {
                     serde_json::from_value(json_result).map_err(|error| {
                         NSError::Failed(format!("Failed to decode zone document:{}", error))
                     })?;
-                ensure_version_seq_for_jwt("ZoneDocument", result.version_seq)?;
+                ensure_jwt_iat_derivable("ZoneDocument", Some(result.iat), Some(result.exp))?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {

@@ -444,6 +444,8 @@ impl BaseHttpProvider {
             effective_owner,
             authority_seq: buckyos.authority_seq,
             migration_target,
+            checked_at: buckyos.checked_at,
+            valid_until: buckyos.valid_until,
         })
     }
 
@@ -880,6 +882,13 @@ struct BuckyosMetadataWire {
     doc_hash: Option<String>,
     #[serde(rename = "migrationTarget", default)]
     migration_target: Option<String>,
+    /// 该条目最近一次经权威源确认/写入控制面的时刻(时间维度扩展,
+    /// doc/http_did_resolver_api.md)。
+    #[serde(rename = "checkedAt", default)]
+    checked_at: Option<u64>,
+    /// 允许消费方视为新鲜的截止时刻。
+    #[serde(rename = "validUntil", default)]
+    valid_until: Option<u64>,
 }
 
 #[async_trait]

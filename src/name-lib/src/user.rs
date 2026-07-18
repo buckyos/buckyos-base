@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     create_jwt_by_x, decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify,
-    default_owner_context, ensure_version_seq_for_jwt, DIDContext, DIDDocumentTrait, DidDocType,
+    default_owner_context, ensure_jwt_iat_derivable, DIDContext, DIDDocumentTrait, DidDocType,
     EncodedDocument, NSError, NSResult, ServiceNode, VerificationMethodNode, DID,
 };
 
@@ -225,50 +225,50 @@ impl OwnerDocument {
             .collect()
     }
 
+    /// owner replay guard(anti-rollback)。revision 只以 iat 为序
+    /// (doc/verify-did-api-boundary-and-freshness-TODO.md):`valid_iat` 一键否决
+    /// 该时间点(含)之前签发的所有文档。`mini_version_seq` 已随 version_seq 整体
+    /// 退出流程——读到时只打 deprecation warning,不再执行。
     pub fn validate_jwt_revocation(&self, doc_type: &str, doc: &EncodedDocument) -> NSResult<()> {
-        if self.mini_version_seq.is_none() && self.valid_iat.is_none() {
-            return Ok(());
+        if self.mini_version_seq.is_some() {
+            log::warn!(
+                "owner document {} declares deprecated mini_version_seq; version_seq has \
+                 exited the flow and the guard is no longer enforced (use valid_iat)",
+                self.id.to_string()
+            );
         }
+        let Some(valid_iat) = self.valid_iat else {
+            return Ok(());
+        };
 
         if !doc.is_proof() {
             return Ok(());
         }
 
+        // revision iat 的补充推导与 revision 契约一致:iat 直接存在,或由
+        // exp - DEFAULT_EXPIRE_TIME 推导;两者皆无的文档本身无效,guard 直接拒绝。
         let doc_value = doc.clone().to_json_value()?;
-        if let Some(mini_version_seq) = self.mini_version_seq {
-            let version_seq = doc_value
-                .get("version_seq")
-                .and_then(|value| value.as_u64())
-                .ok_or_else(|| {
-                    NSError::Failed(format!(
-                        "{} JWT missing version_seq required by owner revocation policy",
-                        doc_type
-                    ))
-                })?;
-            if version_seq <= mini_version_seq {
-                return Err(NSError::Failed(format!(
-                    "{} JWT version_seq {} is not greater than owner mini_version_seq {}",
-                    doc_type, version_seq, mini_version_seq
-                )));
-            }
-        }
-
-        if let Some(valid_iat) = self.valid_iat {
-            let iat = doc_value
-                .get("iat")
-                .and_then(|value| value.as_u64())
-                .ok_or_else(|| {
-                    NSError::Failed(format!(
-                        "{} JWT missing iat required by owner revocation policy",
-                        doc_type
-                    ))
-                })?;
-            if iat <= valid_iat {
-                return Err(NSError::Failed(format!(
-                    "{} JWT iat {} is not greater than owner valid_iat {}",
-                    doc_type, iat, valid_iat
-                )));
-            }
+        let iat = doc_value
+            .get("iat")
+            .and_then(|value| value.as_u64())
+            .or_else(|| {
+                doc_value
+                    .get("exp")
+                    .and_then(|value| value.as_u64())
+                    .map(|exp| exp.saturating_sub(crate::DEFAULT_EXPIRE_TIME))
+            })
+            .ok_or_else(|| {
+                NSError::Failed(format!(
+                    "{} JWT carries neither iat nor exp; owner revocation policy cannot \
+                     order it against valid_iat",
+                    doc_type
+                ))
+            })?;
+        if iat <= valid_iat {
+            return Err(NSError::Failed(format!(
+                "{} JWT iat {} is not greater than owner valid_iat {}",
+                doc_type, iat, valid_iat
+            )));
         }
 
         Ok(())
@@ -358,7 +358,7 @@ impl DIDDocumentTrait for OwnerDocument {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
-        ensure_version_seq_for_jwt("OwnerDocument", self.version_seq)?;
+        ensure_jwt_iat_derivable("OwnerDocument", Some(self.iat), Some(self.exp))?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None; // Default is JWT, set to None to save space
@@ -384,7 +384,7 @@ impl DIDDocumentTrait for OwnerDocument {
                     serde_json::from_value(json_result).map_err(|error| {
                         NSError::Failed(format!("Failed to decode owner document:{}", error))
                     })?;
-                ensure_version_seq_for_jwt("OwnerDocument", result.version_seq)?;
+                ensure_jwt_iat_derivable("OwnerDocument", Some(result.iat), Some(result.exp))?;
                 return Ok(result);
             }
             EncodedDocument::JsonLd(json_value) => {
@@ -592,7 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn owner_document_jwt_requires_version_seq() {
+    fn owner_document_jwt_encodes_without_version_seq() {
+        // version_seq 已整体退出流程:JWT 强制项从"必须带 version_seq"改为
+        // "必须能得出 iat"。无 version_seq 的文档正常编码;字段作为用户自定义
+        // 扩展原样透传。
         let private_key_pem = r#"
         -----BEGIN PRIVATE KEY-----
         MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
@@ -616,8 +619,10 @@ mod tests {
 
         owner_document.version_seq = None;
 
-        let err = owner_document.encode(Some(&private_key)).unwrap_err();
-        assert!(matches!(err, NSError::Failed(_)));
+        let encoded = owner_document.encode(Some(&private_key)).unwrap();
+        let decoded = OwnerDocument::decode(&encoded, None).unwrap();
+        assert_eq!(decoded.version_seq, None);
+        assert_eq!(decoded.iat, owner_document.iat);
     }
 
     #[test]
@@ -657,6 +662,8 @@ mod tests {
             .validate_jwt_revocation("ZoneDocument", &EncodedDocument::Jwt(fresh_jwt))
             .unwrap();
 
+        // mini_version_seq 已随 version_seq 退役:低 version_seq 不再触发拒绝
+        // (兼容期只打 deprecation warning),anti-rollback 由 valid_iat 承担。
         let stale_version_jwt = encode(
             &Header::new(Algorithm::EdDSA),
             &json!({
@@ -667,9 +674,9 @@ mod tests {
             &private_key,
         )
         .unwrap();
-        assert!(owner_document
+        owner_document
             .validate_jwt_revocation("ZoneDocument", &EncodedDocument::Jwt(stale_version_jwt))
-            .is_err());
+            .unwrap();
 
         let stale_iat_jwt = encode(
             &Header::new(Algorithm::EdDSA),
@@ -683,6 +690,17 @@ mod tests {
         .unwrap();
         assert!(owner_document
             .validate_jwt_revocation("ZoneDocument", &EncodedDocument::Jwt(stale_iat_jwt))
+            .is_err());
+
+        // iat/exp 皆无:无法与 valid_iat 排序,guard 拒绝(revision 契约同款)。
+        let no_iat_jwt = encode(
+            &Header::new(Algorithm::EdDSA),
+            &json!({ "marker": "no-iat" }),
+            &private_key,
+        )
+        .unwrap();
+        assert!(owner_document
+            .validate_jwt_revocation("ZoneDocument", &EncodedDocument::Jwt(no_iat_jwt))
             .is_err());
     }
 

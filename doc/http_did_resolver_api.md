@@ -148,20 +148,44 @@ Accept: application/did-resolution
   },
   "didDocument": { /* Active 时建议内联的 DID 文档（JsonLd 或 JWT 字符串），也可只给 docHash 锚点 */ },
   "didDocumentMetadata": {
-    "versionId": "3",            // 字符串化的 document_version
+    "versionId": "1751500000",   // 字符串化的 documentVersion（= 当前发布文档的 iat）
     "deactivated": false,        // Revoked/Tombstoned 时为 true
     "buckyos": {
       "docType": "zone",
       "documentStatus": "active",   // active | missing | revoked | tombstoned | migrated | expired
-      "documentVersion": 3,
+      "documentVersion": 1751500000, // = 当前发布文档的 iat（见下方语义说明）
       "authoritySeq": 9,
       "effectiveOwner": "did:bns:waterflier", // 权威源的 owner 绑定，可以不带文档本体单独返回
       "docHash": "sha256:...",      // 可选：已发布 body 的内容哈希锚点（编码后文档字符串的 sha256）
-      "migrationTarget": null       // Migrated 时必填，目标 DID 字符串
+      "migrationTarget": null,      // Migrated 时必填，目标 DID 字符串
+      "checkedAt": 1751500100,      // 可选：该条目最近一次经权威源确认/写入控制面的时刻（Unix 秒）
+      "validUntil": 1751503700      // 可选：允许消费方视为新鲜的截止时刻（Unix 秒）
     }
   }
 }
 ```
+
+### `documentVersion` 的取值语义（已固定）
+
+**`documentVersion` = 当前发布文档的 `iat`（documentVersion = document_iat）**。权威侧不引入独立
+版本序号："文档版本"就是当前发布文档的 iat（文档缺 `iat` 时按 `exp - DEFAULT_EXPIRE_TIME` 推导）。
+吊销/替换语义统一到 iat 轴上——owner 侧 `valid_iat`（小于等于该值全部作废）与权威侧当前发布 iat
+（候选 iat 小于它即 `Superseded`，见 `AuthorityFreshness::NotCurrent`）用同一把尺子。旧草案中
+把它当作自增版本号的理解**作废**;`version_seq` 已整体退出流程（用户自定义扩展字段，任何比较、
+guard、强制项都不再读取）。`authoritySeq` 保留为权威源自身的变更序号（owner binding 变更等），
+与文档 revision 无关。
+
+### 时间维度字段（`checkedAt` / `validUntil`）
+
+为 Zone Resolver 等 shared cache/control plane 转述权威判断而扩展（verify 家族的
+`AuthorityFreshness::Current { checked_at, valid_until, .. }` 与 snapshot 新鲜度约束消费它们）：
+
+- `checkedAt`：该条目最近一次经权威源确认/写入 Zone control plane 的时刻。缺省时客户端以本地收到
+  回答的时刻代替（本机直连权威源的情况）。
+- `validUntil`：来源允许消费方把这份回答视为新鲜的截止时刻。缺省表示来源不声明，由调用方
+  freshness policy 自行限制检查年龄（`FreshnessRequirement::RequireAuthorityCurrent.max_age_secs`）。
+
+两个字段先固定协议语义;resolver/zone server 侧按各自节奏实现（客户端对缺省值有完备兜底）。
 
 ### 字段 ↔ Rust 类型对照表
 
@@ -175,11 +199,13 @@ Accept: application/did-resolution
 | `didDocumentMetadata.versionId` | `document_version` | 字符串化的 `u64`（`documentVersion` 的后备来源） |
 | `didDocumentMetadata.buckyos.docType` | `doc_type` | |
 | `didDocumentMetadata.buckyos.documentStatus` | `document_status`（`DocumentStatus` 枚举） | 见第 4 节映射 |
-| `didDocumentMetadata.buckyos.documentVersion` | `document_version` | |
-| `didDocumentMetadata.buckyos.authoritySeq` | `authority_seq` | |
+| `didDocumentMetadata.buckyos.documentVersion` | `document_version` | = 当前发布文档的 iat（见上节语义） |
+| `didDocumentMetadata.buckyos.authoritySeq` | `authority_seq` | 权威源自身变更序号，与文档 revision 无关 |
 | `didDocumentMetadata.buckyos.effectiveOwner` | `effective_owner`（`DID`） | 权威源的 owner 绑定；候选文档的 `doc.owner` 必须与它一致（expected_owner 硬规则） |
-| `didDocumentMetadata.buckyos.docHash` | `document_ref.content_hash` | 已发布 body 的锚点；见第 6 节 |
+| `didDocumentMetadata.buckyos.docHash` | `document_ref.content_hash` | 已发布 body 的锚点；见第 6 节。Zone Resolver 客户端不再丢弃该字段（snapshot 的 candidate hash 绑定与 freshness 比较使用它） |
 | `didDocumentMetadata.buckyos.migrationTarget` | `migration_target`（`DID`） | 仅 Migrated 状态使用 |
+| `didDocumentMetadata.buckyos.checkedAt` | `checked_at` | 可选时间维度字段（见上节） |
+| `didDocumentMetadata.buckyos.validUntil` | `valid_until` | 可选时间维度字段（见上节） |
 | `didDocument` | `document_ref.inline_document` | 见第 6 节 |
 
 ## 4. `document_status` 状态机

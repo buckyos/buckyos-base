@@ -58,11 +58,7 @@ pub enum NSError {
     InvalidState(String),
     #[error("Owner conflict: {0}")]
     OwnerConflict(String),
-    /// `verify_did_document_jwt` 的结构化失败:`code` 是需求文档错误表中的稳定
-    /// 错误码(如 `DetachedOwnerRejected`),调用方按 code 分支,不要解析 detail。
-    #[error("verify did document jwt failed: {code}: {detail}")]
-    VerifyDidJwtFailed { code: String, detail: String },
-    /// `update_did_cache` 写入前的快速校验未通过(格式无法解析、`id` 与声明的
+    /// `add_observed_cache` 写入前的快速校验未通过(格式无法解析、`id` 与声明的
     /// did 不一致等),`unverified` 缓存未产生任何写入(doc/update-did-cache.md)。
     #[error("unverified cache write rejected: {0}")]
     UnverifiedCacheWriteRejected(String),
@@ -70,8 +66,8 @@ pub enum NSError {
     /// 网络不可达)。unverified 候选保留,strict 解析按 cache miss 处理。
     #[error("verify-and-promote unavailable: {0}")]
     VerifyAndPromoteUnavailable(String),
-    /// lazy verify(verify_and_promote)明确失败。`code` 复用
-    /// `verify_did_document_jwt` 的稳定错误码集合;unverified 候选已被删除。
+    /// lazy verify(verify_and_promote)明确失败。`code` 复用纯 verify
+    /// (`VerifyError::code`)的稳定错误码集合;unverified 候选已被删除。
     #[error("verify-and-promote rejected: {code}: {detail}")]
     VerifyAndPromoteRejected { code: String, detail: String },
 }

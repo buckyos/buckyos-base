@@ -6,16 +6,17 @@ use crate::addr_rtt_db::{
 };
 use crate::dns_provider::DnsProvider;
 use crate::doc_cache::{
-    CacheBackend, CacheEvidence, CacheLookup, DIDDocumentCache, UnauthenticatedInfoCache,
+    CacheBackend, CacheEvidence, CacheLookup, CacheWriteOutcome, DIDDocumentCache,
+    UnauthenticatedInfoCache,
 };
 use crate::name_query::{NameQuery, ResolveOutcome};
 use crate::provider::RecordType;
-use crate::verify_did_jwt::VerifyPromoteOutcome;
+use crate::verify::VerifyPromoteOutcome;
 use crate::zone_resolver::{ZoneLookup, ZoneResolverClient, ZoneResolverConfig};
 use crate::{
     is_key_class_method, BodyEvidence, CacheStatus, DidDocType, DiscoveredDocument, DocumentStatus,
-    LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy, ResolveWarning,
-    ResolvedDocument, UpdateSource, VerificationStatus,
+    LocalAuthorityOverrideStore, NameInfo, NsProvider, ResolvePolicy, ResolveSourcePolicy,
+    ResolveWarning, ResolvedDocument, UpdateSource, VerificationStatus,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_system_etc_dir};
 use core::error;
@@ -153,7 +154,7 @@ impl NameClient {
         }
     }
 
-    fn zone_resolver_snapshot(&self) -> Option<Arc<ZoneResolverClient>> {
+    pub(crate) fn zone_resolver_snapshot(&self) -> Option<Arc<ZoneResolverClient>> {
         self.zone_resolver.read().ok().and_then(|zone| zone.clone())
     }
 
@@ -254,35 +255,55 @@ impl NameClient {
         self.name_query.add_provider(provider, trust_level).await;
     }
 
-    // ---- 缓存旁路写入 ----
+    // ---- add_cache:显式保存证据(doc/verify-did-api-boundary-and-freshness-TODO.md Phase 4)----
 
-    /// "观察到 DID Document"的松写入入口(doc/update-did-cache.md):UDP 发现、
-    /// gossip、push、文件投递拿到的文档从这里进入 `unverified` cache。这是
-    /// Observed 事件,不是信任入口:产物恒为 `CacheEvidence::Unverified`,落
-    /// `unverified/` 命名空间;它压不过已发布/已验证条目,也翻不了负状态。
-    /// strict 解析在首次使用时做 lazy verify(verify_and_promote),验证通过
-    /// 才会返回给调用方。
+    /// add_cache 动词的 Observed 入口:UDP 发现、gossip、push、文件投递拿到的
+    /// 文档从这里进入 `unverified` cache。这是 Observed 事件,不是信任入口:
+    /// 产物恒为 `CacheEvidence::Unverified`,落 `unverified/` 命名空间;它压
+    /// 不过已发布/已验证条目,也翻不了负状态。strict 解析在首次使用时做
+    /// lazy verify(verify_and_promote),验证通过才会返回给调用方。
     ///
     /// 本函数只是文件系统旁路协议的薄封装(省一次文件 IO,语义完全等价,不享受
-    /// 任何额外信任):写入前做一次快速校验,校验不过不产生任何写入。
-    /// `source` 只描述链路来源(诊断用),不接受写入方自报的信任等级。
-    pub fn update_did_cache(
+    /// 任何额外信任):写入前做一次快速校验(本地解析,不联网),校验不过不
+    /// 产生任何写入。`source` 只描述链路来源(诊断用),不接受写入方自报的
+    /// 信任等级。
+    pub fn add_observed_cache(
         &self,
         did: DID,
         doc_type: Option<DidDocType>,
         doc: EncodedDocument,
         source: Option<UpdateSource>,
-    ) -> NSResult<()> {
+    ) -> NSResult<CacheWriteOutcome> {
         Self::quick_check_observed_document(&did, &doc)?;
         let exp = Self::cache_ttl_exp(&doc);
-        self.doc_cache.update_observed(
+        Ok(self.doc_cache.update_observed(
             did,
             doc_type,
             doc,
             exp,
             source.map(|s| s.as_str().to_string()),
-        );
-        Ok(())
+        ))
+    }
+
+    /// add_cache 动词的 Verified 入口:把一份**调用方已完成验证与最终接受**的
+    /// 文档显式写入 `verified/` 命名空间(证据 `Verified`)。安全边界不在这个
+    /// 函数:是否有权写 verified 命名空间由目标目录的 OS 权限与进程身份保证,
+    /// 直接按文件系统协议写入与调用本函数具有相同语义。
+    ///
+    /// verify 家族**不会**隐式调用它——是否保存、何时保存(在持钥证明/授权/
+    /// 锁管理之后)由完成"最终接受"动作的上游显式决定。组合便捷入口见
+    /// `resolve_verify_and_cache_did_document`。
+    pub fn add_verified_cache(
+        &self,
+        did: DID,
+        doc_type: Option<DidDocType>,
+        doc: EncodedDocument,
+    ) -> NSResult<CacheWriteOutcome> {
+        Self::quick_check_observed_document(&did, &doc)?;
+        let exp = Self::cache_ttl_exp(&doc);
+        Ok(self
+            .doc_cache
+            .update(did, doc_type, doc, exp, CacheEvidence::Verified))
     }
 
     /// 写入 `unverified/` 前的快速校验(doc/update-did-cache.md"写入协议"):
@@ -812,14 +833,20 @@ impl NameClient {
         }
     }
 
-    /// resolve_did 外层(简化文档第 3 节第 0/2 步):
-    /// 0. Zone Resolver L1 cache 快路径(明确回答即命中,unknown 继续 L2);
-    /// 1. 本地覆盖快路径(hosts 语义);
-    /// 2. in-TTL positive cache 快路径(`CacheStatus::Hit`);
-    /// 3. in-TTL negative cache 快路径(直接报错);
-    /// 4. 进入 resolver 主循环;
-    /// 5. 只有主循环没产出可核实文档、且没有负状态屏蔽、权威源也没回答 Missing
-    ///    时,才按策略用"过期但未作废"的缓存兜底。
+    /// resolve_did 外层(简化文档第 3 节第 0/2 步)。来源范围由
+    /// `policy.source`(`ResolveSourcePolicy`)显式决定:
+    /// - `LocalOnly`:只走本机 cache 快路径与 stale 判定,零网络;
+    /// - `LocalAndZone`:Zone 快路径 + 本机 cache,不进 resolver 主循环;
+    /// - `RemoteAuthority`:跳过 Zone 与本机 in-TTL 快路径,直接进主循环取得
+    ///   权威判断;不做 stale cache 兜底;
+    /// - `BestAvailable`(默认):完整正常优先级——
+    ///   0. Zone Resolver L1 cache 快路径(明确回答即命中,unknown 继续 L2);
+    ///   1. 本地覆盖快路径(hosts 语义);
+    ///   2. in-TTL positive cache 快路径(`CacheStatus::Hit`);
+    ///   3. in-TTL negative cache 快路径(直接报错);
+    ///   4. 进入 resolver 主循环;
+    ///   5. 只有主循环没产出可核实文档、且没有负状态屏蔽、权威源也没回答
+    ///      Missing 时,才按策略用"过期但未作废"的缓存兜底。
     pub async fn resolve_did_ex(
         &self,
         did: &DID,
@@ -835,6 +862,7 @@ impl NameClient {
         }
 
         let policy = policy.with_local_authority_override(self.local_authority_overrides.clone());
+        let source = policy.source;
         let allow_stale_cache = policy.allow_stale_cache;
         let doc_type_c = doc_type.clone().unwrap_or_default();
 
@@ -844,16 +872,22 @@ impl NameClient {
         // 时按 L1 miss 继续 L2 本机 cache 与 resolver core。Zone 结果不回写
         // 本机 cache(避免两级 cache entry 合并)。不做 did_in_zone 客户端过滤:
         // 覆盖范围由 Zone Resolver 服务内部策略决定(T5.3)。
-        // policy 可按调用关闭(`use_zone_resolver = false`):zone-resolver-server
-        // 内部用 resolve_did 完成对外查询,必须跳过这里,否则查询到自己造成递归。
-        if policy.use_zone_resolver {
+        // 来源门禁:LocalOnly(零网络)与 RemoteAuthority(显式权威判断)不走
+        // Zone;policy 也可按调用关闭(`use_zone_resolver = false`):
+        // zone-resolver-server 内部用 resolve_did 完成对外查询,必须跳过这里,
+        // 否则查询到自己造成递归。
+        let zone_allowed = matches!(
+            source,
+            ResolveSourcePolicy::LocalAndZone | ResolveSourcePolicy::BestAvailable
+        ) && policy.use_zone_resolver;
+        if zone_allowed {
             if let Some(zone) = self.zone_resolver_snapshot() {
                 let no_proof = self
                     .name_query
                     .is_no_proof_doc_type(&did.method, &doc_type_c)
                     .await;
                 match zone.lookup(did, &doc_type_c, no_proof).await {
-                    ZoneLookup::Answered(result) => return result,
+                    ZoneLookup::Answered(answer) => return answer.result,
                     ZoneLookup::Unknown(err) => {
                         debug!(
                             "zone resolver unknown for {}#{}, falling back to local cache: {}",
@@ -896,130 +930,197 @@ impl NameClient {
             None
         };
 
+        // RemoteAuthority:显式要求本次取得权威判断,跳过一切 in-TTL 快路径
+        // (负状态记忆仍在主循环后置门禁里生效:非权威已发布结果翻不了它)。
+        let fast_path_allowed = source != ResolveSourcePolicy::RemoteAuthority;
+
         // 1. 负状态快路径:负状态是"回答",命中返回错误,不是"查不到"。
-        if let Some(CacheLookup::Negative {
-            message,
-            in_ttl: true,
-            ..
-        }) = &cached
-        {
-            return Err(NSError::Disabled(message.clone()));
+        if fast_path_allowed {
+            if let Some(CacheLookup::Negative {
+                message,
+                in_ttl: true,
+                ..
+            }) = &cached
+            {
+                return Err(NSError::Disabled(message.clone()));
+            }
         }
 
         // 2. in-TTL positive 快路径。owner replay guard 对缓存命中同样生效。
         //    读路径按证据等级分流(doc/update-did-cache.md):Published/Verified
         //    直接返回;Unverified(Observed)必须先过一次 lazy verify——系统
         //    收到过 != 系统信任它,resolver 的默认返回不能不问出处。
-        if let Some(CacheLookup::Positive {
-            doc,
-            exp,
-            evidence,
-            in_ttl: true,
-            source,
-        }) = &cached
-        {
-            let doc = doc.clone();
-            let exp = *exp;
-            let evidence = *evidence;
-            let source = source.as_deref().and_then(UpdateSource::from_str);
-            match evidence {
-                CacheEvidence::Published | CacheEvidence::Verified => {
-                    match self.validate_doc_replay_guard(did, doc_type.clone(), &doc) {
-                        Ok(()) => {
-                            return Ok(ResolvedDocument::from_cache(
-                                doc,
-                                did,
-                                &doc_type_c,
-                                exp,
-                                evidence.to_body_evidence(),
-                                CacheStatus::Hit,
-                            )
-                            .with_verification_status(VerificationStatus::Passed));
-                        }
-                        Err(err) => {
-                            info!(
-                                "cached did:{}#{} rejected by owner replay guard: {}",
-                                did.to_string(),
-                                doc_type_c,
-                                err
-                            );
-                            self.doc_cache.delete(did.clone(), doc_type.clone());
-                            cached = None;
-                        }
-                    }
-                }
-                CacheEvidence::Unverified => {
-                    // 首次使用时 lazy verify。Rejected(候选已删除)与 strict
-                    // 下的 Unavailable 都等同 cache miss 继续主循环,与 owner
-                    // replay guard 失败的处理方式完全对称。
-                    match self.verify_and_promote(did, doc_type.clone(), &policy).await {
-                        Ok(VerifyPromoteOutcome::Promoted(promoted_doc)) => {
-                            return Ok(ResolvedDocument::from_cache(
-                                promoted_doc,
-                                did,
-                                &doc_type_c,
-                                exp,
-                                CacheEvidence::Verified.to_body_evidence(),
-                                CacheStatus::Hit,
-                            )
-                            .with_verification_status(VerificationStatus::Passed)
-                            .with_source(source));
-                        }
-                        Ok(VerifyPromoteOutcome::Rejected(err)) => {
-                            info!(
-                                "observed did:{}#{} rejected by lazy verify: {}",
-                                did.to_string(),
-                                doc_type_c,
-                                err
-                            );
-                            cached = None;
-                        }
-                        Ok(VerifyPromoteOutcome::Unavailable(err)) => {
-                            if policy.allow_unverified_cache_when_unavailable
-                                && self
-                                    .validate_doc_replay_guard(did, doc_type.clone(), &doc)
-                                    .is_ok()
-                            {
-                                // 显式宽松模式:打标露面,绝不冒充已验证结果。
-                                info!(
-                                    "observed did:{}#{} served as ObservedFallback \
-                                     (verification unavailable): {}",
-                                    did.to_string(),
-                                    doc_type_c,
-                                    err
-                                );
+        if fast_path_allowed {
+            if let Some(CacheLookup::Positive {
+                doc,
+                exp,
+                evidence,
+                in_ttl: true,
+                source: entry_source,
+            }) = &cached
+            {
+                let doc = doc.clone();
+                let exp = *exp;
+                let evidence = *evidence;
+                let entry_source = entry_source.as_deref().and_then(UpdateSource::from_str);
+                match evidence {
+                    CacheEvidence::Published | CacheEvidence::Verified => {
+                        match self.validate_doc_replay_guard(did, doc_type.clone(), &doc) {
+                            Ok(()) => {
                                 return Ok(ResolvedDocument::from_cache(
                                     doc,
                                     did,
                                     &doc_type_c,
                                     exp,
-                                    CacheEvidence::Unverified.to_body_evidence(),
-                                    CacheStatus::ObservedFallback,
+                                    evidence.to_body_evidence(),
+                                    CacheStatus::Hit,
                                 )
-                                .with_verification_status(VerificationStatus::Unavailable)
-                                .with_source(source));
+                                .with_verification_status(VerificationStatus::Passed));
                             }
-                            debug!(
-                                "observed did:{}#{} lazy verify unavailable, \
-                                 strict resolve treats it as cache miss: {}",
-                                did.to_string(),
-                                doc_type_c,
-                                err
-                            );
-                            cached = None;
+                            Err(err) => {
+                                info!(
+                                    "cached did:{}#{} rejected by owner replay guard: {}",
+                                    did.to_string(),
+                                    doc_type_c,
+                                    err
+                                );
+                                self.doc_cache.delete(did.clone(), doc_type.clone());
+                                cached = None;
+                            }
                         }
-                        Err(err) => {
-                            debug!(
-                                "lazy verify for observed did:{}#{} failed to run: {}",
-                                did.to_string(),
-                                doc_type_c,
-                                err
-                            );
-                            cached = None;
+                    }
+                    CacheEvidence::Unverified
+                        if source == ResolveSourcePolicy::BestAvailable =>
+                    {
+                        // 首次使用时 lazy verify(需要权威往返,只有
+                        // BestAvailable 允许)。Rejected(候选已删除)与 strict
+                        // 下的 Unavailable 都等同 cache miss 继续主循环,与
+                        // owner replay guard 失败的处理方式完全对称。
+                        match self.verify_and_promote(did, doc_type.clone(), &policy).await {
+                            Ok(VerifyPromoteOutcome::Promoted(promoted_doc)) => {
+                                return Ok(ResolvedDocument::from_cache(
+                                    promoted_doc,
+                                    did,
+                                    &doc_type_c,
+                                    exp,
+                                    CacheEvidence::Verified.to_body_evidence(),
+                                    CacheStatus::Hit,
+                                )
+                                .with_verification_status(VerificationStatus::Passed)
+                                .with_source(entry_source));
+                            }
+                            Ok(VerifyPromoteOutcome::Rejected(err)) => {
+                                info!(
+                                    "observed did:{}#{} rejected by lazy verify: {}",
+                                    did.to_string(),
+                                    doc_type_c,
+                                    err
+                                );
+                                cached = None;
+                            }
+                            Ok(VerifyPromoteOutcome::Unavailable(err)) => {
+                                if policy.allow_unverified_cache_when_unavailable
+                                    && self
+                                        .validate_doc_replay_guard(did, doc_type.clone(), &doc)
+                                        .is_ok()
+                                {
+                                    // 显式宽松模式:打标露面,绝不冒充已验证结果。
+                                    info!(
+                                        "observed did:{}#{} served as ObservedFallback \
+                                         (verification unavailable): {}",
+                                        did.to_string(),
+                                        doc_type_c,
+                                        err
+                                    );
+                                    return Ok(ResolvedDocument::from_cache(
+                                        doc,
+                                        did,
+                                        &doc_type_c,
+                                        exp,
+                                        CacheEvidence::Unverified.to_body_evidence(),
+                                        CacheStatus::ObservedFallback,
+                                    )
+                                    .with_verification_status(VerificationStatus::Unavailable)
+                                    .with_source(entry_source));
+                                }
+                                debug!(
+                                    "observed did:{}#{} lazy verify unavailable, \
+                                     strict resolve treats it as cache miss: {}",
+                                    did.to_string(),
+                                    doc_type_c,
+                                    err
+                                );
+                                cached = None;
+                            }
+                            Err(err) => {
+                                debug!(
+                                    "lazy verify for observed did:{}#{} failed to run: {}",
+                                    did.to_string(),
+                                    doc_type_c,
+                                    err
+                                );
+                                cached = None;
+                            }
                         }
+                    }
+                    CacheEvidence::Unverified => {
+                        // LocalOnly / LocalAndZone:来源策略不允许 lazy verify
+                        // 的权威往返。宽松模式下打标露面(verification 未尝试),
+                        // strict 等同 miss。
+                        if policy.allow_unverified_cache_when_unavailable
+                            && self
+                                .validate_doc_replay_guard(did, doc_type.clone(), &doc)
+                                .is_ok()
+                        {
+                            return Ok(ResolvedDocument::from_cache(
+                                doc,
+                                did,
+                                &doc_type_c,
+                                exp,
+                                CacheEvidence::Unverified.to_body_evidence(),
+                                CacheStatus::ObservedFallback,
+                            )
+                            .with_verification_status(VerificationStatus::NotAttempted)
+                            .with_source(entry_source));
+                        }
+                        cached = None;
                     }
                 }
             }
+        }
+
+        // LocalOnly / LocalAndZone:不进 resolver 主循环。负状态(不论 TTL)
+        // 屏蔽;否则按策略用"过期但未作废"的 Published/Verified 条目兜底。
+        if matches!(
+            source,
+            ResolveSourcePolicy::LocalOnly | ResolveSourcePolicy::LocalAndZone
+        ) {
+            if let Some(CacheLookup::Negative { message, .. }) = &cached {
+                return Err(NSError::Disabled(message.clone()));
+            }
+            if allow_stale_cache {
+                if let Some(CacheLookup::Positive {
+                    doc, exp, evidence, ..
+                }) = cached
+                {
+                    if evidence != CacheEvidence::Unverified && !Self::doc_self_expired(&doc) {
+                        return Ok(ResolvedDocument::from_cache(
+                            doc,
+                            did,
+                            &doc_type_c,
+                            exp,
+                            evidence.to_body_evidence(),
+                            CacheStatus::Fallback,
+                        ));
+                    }
+                }
+            }
+            return Err(NSError::NotFound(format!(
+                "{}#{} not available from {:?} sources",
+                did.to_string(),
+                doc_type_c,
+                source
+            )));
         }
 
         // 3. resolver 主循环。
@@ -1114,7 +1215,8 @@ impl NameClient {
                 // Published/Verified 条目:Unverified 观察缓存从未通过验证,
                 // 连降级露面都必须走显式的 ObservedFallback 打标路径
                 // (doc/update-did-cache.md),不能混进普通 stale 兜底。
-                if allow_stale_cache {
+                // RemoteAuthority 来源策略显式要求权威判断,不做任何兜底。
+                if allow_stale_cache && source == ResolveSourcePolicy::BestAvailable {
                     if let Some(CacheLookup::Positive {
                         doc, exp, evidence, ..
                     }) = cached
@@ -1193,6 +1295,19 @@ impl NameClient {
                     CacheStatus::UnauthenticatedInfoHit,
                 ));
             }
+        }
+
+        // LocalOnly / LocalAndZone:info 契约同样不进 provider 查询
+        // (Zone 快路径已在外层按来源门禁执行过)。
+        if matches!(
+            policy.source,
+            ResolveSourcePolicy::LocalOnly | ResolveSourcePolicy::LocalAndZone
+        ) {
+            return Err(NSError::NotFound(format!(
+                "unauthenticated info not cached: {}#{}",
+                did.to_string(),
+                doc_type_c
+            )));
         }
 
         match self
@@ -1805,7 +1920,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[tokio::test]
-    async fn update_did_cache_writes_local_only_and_zone_still_wins() {
+    async fn add_observed_cache_writes_local_only_and_zone_still_wins() {
         // T5.6:`update DID cache` 只影响 local cache;Zone Resolver 可用时
         // Zone 结果仍优先。
         let (endpoint, _hits) = spawn_zone_stub("200 OK", zone_doc_body("zone-answer")).await;
@@ -1816,7 +1931,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let now = buckyos_get_unix_timestamp();
         let pushed = make_doc(now, now + 1000, "pushed");
         client
-            .update_did_cache(did.clone(), None, pushed.clone(), None)
+            .add_observed_cache(did.clone(), None, pushed.clone(), None)
             .unwrap();
         // push 进的是本机 cache。
         assert_eq!(client.doc_cache.get(&did, None).unwrap().0, pushed);
@@ -2130,10 +2245,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let _ = client.resolve_did(&did, None).await.unwrap_err();
         assert!(client.doc_cache.lookup(&did, None).unwrap().is_negative());
 
-        // push(update_did_cache)写不进去,负状态仍在。
+        // push(add_observed_cache)写不进去,负状态仍在。
         let now = buckyos_get_unix_timestamp();
         client
-            .update_did_cache(
+            .add_observed_cache(
                 did.clone(),
                 None,
                 make_doc(now, now + 1000, "pushed"),
@@ -2927,7 +3042,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let first_info = build_discovered_device_info(&device_did, first_ip, now);
         let first_doc = EncodedDocument::JsonLd(serde_json::to_value(&first_info).unwrap());
         writer
-            .update_did_cache(
+            .add_observed_cache(
                 device_did.clone(),
                 Some(DidDocType::Info),
                 first_doc,
@@ -3016,7 +3131,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .await;
 
         client
-            .update_did_cache(
+            .add_observed_cache(
                 app_did.clone(),
                 None,
                 zone_doc.clone(),
@@ -3101,7 +3216,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .await;
 
         client
-            .update_did_cache(app_did.clone(), None, impersonated_doc, Some(UpdateSource::Gossip))
+            .add_observed_cache(app_did.clone(), None, impersonated_doc, Some(UpdateSource::Gossip))
             .unwrap();
         assert!(client.doc_cache.observed_candidate(&app_did, None).is_some());
 
@@ -3111,7 +3226,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .unwrap();
         match outcome {
             VerifyPromoteOutcome::Rejected(NSError::VerifyAndPromoteRejected { code, .. }) => {
-                assert_eq!(code, "DeclaredOwnerMismatch");
+                assert_eq!(code, "OwnerMismatch");
             }
             other => panic!("expected rejected, got {:?}", other),
         }
@@ -3142,7 +3257,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .await;
 
         client
-            .update_did_cache(app_did.clone(), None, zone_doc.clone(), Some(UpdateSource::Push))
+            .add_observed_cache(app_did.clone(), None, zone_doc.clone(), Some(UpdateSource::Push))
             .unwrap();
 
         // strict(默认):等同 cache miss,主循环也拿不到结果时报错,但绝不把
@@ -3180,7 +3295,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert!(client.doc_cache.observed_candidate(&app_did, None).is_some());
     }
 
-    // 测试要求 1 + 7:手工往 unverified/ 目录放文件与调用 update_did_cache 完全
+    // 测试要求 1 + 7:手工往 unverified/ 目录放文件与调用 add_observed_cache 完全
     // 等价("目录即协议");格式合法但验证不过的文件,strict resolve 不返回它、
     // 也不因它报错——视为 miss 继续主循环,拿到权威源结果。
     #[tokio::test]
@@ -3212,7 +3327,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .join("unverified")
             .join(format!("{}.doc.json", key));
         std::fs::write(&unverified_doc_path, hand_placed.to_string()).unwrap();
-        // 与 update_did_cache 等价:立即被观察到。
+        // 与 add_observed_cache 等价:立即被观察到。
         assert!(client.doc_cache.observed_candidate(&did, None).is_some());
 
         // strict resolve:不返回手工文件、不报错,继续主循环拿权威结果。
@@ -3227,10 +3342,10 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     // 测试要求 7(promote 形态):手工放进 unverified/ 的可验证候选与
-    // update_did_cache 行为一致——resolve 时被 lazy verify 转正,文件物理移动
+    // add_observed_cache 行为一致——resolve 时被 lazy verify 转正,文件物理移动
     // 到 verified/;meta 自称的 evidence 不被信任。
     #[tokio::test]
-    async fn hand_placed_verifiable_file_promotes_like_update_did_cache() {
+    async fn hand_placed_verifiable_file_promotes_like_add_observed_cache() {
         let tmp = tempdir().unwrap();
         let client = NameClient::new(NameClientConfig {
             enable_cache: true,
@@ -3320,7 +3435,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         // Observed 事件被记录,但查询永远优先命中 verified。
         client
-            .update_did_cache(
+            .add_observed_cache(
                 did.clone(),
                 None,
                 make_doc(now + 10, now + 5000, "observed-later"),
@@ -3363,7 +3478,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             "exp": buckyos_get_unix_timestamp() + 1000,
         }));
         let err = client
-            .update_did_cache(declared.clone(), None, mismatched, Some(UpdateSource::Push))
+            .add_observed_cache(declared.clone(), None, mismatched, Some(UpdateSource::Push))
             .unwrap_err();
         assert!(matches!(err, NSError::UnverifiedCacheWriteRejected(_)));
 
@@ -3384,7 +3499,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = mem_client();
         let did = DID::from_str("did:web:observed-stale.example").unwrap();
         let now = buckyos_get_unix_timestamp();
-        // 直接以过期 exp 写入 Observed 条目(绕过 update_did_cache 的 TTL 计算)。
+        // 直接以过期 exp 写入 Observed 条目(绕过 add_observed_cache 的 TTL 计算)。
         client.doc_cache.update_observed(
             did.clone(),
             None,

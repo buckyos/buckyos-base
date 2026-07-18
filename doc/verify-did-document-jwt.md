@@ -1,5 +1,33 @@
 # verify_did_document_jwt 需求文档
 
+> `resolve / verify / add_cache` API 边界与“我看到的最新 / 权威源说明的最新”
+> 见 [Verify DID API 边界与最新性 TODO](./verify-did-api-boundary-and-freshness-TODO.md)——**已实现**。
+
+## 2026-07 API 边界重构补记(breaking change,以此为准)
+
+原 `verify_did_document_jwt` 单入口已按三动词边界拆分/替换(实现见
+`src/name-client/src/verify_context.rs` 纯 verify 与 `src/name-client/src/verify.rs`
+组合层),对照如下:
+
+| 旧 | 新 | 说明 |
+| --- | --- | --- |
+| `verify_did_document_jwt(did, doc_type, jwt, options)` | `resolve_and_verify_did_document_jwt(did, doc_type, jwt, &ResolveVerifyOptions)` | 组合入口,名字显式暴露"resolve + verify";**不再隐式写 cache** |
+| `VerifyDidDocumentJwtOptions { purpose, validity, cache_result }` | `ResolveVerifyOptions { purpose, policy }` | `cache_result` 删除——写 cache 用 `resolve_verify_and_cache_did_document`;`validity`(ValidAtIssue)随 CurrentActive 拆解一并退场;`policy.source`(`ResolveSourcePolicy`)显式决定证据来源范围 |
+| (无) | `verify_did_document(expected_did, doc_type, candidate, &VerifyContextSnapshot, VerifyOptions)` | **纯 verify**:同步、无网络、无写入,只消费调用方准备的 snapshot;缺材料返回结构化 `MissingDependency` |
+| (无) | `NameClient::build_verify_context(did, doc_type, &ResolvePolicy)` | resolve 家族的 snapshot 构建 helper(LocalOnly / LocalAndZone / RemoteAuthority / BestAvailable) |
+| `verify_device_document_jwt` | `resolve_and_verify_device_document_jwt` | RTCP typed wrapper |
+| 错误码 `NotCurrentActive` | 拆解:`ValidityEvidence` + `FreshnessEvidence { local, authority }` + `evaluate_freshness(&verified, &FreshnessRequirement)` | "签名失败 / 本地比它新 / 没联网查 authority / authority 明确否定"不再压成一个错误;terminal 负状态硬失败为 `VerifyError::RejectedByNegativeState` |
+| `NSError::VerifyDidJwtFailed { code, .. }` | 类型化 `VerifyError`(`InvalidDocument` / `DocumentIdMismatch` / `OwnerMismatch` / `DetachedOwnerRejected` / `OwnerBindingUnavailable` / `SignatureRejected` / `RevokedByOwnerPolicy` / `RejectedByNegativeState` / `MissingDependency`) | promote 路径的 `VerifyAndPromoteRejected.code` 复用 `VerifyError::code()` |
+| `document_version`(version_seq 语义) | `DocumentRevision { iat, content_hash }` | version_seq 整体退出流程;`mini_version_seq` guard 退役(只警告),anti-rollback 由 `valid_iat` 承担 |
+
+行为要点:纯 verify 默认无网络、无写入副作用;权威负状态学习/Migrated 条目删除移到
+snapshot 构建(resolve 缓存回填);`AuthorityFreshness::Current` 只能由本次显式
+Remote Authority Resolve 且绑定候选 hash/body 产生,ZoneHit/Published cache 命中
+不冒充权威当前。
+
+下文保留原始需求论证(验证语义——expected_owner 硬规则、owner 递归、验签、
+replay guard——全部延续);与本补记冲突处以补记为准。
+
 ## 背景
 
 应用层经常会收到一份 DID Document JWT, 例如 RTCP 握手里携带的

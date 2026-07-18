@@ -573,7 +573,7 @@ impl NameQuery {
         }
     }
 
-    /// `verify_did_document_jwt` 的权威阶段入口:对 (did, doc_type) 运行一次
+    /// verify 家族(`build_verify_context`)的权威阶段入口:对 (did, doc_type) 运行一次
     /// 权威渠道查询并归一化。`Err(NotFound)` = method 未注册;`Ok(None)` = 该
     /// method 没有注册权威渠道(发布状态不可知,外部候选只能按 NeedProof 验证);
     /// `Ok(Some(..))` = 权威读取端的回答(Dr)或"没有得到回答"(Unknown)。

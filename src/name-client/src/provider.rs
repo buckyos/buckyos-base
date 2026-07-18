@@ -29,13 +29,34 @@ pub fn structural_owner(did: &DID) -> Option<DID> {
     }
 }
 
-/// 计算文档 body 的内容哈希(权威源锚定 `doc_hash` 时用来做成员判断)。
-/// 约定为编码后文档字符串(JWT 原文或 JSON 序列化)的 sha256 hex。
+/// 计算文档 body 的内容哈希(权威源锚定 `doc_hash` 时用来做成员判断,
+/// `DocumentRevision::content_hash` 同一契约)。
+///
+/// 编码契约(doc/verify-did-api-boundary-and-freshness-TODO.md,已确认):
+/// - JWT:对 compact artifact **原文**做 sha256;
+/// - JsonLd:对 `serde_json::Value` 重序列化结果做 sha256。workspace 不启用
+///   serde_json 的 `preserve_order`,`Value` 的 map 是 BTreeMap,序列化天然是
+///   "键字典序 + 紧凑分隔符",已消除键序/空白差异(有防护测试锁定该前提);
+///   不引入 JCS(RFC 8785)/URDNA2015。
 pub fn document_content_hash(doc: &EncodedDocument) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(doc.to_string().as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// 文档的 revision `iat`:`iat` 直接存在,或由 `exp - DEFAULT_EXPIRE_TIME`
+/// 补充推导(既有 `get_doc_iat` 语义,现为 revision 契约的唯一时间轴)。
+/// 两者皆无、无法得出 iat 的文档没有 revision(verify 家族按 InvalidDocument 拒绝)。
+pub fn document_iat(doc: &EncodedDocument) -> Option<u64> {
+    let value = doc.clone().to_json_value().ok()?;
+    if let Some(iat) = value.get("iat").and_then(|ts| ts.as_u64()) {
+        return Some(iat);
+    }
+    value
+        .get("exp")
+        .and_then(|ts| ts.as_u64())
+        .map(|exp| exp.saturating_sub(name_lib::DEFAULT_EXPIRE_TIME))
 }
 
 /// 权威源锚定的 hash 与 body 是否匹配。允许 `sha256:` 前缀,大小写不敏感。
@@ -97,12 +118,25 @@ pub struct PublishedState {
     pub doc_type: String,
     pub document_status: DocumentStatus,
     pub document_ref: Option<DocumentRef>,
+    /// 权威记录的"文档版本"= 当前发布文档的 iat(wire `documentVersion` 的统一
+    /// 语义,documentVersion = document_iat)。权威侧不引入独立版本序号,吊销/
+    /// 替换语义与 owner 侧 `valid_iat` 统一在同一条 iat 轴上:候选 iat 小于它
+    /// 即 `Superseded`。
     pub document_version: Option<u64>,
     /// 权威源记录的 owner 绑定。owner 变更/委托只能通过这里生效,
     /// 候选文档自声明的 owner 说了不算(简化文档 2.4 节)。
     pub effective_owner: Option<DID>,
+    /// 权威源自身的变更序号(owner binding 变更等),与文档 revision 无关。
     pub authority_seq: Option<u64>,
     pub migration_target: Option<DID>,
+    /// 该条目最近一次经权威源确认/写入控制面的时刻(wire `checkedAt`)。
+    /// 本机直连权威源时由客户端在收到回答时补记;Zone 控制面转述时来自 wire。
+    #[serde(default)]
+    pub checked_at: Option<u64>,
+    /// 该回答允许消费方视为新鲜的截止时刻(wire `validUntil`);None 表示
+    /// 来源没有声明,由调用方 freshness policy 自行限制检查年龄。
+    #[serde(default)]
+    pub valid_until: Option<u64>,
 }
 
 impl PublishedState {
@@ -116,6 +150,8 @@ impl PublishedState {
             effective_owner: None,
             authority_seq: None,
             migration_target: None,
+            checked_at: None,
+            valid_until: None,
         }
     }
 
@@ -129,6 +165,8 @@ impl PublishedState {
             effective_owner: None,
             authority_seq: None,
             migration_target: None,
+            checked_at: None,
+            valid_until: None,
         }
     }
 }
@@ -585,14 +623,14 @@ impl ResolvedDocument {
             .as_ref()
             .and_then(|value| value.get("iat").and_then(|ts| ts.as_u64()));
         let updated = created;
-        let version_seq = doc_value
-            .as_ref()
-            .and_then(|value| value.get("version_seq").and_then(|ts| ts.as_u64()));
 
         let document_status = published.map(|state| state.document_status.clone());
+        // documentVersion = document_iat:权威没有给出时,兜底为文档自身的
+        // revision iat(iat 直接存在或由 exp 推导)。version_seq 已退出流程,
+        // 不再参与任何版本语义。
         let document_version = published
             .and_then(|state| state.document_version)
-            .or(version_seq);
+            .or_else(|| document_iat(&document));
 
         let content_type = match &document {
             EncodedDocument::Jwt(_) => "application/did+jwt",
@@ -710,8 +748,41 @@ impl ResolvedDocument {
     }
 }
 
+/// 解析来源范围(doc/verify-did-api-boundary-and-freshness-TODO.md):调用方只看
+/// 这个值就能判断一次 resolve 可能访问哪些信道、延迟档位是什么。它与
+/// `ResolvePolicy` 其余字段的分工:`source` 决定**哪些信道可访问**;
+/// `use_zone_resolver` 是 Zone 信道的额外开关(zone-resolver-server 自递归保护);
+/// `allow_self_signed_when_missing` / `allow_stale_cache` /
+/// `allow_unverified_cache_when_unavailable` 是候选**准入/兜底策略**;
+/// `local_authority_override` / `follow_migration` / `max_depth` 归属解析细节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolveSourcePolicy {
+    /// 只读进程内/本机文件 cache,不访问 Zone Resolver 和 provider。
+    /// 唯一保证无网络 I/O 的档位。
+    LocalOnly,
+    /// 允许访问 Zone Resolver(即使 endpoint 是 localhost 也是显式允许的 I/O),
+    /// 但不访问 method authority remote provider。
+    LocalAndZone,
+    /// 显式访问 method authority,取得当前权威判断:跳过本机 in-TTL cache 快路径
+    /// 与 Zone 快路径,直接进入 resolver 主循环,且不做 stale cache 兜底。
+    /// 只有这个档位(或 `BestAvailable` 明确命中 method authority)的结果才有
+    /// 资格产生"权威全局当前"receipt。
+    RemoteAuthority,
+    /// 按 resolver 正常优先级取得当前最佳答案(Zone → 本机 cache → 主循环)。
+    BestAvailable,
+}
+
+impl Default for ResolveSourcePolicy {
+    fn default() -> Self {
+        Self::BestAvailable
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvePolicy {
+    /// 本次解析允许访问的来源范围。resolve 可能读写解析缓存、可能联网,
+    /// 由这个字段显式决定(LocalOnly 除外都可能是异步慢操作)。
+    pub source: ResolveSourcePolicy,
     pub follow_migration: bool,
     /// 策略点②:权威源明确回答 Missing 时,自签名候选是否有入场资格。
     /// 入场不豁免 expected_owner 一致性与验签。
@@ -743,6 +814,7 @@ pub struct ResolvePolicy {
 impl Default for ResolvePolicy {
     fn default() -> Self {
         Self {
+            source: ResolveSourcePolicy::BestAvailable,
             follow_migration: true,
             allow_self_signed_when_missing: false,
             allow_stale_cache: true,
@@ -756,6 +828,11 @@ impl Default for ResolvePolicy {
 }
 
 impl ResolvePolicy {
+    pub fn with_source(mut self, source: ResolveSourcePolicy) -> Self {
+        self.source = source;
+        self
+    }
+
     pub fn with_local_authority_override(
         mut self,
         store: Arc<LocalAuthorityOverrideStore>,
@@ -779,6 +856,19 @@ impl ResolvePolicy {
         policy.allow_self_signed_when_missing = false;
         policy.allow_stale_cache = false;
         policy.allow_unverified_cache_when_unavailable = false;
+        policy
+    }
+
+    /// owner 材料解析使用的 policy:在 `for_authority_lookup` 之上调整来源范围。
+    /// `RemoteAuthority` 只约束**主体** (did, doc_type) 必须取得权威判断;owner
+    /// 文档是内部依赖,走正常优先级(含本机 cache 复用,新鲜度由 cache TTL 约束),
+    /// 避免每次验证都放大出一次 owner 的权威往返。`LocalOnly` / `LocalAndZone`
+    /// 原样传播——这两个档位承诺不访问 method authority,owner 解析同样受约束。
+    pub fn for_owner_lookup(&self) -> Self {
+        let mut policy = self.for_authority_lookup();
+        if policy.source == ResolveSourcePolicy::RemoteAuthority {
+            policy.source = ResolveSourcePolicy::BestAvailable;
+        }
         policy
     }
 
@@ -1353,5 +1443,44 @@ mod tests {
         assert!(content_hash_matches(&format!("sha256:{}", hash), &doc));
         assert!(content_hash_matches(&hash.to_uppercase(), &doc));
         assert!(!content_hash_matches("deadbeef", &doc));
+    }
+
+    /// content hash 编码契约的防护测试(已确认):workspace 不得开启 serde_json
+    /// 的 `preserve_order`——`Value` 的 map 必须是 BTreeMap,序列化天然是
+    /// "键字典序 + 紧凑分隔符",这是 JsonLd content hash 跨进程稳定的前提。
+    /// 若有人打开 preserve_order,本测试会失败。
+    #[test]
+    fn json_value_serialization_is_key_sorted_and_compact() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{ "zebra": 1, "alpha": {"z": 1, "a": 2}, "mid": [1, 2] }"#)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"alpha":{"a":2,"z":1},"mid":[1,2],"zebra":1}"#
+        );
+
+        // 键序/空白差异不影响 JsonLd 的 content hash。
+        let reordered: serde_json::Value = serde_json::from_str(
+            r#"{"mid":[1,2],  "alpha":{"a":2,"z":1},"zebra":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            document_content_hash(&EncodedDocument::JsonLd(value)),
+            document_content_hash(&EncodedDocument::JsonLd(reordered))
+        );
+    }
+
+    #[test]
+    fn document_iat_derives_from_exp_when_missing() {
+        // revision iat 的补充流程(get_doc_iat 语义):iat 直接存在优先;
+        // 缺 iat 用 exp - DEFAULT_EXPIRE_TIME;两者皆无 → None(文档无效)。
+        let with_iat = EncodedDocument::JsonLd(json!({"iat": 100, "exp": 999_999}));
+        assert_eq!(document_iat(&with_iat), Some(100));
+
+        let exp_only = EncodedDocument::JsonLd(json!({"exp": name_lib::DEFAULT_EXPIRE_TIME + 7}));
+        assert_eq!(document_iat(&exp_only), Some(7));
+
+        let neither = EncodedDocument::JsonLd(json!({"marker": "no-time"}));
+        assert_eq!(document_iat(&neither), None);
     }
 }

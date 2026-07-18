@@ -582,10 +582,20 @@ pub trait DIDDocumentTrait: Send + Sync {
 
 pub static KNOWN_WEB3_BRIDGE_CONFIG: OnceCell<HashMap<String, String>> = OnceCell::new();
 
-pub(crate) fn ensure_version_seq_for_jwt(doc_type: &str, version_seq: Option<u64>) -> NSResult<()> {
-    if version_seq.is_none() {
+/// JWT 形式 DID Document 的硬规则(doc/verify-did-api-boundary-and-freshness-TODO.md):
+/// 必须能得出 revision `iat`——`iat` 直接存在,或可由 `exp - DEFAULT_EXPIRE_TIME`
+/// 补充推导(`get_doc_iat` 语义)。两者皆无、无法得出 iat 的文档无效。
+///
+/// 旧的"JWT 必须带 version_seq"强制项已随 version_seq 整体退出流程:
+/// `version_seq` 字段视作用户自定义扩展原样透传,不参与任何比较、guard 与强制项。
+pub(crate) fn ensure_jwt_iat_derivable(
+    doc_type: &str,
+    iat: Option<u64>,
+    exp: Option<u64>,
+) -> NSResult<()> {
+    if iat.is_none() && exp.is_none() {
         return Err(NSError::Failed(format!(
-            "{} version_seq is required when encoding as JWT",
+            "{} JWT carries neither iat nor exp; revision iat cannot be derived",
             doc_type
         )));
     }
@@ -609,7 +619,7 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
         let owner_document = serde_json::from_value::<OwnerDocument>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse owner document failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("OwnerDocument", owner_document.get_version_seq())?;
+            ensure_jwt_iat_derivable("OwnerDocument", owner_document.get_iat(), owner_document.get_exp())?;
         }
         return Ok(Box::new(owner_document));
     }
@@ -617,7 +627,7 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
         let agent_document = serde_json::from_value::<AgentDocument>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse agent document failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("AgentDocument", agent_document.get_version_seq())?;
+            ensure_jwt_iat_derivable("AgentDocument", agent_document.get_iat(), agent_document.get_exp())?;
         }
         return Ok(Box::new(agent_document));
     }
@@ -625,7 +635,7 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
         let device_document = serde_json::from_value::<DeviceDocument>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse device document failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("DeviceDocument", device_document.get_version_seq())?;
+            ensure_jwt_iat_derivable("DeviceDocument", device_document.get_iat(), device_document.get_exp())?;
         }
         return Ok(Box::new(device_document));
     }
@@ -634,7 +644,7 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
         let zone_document = serde_json::from_value::<ZoneDocument>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse zone document failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("ZoneDocument", zone_document.get_version_seq())?;
+            ensure_jwt_iat_derivable("ZoneDocument", zone_document.get_iat(), zone_document.get_exp())?;
         }
         return Ok(Box::new(zone_document));
     }
@@ -656,7 +666,7 @@ pub fn parse_did_doc(doc: EncodedDocument) -> NSResult<Box<dyn DIDDocumentTrait 
         let did_object_card = serde_json::from_value::<DIDObjectCard>(doc_value)
             .map_err(|e| NSError::Failed(format!("parse DID Object Card failed: {}", e)))?;
         if is_jwt {
-            ensure_version_seq_for_jwt("DIDObjectCard", did_object_card.get_version_seq())?;
+            ensure_jwt_iat_derivable("DIDObjectCard", did_object_card.get_iat(), did_object_card.get_exp())?;
         }
         return Ok(Box::new(did_object_card));
     }

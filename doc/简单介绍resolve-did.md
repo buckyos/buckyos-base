@@ -98,6 +98,22 @@ expected_owner 必须来自候选文档**之外**，来源只有两个，按优�
 使用点，都标在注释里。expected_owner 与候选入场门禁不是策略，是约束——它们决定
 "用谁验、有没有资格"，没有裁量空间。
 
+在主循环之外，`ResolvePolicy.source`（`ResolveSourcePolicy`）显式声明一次解析的
+**来源范围**——调用方只看这个值就能判断延迟档位与可能的 I/O
+（doc/verify-did-api-boundary-and-freshness-TODO.md）：
+
+- `LocalOnly`：只读本机 cache，零网络；
+- `LocalAndZone`：加 Zone cache（localhost 也是显式允许的 I/O），不进主循环；
+- `RemoteAuthority`：跳过各级 cache 快路径，显式取得权威判断，不做 stale 兜底
+  ——只有它（或 `BestAvailable` 明确命中权威源）的结果有资格支撑
+  `AuthorityFreshness::Current`；
+- `BestAvailable`（默认）：下述完整正常优先级。
+
+另外注意 revision 语义：文档新旧只以 `iat` 为序（缺 `iat` 由
+`exp - DEFAULT_EXPIRE_TIME` 推导），content hash 判定同一性与冲突;`version_seq`
+已整体退出流程（用户自定义扩展字段，cache 合并、replay guard、JWT 强制项都不再
+读取；owner 侧 anti-rollback 由 `valid_iat` 承担）。
+
 resolver core 之前有一层默认启用、可显式关闭的 Zone cache。它通常跑在
 `127.0.0.1:3180`，对外看起来是 resolver 接口，实际定位是 cluster-level cache /
 control plane。cache 分两级：Zone Resolver 是 L1，本机 did_cache 是 L2。Zone

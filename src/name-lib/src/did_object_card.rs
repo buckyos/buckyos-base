@@ -350,7 +350,7 @@ impl DIDDocumentTrait for DIDObjectCard {
 
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument> {
         if let Some(key) = key {
-            crate::ensure_version_seq_for_jwt("DIDObjectCard", self.version_seq)?;
+            crate::ensure_jwt_iat_derivable("DIDObjectCard", self.iat, self.exp)?;
             let mut header = Header::new(Algorithm::EdDSA);
             header.typ = None;
             let token = encode(&header, self, key)
@@ -390,7 +390,7 @@ impl DIDDocumentTrait for DIDObjectCard {
         let card: DIDObjectCard = serde_json::from_value(value)
             .map_err(|err| NSError::Failed(format!("Failed to decode DIDObjectCard: {err}")))?;
         if matches!(doc, EncodedDocument::Jwt(_)) {
-            crate::ensure_version_seq_for_jwt("DIDObjectCard", card.version_seq)?;
+            crate::ensure_jwt_iat_derivable("DIDObjectCard", card.iat, card.exp)?;
         }
         Ok(card)
     }
