@@ -48,13 +48,21 @@ did:web 把身份锚定在域名控制权上:权威发布面就是该域名 HTTP
 
 对 did:bns,同样的取回逻辑作用在名字的规范 host 映射上(`did:bns:alice` ↔ `alice.{bns_root}`,通常最终指向对方 zone 的网关)。但这条信道不是 BNS 的权威渠道,只产出 need_proof 候选,所以 web_resolver 在 did:bns 下是补充源。
 
-## 3. dns_resolver(did:web + did:bns 的补充源)
+## 3. dns_resolver(current zone boot 专用补充源)
 
 非权威源,使用 DNS TXT 协议(`PKX=` / `BOOT=` / `DEV=` 几类记录,可还原 owner / boot / zone / device 文档)。DNS 信道本身没有认证能力(明文查询,可被伪造),所以它取回的一切都只是 need_proof 候选——"英雄不问出处,但要验证"(简介 2.3 节)。
 
 典型场景是 **Zone 自举**:Zone 在 Booting 阶段自己还没启动——对 did:web 的 Zone 来说,它自己的 HTTPS 服务器这时也没生效——所以必须有一个 Zone 外的系统保存引导信息,DNS 就是这个系统。
 
 Booting 阶段还有一个特殊性:本地已经有 Owner Document,所以 dns_resolver 上保存的那几个文档是 **100% 可验证**的——验签在本地闭环,不依赖任何额外的网络查询。
+
+因此 DNS TXT 不是普通的跨-zone DID 发现源。默认注册把它标成
+`CurrentZoneBootstrap` scope；普通 `resolve_did` / 默认 `ResolvePolicy` 会直接
+跳过。只有 current-zone 启动路径显式调用
+`ResolvePolicy::with_current_zone(current_zone_did)`，且实际请求的 DID 与该值完全
+相同，才会查询 DNS。policy 传播到 owner 递归、migration 或其它 DID 时不会把这项
+权限带过去。调用方设置该 policy 的前提是本机已经持有对应 Owner Document，可以完成
+验签。
 
 ## 4. sn_resolver(did:web + did:bns 的补充源)
 
@@ -122,18 +130,18 @@ Zone cache 位于 provider 顺序之前:默认先查 `http://127.0.0.1:3180`,明
 
 - 排第一的 provider 权威源是每个 did **自己的发布面**:did:web 打到目标自己的域名,流量随站点天然分散,与 Web / DNS 本身的去中心化结构同构;zone 内 did 通常已被前置 Zone cache 短路(第 5 节),查询根本不出 zone;
 - did:bns 的权威渠道是合约,网关只是可替换的读取端:任何域名都能自建网关、且鼓励自建(第 1 节),`bns.buckyos.ai` 只是自建之前的引导默认值,不是全网必经之路;
-- 补充源里,dns_resolver 复用 DNS 自身已分布式部署的基础设施(递归解析 + 缓存),不引入新的集中点;sn_resolver 这类共享服务注册在末位,first-win 意味着只有前面的源都给不出回答时才会打到它——共享基础设施只承接兜底流量,不在热路径上。
+- 补充源里,dns_resolver 复用 DNS 自身已分布式部署的基础设施(递归解析 + 缓存),但只在 current-zone boot policy 下启用;sn_resolver 这类共享服务注册在末位,first-win 意味着只有前面的源都给不出回答时才会打到它——共享基础设施只承接兜底流量,不在热路径上。
 
 ### did:bns
 
 ```
-bns_resolver → web_resolver → dns_resolver → sn_resolver
+bns_resolver → web_resolver → dns_resolver[current-zone only] → sn_resolver
 ```
 
 ### did:web
 
 ```
-web_resolver → dns_resolver → sn_resolver
+web_resolver → dns_resolver[current-zone only] → sn_resolver
 ```
 
 ### buckyos 内部(zone 场景)
@@ -141,7 +149,7 @@ web_resolver → dns_resolver → sn_resolver
 1. name-client 默认启用 zone_resolver cache,默认地址是 `http://127.0.0.1:3180`。它不按 DID 是否属于当前 zone 做客户端侧过滤;覆盖范围、是否允许出 Zone、是否短路,都由 zone_resolver 服务内部策略决定;
 2. 当 zone_resolver 明确命中时,它的回答直接返回,不再查 local cache、method authority 或 supplements;
 3. 当 zone_resolver 返回 unknown 时,才退回单机模式:local cache / local override 快路径,再进入上面的 provider 顺序;
-4. 如果 current zone 是 `did:web:xxx`,需要走一个特殊流程:zone 的权威发布面是它自己的 HTTPS 服务,启动完成之前不可达。Booting 阶段要靠本地已有的 Owner Document + dns_resolver 引导(见第 3 节)。具体流程待展开。
+4. 如果 current zone 是 `did:web:xxx`,需要走一个特殊流程:zone 的权威发布面是它自己的 HTTPS 服务,启动完成之前不可达。Booting 阶段用本地已有的 Owner Document + `ResolvePolicy::with_current_zone(current_zone_did)` 显式开启 dns_resolver 引导(见第 3 节);所有非 current-zone 路径保持默认 policy,不会查询 DNS TXT。
 
 ## 8. 与当前实现的对照(2026-07 快照)
 
@@ -152,11 +160,11 @@ Zone Resolver 的 cache 层化已完成(2026-07-03):
 | --- | --- | --- |
 | bns_resolver | `BnsProvider`(bns_provider.rs,薄配置壳,HTTP 细节复用 `BaseHttpProvider`) | 已注册为 did:bns 权威源。公网默认网关是 `bns.buckyos.ai`;resolver host 只由 machine config 的可选 `bns_host` 指定，`web3_bridge.bns` 不参与选择权威 resolver |
 | web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现，bns_root 由 `web3_bridge.bns` 独立配置；一级 bns 名字没有 uppername 回退，其权威解析由指向 `bns_host` 的 bns_resolver 负责 |
-| dns_resolver | `DnsProvider`(dns_provider.rs) | 已按本文降为补充源:did:web 与 did:bns 下均注册在 web_resolver 之后,取回结果一律 need_proof 候选。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
+| dns_resolver | `DnsProvider`(dns_provider.rs) | 已注册为 `CurrentZoneBootstrap` scope 的补充源:did:web 与 did:bns 下均排在 web_resolver 之后,取回结果一律 need_proof 候选。默认 policy 跳过;仅 `with_current_zone` 且目标 DID 精确匹配时查询。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
 | sn_resolver | `BaseHttpProvider` 指向 SN host | web3 bridge 配置含 `"sn"` 键时,自动注册为 did:web / did:bns 的末位补充源;默认配置不含 sn,即默认未注册 |
 | zone_resolver | `ZoneResolverClient`(zone_resolver.rs,独立 cache 客户端,不是 `NsProvider`),默认启用、默认指向 `http://127.0.0.1:3180`,`NameClient::resolve_did_ex` 第 0 步查询 | **已迁移**:明确命中时返回 `CacheStatus::ZoneHit`(正结果、Missing、Revoked/Tombstoned 都是命中);unknown 时落回 local cache 和 provider 链。裸 404、500、502/503/504、连接失败/超时都按 unknown 处理;明确 Missing 需通过 `documentStatus: "missing"` 表达。旧的 `set_zone_authority` 接法与 `did_in_zone` 客户端过滤已删除;`disable_zone_resolver()` / `set_zone_resolver_endpoint(...)` 控制启停与地址,zone 回答不回写本机 cache |
 | smart_resolver(社交版) | 无 | 暂不实现 |
 
 另外:resolver 接口响应里的 buckyos 扩展信封(发布状态等)客户端解析已就绪(`BaseHttpProvider`),服务端尚未实现;在那之前,did:web 的发布状态由主循环把 200 / 404 / 410 归一成 Active / Missing / 负状态。
 
-**dns_resolver 降级的行为变化**:此前 TXT 记录还原出的文档按权威结果(need_proof = false)直接放行;现在它们是普通候选,须通过 expected_owner 一致性与 owner 验签才可见。对第 3 节的 Zone 自举场景,这正是"本地已有 Owner Document,验签在本地闭环"的前提——纯 TXT 发布、又没有任何 owner 绑定来源的 did,将不再能通过 resolve_did 管线解析(这是本文第 3 节要求的安全语义,不是缺陷)。Booting 具体流程仍待展开(第 7 节)。
+**dns_resolver 降级的行为变化**:此前 TXT 记录还原出的文档按权威结果(need_proof = false)直接放行;现在它们是 current-zone-only 普通候选,须通过 expected_owner 一致性与本地 Owner Document 验签才可见。非 current-zone 请求在 provider 调用前即跳过 DNS；纯 TXT 发布不再是跨-zone 的 DID 解析入口(这是本文第 3 节要求的安全语义,不是缺陷)。

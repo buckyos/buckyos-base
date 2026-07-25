@@ -110,7 +110,9 @@ pub async fn init_name_lib_ex(
     // did:bns —— 权威渠道:BNS 智能合约,bns_resolver 是它的委托读取端
     // (web3 bridge 的 BNS 网关)。补充源:web_resolver(名字的规范 host 映射
     // alice.{bns_root} 上的 well-known / uppername 双信道)→ dns_resolver
-    // (同一映射 host 上的 TXT 记录,need_proof 候选)。
+    // (同一映射 host 上的 TXT 记录,need_proof 候选)。DNS TXT 只用于
+    // current-zone boot:普通 resolve 默认跳过,调用方须通过
+    // ResolvePolicy::with_current_zone 显式给出相同的 zone DID。
     let bns_provider = BnsProvider::new()?;
     client
         .set_method_authority("bns", Box::new(bns_provider))
@@ -119,19 +121,20 @@ pub async fn init_name_lib_ex(
         .add_method_supplement("bns", Box::new(WebProvider::new()))
         .await;
     client
-        .add_method_supplement("bns", Box::new(DnsProvider::new(None)))
+        .add_current_zone_bootstrap_supplement("bns", Box::new(DnsProvider::new(None)))
         .await;
 
     // did:web —— 权威发布面就是该域名 HTTPS 站点的固定路径,web_resolver 是
     // 这个 canonical endpoint 的读取端(先查 W3C well-known 静态 URL,未命中
     // 再回退 uppername 的 resolver 接口,见 web_provider.rs)。dns_resolver
     // 降为补充源:DNS 信道本身没有认证能力,它取回的一切都只是 need_proof
-    // 候选("英雄不问出处,但要验证",介绍文档第 3 节)。
+    // 候选("英雄不问出处,但要验证",介绍文档第 3 节),并同样只在
+    // current-zone bootstrap policy 下启用。
     client
         .set_method_authority("web", Box::new(WebProvider::new()))
         .await;
     client
-        .add_method_supplement("web", Box::new(DnsProvider::new(None)))
+        .add_current_zone_bootstrap_supplement("web", Box::new(DnsProvider::new(None)))
         .await;
 
     // sn_resolver(介绍文档第 4 节)—— 补充源,走 resolver 接口,支持跨 NAT

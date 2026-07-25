@@ -9,7 +9,7 @@ use crate::{
     content_hash_matches, is_key_class_method, structural_owner, BodyEvidence, DidDocType,
     DiscoveredDocument, DocumentBody, DocumentStatus, MethodProviders, NameInfo, NsProvider,
     OwnerDocumentPolicy, ProviderAnswer, ProviderResolveResult, PublishedState, RecordType,
-    ResolvePolicy, ResolveWarning, ResolvedDocument,
+    RegisteredSupplement, ResolvePolicy, ResolveWarning, ResolvedDocument,
 };
 
 /// 候选文档在验证阶段被拒绝的原因。契约违规会被记录为 warning 并静默丢弃该候选,
@@ -101,7 +101,23 @@ impl NameQuery {
             .entry(method.into())
             .or_default()
             .supplements
-            .push(provider);
+            .push(RegisteredSupplement::always(provider));
+    }
+
+    /// 追加一个只允许 current-zone 自举调用的补充源。调用方必须在
+    /// `ResolvePolicy::with_current_zone` 中给出精确 zone DID;其它请求会跳过
+    /// 该 provider 并继续后面的补充源。
+    pub async fn add_current_zone_bootstrap_supplement(
+        &self,
+        method: impl Into<String>,
+        provider: Box<dyn NsProvider>,
+    ) {
+        let mut methods = self.methods.write().await;
+        methods
+            .entry(method.into())
+            .or_default()
+            .supplements
+            .push(RegisteredSupplement::current_zone_bootstrap(provider));
     }
 
     /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
@@ -155,7 +171,9 @@ impl NameQuery {
         if entry.authority.is_none() {
             entry.authority = Some(provider);
         } else {
-            entry.supplements.push(provider);
+            entry
+                .supplements
+                .push(RegisteredSupplement::always(provider));
         }
     }
 
@@ -231,7 +249,7 @@ impl NameQuery {
         // 外层 NameClient 负责进程内与本机持久化 cache。
         if method_providers.no_proof_doc_types.contains(&doc_type) {
             return self
-                .resolve_unproof_info(method_providers, did, &doc_type)
+                .resolve_unproof_info(method_providers, did, &doc_type, &policy)
                 .await;
         }
 
@@ -394,9 +412,13 @@ impl NameQuery {
         // ---- 补充源阶段:显式有序,first-win ----
         // 补充源永远只产出候选文档(need_proof),给不出发布状态和 owner 绑定;
         // 它答不上来也不影响任何门禁。
-        for provider in method_providers.supplements.iter() {
+        for supplement in method_providers.supplements.iter() {
+            if !supplement.is_enabled(did, &policy) {
+                continue;
+            }
+            let provider = supplement.provider.as_ref();
             let Ok(body) = self
-                .query_provider_body(provider.as_ref(), did, &doc_type, BodyEvidence::NeedProof)
+                .query_provider_body(provider, did, &doc_type, BodyEvidence::NeedProof)
                 .await
             else {
                 continue;
@@ -965,6 +987,7 @@ impl NameQuery {
         method_providers: &MethodProviders,
         did: &DID,
         doc_type: &DidDocType,
+        policy: &ResolvePolicy,
     ) -> NSResult<ResolveOutcome> {
         let mut authority_unknown = false;
         let mut last_error: Option<NSError> = None;
@@ -977,7 +1000,8 @@ impl NameQuery {
                 method_providers
                     .supplements
                     .iter()
-                    .map(|provider| (Channel::Supplement, provider.as_ref())),
+                    .filter(|supplement| supplement.is_enabled(did, policy))
+                    .map(|supplement| (Channel::Supplement, supplement.provider.as_ref())),
             );
 
         for (channel, provider) in providers {
@@ -1270,6 +1294,46 @@ mod tests {
             _doc_type: &DidDocType,
         ) -> NSResult<Option<PublishedState>> {
             Err(NSError::Failed("network down".into()))
+        }
+    }
+
+    struct CountingMissProvider {
+        id: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingMissProvider {
+        fn new(id: &str, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                id: id.to_string(),
+                calls,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NsProvider for CountingMissProvider {
+        fn get_id(&self) -> String {
+            self.id.clone()
+        }
+
+        async fn query(
+            &self,
+            _name: &str,
+            _record_type: Option<RecordType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<NameInfo> {
+            Err(NSError::NotFound("not implemented".into()))
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            _doc_type: Option<DidDocType>,
+            _from_ip: Option<std::net::IpAddr>,
+        ) -> NSResult<EncodedDocument> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(NSError::NotFound("no matching doc".into()))
         }
     }
 
@@ -2148,6 +2212,128 @@ mod tests {
     }
 
     // ---- method registry ----
+
+    #[tokio::test]
+    async fn current_zone_bootstrap_scope_gates_verified_document_loop() {
+        let q = NameQuery::new();
+        let current_zone = DID::new("web", "current.example");
+        let other_zone = DID::new("web", "other.example");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        q.add_current_zone_bootstrap_supplement(
+            "web",
+            Box::new(CountingMissProvider::new(
+                "dns-bootstrap",
+                calls.clone(),
+            )),
+        )
+        .await;
+
+        let current_policy = ResolvePolicy::default().with_current_zone(current_zone.clone());
+        let _ = q
+            .query_did_ex(
+                &current_zone,
+                Some(DidDocType::Boot),
+                current_policy.clone(),
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // policy 被带到非 current-zone DID 时必须在 provider I/O 之前跳过。
+        let _ = q
+            .query_did_ex(&other_zone, Some(DidDocType::Boot), current_policy)
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 默认 policy 对 current-zone bootstrap supplement 也没有访问权限。
+        let _ = q
+            .query_did_ex(
+                &current_zone,
+                Some(DidDocType::Boot),
+                ResolvePolicy::default(),
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn current_zone_bootstrap_supplement_is_scoped_to_exact_policy_did() {
+        let q = NameQuery::new();
+        let current_zone = DID::new("web", "current.example");
+        let other_zone = DID::new("web", "other.example");
+
+        let bootstrap_current =
+            EncodedDocument::JsonLd(json!({"marker": "current-zone-bootstrap"}));
+        let bootstrap_other =
+            EncodedDocument::JsonLd(json!({"marker": "must-not-leak-to-other-zone"}));
+        let normal_current = EncodedDocument::JsonLd(json!({"marker": "normal-current"}));
+        let normal_other = EncodedDocument::JsonLd(json!({"marker": "normal-other"}));
+
+        q.add_current_zone_bootstrap_supplement(
+            "web",
+            Box::new(
+                DocProvider::new("dns-bootstrap")
+                    .with_doc(current_zone.clone(), "info", bootstrap_current.clone())
+                    .with_doc(other_zone.clone(), "info", bootstrap_other),
+            ),
+        )
+        .await;
+        q.add_method_supplement(
+            "web",
+            Box::new(
+                DocProvider::new("normal-supplement")
+                    .with_doc(current_zone.clone(), "info", normal_current.clone())
+                    .with_doc(other_zone.clone(), "info", normal_other.clone()),
+            ),
+        )
+        .await;
+
+        let current_policy = ResolvePolicy::default().with_current_zone(current_zone.clone());
+        let current = q
+            .query_did_ex(
+                &current_zone,
+                Some(DidDocType::Info),
+                current_policy.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.document, bootstrap_current);
+        assert_eq!(
+            current.resolution_metadata.resolver_id.as_deref(),
+            Some("dns-bootstrap")
+        );
+
+        // 同一 policy 传播到其它 DID 时,bootstrap supplement 必须跳过,并继续
+        // 后面的正常 supplement。
+        let other = q
+            .query_did_ex(&other_zone, Some(DidDocType::Info), current_policy)
+            .await
+            .unwrap();
+        assert_eq!(other.document, normal_other);
+        assert_eq!(
+            other.resolution_metadata.resolver_id.as_deref(),
+            Some("normal-supplement")
+        );
+
+        // 普通 resolve 的默认 policy 没有 current-zone 上下文,即使请求 DID
+        // 恰好相同也不能访问 bootstrap supplement。
+        let current_without_bootstrap = q
+            .query_did_ex(
+                &current_zone,
+                Some(DidDocType::Info),
+                ResolvePolicy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current_without_bootstrap.document, normal_current);
+        assert_eq!(
+            current_without_bootstrap
+                .resolution_metadata
+                .resolver_id
+                .as_deref(),
+            Some("normal-supplement")
+        );
+    }
 
     #[tokio::test]
     async fn unknown_method_is_not_supported() {

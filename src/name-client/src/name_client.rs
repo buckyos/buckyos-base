@@ -236,6 +236,18 @@ impl NameClient {
             .await;
     }
 
+    /// 追加一个只允许 current-zone 自举请求访问的补充源。普通 resolve 的
+    /// `ResolvePolicy::current_zone_did` 为 None,因此会跳过该项。
+    pub async fn add_current_zone_bootstrap_supplement(
+        &self,
+        method: impl Into<String>,
+        provider: Box<dyn NsProvider>,
+    ) {
+        self.name_query
+            .add_current_zone_bootstrap_supplement(method, provider)
+            .await;
+    }
+
     /// 覆盖某 method 的免验证 doc_type 契约(默认只有 `info`)。
     pub async fn set_no_proof_doc_types(&self, method: &str, doc_types: HashSet<DidDocType>) {
         self.name_query
@@ -847,6 +859,10 @@ impl NameClient {
     ///   4. 进入 resolver 主循环;
     ///   5. 只有主循环没产出可核实文档、且没有负状态屏蔽、权威源也没回答
     ///      Missing 时,才按策略用"过期但未作废"的缓存兜底。
+    ///
+    /// 默认注册中的 DNS TXT supplement 另受 `policy.current_zone_did` 限制:
+    /// None 时跳过;只有请求 DID 与它精确相等时才作为 current-zone bootstrap
+    /// 信道参与主循环。
     pub async fn resolve_did_ex(
         &self,
         did: &DID,

@@ -269,12 +269,51 @@ pub enum ProviderResolveResult {
     Unknown(NSError),
 }
 
+/// 补充源的调用范围。`CurrentZoneBootstrap` 专门用于 DNS TXT 这类只在本机
+/// Zone 自举时安全的发现信道:是否允许访问由每次 resolve 的
+/// `ResolvePolicy::current_zone_did` 决定,而不是由 provider 自行判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupplementScope {
+    Always,
+    CurrentZoneBootstrap,
+}
+
+/// 一个带调用范围的补充源注册项。补充源顺序仍然是显式的 first-win 顺序;
+/// scope 只决定当前请求是否跳过该项,不会改变其它补充源的相对顺序。
+pub struct RegisteredSupplement {
+    pub provider: Box<dyn NsProvider>,
+    pub scope: SupplementScope,
+}
+
+impl RegisteredSupplement {
+    pub fn always(provider: Box<dyn NsProvider>) -> Self {
+        Self {
+            provider,
+            scope: SupplementScope::Always,
+        }
+    }
+
+    pub fn current_zone_bootstrap(provider: Box<dyn NsProvider>) -> Self {
+        Self {
+            provider,
+            scope: SupplementScope::CurrentZoneBootstrap,
+        }
+    }
+
+    pub fn is_enabled(&self, did: &DID, policy: &ResolvePolicy) -> bool {
+        match self.scope {
+            SupplementScope::Always => true,
+            SupplementScope::CurrentZoneBootstrap => policy.current_zone_did.as_ref() == Some(did),
+        }
+    }
+}
+
 /// 一个 DID method 的解析注册模型(简化 TODO T2.2):至多一个权威发布渠道 +
 /// 显式有序的少数补充源(first-win)。免验证 doc_type 是 method 契约,
 /// 不由 provider 运行时协商。
 pub struct MethodProviders {
     pub authority: Option<Box<dyn NsProvider>>,
-    pub supplements: Vec<Box<dyn NsProvider>>,
+    pub supplements: Vec<RegisteredSupplement>,
     pub no_proof_doc_types: HashSet<DidDocType>,
 }
 
@@ -754,6 +793,7 @@ impl ResolvedDocument {
 /// `use_zone_resolver` 是 Zone 信道的额外开关(zone-resolver-server 自递归保护);
 /// `allow_self_signed_when_missing` / `allow_stale_cache` /
 /// `allow_unverified_cache_when_unavailable` 是候选**准入/兜底策略**;
+/// `current_zone_did` 是 current-zone bootstrap supplement 的访问边界;
 /// `local_authority_override` / `follow_migration` / `max_depth` 归属解析细节。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolveSourcePolicy {
@@ -803,6 +843,13 @@ pub struct ResolvePolicy {
     /// 完成对外查询,若不跳过 zone 快路径,就会查询到自己(127.0.0.1:3180)
     /// 造成自递归。
     pub use_zone_resolver: bool,
+    /// 本次调用被确认处于哪个 current-zone 自举上下文。None(默认)表示没有
+    /// current-zone 权限,注册为 `CurrentZoneBootstrap` 的补充源会被跳过。
+    ///
+    /// 这里携带精确 DID 而不是一个 bool:即使 policy 在 migration / owner
+    /// 递归中继续传播,也只有对该 DID 本身的查询能使用自举信道,不会把 DNS
+    /// TXT 的访问权限扩散到 owner 或其它 zone。
+    pub current_zone_did: Option<DID>,
     pub max_depth: usize,
     /// 本地测试/运维显式注入的发布模拟(简化文档第 7 节),类似 hosts 文件。
     /// 挂在 policy 上是为了让它随 `descend()`/`for_authority_lookup()` 一起传播到
@@ -820,6 +867,7 @@ impl Default for ResolvePolicy {
             allow_stale_cache: true,
             allow_unverified_cache_when_unavailable: false,
             use_zone_resolver: true,
+            current_zone_did: None,
             max_depth: 8,
             local_authority_override: None,
             visited: Vec::new(),
@@ -846,6 +894,16 @@ impl ResolvePolicy {
     /// 就是本机 3180)造成递归。
     pub fn without_zone_resolver(mut self) -> Self {
         self.use_zone_resolver = false;
+        self
+    }
+
+    /// 标记本次解析的 current zone。只有请求 DID 与该值完全相同,才会启用
+    /// 注册为 `CurrentZoneBootstrap` 的补充源(默认注册中的 DNS TXT)。
+    ///
+    /// 调用方应只在已经持有该 zone 的本地 OwnerDocument、能够完成后续验签时
+    /// 使用；普通跨-zone resolve 保持默认 policy 即会跳过这类信道。
+    pub fn with_current_zone(mut self, current_zone_did: DID) -> Self {
+        self.current_zone_did = Some(current_zone_did);
         self
     }
 
