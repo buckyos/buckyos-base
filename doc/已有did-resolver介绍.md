@@ -150,8 +150,8 @@ Zone Resolver 的 cache 层化已完成(2026-07-03):
 
 | 本文的 resolver | 代码 | 状态 |
 | --- | --- | --- |
-| bns_resolver | `BnsProvider`(bns_provider.rs,薄配置壳,HTTP 细节复用 `BaseHttpProvider`) | 已注册为 did:bns 权威源。公网默认网关是 `bns.buckyos.ai`;默认值由 machine config 的可选 `bns_host` 指定,显式 `web3_bridge.bns` 会覆盖该默认值 |
-| web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现,bns_root 与 BNS 网关共用 web3 bridge 配置;一级 bns 名字没有 uppername 回退(那个端点就是 BNS 网关本身,归 bns_resolver 管) |
+| bns_resolver | `BnsProvider`(bns_provider.rs,薄配置壳,HTTP 细节复用 `BaseHttpProvider`) | 已注册为 did:bns 权威源。公网默认网关是 `bns.buckyos.ai`;resolver host 只由 machine config 的可选 `bns_host` 指定，`web3_bridge.bns` 不参与选择权威 resolver |
+| web_resolver | `WebProvider`(web_provider.rs,well-known + uppername 双信道) | 已注册为 did:web 权威源(canonical endpoint 唯一读取端)+ did:bns 第一补充源。did:bns 的名字映射(`did:bns:alice` ↔ `alice.{bns_root}`)已实现，bns_root 由 `web3_bridge.bns` 独立配置；一级 bns 名字没有 uppername 回退，其权威解析由指向 `bns_host` 的 bns_resolver 负责 |
 | dns_resolver | `DnsProvider`(dns_provider.rs) | 已按本文降为补充源:did:web 与 did:bns 下均注册在 web_resolver 之后,取回结果一律 need_proof 候选。原先"经 `AuthorityReaders` 并入 did:web 权威渠道"的注册已移除 |
 | sn_resolver | `BaseHttpProvider` 指向 SN host | web3 bridge 配置含 `"sn"` 键时,自动注册为 did:web / did:bns 的末位补充源;默认配置不含 sn,即默认未注册 |
 | zone_resolver | `ZoneResolverClient`(zone_resolver.rs,独立 cache 客户端,不是 `NsProvider`),默认启用、默认指向 `http://127.0.0.1:3180`,`NameClient::resolve_did_ex` 第 0 步查询 | **已迁移**:明确命中时返回 `CacheStatus::ZoneHit`(正结果、Missing、Revoked/Tombstoned 都是命中);unknown 时落回 local cache 和 provider 链。裸 404、500、502/503/504、连接失败/超时都按 unknown 处理;明确 Missing 需通过 `documentStatus: "missing"` 表达。旧的 `set_zone_authority` 接法与 `did_in_zone` 客户端过滤已删除;`disable_zone_resolver()` / `set_zone_resolver_endpoint(...)` 控制启停与地址,zone 回答不回写本机 cache |

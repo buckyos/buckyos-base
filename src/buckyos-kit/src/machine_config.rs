@@ -57,18 +57,8 @@ impl BuckyOSMachineConfig {
             .unwrap_or(DEFAULT_BNS_HOST)
     }
 
-    pub fn default_bns_resolver_host(&self) -> String {
-        self.bns_host_or_default().to_string()
-    }
-
     pub fn bns_resolver_host(&self) -> String {
-        self.web3_bridge
-            .get("bns")
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|host| !host.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| self.default_bns_resolver_host())
+        self.bns_host_or_default().to_string()
     }
 
     pub fn load_machine_config() -> Option<Self> {
@@ -104,23 +94,26 @@ mod tests {
     }
 
     #[test]
-    fn bns_resolver_falls_back_to_bns_host_when_bridge_missing() {
+    fn bns_resolver_uses_configured_bns_host() {
         let mut config = BuckyOSMachineConfig::default();
-        config.web3_bridge.remove("bns");
         config.bns_host = Some("resolver.example.org".to_string());
 
         assert_eq!(config.bns_resolver_host(), "resolver.example.org");
     }
 
     #[test]
-    fn explicit_bns_bridge_overrides_bns_host_default() {
+    fn bns_bridge_does_not_override_bns_host() {
         let mut config = BuckyOSMachineConfig::default();
         config
             .web3_bridge
             .insert("bns".to_string(), "resolver.example.org".to_string());
         config.bns_host = Some("bns.example.org".to_string());
 
-        assert_eq!(config.bns_resolver_host(), "resolver.example.org");
+        assert_eq!(config.bns_resolver_host(), "bns.example.org");
+        assert_eq!(
+            config.web3_bridge.get("bns").map(String::as_str),
+            Some("resolver.example.org")
+        );
     }
 
     #[test]

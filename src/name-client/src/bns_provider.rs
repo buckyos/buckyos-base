@@ -1,7 +1,7 @@
 /*
 实现基于bns合约的NsProvider实现
 从接口上是对https_provider的封装
-1. 通过输入machine_config的web3网桥配置，得到正确的查询URL
+1. 通过 machine config 的 bns_host，得到正确的查询 URL
 2. 只处理 did method 是 bns 的请求,其它一概返回不支持。
    did:dev 是 key 类 DID,不是 resolve_did 的合法入参(简化文档第 6 节),
    任何 provider 都不再受理它。
@@ -21,33 +21,49 @@ use name_lib::{EncodedDocument, NSError, NSResult, DID};
 use serde_json::Value;
 use std::net::IpAddr;
 
-/// bns 的 web3 bridge 根域。既是 BNS 网关(resolver 接口)的 host,也是
-/// did:bns 名字的规范 host 映射根(`did:bns:alice` ↔ `alice.{bns_root}`,
-/// 见 doc/已有did-resolver介绍.md 第 1、2 节)——两个用途必须读同一份配置,
-/// WebProvider 的 did:bns 信道与 BnsProvider 共用本函数。
+/// did:bns 名字的 web3 bridge 映射根(`did:bns:alice` ↔
+/// `alice.{bns_root}`，见 doc/已有did-resolver介绍.md 第 2 节)。
+///
+/// 该配置只供 WebProvider 的 did:bns 补充信道使用，与 BNS 权威 resolver
+/// 的 `bns_host` 是两个独立语义。
 /// 优先级:全局 `KNOWN_WEB3_BRIDGE_CONFIG` → machine.json → 默认配置。
-/// 默认值为 machine config 的 `bns_host`,当前是 `bns.buckyos.ai`。
-pub(crate) fn bns_bridge_host() -> NSResult<String> {
-    let host = name_lib::KNOWN_WEB3_BRIDGE_CONFIG
+pub(crate) fn bns_web3_bridge_host() -> NSResult<String> {
+    name_lib::KNOWN_WEB3_BRIDGE_CONFIG
         .get()
         .and_then(|m| m.get("bns"))
         .cloned()
-        .or_else(|| BuckyOSMachineConfig::load_machine_config().map(|mc| mc.bns_resolver_host()))
-        .unwrap_or_else(|| BuckyOSMachineConfig::default().bns_resolver_host());
-    Ok(host)
+        .or_else(|| {
+            BuckyOSMachineConfig::load_machine_config()
+                .and_then(|mc| mc.web3_bridge.get("bns").cloned())
+        })
+        .or_else(|| {
+            BuckyOSMachineConfig::default()
+                .web3_bridge
+                .get("bns")
+                .cloned()
+        })
+        .ok_or_else(|| NSError::Failed("web3_bridge.bns not set".to_string()))
 }
 
-/// 基于 web3 bridge 的 BNS DID 解析器(bns method 的权威渠道委托读取端),
+/// BNS 权威 resolver 的 host。只读取 machine config 的 `bns_host`；
+/// `web3_bridge.bns` 是名字映射配置，不能覆盖这里。
+fn bns_resolver_host() -> String {
+    BuckyOSMachineConfig::load_machine_config()
+        .map(|mc| mc.bns_resolver_host())
+        .unwrap_or_else(|| BuckyOSMachineConfig::default().bns_resolver_host())
+}
+
+/// 基于 bns_host 的 BNS DID 解析器(bns method 的权威渠道委托读取端),
 /// 内部完全复用 `HttpsProvider`。
 pub struct BnsProvider {
     inner: BaseHttpProvider,
 }
 
 impl BnsProvider {
-    /// 使用全局 `KNOWN_WEB3_BRIDGE_CONFIG` 的 bns 网关作为 resolver host。
-    /// 若未初始化全局配置，则回退读取 machine.json，再回退默认配置。
+    /// 使用 machine.json 的 bns_host 作为 resolver host；若没有 machine
+    /// config，则使用默认的 bns_host。
     pub fn new() -> NSResult<Self> {
-        let resolver_host = bns_bridge_host()?;
+        let resolver_host = bns_resolver_host();
 
         info!("bns provider using resolver host: {}", resolver_host);
 
@@ -56,7 +72,7 @@ impl BnsProvider {
         })
     }
 
-    /// 便捷构造：接收 JSON 配置，允许外部显式指定 web3 bridge 或 bns_host。
+    /// 便捷构造：接收 JSON 配置并读取其中的 bns_host。
     pub fn new_with_config(config: Value) -> NSResult<Self> {
         let mc = serde_json::from_value::<BuckyOSMachineConfig>(config).unwrap_or_default();
         let host = mc.bns_resolver_host();

@@ -19,13 +19,14 @@ web_resolver(doc/已有did-resolver介绍.md 第 2 节):did:web 的权威 resolv
      410/deactivated 是权威负回答,出现即终止,不再尝试下一个信道。
 
 did:bns:同样的取回逻辑作用在名字的规范 host 映射上(介绍文档第 2 节):
-  did:bns:{name} ↔ {name}.{bns_root},bns_root 与 BNS 网关共用同一份 web3
-  bridge 配置(bns_provider.rs 的 bns_bridge_host)。
+  did:bns:{name} ↔ {name}.{bns_root},bns_root 使用独立的 web3_bridge.bns
+  配置(bns_provider.rs 的 bns_web3_bridge_host),不与 BNS 权威 resolver 的
+  bns_host 混用。
   did:bns:alice        => https://alice.{bns_root}/.well-known/did.json
   did:bns:ood1.alice   => https://ood1.alice.{bns_root}/.well-known/did.json
     回退 uppername     => https://alice.{bns_root}/1.0/identifiers/did:bns:ood1.alice
-  一级名字(alice)没有 uppername——它的 resolver 接口端点就是 BNS 网关本身,
-  那是 bns_resolver(权威渠道)的职责,这里不重复查询。
+  一级名字(alice)没有 uppername;它的权威解析由指向 bns_host 的
+  bns_resolver 负责,这里不重复查询。
   注意:这条信道不是 BNS 的权威渠道(权威是 BNS 合约/网关),所以 WebProvider
   在 did:bns 下只能注册为补充源,产出 need_proof 候选,注册见 lib.rs。
 
@@ -68,7 +69,7 @@ uppername 端点补上真正的发布状态查询。did:web 的权威渠道 = DN
 两个委托读取端的 first-win 合并,注册见 lib.rs。
 */
 
-use crate::bns_provider::bns_bridge_host;
+use crate::bns_provider::bns_web3_bridge_host;
 use crate::{BaseHttpProvider, DidDocType, NameInfo, NsProvider, PublishedState, RecordType};
 use async_trait::async_trait;
 use log::{debug, info};
@@ -146,7 +147,7 @@ impl WebProvider {
                 did.to_string()
             )));
         }
-        let bridge = bns_bridge_host()?;
+        let bridge = bns_web3_bridge_host()?;
         Ok(format!("{}.{}", raw_name, bridge))
     }
 
@@ -449,7 +450,7 @@ mod tests {
         let mut cfg = std::collections::HashMap::new();
         cfg.insert("bns".to_string(), "web3.buckyos.ai".to_string());
         let _ = name_lib::KNOWN_WEB3_BRIDGE_CONFIG.set(cfg);
-        bns_bridge_host().unwrap()
+        bns_web3_bridge_host().unwrap()
     }
 
     #[test]
