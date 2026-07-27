@@ -104,3 +104,12 @@ session_token中有签发时间和有效期，因此只在这个周期内有效
 ## 5. Skils
 1. 根据需求产生一个rust的接口定义文件，核心是定义了api client的接口，并提供了handle_rpc_call的实现。该文件的结构参考 example_krpc_client.rs
 2. 根据需要，基于该接口文件，产生type-script的封装
+
+## 6. S2S Payload 加密
+
+kRPC 可以增加一个可选的、无在线握手的 S2S Payload 加密 Profile，使服务能够通过
+`http://target_ip:port/s2s/$apiname` 直接通信，同时使用双方已有的 Ed25519/DID 身份密钥
+保护完整 RPC JSON。
+
+正式设计和实现清单见
+[kRPC S2S Payload 加密 Profile TODO](../../doc/krpc-s2s-payload-encryption-TODO.md)。

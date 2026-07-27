@@ -503,27 +503,9 @@ pub fn generate_x25519_key_pair() -> (PublicKey, StaticSecret) {
 
     let private_key_bytes = signing_key.to_bytes();
     let public_key_bytes = signing_key.verifying_key().to_bytes();
-    println!("public_key_bytes: {:?}", public_key_bytes);
-    println!("private_key_bytes: {:?}", private_key_bytes);
-
-    let public_key_jwk = json!({
-        "kty": "OKP",
-        "crv": "Ed25519",
-        "x": URL_SAFE_NO_PAD.encode(public_key_bytes),
-    });
-    println!("{}", public_key_jwk);
-
-    let pkcs8_bytes = build_pkcs8(&private_key_bytes);
-    let private_key_pem = format!(
-        "\n-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        STANDARD.encode(&pkcs8_bytes)
-    );
-    println!("{}", private_key_pem);
 
     let x25519_public_key = ed25519_to_curve25519::ed25519_pk_to_curve25519(public_key_bytes);
-    println!("x25519_public_key: {:?}", x25519_public_key);
     let x25519_private_key = ed25519_to_curve25519::ed25519_sk_to_curve25519(private_key_bytes);
-    println!("x25519_private_key: {:?}", x25519_private_key);
 
     let x25519_public_key = x25519_dalek::PublicKey::from(x25519_public_key);
     let x25519_private_key = x25519_dalek::StaticSecret::from(x25519_private_key);

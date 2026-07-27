@@ -14,7 +14,7 @@ use buckyos_kit::AsyncStream;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Body, Bytes};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
 pub use did_obj_server::*;
@@ -118,10 +118,22 @@ pub trait HttpServer: Send + Sync + 'static {
     fn http3_port(&self) -> Option<u16>;
 }
 
+/// Hard limit for kRPC request bodies, per doc/krpc-s2s-payload-encryption-TODO.md §11.5.
+pub const DEFAULT_MAX_RPC_BODY_SIZE: usize = 1024 * 1024;
+
 pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
     req: http::Request<BoxBody<Bytes, ServerError>>,
     info: StreamInfo,
     rpc_handler: &T,
+) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    serve_http_by_rpc_handler_with_limit(req, info, rpc_handler, DEFAULT_MAX_RPC_BODY_SIZE).await
+}
+
+pub async fn serve_http_by_rpc_handler_with_limit<T: RPCHandler + Send + Sync + 'static>(
+    req: http::Request<BoxBody<Bytes, ServerError>>,
+    info: StreamInfo,
+    rpc_handler: &T,
+    max_body_size: usize,
 ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
     if req.method() != hyper::Method::POST {
         return Ok(text_response(
@@ -135,14 +147,9 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
         Err(resp) => return Ok(resp),
     };
 
-    let body_bytes = match req.collect().await {
-        Ok(data) => data.to_bytes(),
-        Err(e) => {
-            return Ok(text_response(
-                hyper::StatusCode::BAD_REQUEST,
-                format!("Failed to read body: {:?}", e),
-            )?);
-        }
+    let body_bytes = match read_body_with_limit(req, max_body_size).await {
+        Ok(bytes) => bytes,
+        Err(resp) => return Ok(resp),
     };
 
     let body_str = match String::from_utf8(body_bytes.to_vec()) {
@@ -379,6 +386,60 @@ fn client_ip(info: &StreamInfo) -> Result<IpAddr, http::Response<BoxBody<Bytes, 
     }
 }
 
+/// Reads the request body while enforcing `max_body_size` as a hard limit.
+///
+/// Requests whose declared size (Content-Length header or body size hint)
+/// already exceeds the limit are rejected before any body data is read;
+/// chunked/unknown-length bodies are read frame by frame and rejected as
+/// soon as the accumulated size would exceed the limit.
+pub(crate) async fn read_body_with_limit(
+    req: http::Request<BoxBody<Bytes, ServerError>>,
+    max_body_size: usize,
+) -> Result<Bytes, Response<BoxBody<Bytes, ServerError>>> {
+    if let Some(len) = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        if len > max_body_size as u64 {
+            return Err(payload_too_large());
+        }
+    }
+
+    let mut body = req.into_body();
+    if body.size_hint().lower() > max_body_size as u64 {
+        return Err(payload_too_large());
+    }
+
+    let mut collected = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => {
+                return Err(text_response(
+                    hyper::StatusCode::BAD_REQUEST,
+                    format!("Failed to read body: {:?}", e),
+                )
+                .expect("static bad request response should build"));
+            }
+        };
+        if let Some(data) = frame.data_ref() {
+            if data.len() > max_body_size - collected.len() {
+                return Err(payload_too_large());
+            }
+            collected.extend_from_slice(data);
+        }
+    }
+
+    Ok(Bytes::from(collected))
+}
+
+fn payload_too_large() -> Response<BoxBody<Bytes, ServerError>> {
+    text_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large")
+        .expect("static payload too large response should build")
+}
+
 fn text_response(
     status: StatusCode,
     body: impl Into<Bytes>,
@@ -455,6 +516,117 @@ mod tests {
                 seq: 42,
                 trace_id: Some("trace-1".to_string()),
             }
+        );
+    }
+
+    fn rpc_request_body() -> String {
+        serde_json::to_string(&RPCRequest::new("test", json!({}))).unwrap()
+    }
+
+    async fn assert_payload_too_large(response: Response<BoxBody<Bytes, ServerError>>) {
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.collect().await.unwrap().to_bytes(),
+            Bytes::from("Payload Too Large")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_request_by_content_length_header() {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/krpc")
+            .header(http::header::CONTENT_LENGTH, DEFAULT_MAX_RPC_BODY_SIZE + 1)
+            .body(full_body(rpc_request_body()))
+            .unwrap();
+
+        let response = serve_http_by_rpc_handler(
+            request,
+            StreamInfo::new("127.0.0.1:12345".to_string()),
+            &ErrorRpcHandler,
+        )
+        .await
+        .unwrap();
+
+        assert_payload_too_large(response).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_body_without_content_length() {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/krpc")
+            .body(full_body(vec![b'a'; DEFAULT_MAX_RPC_BODY_SIZE + 1]))
+            .unwrap();
+
+        let response = serve_http_by_rpc_handler(
+            request,
+            StreamInfo::new("127.0.0.1:12345".to_string()),
+            &ErrorRpcHandler,
+        )
+        .await
+        .unwrap();
+
+        assert_payload_too_large(response).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_streaming_body_with_unknown_length() {
+        // Simulates a chunked request: the stream reports no size hint, so the
+        // limit can only be enforced while reading frames.
+        let chunks: Vec<Result<hyper::body::Frame<Bytes>, ServerError>> = (0..3)
+            .map(|_| Ok(hyper::body::Frame::data(Bytes::from(vec![b'a'; 64]))))
+            .collect();
+        let body = BoxBody::new(http_body_util::StreamBody::new(futures_util::stream::iter(
+            chunks,
+        )));
+        assert_eq!(body.size_hint().lower(), 0);
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/krpc")
+            .body(body)
+            .unwrap();
+
+        let response = serve_http_by_rpc_handler_with_limit(
+            request,
+            StreamInfo::new("127.0.0.1:12345".to_string()),
+            &ErrorRpcHandler,
+            128,
+        )
+        .await
+        .unwrap();
+
+        assert_payload_too_large(response).await;
+    }
+
+    #[tokio::test]
+    async fn accepts_body_exactly_at_limit() {
+        let body = rpc_request_body();
+        let limit = body.len();
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/krpc")
+            .header(http::header::CONTENT_LENGTH, limit)
+            .body(full_body(body))
+            .unwrap();
+
+        let response = serve_http_by_rpc_handler_with_limit(
+            request,
+            StreamInfo::new("127.0.0.1:12345".to_string()),
+            &ErrorRpcHandler,
+            limit,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let rpc_response: RPCResponse =
+            serde_json::from_slice(&response.collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            rpc_response.result,
+            RPCResult::Failed("Failed due to reason: boom".to_string())
         );
     }
 }

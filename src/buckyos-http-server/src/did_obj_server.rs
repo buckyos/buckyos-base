@@ -11,7 +11,10 @@ use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{server_err, HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo};
+use crate::{
+    read_body_with_limit, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
+    StreamInfo, DEFAULT_MAX_RPC_BODY_SIZE,
+};
 
 pub const DID_OBJECT_CARD_PATH: &str = "did.json";
 pub const DID_OBJECT_PROFILE_PATH: &str = "profile.json";
@@ -403,14 +406,11 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
 
         if method == Method::POST && endpoint.kind == DIDObjectEndpointKind::Action {
             let action = endpoint.item.as_deref().unwrap_or_default();
-            let body = req.into_body().collect().await.map_err(|e| {
-                server_err!(
-                    ServerErrorCode::BadRequest,
-                    "failed to read DID Object action body: {:?}",
-                    e
-                )
-            })?;
-            let request = match serde_json::from_slice::<DIDObjectActionRequest>(&body.to_bytes()) {
+            let body = match read_body_with_limit(req, DEFAULT_MAX_RPC_BODY_SIZE).await {
+                Ok(body) => body,
+                Err(resp) => return Ok(resp),
+            };
+            let request = match serde_json::from_slice::<DIDObjectActionRequest>(&body) {
                 Ok(request) => request,
                 Err(err) => {
                     return did_object_action_error_response(DIDObjectError::bad_request(format!(
@@ -755,6 +755,105 @@ fn full_body(body: impl Into<Bytes>) -> BoxBody<Bytes, ServerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use name_lib::DID;
+    use serde_json::json;
+
+    struct EchoActionServer {
+        card: DIDObjectCard,
+        profile: Value,
+    }
+
+    impl EchoActionServer {
+        fn new() -> Self {
+            Self {
+                card: DIDObjectCard::new(
+                    DID::new("web", "test.example"),
+                    "https://test.example/devices/cam01",
+                    None,
+                    "https://test.example/devices/cam01/profile.json",
+                    None::<String>,
+                ),
+                profile: json!({}),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DIDObjectServer for EchoActionServer {
+        fn object_card(&self) -> &DIDObjectCard {
+            &self.card
+        }
+
+        fn object_profile(&self) -> &Value {
+            &self.profile
+        }
+
+        async fn read_property(
+            &self,
+            _name: &str,
+            _ctx: DIDObjectRequestContext,
+        ) -> DIDObjectServerResult<Value> {
+            Err(DIDObjectError::unsupported("no properties"))
+        }
+
+        async fn invoke_action(
+            &self,
+            request: DIDObjectActionRequest,
+            _ctx: DIDObjectRequestContext,
+        ) -> DIDObjectServerResult<DIDObjectActionSuccess> {
+            Ok(DIDObjectActionSuccess::new(request.params))
+        }
+    }
+
+    fn echo_action_server() -> DIDObjectHttpServer<EchoActionServer> {
+        DIDObjectHttpServer::new("test-server", Arc::new(EchoActionServer::new()))
+    }
+
+    #[tokio::test]
+    async fn action_rejects_oversized_body() {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://test.example/devices/cam01/methods/echo")
+            .body(full_body(vec![b'a'; DEFAULT_MAX_RPC_BODY_SIZE + 1]))
+            .unwrap();
+
+        let response = echo_action_server()
+            .serve_request(request, StreamInfo::new("127.0.0.1:12345".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.collect().await.unwrap().to_bytes(),
+            Bytes::from("Payload Too Large")
+        );
+    }
+
+    #[tokio::test]
+    async fn action_accepts_body_within_limit() {
+        let body = serde_json::to_vec(&json!({
+            "method": "echo",
+            "params": { "hello": "world" },
+        }))
+        .unwrap();
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://test.example/devices/cam01/methods/echo")
+            .body(full_body(body))
+            .unwrap();
+
+        let response = echo_action_server()
+            .serve_request(request, StreamInfo::new("127.0.0.1:12345".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&response.collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(value["result"], json!({ "hello": "world" }));
+    }
 
     #[test]
     fn path_item_after_matches_one_decoded_segment() {
