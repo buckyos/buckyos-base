@@ -562,8 +562,10 @@ mod test {
 
     #[test]
     fn test_generate_ed25519_key_pair() {
+        // 审计(krpc-s2s-payload-encryption-TODO §Phase1):测试不打印私钥材料
         let (private_key, public_key) = generate_ed25519_key_pair();
-        println!("private_key: {}", private_key);
+        assert!(private_key.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(public_key.get("x").is_some());
         println!(
             "public_key: {}",
             serde_json::to_string(&public_key).unwrap()
@@ -591,17 +593,15 @@ mod test {
 
     // #[test]
     fn test_load_pem_private_key() {
+        // 审计(krpc-s2s-payload-encryption-TODO §Phase1):不打印私钥、
+        // 转换后私钥或文件内容
         let key_path = Path::new("d:\\temp\\device_key.pem");
         let private_key = load_raw_private_key(&key_path).unwrap();
-        println!("private_key: {:?}", private_key);
         let private_key_der = from_pkcs8(&private_key).unwrap();
-        println!("private_key_der: {:?}", private_key_der);
 
         let private_key_x25519 = ed25519_to_curve25519::ed25519_sk_to_curve25519(private_key_der);
-        println!("private_key_x25519: {:?}", private_key_x25519);
 
         let file_content = std::fs::read_to_string("d:\\temp\\device_key.pem").unwrap();
-        println!("file_content: {}", file_content);
 
         //let encoding_key = EncodingKey::from_ed_pem(file_content.as_bytes()).unwrap();
         let encoding_key = EncodingKey::from_ed_der(&private_key);
@@ -647,7 +647,7 @@ mod test {
         let (pem, jwk) = generate_ed25519_key_pair_from_mnemonic(mnemonic, passphrase, index)
             .expect("derive should succeed");
 
-        println!("mnemonic derived pem: {}", pem);
+        // 审计:不打印派生私钥 PEM,只打印公钥 JWK
         println!(
             "mnemonic derived jwk: {}",
             serde_json::to_string(&jwk).unwrap()

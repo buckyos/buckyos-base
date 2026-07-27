@@ -241,6 +241,49 @@ impl<'de> Deserialize<'de> for RPCResponse {
     }
 }
 
+/// 服务端观察到的 transport 安全模式(doc/krpc-s2s-payload-encryption-TODO.md §9.2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RPCTransportSecurity {
+    Plaintext,
+    Tls,
+    S2sPayloadV1,
+    TlsAndS2sPayloadV1,
+}
+
+/// dispatch 前由 transport 层构造的 server-side context(§9.2)。
+///
+/// 必须区分:
+/// - `from_ip`:网络观察值,不是密码学身份;
+/// - `admitted_by_trusted_network`:只说明 plaintext transport 被放行,
+///   不代表 service 身份;
+/// - `authenticated_from_service_did`:AEAD 成功后确认的 canonical service DID;
+///   plaintext 分支恒为 `None`。
+#[derive(Debug, Clone)]
+pub struct RPCServerContext {
+    pub from_ip: Option<IpAddr>,
+    pub source_ip_provenance: Option<crate::s2s::SourceIpProvenance>,
+    pub transport_security: RPCTransportSecurity,
+    pub admitted_by_trusted_network: bool,
+    pub authenticated_from_service_did: Option<name_lib::DID>,
+    pub authenticated_from_key_fingerprint: Option<[u8; 32]>,
+    pub canonical_api_name: Option<String>,
+}
+
+impl RPCServerContext {
+    /// 现有明文入口使用的 context(行为与旧 `handle_rpc_call(req, ip)` 一致)。
+    pub fn plaintext(from_ip: IpAddr) -> Self {
+        Self {
+            from_ip: Some(from_ip),
+            source_ip_provenance: None,
+            transport_security: RPCTransportSecurity::Plaintext,
+            admitted_by_trusted_network: false,
+            authenticated_from_service_did: None,
+            authenticated_from_key_fingerprint: None,
+            canonical_api_name: None,
+        }
+    }
+}
+
 //通过RPCContext可以方便跟踪和调试一个长的call chain
 //call chain用trace_id来定义
 #[derive(Debug, PartialEq, Clone)]
@@ -252,6 +295,12 @@ pub struct RPCContext {
     pub trace_id: Option<String>,
     pub from_ip: Option<IpAddr>, //filled by gateway,client never fill this
     pub from_device: Option<String>, //filled by gateway,client never fill this
+    /// S2S 加密验证成功后的 sender service DID(§9.2);plaintext 恒为 None。
+    pub authenticated_from_service_did: Option<name_lib::DID>,
+    /// 实际参与 DH 的 sender key fingerprint。
+    pub authenticated_from_key_fingerprint: Option<[u8; 32]>,
+    /// plaintext transport 是否经由可信网段 allowlist 放行(不是身份)。
+    pub admitted_by_trusted_network: bool,
 }
 
 impl Default for RPCContext {
@@ -264,6 +313,9 @@ impl Default for RPCContext {
             trace_id: None,
             from_ip: None,
             from_device: None,
+            authenticated_from_service_did: None,
+            authenticated_from_key_fingerprint: None,
+            admitted_by_trusted_network: false,
         }
     }
 }
@@ -278,6 +330,24 @@ impl RPCContext {
             trace_id: req.trace_id.clone(),
             from_ip: Some(ip_from),
             from_device: None,
+            ..Default::default()
+        }
+    }
+
+    /// 从 server context 构造(携带 authenticated service identity,
+    /// 供 token/RBAC 做一致性检查)。
+    pub fn from_server_context(req: &RPCRequest, server_ctx: &RPCServerContext) -> Self {
+        Self {
+            seq: req.seq,
+            schema: None,
+            start_time: buckyos_get_unix_timestamp(),
+            token: req.token.clone(),
+            trace_id: req.trace_id.clone(),
+            from_ip: server_ctx.from_ip,
+            from_device: None,
+            authenticated_from_service_did: server_ctx.authenticated_from_service_did.clone(),
+            authenticated_from_key_fingerprint: server_ctx.authenticated_from_key_fingerprint,
+            admitted_by_trusted_network: server_ctx.admitted_by_trusted_network,
         }
     }
 }
@@ -289,6 +359,37 @@ pub trait RPCHandler {
         req: RPCRequest,
         ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors>;
+}
+
+/// context-aware handler(§9.2):S2S 入口通过它把 authenticated service
+/// identity 传给业务层。
+///
+/// 所有 `RPCHandler` 实现自动获得 blanket adapter(丢弃额外 context,仅传
+/// IP,行为与旧入口一致);需要 authenticated identity 的服务直接实现本
+/// trait(不再实现 `RPCHandler`)。
+#[async_trait]
+pub trait RPCServerHandler: Send + Sync {
+    async fn handle_rpc_call_with_context(
+        &self,
+        req: RPCRequest,
+        server_ctx: &RPCServerContext,
+    ) -> Result<RPCResponse, RPCErrors>;
+}
+
+#[async_trait]
+impl<T: RPCHandler + Send + Sync> RPCServerHandler for T {
+    async fn handle_rpc_call_with_context(
+        &self,
+        req: RPCRequest,
+        server_ctx: &RPCServerContext,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let Some(from_ip) = server_ctx.from_ip else {
+            return Err(RPCErrors::ReasonError(
+                "server context has no source ip".to_string(),
+            ));
+        };
+        self.handle_rpc_call(req, from_ip).await
+    }
 }
 
 #[cfg(test)]

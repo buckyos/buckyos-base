@@ -16,6 +16,24 @@ thiserror = { workspace = true }
 reqwest = { workspace = true }
 jsonwebtoken = { workspace = true }
 
+# S2S Payload Protection v1 (doc/krpc-s2s-payload-encryption-TODO.md)
+base64 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+curve25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+hkdf = { workspace = true }
+http = { workspace = true }
+ipnet = { workspace = true }
+percent-encoding = { workspace = true }
+rand_core = { workspace = true, features = ["getrandom"] }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+zeroize = { workspace = true }
+
 buckyos-kit = { workspace = true }
 name-lib = { workspace = true }
 rbac = { workspace = true }
+
+[dev-dependencies]
+ed25519_to_curve25519 = { workspace = true }

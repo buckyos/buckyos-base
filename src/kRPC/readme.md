@@ -107,9 +107,54 @@ session_token中有签发时间和有效期，因此只在这个周期内有效
 
 ## 6. S2S Payload 加密
 
-kRPC 可以增加一个可选的、无在线握手的 S2S Payload 加密 Profile，使服务能够通过
-`http://target_ip:port/s2s/$apiname` 直接通信，同时使用双方已有的 Ed25519/DID 身份密钥
-保护完整 RPC JSON。
+kRPC 提供一个可选的、无在线握手的 S2S Payload 加密 Profile（v1，已实现于
+`kRPC::s2s` 模块），使服务能够通过 `http://target_ip:port/s2s/$apiname` 直接通信，
+同时使用双方已有的 Ed25519/DID 身份密钥保护完整 RPC JSON
+（Ed25519→X25519 static-static DH + HKDF-SHA-256 + XChaCha20-Poly1305）。
+
+client:
+
+```rust
+use kRPC::{kRPC, KrpcTransportSecurity};
+use kRPC::s2s::*;
+
+let local = S2sLocalIdentityConfig::new(
+    "event-producer",                 // local_service_appid
+    current_zone_did,                 // 二者派生 canonical service DID
+    S2sLocalKeySource::Provider { provider },  // 或 ExplicitEd25519
+);
+// 推荐:target DID + target 公钥都是确定值,来自 verified service
+// descriptor;transport 发送路径不做任何隐式解析
+let config = S2sClientConfig::with_pinned_key(
+    local,
+    target_service_did,
+    target_service_public_key,        // [u8; 32] Ed25519 公钥,构造时校验
+);
+// 动态部署可改用 S2sClientConfig::with_resolver(local, did, resolver)
+let client = kRPC::new_with_transport(
+    "http://203.0.113.10:18080/s2s/event-report-v1",
+    session_token,
+    KrpcTransportSecurity::S2sPayloadV1(config),
+).await?;
+let result = client.call("report_event", params).await?;
+client.probe_s2s(Some("event-report-v1")).await?; // 加密探测
+```
+
+server（`buckyos-http-server`）:
+
+```rust
+let ctx = S2sRpcServerContext::builder("event-service", current_zone_did)
+    .key_agreement_provider(identity_manager_provider) // name-client 提供
+    .peer_key_resolver(resolver)
+    .security_policy(S2sServerSecurityPolicy::public_internet_default())
+    .build().await?;
+// 在 /s2s/ 路由内:
+serve_http_by_s2s_rpc_handler(req, info, &my_handler, &ctx).await
+```
+
+安全默认 fail closed：`/s2s/` 只接受加密请求、不信任 forwarded source、
+peer DenyAll;明文只能通过显式 CIDR + API allowlist 放行且不产生
+authenticated service identity;失败绝不降级明文。
 
 正式设计和实现清单见
 [kRPC S2S Payload 加密 Profile TODO](../../doc/krpc-s2s-payload-encryption-TODO.md)。

@@ -390,6 +390,74 @@ impl DID {
     }
 }
 
+/// 名字类 DID(`did:web` / `did:bns`)的 child 派生共享规则:
+/// `did:{method}:{child_label}.{zone_id}`。
+///
+/// 这是 name resolution(zone 内嵌 device 文档缓存)、identity path 和
+/// kRPC S2S service DID 派生共用的唯一算法
+/// (doc/krpc-s2s-payload-encryption-TODO.md §6.1);
+/// 各处不得再自行拼接字符串。
+///
+/// `child_label` 必须是合法的单级 DNS-safe label:
+/// 仅 `[a-z0-9-]`、长度 1..=63、不以 `-` 开头/结尾、不含 `.`。
+/// zone DID method 不支持 child 派生(非 web/bns)时直接报错,不猜测其他规则。
+pub fn zone_child_did(zone_did: &DID, child_label: &str) -> NSResult<DID> {
+    validate_zone_child_label(child_label)?;
+    match zone_did.method.as_str() {
+        "web" | "bns" => {
+            // zone id 携带 path/端口段(`:` 分段)时,child 不继承这些段
+            let zone_name = zone_did.id.split(':').next().unwrap_or_default();
+            if zone_name.is_empty() {
+                return Err(NSError::InvalidDID(format!(
+                    "zone did {} has empty name part",
+                    zone_did.to_string()
+                )));
+            }
+            if zone_name.contains('%') {
+                // %3A 编码端口:带端口的 zone 名字不参与 child 派生
+                return Err(NSError::InvalidDID(format!(
+                    "zone did {} carries an encoded port; cannot derive child did",
+                    zone_did.to_string()
+                )));
+            }
+            Ok(DID::new(
+                &zone_did.method,
+                &format!("{}.{}", child_label, zone_name),
+            ))
+        }
+        other => Err(NSError::InvalidDID(format!(
+            "zone did method {} does not support child derivation",
+            other
+        ))),
+    }
+}
+
+/// `zone_child_did` 的 label 校验,独立导出便于调用方在配置阶段提前检查。
+pub fn validate_zone_child_label(label: &str) -> NSResult<()> {
+    if label.is_empty() || label.len() > 63 {
+        return Err(NSError::InvalidParam(format!(
+            "invalid zone child label {:?}: length must be 1..=63",
+            label
+        )));
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return Err(NSError::InvalidParam(format!(
+            "invalid zone child label {:?}: must not start or end with '-'",
+            label
+        )));
+    }
+    if !label
+        .bytes()
+        .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+    {
+        return Err(NSError::InvalidParam(format!(
+            "invalid zone child label {:?}: only [a-z0-9-] allowed",
+            label
+        )));
+    }
+    Ok(())
+}
+
 impl Serialize for DID {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -812,6 +880,41 @@ mod tests {
         assert_eq!(did_str, "did:web:waterflier.buckyos.io");
         let host_name = did.to_host_name_by_bridge("web3.buckyos.io");
         assert_eq!(host_name, "waterflier.buckyos.io");
+    }
+
+    #[test]
+    fn test_zone_child_did() {
+        let zone = DID::new("web", "example.com");
+        assert_eq!(
+            zone_child_did(&zone, "event-service").unwrap(),
+            DID::new("web", "event-service.example.com")
+        );
+        let zone = DID::new("bns", "alice");
+        assert_eq!(
+            zone_child_did(&zone, "app1").unwrap(),
+            DID::new("bns", "app1.alice")
+        );
+        // path 段不被 child 继承
+        let zone = DID::new("web", "example.com:user:alice");
+        assert_eq!(
+            zone_child_did(&zone, "svc").unwrap(),
+            DID::new("web", "svc.example.com")
+        );
+        // 编码端口的 zone 不支持派生
+        let zone = DID::new("web", "example.com%3A8080");
+        assert!(zone_child_did(&zone, "svc").is_err());
+        // method 不支持
+        let zone = DID::new("dev", "5bUuyWLOKyCre9az_IhJVIuOw8bA0gyKjstcYGHbaPE");
+        assert!(zone_child_did(&zone, "svc").is_err());
+        // 非法 label
+        let zone = DID::new("web", "example.com");
+        assert!(zone_child_did(&zone, "").is_err());
+        assert!(zone_child_did(&zone, "Upper").is_err());
+        assert!(zone_child_did(&zone, "a.b").is_err());
+        assert!(zone_child_did(&zone, "-bad").is_err());
+        assert!(zone_child_did(&zone, "bad-").is_err());
+        assert!(zone_child_did(&zone, &"a".repeat(64)).is_err());
+        assert!(zone_child_did(&zone, &"a".repeat(63)).is_ok());
     }
 
     #[test]

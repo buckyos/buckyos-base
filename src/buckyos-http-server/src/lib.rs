@@ -3,13 +3,16 @@
 mod did_obj_server;
 mod dir_server;
 mod runner;
+mod s2s_rpc_server;
 #[cfg(test)]
 mod test_did_obj_server;
+#[cfg(test)]
+mod test_s2s_rpc_server;
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use ::kRPC::{RPCHandler, RPCRequest, RPCResponse, RPCResult};
+use ::kRPC::{RPCHandler, RPCRequest, RPCResponse, RPCResult, RPCServerContext, RPCServerHandler};
 use buckyos_kit::AsyncStream;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -20,6 +23,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 pub use did_obj_server::*;
 pub use dir_server::*;
 pub use runner::*;
+pub use s2s_rpc_server::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServerErrorCode {
@@ -174,19 +178,8 @@ pub async fn serve_http_by_rpc_handler_with_limit<T: RPCHandler + Send + Sync + 
 
     log::debug!("|==>recv kRPC req: method={}", rpc_request.method);
 
-    let rpc_seq = rpc_request.seq;
-    let rpc_trace_id = rpc_request.trace_id.clone();
-    let resp: RPCResponse = match rpc_handler.handle_rpc_call(rpc_request, client_ip).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            log::warn!("Failed to handle rpc call: {}", e);
-            RPCResponse {
-                result: RPCResult::Failed(e.to_string()),
-                seq: rpc_seq,
-                trace_id: rpc_trace_id,
-            }
-        }
-    };
+    let server_ctx = RPCServerContext::plaintext(client_ip);
+    let resp = dispatch_rpc_request(rpc_handler, rpc_request, &server_ctx).await;
 
     let body_json = serde_json::to_string(&resp).map_err(|e| {
         server_err!(
@@ -205,6 +198,32 @@ pub async fn serve_http_by_rpc_handler_with_limit<T: RPCHandler + Send + Sync + 
                 e
             )
         })?)
+}
+
+/// 共享 RPC dispatch(doc/krpc-s2s-payload-encryption-TODO.md §9.2):
+/// plaintext 与 S2S 加密入口都经由它把 `RPCRequest` 变成 `RPCResponse`,
+/// handler 错误统一映射为 `RPCResult::Failed`,不复制 error mapping。
+pub(crate) async fn dispatch_rpc_request<T: RPCServerHandler + Send + Sync + 'static>(
+    rpc_handler: &T,
+    rpc_request: RPCRequest,
+    server_ctx: &RPCServerContext,
+) -> RPCResponse {
+    let rpc_seq = rpc_request.seq;
+    let rpc_trace_id = rpc_request.trace_id.clone();
+    match rpc_handler
+        .handle_rpc_call_with_context(rpc_request, server_ctx)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::warn!("Failed to handle rpc call: {}", e);
+            RPCResponse {
+                result: RPCResult::Failed(e.to_string()),
+                seq: rpc_seq,
+                trace_id: rpc_trace_id,
+            }
+        }
+    }
 }
 
 pub async fn hyper_serve_http(
@@ -440,7 +459,7 @@ fn payload_too_large() -> Response<BoxBody<Bytes, ServerError>> {
         .expect("static payload too large response should build")
 }
 
-fn text_response(
+pub(crate) fn text_response(
     status: StatusCode,
     body: impl Into<Bytes>,
 ) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
@@ -456,7 +475,7 @@ fn text_response(
         })
 }
 
-fn full_body(body: impl Into<Bytes>) -> BoxBody<Bytes, ServerError> {
+pub(crate) fn full_body(body: impl Into<Bytes>) -> BoxBody<Bytes, ServerError> {
     Full::new(body.into())
         .map_err(|never| match never {})
         .boxed()

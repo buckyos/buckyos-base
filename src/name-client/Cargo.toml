@@ -35,6 +35,7 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 
 name-lib = { workspace = true }
 buckyos-kit = { workspace = true }

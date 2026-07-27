@@ -768,16 +768,8 @@ impl NameClient {
     }
 
     fn zone_child_did(zone_did: &DID, device_name: &str) -> Option<DID> {
-        if device_name.is_empty() {
-            return None;
-        }
-        match zone_did.method.as_str() {
-            "web" | "bns" => Some(DID::new(
-                &zone_did.method,
-                &format!("{}.{}", device_name, zone_did.id),
-            )),
-            _ => None,
-        }
+        // 共享派生规则下沉到 name-lib(kRPC S2S 的 service DID 派生复用同一算法)
+        name_lib::zone_child_did(zone_did, device_name).ok()
     }
 
     fn cache_embedded_zone_devices(

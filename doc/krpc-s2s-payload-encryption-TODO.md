@@ -1,6 +1,19 @@
 # kRPC S2S Payload 加密 Profile TODO
 
-> 状态：Review 中（2026-07-27 已吸收第一轮协议安全 review 意见），未实现。
+> 状态：**基础库已实现**（2026-07-27，Phase 0–4 全量 + Phase 5/6 可在本仓库
+> 落地的部分；见各 Phase 勾选与行内备注）。
+>
+> 代码入口：
+> - 协议基元/密钥/policy/replay/客户端引擎：`src/kRPC/src/s2s/`（`kRPC::s2s`）；
+> - 客户端 transport 模式：`kRPC::KrpcTransportSecurity` + `kRPC::new_with_transport`；
+> - 服务端入口：`buckyos-http-server::serve_http_by_s2s_rpc_handler`
+>   （共享 dispatch 已抽出，`RPCServerHandler`/`RPCServerContext` 见 `kRPC::protocol`）；
+> - Identity Manager key provider：`name-client::IdentityManagerS2sKeyProvider`；
+> - 共享 service DID 派生：`name_lib::zone_child_did` + `kRPC::s2s::derive_service_did`。
+>
+> 仍未完成（跨仓库/运维项）：endpoint descriptor 的 name-system 发布、共享
+> replay store backend、metric/dashboard/告警接入、durable outbox/DLQ、
+> 跨语言互操作实现与性能基准；见 Phase 5/6 未勾选项。
 >
 > 本 TODO 定义一个**可选的** `kRPC S2S Payload Protection v1`：
 > 调用双方已经持有自己的 Ed25519 私钥，并能取得经过验证的对端 Ed25519 公钥；
@@ -338,6 +351,13 @@ pub struct S2sLocalIdentityConfig {
 
 - 客户端不得只因为某个 DID Document 能被解析就直接信任其中的 key。
 - key 必须来自经过验证的 DID/name-system evidence。
+- 取得 target public key 是关键安全行为。**推荐形态是确定值**：客户端直接
+  消费 verified service descriptor（§12）给出的
+  `(target_service_did, target_service_public_key)`，发送热路径不做任何隐式
+  解析，验证责任明确落在产出 descriptor 的服务发现层
+  （实现：`S2sClientConfig::with_pinned_key`，构造时即校验公钥有效性）。
+  只有确实需要在线轮换发现的动态部署才使用 resolver 形态
+  （`S2sClientConfig::with_resolver`），且 resolver 只能返回已验证 key。
 - key freshness 是调用方策略：可以接受本地已验证 cache，也可以要求 Zone/Authority 最新。
 - 热路径不得隐式执行无界远程 resolve；调用方应预热或使用有界、可观测的 key cache。
 - 收到未知 target key reference 或解密失败时，客户端可以显式重新 resolve 一次并使用
@@ -1217,129 +1237,197 @@ store，记录 p50/p95/p99、CPU、allocation 和 wire bytes。
 
 ### Phase 0：冻结协议
 
-- [ ] 确认 v1 Header 名称、大小上限、timestamp 单位和默认 lifetime。
-- [ ] 冻结 `ServiceKeyRef = canonical_service_did[#key_id]` 的语法和 canonical form。
-- [ ] 冻结 `local_service_appid + current_zone_did -> canonical service DID` 的派生规则和
-  test vectors。
-- [ ] 将现有私有 `zone_child_did` 规则下沉为 name-lib 共享 helper，并让 resolver/identity/S2S
-  复用。
-- [ ] 冻结 Ed25519 public key fingerprint 的 domain-separated 计算规则。
-- [ ] 定义 canonical length-prefixed encoder，并冻结 AAD/KDF 整数字段宽度
-  （`version`=u32，`iat`/`exp`=u64）与 `canonical_sort` 字节字典序比较规则。
-- [ ] 冻结 canonical API name 的字符集、长度上限和规范化规则（percent-encoding、大小写、
-  `..`/`//` 处理），并保留 `__` 前缀给协议自身（如 `__probe`）。
-- [ ] 冻结 response AAD 字段表与 `In-Reply-To` 在 AAD 中的编码（raw 24 bytes）。
-- [ ] 冻结“AAD key reference 逐字节使用 wire 形式、response Header 对调回显 request
-  `To`/`From`”的规则。
-- [ ] 固定 Ed25519 private input representation 和 libsodium-compatible 转换规则。
-- [ ] 生成并 review Ed25519→X25519、DH、HKDF、request/response AEAD 完整测试向量。
+- [x] 确认 v1 Header 名称、大小上限、timestamp 单位和默认 lifetime
+  （`kRPC::s2s` 常量：`HEADER_S2S_*`、`S2S_DEFAULT_*`、`S2S_HARD_*`）。
+- [x] 冻结 `ServiceKeyRef = canonical_service_did[#key_id]` 的语法和 canonical form
+  （`s2s/service_key_ref.rs`，含拒绝非 canonical/控制字符/重复 `#` 测试）。
+- [x] 冻结 `local_service_appid + current_zone_did -> canonical service DID` 的派生规则和
+  test vectors（`derive_service_did` + name-lib/kRPC 两侧测试）。
+- [x] 将现有私有 `zone_child_did` 规则下沉为 name-lib 共享 helper，并让 resolver/identity/S2S
+  复用（`name_lib::zone_child_did`；name-client `NameClient::zone_child_did` 已委托）。
+- [x] 冻结 Ed25519 public key fingerprint 的 domain-separated 计算规则
+  （`ed25519_key_fingerprint`，`SHA256(encode("buckyos.krpc.s2s.v1/ed25519-key", pk))`）。
+- [x] 定义 canonical length-prefixed encoder，并冻结 AAD/KDF 整数字段宽度
+  （`version`=u32，`iat`/`exp`=u64）与 `canonical_sort` 字节字典序比较规则
+  （`s2s/codec.rs`，layout 有冻结字节级测试）。
+- [x] 冻结 canonical API name 的字符集、长度上限和规范化规则（percent-encoding、大小写、
+  `..`/`//` 处理），并保留 `__` 前缀给协议自身（如 `__probe`）（`s2s/api_name.rs`）。
+- [x] 冻结 response AAD 字段表与 `In-Reply-To` 在 AAD 中的编码（raw 24 bytes）
+  （`s2s/aad.rs`）。
+- [x] 冻结“AAD key reference 逐字节使用 wire 形式、response Header 对调回显 request
+  `To`/`From`”的规则（`open_request`/`seal_response`/`open_response` 实现并有测试）。
+- [x] 固定 Ed25519 private input representation（raw 32-byte seed）和 libsodium-compatible
+  转换规则（`s2s/keys.rs` 模块注释 + 实现）。
+- [x] 生成并 review Ed25519→X25519、DH、HKDF、request/response AEAD 完整测试向量
+  （`frozen_test_vector_conversion_and_kdf`；实现变更导致该测试失败即 wire 不兼容）。
 - [ ] 至少使用一个独立实现验证测试向量。
+  （Ed25519→X25519 转换已用 `ed25519_to_curve25519` crate 交叉验证;
+  DH/HKDF/AEAD 全链路向量的独立实现验证仍待做。）
 - [x] 第一轮协议安全 review（2026-07-27）：产出 KCI 残余风险、AAD wire-form 规则、
   response AAD 冻结、API name 规范化等意见，已并入本文档。
 - [ ] 测试向量冻结前，由独立实现/外部视角再做一轮密码学 review。
 
 ### Phase 1：crypto foundation
 
-- [ ] 在 workspace 固定 `hkdf`、`chacha20poly1305`、`zeroize`、`ipnet` 等依赖版本和 feature。
-- [ ] 提供 `KrpcS2sKeyProvider`，只返回必要的 key handle，不复制或打印私钥。
-- [ ] 定义 `S2sKeyAgreementProvider` capability，使非导出 key 可以直接执行 X25519 DH；
-  sign-only provider 不得被误判为可用。
-- [ ] 提供经过验证的 peer key resolver/cache 接口。
-- [ ] 实现 Ed25519→X25519 转换并拒绝无效/non-contributory key。
-- [ ] 实现 directional request/response key derivation。
-- [ ] 实现有界、可失效、尽可能 zeroize-on-evict 的派生 key cache。
-- [ ] 审计现有测试和日志，删除私钥、转换后私钥、shared secret 的打印。
+- [x] 在 workspace 固定 `hkdf`、`chacha20poly1305`、`zeroize`、`ipnet` 等依赖版本和 feature。
+- [x] 提供 key provider 接口，只返回必要的 key handle（`S2sLocalKeyHandle`），不复制或
+  打印私钥（`SecretEd25519Key` 无 Clone/Serialize，Debug redacted，drop 即 zeroize）。
+- [x] 定义 `S2sKeyAgreementProvider` capability，使非导出 key 可以直接执行 X25519 DH；
+  sign-only provider 不得被误判为可用（signer/remote keyref 返回
+  `KeyAgreementNotSupported`，见 name-client `identity_s2s.rs`）。
+- [x] 提供经过验证的 peer key resolver/cache 接口
+  （`S2sPeerKeyResolver` + `StaticPeerKeyResolver`；`refresh_verified_keys` 供显式刷新）。
+- [x] 实现 Ed25519→X25519 转换并拒绝无效/non-contributory key。
+- [x] 实现 directional request/response key derivation（`derive_aead_key`,方向与
+  kind 分离有测试）。
+- [x] 实现有界、可失效、尽可能 zeroize-on-evict 的派生 key cache
+  （`DerivedKeyCache`,容量/TTL/按 fingerprint 失效）。
+- [x] 审计现有测试和日志，删除私钥、转换后私钥、shared secret 的打印
+  （name-lib utility.rs 测试中的私钥/PEM 打印已删）。
 
 ### Phase 2：protocol types
 
-- [ ] 定义严格的 request/response S2S Header DTO 和字段上限。
-- [ ] 实现 Header nonce 的 Base64URL no-padding 编解码。
-- [ ] 实现 binary ciphertext Body，禁止密文 Base64/JSON wrapper。
-- [ ] 实现 canonical AAD/KDF context encoder。
-- [ ] 实现完整 `RPCRequest` / `RPCResponse` bytes 的 seal/open。
-- [ ] 增加 unknown version、wrong kind、wrong peer、wrong API、expired message 等结构化错误。
-- [ ] 确保错误类型不会把密码学细节直接返回未认证 peer。
+- [x] 定义严格的 request/response S2S Header DTO 和字段上限（`s2s/headers.rs`：
+  重复/缺失/超长/控制字符/未知 `krpc-s2s-*` 一律拒绝）。
+- [x] 实现 Header nonce 的 Base64URL no-padding 编解码（严格 32 chars/24 bytes）。
+- [x] 实现 binary ciphertext Body，禁止密文 Base64/JSON wrapper。
+- [x] 实现 canonical AAD/KDF context encoder。
+- [x] 实现完整 `RPCRequest` / `RPCResponse` bytes 的 seal/open（XChaCha20-Poly1305）。
+- [x] 增加 unknown version、wrong kind、wrong peer、wrong API、expired message 等结构化错误
+  （`S2sError`,含低基数 `reason_code()`）。
+- [x] 确保错误类型不会把密码学细节直接返回未认证 peer（服务端统一无细节短 403；
+  `DecryptFailed` 刻意不区分失败原因）。
 
 ### Phase 3：client
 
-- [ ] 为 `kRPC` 增加显式 `KrpcTransportSecurity` 配置。
-- [ ] 不改变现有 plaintext/TLS 模式的 wire compatibility。
-- [ ] S2S 模式在发送前取得 verified target key，生成 S2S Header 和 binary Body。
-- [ ] 禁止 redirect/失败后的隐式 plaintext fallback。
-- [ ] 验证 response service DID/key reference、request nonce、时间和内部 seq。
-- [ ] 实现一次有界 key refresh retry，并始终使用新 nonce。
-- [ ] 将 permanent/transient failure 暴露给调用方，避免全部压成 `ReasonError(String)`。
+- [x] 为 `kRPC` 增加显式 `KrpcTransportSecurity` 配置
+  （`Plaintext`/`Tls`/`S2sPayloadV1`/`TlsAndS2sPayloadV1`，不由 URL scheme 猜测）。
+- [x] 不改变现有 plaintext/TLS 模式的 wire compatibility（现有测试全部保留通过）。
+- [x] S2S 模式在发送前取得 verified target key，生成 S2S Header 和 binary Body
+  （推荐 `with_pinned_key` 直接固定 `(target_service_did, target_public_key)`
+  确定值,发送路径零隐式解析;`with_resolver` 供动态部署,见 §6.4）。
+- [x] 禁止 redirect/失败后的隐式 plaintext fallback（S2S 模式 reqwest
+  `redirect::Policy::none()`;任何失败路径都不会发出明文）。
+- [x] 验证 response service DID/key reference、request nonce、时间和内部 seq
+  （`open_response` + `check_rpc_response`）。
+- [x] 实现一次有界 key refresh retry，并始终使用新 nonce
+  （`post_s2s` 两次尝试上限;重试路径 `refresh_verified_keys` + 失效派生 cache）。
+- [x] 将 permanent/transient failure 暴露给调用方，避免全部压成 `ReasonError(String)`
+  （`RPCErrors::S2sPermanentError` / `S2sTransientError`）。
 
 ### Phase 4：server
 
-- [ ] 在 `buckyos-http-server` 增加 `serve_http_by_s2s_rpc_handler`。
-- [ ] 从现有 `serve_http_by_rpc_handler` 抽出共享 `dispatch_rpc_request`，禁止复制
+- [x] 在 `buckyos-http-server` 增加 `serve_http_by_s2s_rpc_handler`（`s2s_rpc_server.rs`）。
+- [x] 从现有 `serve_http_by_rpc_handler` 抽出共享 `dispatch_rpc_request`，禁止复制
   handler/error mapping。
-- [ ] 定义 `S2sRpcServerContext`，包含 local appid、current Zone DID、derived service DID、
-  local key source、peer resolver 和 replay store。
-- [ ] 接入 Identity Manager：按 derived service DID + `IdentityUsage::Authentication`
-  加载/监听 active Ed25519 keyref。
-- [ ] 支持 context 显式传入 Ed25519 private key 或 `S2sKeyAgreementProvider`，并强制校验
-  public key 与 derived service DID/key id 匹配。
-- [ ] 为 signer/remote keyref 定义 key-agreement capability；sign-only provider 返回明确错误。
-- [ ] 定义 `S2sServerSecurityPolicy`、安全默认值、trusted-network preset 和配置 validation。
-- [ ] 实现 immutable policy snapshot 与原子 reload。
-- [ ] 实现基于 `conn_src_addr` 的 source-address resolver；trusted proxy 必须验证 socket peer
-  后才能采用 `real_src_addr`。
-- [ ] 实现 CIDR + canonical API 的 plaintext admission，并确保 admission 在 Body parse 前完成。
-- [ ] 定义 `RPCServerContext`，迁移或扩展 `RPCHandler` 使 authenticated service DID
-  能进入生成的 `RPCContext`。
-- [ ] 为 `/s2s/$apiname` 增加有界 S2S Header + binary Body parser。
-- [ ] 在解析内部 JSON 和调用 handler 前完成身份、AEAD、时间和 replay 验证。
-- [ ] 将认证后的 sender service DID/key fingerprint 加入 `RPCContext`，供 token/RBAC
+- [x] 定义 `S2sRpcServerContext`，包含 local appid、current Zone DID、derived service DID、
+  local key source、peer resolver 和 replay store（builder 构造并校验不变量）。
+- [x] 接入 Identity Manager：按 derived service DID + `IdentityUsage::Authentication`
+  加载 active Ed25519 keyref（name-client `IdentityManagerS2sKeyProvider`；
+  监听/自动 reload 由调用方在轮换事件时调用 `reload()`,见 Phase 5 备注）。
+- [x] 支持 context 显式传入 Ed25519 private key 或 `S2sKeyAgreementProvider`，并强制校验
+  public key 与 derived service DID/key id 匹配（`LocalKeyBindingCheck::VerifyAgainst`,
+  测试环境可显式 `unsafe_skip_local_key_binding_check`）。
+- [x] 为 signer/remote keyref 定义 key-agreement capability；sign-only provider 返回明确错误。
+- [x] 定义 `S2sServerSecurityPolicy`、安全默认值、trusted-network preset 和配置 validation
+  （`public_internet_default()`/`trusted_network_plaintext()`/builder;`Default` 即安全默认）。
+- [x] 实现 immutable policy snapshot 与原子 reload（`policy_snapshot()`/`reload_policy()`,
+  一次 request 全程使用同一 snapshot）。
+- [x] 实现基于 `conn_src_addr` 的 source-address resolver；trusted proxy 必须验证 socket peer
+  后才能采用 `real_src_addr`（`resolve_effective_source` + `SourceIpProvenance`）。
+- [x] 实现 CIDR + canonical API 的 plaintext admission，并确保 admission 在 Body parse 前完成。
+- [x] 定义 `RPCServerContext`，迁移或扩展 `RPCHandler` 使 authenticated service DID
+  能进入生成的 `RPCContext`（新 `RPCServerHandler` trait + 既有 `RPCHandler` blanket
+  adapter;`RPCContext::from_server_context`）。
+- [x] 为 `/s2s/$apiname` 增加有界 S2S Header + binary Body parser。
+- [x] 在解析内部 JSON 和调用 handler 前完成身份、AEAD、时间和 replay 验证
+  （§9.3 顺序在 `serve_encrypted` + `S2sRpcServerContext::open_request` 内固定）。
+- [x] 将认证后的 sender service DID/key fingerprint 加入 `RPCContext`，供 token/RBAC
   做一致性检查。
-- [ ] 实现 request-bound encrypted response（含 `Cache-Control: no-store`）。
-- [ ] 对未认证错误返回统一 transport failure。
-- [ ] 实现共享 replay store trait 和原子 `put-if-absent`。
-- [ ] 明确单实例 local replay cache 与生产集群 backend 的配置区别。
-- [ ] 保留 `serve_http_by_rpc_handler` 的 plaintext wire compatibility 和现有测试。
-- [ ] 为现有 `serve_http_by_rpc_handler` 明文入口补上有界 Body 读取（当前 `req.collect()`
+- [x] 实现 request-bound encrypted response（含 `Cache-Control: no-store`）。
+- [x] 对未认证错误返回统一 transport failure（统一短 403 "Forbidden",内部只记
+  低基数 reason code）。
+- [x] 实现共享 replay store trait 和原子 `put-if-absent`（`S2sReplayStore`）。
+- [x] 明确单实例 local replay cache 与生产集群 backend 的配置区别
+  （`MemoryReplayStore::new_single_instance` 命名 + 文档;共享 backend 经
+  `.replay_store(..)` 注入,本仓库未提供具体分布式实现）。
+- [x] 保留 `serve_http_by_rpc_handler` 的 plaintext wire compatibility 和现有测试。
+- [x] 为现有 `serve_http_by_rpc_handler` 明文入口补上有界 Body 读取（当前 `req.collect()`
   无上限），默认值与 §11.5 的 Body limit 对齐。
 
 ### Phase 5：轮换与运维
 
 - [ ] endpoint descriptor 原子绑定 service appid、Zone DID、derived service DID、URL、
-  security profile、默认 key 和 API version。
-- [ ] active/grace/retired key 生命周期接入现有轮换体系。
-- [ ] 监听 Identity Manager active key generation；reload 后在内存保留有界 grace key，
-  到期 zeroize。
-- [ ] key retire 时主动失效派生 key cache。
-- [ ] 定义旧私钥、derived secret 和 crash dump/backup 的删除策略。
-- [ ] 实现加密 `__probe` 和 API registry 检查。
+  security profile、默认 key 和 API version。（name-system/服务发现侧,跨仓库）
+- [ ] active/grace/retired key 生命周期接入现有轮换体系。（provider 侧已具备
+  `reload()`/grace 语义,轮换体系触发接线在 buckyos 侧）
+- [x] 监听 Identity Manager active key generation 后 reload；reload 后在内存保留有界
+  grace key，到期丢弃即 zeroize（`IdentityManagerS2sKeyProvider::reload()`;
+  监听触发由部署侧接线,进程重启丢失旧 grace key 的行为已按 §6.6 文档化）。
+- [x] key retire 时主动失效派生 key cache（`reload()` 返回 retired fingerprint,
+  配合 `S2sRpcServerContext::invalidate_key_fingerprint`）。
+- [ ] 定义旧私钥、derived secret 和 crash dump/backup 的删除策略。（运维文档项）
+- [x] 实现加密 `__probe` 和 API registry 检查（服务端保留 API + `S2sApiRegistry`
+  RBAC 钩子;客户端 `kRPC::probe_s2s()`）。
 - [ ] 增加 metric、dashboard、低频 API silence alert、permanent failure alert。
-- [ ] 为事件上报接入 durable outbox、稳定 event id 和 DLQ。
+  （库侧已提供低基数 `S2sError::reason_code()` 与 permanent/transient 分类;
+  metric 管线接入在部署侧）
+- [ ] 为事件上报接入 durable outbox、稳定 event id 和 DLQ。（业务侧）
 
 ### Phase 6：安全与兼容验证
 
-- [ ] 篡改每个 S2S Header/AAD 字段都必须导致验证失败。
-- [ ] 跨 API、跨服务、request/response 反射测试。
-- [ ] 同 nonce/密文顺序和高并发 replay 测试。
-- [ ] 多实例跨节点 replay 测试。
-- [ ] active→grace→retired 轮换和 cache eviction 测试。
-- [ ] current key compromise/old key deletion 的运维演练。
+已实现的测试见 `src/kRPC/src/s2s/*`（单元）与
+`src/buckyos-http-server/src/test_s2s_rpc_server.rs`（服务端/端到端）。
+
+- [x] 篡改每个 S2S Header/AAD 字段都必须导致验证失败
+  （`tampering_any_s2s_header_fails_before_handler` + AAD 逐字段单元测试 +
+  `tampered_body_rejected`）。
+- [x] 跨 API、跨服务、request/response 反射测试
+  （`cross_api_reflection_rejected`、`wrong_target_service_rejected`、
+  `derived_keys_are_directional_and_kind_separated`）。
+- [x] 同 nonce/密文顺序和高并发 replay 测试
+  （`replayed_request_rejected_and_not_dispatched_twice`、
+  `concurrent_same_nonce_only_one_wins`）。
+- [ ] 多实例跨节点 replay 测试。（需共享 replay store backend,本仓库仅有
+  单实例 `MemoryReplayStore`）
+- [x] active→grace→retired 轮换和 cache eviction 测试
+  （`server_grace_key_still_decrypts_after_rotation`、
+  `reload_moves_old_key_to_grace`、`derived_key_cache_bounded_ttl_and_invalidate`）。
+- [ ] current key compromise/old key deletion 的运维演练。（运维项）
 - [ ] Header/parser fuzz、oversized body、random ServiceKeyRef resolve amplification 测试。
-- [ ] `serve_http_by_s2s_rpc_handler` 的成功、错误、身份传递和加密响应集成测试。
-- [ ] 默认 policy 拒绝所有 plaintext、unknown peer 和 forwarded source 测试。
-- [ ] direct socket CIDR、IPv4/IPv6 boundary、IPv4-mapped IPv6 和 trusted proxy provenance 测试。
-- [ ] 伪造 `Forwarded`/`X-Forwarded-For`/`real_src_addr` 不能绕过 plaintext policy。
-- [ ] plaintext 必须同时命中 source CIDR 和 API allowlist，且不能产生 authenticated service DID。
-- [ ] appid + did:web/did:bns Zone 的 service DID 派生、canonicalization 和非法 label 测试。
-- [ ] Identity Manager file key、显式 key、provider 三种 local key source 测试。
-- [ ] 显式 key/DID fingerprint mismatch 与 sign-only keyref 必须在 context 构造时失败。
-- [ ] Identity Manager active key reload、grace expiry 和进程重启丢失旧 grace key 的测试。
-- [ ] encrypted 验证失败后绝不进入 plaintext parser。
-- [ ] response From/To 未逐字节对调回显（例如补全 key id）时 client 必须拒绝。
-- [ ] Content-Type dispatch 测试：参数被忽略、缺失/未知 media type 被拒绝。
-- [ ] 无效/unsafe policy 无法构造 context 或 reload。
-- [ ] 验证解密失败、replay 失败时不会进入 `RPCHandler`。
-- [ ] 验证 plaintext 入口不能伪造 authenticated service context。
+  （边界/超限用例已覆盖:oversized body、超长 key ref、非法字符;
+  持续 fuzz harness 未建）
+- [x] `serve_http_by_s2s_rpc_handler` 的成功、错误、身份传递和加密响应集成测试
+  （`encrypted_roundtrip_success_and_identity_passed` 等 + 两个真实 HTTP
+  端到端测试 `end_to_end_*`）。
+- [x] 默认 policy 拒绝所有 plaintext、unknown peer 和 forwarded source 测试。
+- [x] direct socket CIDR、IPv4/IPv6 boundary、IPv4-mapped IPv6 和 trusted proxy provenance 测试。
+- [x] 伪造 `Forwarded`/`X-Forwarded-For`/`real_src_addr` 不能绕过 plaintext policy
+  （`forwarded_headers_cannot_bypass_plaintext_policy`）。
+- [x] plaintext 必须同时命中 source CIDR 和 API allowlist，且不能产生 authenticated service DID
+  （`plaintext_needs_cidr_and_api_and_token_and_never_gets_identity`）。
+- [x] appid + did:web/did:bns Zone 的 service DID 派生、canonicalization 和非法 label 测试。
+- [x] Identity Manager file key、显式 key、provider 三种 local key source 测试
+  （`identity_s2s` 测试、显式 key 服务端测试、`TwoKeyProvider` 自定义 provider 测试）。
+- [x] 显式 key/DID fingerprint mismatch 与 sign-only keyref 必须在 context 构造时失败
+  （`context_construction_rejects_missing_pieces`、`fingerprint_mismatch_fails_at_load`、
+  `sign_only_keyref_is_rejected`）。
+- [x] Identity Manager active key reload、grace expiry 和进程重启丢失旧 grace key 的测试
+  （`reload_moves_old_key_to_grace`;重启丢失 grace key 的行为按 §6.6 定义为
+  client refresh+重试路径,由 `end_to_end_client_recovers_from_stale_target_key...` 覆盖）。
+- [x] encrypted 验证失败后绝不进入 plaintext parser
+  （`encrypted_failure_never_falls_back_to_plaintext_parser`）。
+- [x] response From/To 未逐字节对调回显（例如补全 key id）时 client 必须拒绝
+  （`client_rejects_response_with_rewritten_key_refs`）。
+- [x] Content-Type dispatch 测试：参数被忽略、缺失/未知 media type 被拒绝。
+- [x] 无效/unsafe policy 无法构造 context 或 reload。
+- [x] 验证解密失败、replay 失败时不会进入 `RPCHandler`（所有拒绝路径断言
+  handler 调用次数为 0）。
+- [x] 验证 plaintext 入口不能伪造 authenticated service context。
 - [ ] Rust 与至少一个其他语言实现互操作测试。
-- [ ] plaintext downgrade、redirect 和错误重试测试。
+- [x] plaintext downgrade、redirect 和错误重试测试
+  （downgrade 由 no-fallback 测试覆盖;redirect 在 S2S 模式经
+  `redirect::Policy::none()` 禁用;错误重试由 stale-key 端到端测试覆盖）。
 - [ ] 性能基准和公网故障注入测试。
 
 ## 17. 上线验收标准
