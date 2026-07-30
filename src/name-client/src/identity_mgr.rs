@@ -9,10 +9,15 @@ use crate::DidDocType;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use buckyos_kit::get_buckyos_root_dir;
 use chrono::{DateTime, Utc};
-use name_lib::{NSError, NSResult, DID};
+use ed25519_dalek::SigningKey;
+use name_lib::{
+    jwk_to_ed25519_pk, parse_did_doc, DIDDocumentTrait, EncodedDocument, NSError, NSResult, DID,
+};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha512};
+use zeroize::{Zeroize, Zeroizing};
 
 pub const IDENTITY_KEYREF_SCHEMA: &str = "buckyos.identity.keyref.v1";
 pub const X509_METADATA_SCHEMA: &str = "buckyos.identity.x509.metadata.v1";
@@ -156,8 +161,10 @@ pub struct X509Paths {
     pub fullchain: PathBuf,
     pub ca: Option<PathBuf>,
     pub metadata: PathBuf,
-    pub keyref: PathBuf,
-    pub private_key: Option<PathBuf>,
+    /// 可选的 HSM/remote/非默认文件位置 fallback。
+    pub keyref: Option<PathBuf>,
+    /// file mode 的默认私钥路径。
+    pub private_key: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +221,58 @@ pub struct KeyRef {
     pub public_key_fingerprint: String,
     pub access: KeyAccess,
     pub exportable: bool,
+}
+
+/// 已通过 `did.json` 默认公钥绑定校验的本地 Ed25519 authentication key。
+///
+/// 私钥 seed 不提供读取接口；drop 时清零，只能用于标准 X25519 key agreement。
+pub struct LocalEd25519IdentityKey {
+    did: DID,
+    seed: Zeroizing<[u8; 32]>,
+    public_key: [u8; 32],
+}
+
+impl fmt::Debug for LocalEd25519IdentityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalEd25519IdentityKey")
+            .field("did", &self.did.to_string())
+            .field("public_key", &hex::encode(self.public_key))
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalEd25519IdentityKey {
+    pub fn did(&self) -> &DID {
+        &self.did
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    /// Ed25519 seed 按 libsodium 规则转换为 X25519 static secret 后执行 DH。
+    pub fn diffie_hellman_x25519(
+        &self,
+        peer_x25519_public: &[u8; 32],
+    ) -> NSResult<Zeroizing<[u8; 32]>> {
+        let mut digest = Sha512::digest(&self.seed[..]);
+        let mut scalar = Zeroizing::new([0u8; 32]);
+        scalar.copy_from_slice(&digest[..32]);
+        scalar[0] &= 248;
+        scalar[31] &= 127;
+        scalar[31] |= 64;
+        digest.zeroize();
+
+        let secret = x25519_dalek::StaticSecret::from(*scalar);
+        let public = x25519_dalek::PublicKey::from(*peer_x25519_public);
+        let shared = secret.diffie_hellman(&public);
+        if !shared.was_contributory() {
+            return Err(NSError::InvalidParam(
+                "non-contributory X25519 peer key".to_string(),
+            ));
+        }
+        Ok(Zeroizing::new(shared.to_bytes()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,13 +406,39 @@ impl IdentityRoots {
             fullchain: self.public_file(did_or_hostname, usage, IdentityMaterial::Fullchain)?,
             ca: Some(self.public_file(did_or_hostname, usage, IdentityMaterial::Ca)?),
             metadata: self.public_file(did_or_hostname, usage, IdentityMaterial::Meta)?,
-            keyref: self.security_file(did_or_hostname, usage, IdentityMaterial::KeyRef)?,
-            private_key: Some(self.security_file(
+            keyref: Some(self.security_file(did_or_hostname, usage, IdentityMaterial::KeyRef)?),
+            private_key: self.security_file(
                 did_or_hostname,
                 usage,
                 IdentityMaterial::PrivateKey,
-            )?),
+            )?,
         })
+    }
+
+    /// 指定 DID 的 exact `did.json` 路径。DID document 绝不使用 wildcard。
+    pub fn did_document_file(&self, did: &DID) -> NSResult<PathBuf> {
+        self.public_file(
+            &did.to_string(),
+            IdentityUsage::Authentication,
+            IdentityMaterial::DidDocJson(None),
+        )
+    }
+
+    /// 指定 DID 的 exact 默认 authentication private key 路径。
+    pub fn authentication_private_key_file(&self, did: &DID) -> NSResult<PathBuf> {
+        self.security_file(
+            &did.to_string(),
+            IdentityUsage::Authentication,
+            IdentityMaterial::PrivateKey,
+        )
+    }
+
+    fn authentication_keyref_file(&self, did: &DID) -> NSResult<PathBuf> {
+        self.security_file(
+            &did.to_string(),
+            IdentityUsage::Authentication,
+            IdentityMaterial::KeyRef,
+        )
     }
 
     pub fn find_identity_dir(&self, did_or_hostname: &str) -> NSResult<IdentityDirMatch> {
@@ -382,12 +467,15 @@ impl IdentityRoots {
         material: IdentityMaterial,
     ) -> NSResult<IdentityFileMatch> {
         let file_name = material.public_file_name(usage)?;
-        self.find_file(
-            did_or_hostname,
-            file_name,
-            true,
-            format!("{} {}", usage, material.as_str()),
-        )
+        let description = format!("{} {}", usage, material.as_str());
+        if matches!(
+            material,
+            IdentityMaterial::DidDocJson(_) | IdentityMaterial::DidDocJwt(_)
+        ) {
+            self.find_exact_file(did_or_hostname, file_name, true, description)
+        } else {
+            self.find_file(did_or_hostname, file_name, true, description)
+        }
     }
 
     pub fn find_security_file(
@@ -397,12 +485,12 @@ impl IdentityRoots {
         material: IdentityMaterial,
     ) -> NSResult<IdentityFileMatch> {
         let file_name = material.security_file_name(usage)?;
-        self.find_file(
-            did_or_hostname,
-            file_name,
-            false,
-            format!("{} {}", usage, material.as_str()),
-        )
+        let description = format!("{} {}", usage, material.as_str());
+        if usage.is_x509() {
+            self.find_file(did_or_hostname, file_name, false, description)
+        } else {
+            self.find_exact_file(did_or_hostname, file_name, false, description)
+        }
     }
 
     pub fn load_keyref(&self, keyref_path: &Path) -> NSResult<KeyRef> {
@@ -417,11 +505,141 @@ impl IdentityRoots {
         raw.into_keyref(self, keyref_path.parent())
     }
 
+    /// 默认私钥访问顺序：exact direct PEM，缺失时才读取 exact keyref。
+    pub fn resolve_private_key_access(&self, did: &DID) -> NSResult<KeyAccess> {
+        let direct = self.authentication_private_key_file(did)?;
+        if direct.is_file() {
+            return Ok(KeyAccess::File {
+                path: direct,
+                format: "pkcs8-pem".to_string(),
+            });
+        }
+
+        let keyref_path = self.authentication_keyref_file(did)?;
+        if !keyref_path.is_file() {
+            return Err(NSError::NotFound(format!(
+                "authentication private key for {} (expected {} or {})",
+                did.to_string(),
+                direct.display(),
+                keyref_path.display()
+            )));
+        }
+        let keyref = self.load_keyref(&keyref_path)?;
+        if keyref.did != did.to_string() {
+            return Err(NSError::InvalidState(format!(
+                "keyref did {} does not match {}",
+                keyref.did,
+                did.to_string()
+            )));
+        }
+        if keyref.usage != IdentityUsage::Authentication {
+            return Err(NSError::InvalidState(format!(
+                "keyref usage {} is not authentication",
+                keyref.usage
+            )));
+        }
+        if !keyref.algorithm.eq_ignore_ascii_case("ed25519") {
+            return Err(NSError::InvalidState(format!(
+                "keyref algorithm {} is not Ed25519",
+                keyref.algorithm
+            )));
+        }
+        Ok(keyref.access)
+    }
+
+    /// 加载 exact `did.json`，校验 document id，并返回标准默认 authentication key。
+    pub fn load_default_ed25519_public_key(&self, did: &DID) -> NSResult<[u8; 32]> {
+        let path = self.did_document_file(did)?;
+        let content = fs::read_to_string(&path).map_err(|err| {
+            NSError::ReadLocalFileError(format!("read DID document {}: {err}", path.display()))
+        })?;
+        let value: Value = serde_json::from_str(&content).map_err(|err| {
+            NSError::InvalidParam(format!(
+                "invalid DID document JSON {}: {err}",
+                path.display()
+            ))
+        })?;
+        let document = parse_did_doc(EncodedDocument::JsonLd(value)).map_err(|err| {
+            NSError::InvalidParam(format!(
+                "invalid DID document or default authentication Ed25519 key {}: {err}",
+                path.display()
+            ))
+        })?;
+        self.default_ed25519_key_from_document(did, document.as_ref())
+    }
+
+    fn default_ed25519_key_from_document(
+        &self,
+        did: &DID,
+        document: &dyn DIDDocumentTrait,
+    ) -> NSResult<[u8; 32]> {
+        if document.get_id() != *did {
+            return Err(NSError::InvalidState(format!(
+                "DID document id {} does not match requested {}",
+                document.get_id().to_string(),
+                did.to_string()
+            )));
+        }
+        let (_, jwk) = document.get_auth_key(None).ok_or_else(|| {
+            NSError::NotFound(format!(
+                "default authentication Ed25519 key in {} (missing or invalid)",
+                did.to_string()
+            ))
+        })?;
+        jwk_to_ed25519_pk(&jwk)
+    }
+
+    /// 加载 direct PKCS#8 PEM（或 direct 缺失时的 file keyref fallback），并校验
+    /// 私钥导出的 Ed25519 公钥等于 exact `did.json` 的默认 authentication key。
+    pub fn load_default_ed25519_private_key(&self, did: &DID) -> NSResult<LocalEd25519IdentityKey> {
+        let expected_public = self.load_default_ed25519_public_key(did)?;
+        let access = self.resolve_private_key_access(did)?;
+        let key_path = match access {
+            KeyAccess::File { path, format } => {
+                if !format.eq_ignore_ascii_case("pkcs8-pem") {
+                    return Err(NSError::InvalidParam(format!(
+                        "authentication key format {format} is not pkcs8-pem"
+                    )));
+                }
+                path
+            }
+            KeyAccess::Signer { .. } | KeyAccess::RemoteMeta { .. } => {
+                return Err(NSError::Failed(
+                    "KeyAgreementNotSupported: authentication key access cannot perform X25519 key agreement"
+                        .to_string(),
+                ));
+            }
+        };
+        let pem = fs::read_to_string(&key_path).map_err(|err| {
+            NSError::ReadLocalFileError(format!(
+                "read authentication private key {}: {err}",
+                key_path.display()
+            ))
+        })?;
+        let seed = parse_ed25519_pkcs8_pem(&pem)?;
+        let public_key = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        if public_key != expected_public {
+            return Err(NSError::InvalidState(format!(
+                "authentication private key does not match {} default key",
+                did.to_string()
+            )));
+        }
+        Ok(LocalEd25519IdentityKey {
+            did: did.clone(),
+            seed: Zeroizing::new(seed),
+            public_key,
+        })
+    }
+
     pub fn private_key_file_for_legacy_tool(
         &self,
         did_or_hostname: &str,
         usage: IdentityUsage,
     ) -> NSResult<PathBuf> {
+        let direct = self.find_security_file(did_or_hostname, usage, IdentityMaterial::PrivateKey);
+        if let Ok(direct) = direct {
+            return Ok(direct.path);
+        }
         let keyref_match =
             self.find_security_file(did_or_hostname, usage, IdentityMaterial::KeyRef)?;
         let keyref = self.load_keyref(&keyref_match.path)?;
@@ -471,6 +689,8 @@ impl IdentityRoots {
         let cert = self.find_public_file(did_or_hostname, usage, IdentityMaterial::Cert);
         let metadata = self.parse_x509_metadata(did_or_hostname, usage);
         let keyref = self.find_security_file(did_or_hostname, usage, IdentityMaterial::KeyRef);
+        let private_key =
+            self.find_security_file(did_or_hostname, usage, IdentityMaterial::PrivateKey);
 
         let installed = fullchain.is_ok() || cert.is_ok() || metadata.is_ok();
         let match_type = fullchain
@@ -525,8 +745,19 @@ impl IdentityRoots {
                 }
             }
 
-            if let (Some(certificate), Ok(keyref_match)) = (metadata.certificate.as_ref(), &keyref)
+            if let (Some(cert_match), Ok(private_match)) = (
+                cert.as_ref().ok().or_else(|| fullchain.as_ref().ok()),
+                &private_key,
+            ) {
+                // direct private file 是默认入口：直接比较证书 SPKI 与私钥派生 SPKI。
+                key_matches_certificate = Some(
+                    x509_private_key_matches(&cert_match.path, &private_match.path)
+                        .unwrap_or(false),
+                );
+            } else if let (Some(certificate), Ok(keyref_match)) =
+                (metadata.certificate.as_ref(), &keyref)
             {
+                // direct file 缺失时才使用 keyref fingerprint fallback。
                 if let Some(cert_key_fingerprint) = certificate.public_key_fingerprint.as_ref() {
                     key_matches_certificate = Some(
                         self.load_keyref(&keyref_match.path)
@@ -549,7 +780,7 @@ impl IdentityRoots {
 
         let locally_usable = installed
             && pem_ok
-            && keyref.is_ok()
+            && (private_key.is_ok() || keyref.is_ok())
             && metadata.is_ok()
             && metadata_consistent
             && san_matches
@@ -624,6 +855,34 @@ impl IdentityRoots {
             }
         }
 
+        Err(NSError::NotFound(format!(
+            "UsageNotInstalled: {did_or_hostname} {description}"
+        )))
+    }
+
+    fn find_exact_file(
+        &self,
+        did_or_hostname: &str,
+        file_name: String,
+        public_root: bool,
+        description: String,
+    ) -> NSResult<IdentityFileMatch> {
+        let raw_host_uri = self.raw_host_uri(did_or_hostname)?;
+        let dir_name = encode_filename_checked(&raw_host_uri)?;
+        let root = if public_root {
+            &self.public_root
+        } else {
+            &self.security_root
+        };
+        let path = root.join(&dir_name).join(file_name);
+        if path.is_file() {
+            return Ok(IdentityFileMatch {
+                match_type: IdentityMatchType::Exact,
+                raw_host_uri,
+                dir_name,
+                path,
+            });
+        }
         Err(NSError::NotFound(format!(
             "UsageNotInstalled: {did_or_hostname} {description}"
         )))
@@ -1043,6 +1302,78 @@ fn certificate_pem_looks_parseable(path: &Path) -> NSResult<bool> {
         .any(|block| STANDARD.decode(block.as_bytes()).is_ok()))
 }
 
+fn x509_private_key_matches(certificate_path: &Path, private_key_path: &Path) -> NSResult<bool> {
+    let certificate_pem = fs::read_to_string(certificate_path).map_err(|err| {
+        NSError::ReadLocalFileError(format!(
+            "Failed to read certificate {}: {err}",
+            certificate_path.display()
+        ))
+    })?;
+    let certificate_der = extract_pem_blocks(&certificate_pem, "CERTIFICATE")
+        .into_iter()
+        .next()
+        .ok_or_else(|| NSError::InvalidParam("certificate PEM has no leaf certificate".to_string()))
+        .and_then(|body| {
+            STANDARD.decode(body.as_bytes()).map_err(|err| {
+                NSError::InvalidParam(format!("invalid leaf certificate PEM: {err}"))
+            })
+        })?;
+
+    let private_pem = fs::read_to_string(private_key_path).map_err(|err| {
+        NSError::ReadLocalFileError(format!(
+            "Failed to read private key {}: {err}",
+            private_key_path.display()
+        ))
+    })?;
+    let private_der = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"]
+        .iter()
+        .find_map(|label| extract_pem_blocks(&private_pem, label).into_iter().next())
+        .ok_or_else(|| NSError::InvalidParam("unsupported private key PEM".to_string()))
+        .and_then(|body| {
+            STANDARD
+                .decode(body.as_bytes())
+                .map_err(|err| NSError::InvalidParam(format!("invalid private key PEM: {err}")))
+        })?;
+    let private_der = Zeroizing::new(private_der);
+    let private_key = rustls::pki_types::PrivateKeyDer::try_from(&private_der[..])
+        .map_err(|err| NSError::InvalidParam(format!("invalid private key DER: {err}")))?;
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&private_key)
+        .map_err(|err| NSError::InvalidParam(format!("unsupported private key: {err}")))?;
+    let certified_key = rustls::sign::CertifiedKey::new(
+        vec![rustls::pki_types::CertificateDer::from(certificate_der)],
+        signing_key,
+    );
+    Ok(certified_key.keys_match().is_ok())
+}
+
+fn parse_ed25519_pkcs8_pem(pem: &str) -> NSResult<[u8; 32]> {
+    let begin = "-----BEGIN PRIVATE KEY-----";
+    let end = "-----END PRIVATE KEY-----";
+    let Some(begin_pos) = pem.find(begin) else {
+        return Err(NSError::InvalidParam(
+            "authentication private key is not PKCS#8 PEM".to_string(),
+        ));
+    };
+    let after_begin = &pem[begin_pos + begin.len()..];
+    let Some(end_pos) = after_begin.find(end) else {
+        return Err(NSError::InvalidParam(
+            "authentication private key has no PKCS#8 PEM end marker".to_string(),
+        ));
+    };
+    let body: String = after_begin[..end_pos]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let der = STANDARD.decode(body.as_bytes()).map_err(|err| {
+        NSError::InvalidParam(format!("invalid authentication private key PEM: {err}"))
+    })?;
+    name_lib::from_pkcs8(&der).map_err(|err| {
+        NSError::InvalidParam(format!(
+            "authentication private key is not Ed25519 PKCS#8: {err}"
+        ))
+    })
+}
+
 fn extract_pem_blocks(content: &str, label: &str) -> Vec<String> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
@@ -1078,6 +1409,8 @@ fn dns_san_matches(pattern: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::SigningKey;
     use serde_json::json;
 
     fn roots(tmp: &tempfile::TempDir) -> IdentityRoots {
@@ -1085,6 +1418,60 @@ mod tests {
             tmp.path().join("local").join("identity"),
             tmp.path().join("security"),
         )
+    }
+
+    fn test_did_document(did: &DID, seed: [u8; 32]) -> Value {
+        let public = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        json!({
+            "@context": ["https://www.w3.org/ns/did/v1", "https://buckyos.ai/ns/did/v1"],
+            "id": did.to_string(),
+            "verificationMethod": [{
+                "id": "#main_key",
+                "type": "JsonWebKey2020",
+                "controller": did.to_string(),
+                "publicKeyJwk": {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": URL_SAFE_NO_PAD.encode(public)
+                }
+            }],
+            "authentication": ["#main_key"],
+            "service": [{
+                "id": "#did-object",
+                "type": "DIDObjectService",
+                "serviceEndpoint": "https://service.example.com/",
+                "profile": "https://service.example.com/profile.json"
+            }]
+        })
+    }
+
+    fn test_pkcs8_pem(seed: [u8; 32]) -> String {
+        let mut der = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        der.extend_from_slice(&seed);
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            STANDARD.encode(der)
+        )
+    }
+
+    fn write_default_identity(roots: &IdentityRoots, did: &DID, seed: [u8; 32]) {
+        let public_dir = roots.public_dir(&did.to_string()).unwrap();
+        let security_dir = roots.security_dir(&did.to_string()).unwrap();
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&security_dir).unwrap();
+        fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&test_did_document(did, seed)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            security_dir.join("authentication.private.pem"),
+            test_pkcs8_pem(seed),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1481,5 +1868,283 @@ mod tests {
         assert!(!status.expired);
         assert_eq!(status.key_matches_certificate, Some(true));
         assert_eq!(status.did_binding_valid, Some(true));
+    }
+
+    #[test]
+    fn local_status_directly_binds_private_key_to_certificate_without_keyref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let public_dir = roots.public_dir("node1.example.com").unwrap();
+        let security_dir = roots.security_dir("node1.example.com").unwrap();
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&security_dir).unwrap();
+
+        let matching =
+            rcgen::generate_simple_self_signed(vec!["node1.example.com".to_string()]).unwrap();
+        fs::write(public_dir.join("server.cert.pem"), matching.cert.pem()).unwrap();
+        fs::write(
+            security_dir.join("server.private.pem"),
+            matching.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        fs::write(
+            public_dir.join("server.meta.json"),
+            json!({
+                "schema": X509_METADATA_SCHEMA,
+                "did": "did:web:node1.example.com",
+                "raw_host_uri": "node1.example.com",
+                "dir_name": "node1.example.com",
+                "usage": "server",
+                "match": { "type": "exact", "host": "node1.example.com" },
+                "certificate": {
+                    "not_before": "1970-01-01T00:00:00Z",
+                    "not_after": "2999-01-01T00:00:00Z"
+                },
+                "san": { "dns": ["node1.example.com"], "uri": ["did:web:node1.example.com"] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let status = roots
+            .check_x509_local_status("node1.example.com", IdentityUsage::Server)
+            .unwrap();
+        assert!(status.locally_usable);
+        assert_eq!(status.key_matches_certificate, Some(true));
+        assert!(!security_dir.join("server.keyref.json").exists());
+
+        let mismatched =
+            rcgen::generate_simple_self_signed(vec!["node1.example.com".to_string()]).unwrap();
+        fs::write(
+            security_dir.join("server.private.pem"),
+            mismatched.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        let status = roots
+            .check_x509_local_status("node1.example.com", IdentityUsage::Server)
+            .unwrap();
+        assert!(!status.locally_usable);
+        assert_eq!(status.key_matches_certificate, Some(false));
+    }
+
+    #[test]
+    fn standard_did_identity_loads_direct_file_without_keyref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let did = DID::new("bns", "event-service.alice");
+        write_default_identity(&roots, &did, [3u8; 32]);
+        let public_dir = roots.public_dir(&did.to_string()).unwrap();
+        fs::write(public_dir.join("app.json"), "{}").unwrap();
+        fs::write(public_dir.join("info.json"), "{}").unwrap();
+
+        let loaded = roots.load_default_ed25519_private_key(&did).unwrap();
+        assert_eq!(loaded.did(), &did);
+        assert_eq!(
+            loaded.public_key(),
+            SigningKey::from_bytes(&[3u8; 32])
+                .verifying_key()
+                .to_bytes()
+        );
+        assert!(!roots
+            .security_dir(&did.to_string())
+            .unwrap()
+            .join("authentication.keyref.json")
+            .exists());
+    }
+
+    #[test]
+    fn direct_private_file_wins_over_keyref_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let did = DID::new("web", "event-service.example.com");
+        write_default_identity(&roots, &did, [3u8; 32]);
+        let security_dir = roots.security_dir(&did.to_string()).unwrap();
+        fs::write(
+            security_dir.join("authentication.keyref.json"),
+            json!({
+                "schema": IDENTITY_KEYREF_SCHEMA,
+                "kind": "key",
+                "did": did.to_string(),
+                "usage": "authentication",
+                "algorithm": "Ed25519",
+                "public_key_fingerprint": "sha256:ignored",
+                "mode": "signer",
+                "exportable": false,
+                "ref": {
+                    "type": "unix-socket",
+                    "endpoint": "/tmp/ignored.sock",
+                    "protocol": "sign-only"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            roots.resolve_private_key_access(&did).unwrap(),
+            KeyAccess::File { path, .. }
+                if path == security_dir.join("authentication.private.pem")
+        ));
+        assert!(roots.load_default_ed25519_private_key(&did).is_ok());
+    }
+
+    #[test]
+    fn file_keyref_is_used_only_when_direct_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let did = DID::new("web", "event-service.example.com");
+        let public_dir = roots.public_dir(&did.to_string()).unwrap();
+        let security_dir = roots.security_dir(&did.to_string()).unwrap();
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&security_dir).unwrap();
+        fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&test_did_document(&did, [5u8; 32])).unwrap(),
+        )
+        .unwrap();
+        let alternate = security_dir.join("hsm-export.private.pem");
+        fs::write(&alternate, test_pkcs8_pem([5u8; 32])).unwrap();
+        fs::write(
+            security_dir.join("authentication.keyref.json"),
+            json!({
+                "schema": IDENTITY_KEYREF_SCHEMA,
+                "kind": "key",
+                "did": did.to_string(),
+                "usage": "authentication",
+                "algorithm": "Ed25519",
+                "public_key_fingerprint": "sha256:not-used-for-default-binding",
+                "mode": "file",
+                "exportable": true,
+                "ref": {
+                    "type": "file",
+                    "path": alternate.to_string_lossy(),
+                    "format": "pkcs8-pem"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            roots
+                .load_default_ed25519_private_key(&did)
+                .unwrap()
+                .public_key(),
+            SigningKey::from_bytes(&[5u8; 32])
+                .verifying_key()
+                .to_bytes()
+        );
+    }
+
+    #[test]
+    fn default_identity_binding_failures_are_explicit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let did = DID::new("web", "event-service.example.com");
+        write_default_identity(&roots, &did, [3u8; 32]);
+
+        let public_dir = roots.public_dir(&did.to_string()).unwrap();
+        fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&test_did_document(
+                &DID::new("web", "other.example.com"),
+                [3u8; 32],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(roots
+            .load_default_ed25519_private_key(&did)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match requested"));
+
+        fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&test_did_document(&did, [7u8; 32])).unwrap(),
+        )
+        .unwrap();
+        assert!(roots
+            .load_default_ed25519_private_key(&did)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+
+        let mut non_ed = test_did_document(&did, [3u8; 32]);
+        non_ed["verificationMethod"][0]["publicKeyJwk"]["crv"] = json!("X25519");
+        fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&non_ed).unwrap(),
+        )
+        .unwrap();
+        assert!(roots
+            .load_default_ed25519_public_key(&did)
+            .unwrap_err()
+            .to_string()
+            .contains("Ed25519"));
+    }
+
+    #[test]
+    fn authentication_material_never_uses_wildcard_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let requested = DID::new("web", "api.example.com");
+        let wildcard = DID::new("web", "_.example.com");
+        write_default_identity(&roots, &wildcard, [3u8; 32]);
+        assert!(roots
+            .did_document_file(&requested)
+            .unwrap()
+            .ends_with("api.example.com/did.json"));
+        assert!(roots
+            .find_public_file(
+                &requested.to_string(),
+                IdentityUsage::Authentication,
+                IdentityMaterial::DidDocJson(None),
+            )
+            .is_err());
+        assert!(roots
+            .resolve_private_key_access(&requested)
+            .unwrap_err()
+            .to_string()
+            .contains("authentication private key"));
+    }
+
+    #[test]
+    fn sign_only_authentication_keyref_cannot_supply_key_agreement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let did = DID::new("web", "event-service.example.com");
+        let public_dir = roots.public_dir(&did.to_string()).unwrap();
+        let security_dir = roots.security_dir(&did.to_string()).unwrap();
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::create_dir_all(&security_dir).unwrap();
+        fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&test_did_document(&did, [3u8; 32])).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            security_dir.join("authentication.keyref.json"),
+            json!({
+                "schema": IDENTITY_KEYREF_SCHEMA,
+                "kind": "key",
+                "did": did.to_string(),
+                "usage": "authentication",
+                "algorithm": "Ed25519",
+                "public_key_fingerprint": "sha256:test",
+                "mode": "signer",
+                "exportable": false,
+                "ref": {
+                    "type": "unix-socket",
+                    "endpoint": "/tmp/signer.sock",
+                    "protocol": "sign-only"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(roots
+            .load_default_ed25519_private_key(&did)
+            .unwrap_err()
+            .to_string()
+            .contains("KeyAgreementNotSupported"));
     }
 }

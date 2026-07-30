@@ -463,6 +463,15 @@ pub fn ed25519_to_decoding_key(sk: &[u8; 32]) -> NSResult<DecodingKey> {
 }
 
 pub fn jwk_to_ed25519_pk(jwk: &Jwk) -> NSResult<[u8; 32]> {
+    let jwk_value =
+        serde_json::to_value(jwk).map_err(|_| NSError::Failed("Invalid jwk".to_string()))?;
+    if jwk_value.get("kty").and_then(|v| v.as_str()) != Some("OKP")
+        || jwk_value.get("crv").and_then(|v| v.as_str()) != Some("Ed25519")
+    {
+        return Err(NSError::InvalidParam(
+            "default authentication key must be an Ed25519 OKP JWK".to_string(),
+        ));
+    }
     let x = get_x_from_jwk(jwk)?;
     let x_bytes = URL_SAFE_NO_PAD
         .decode(x)

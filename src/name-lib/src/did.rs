@@ -393,10 +393,9 @@ impl DID {
 /// 名字类 DID(`did:web` / `did:bns`)的 child 派生共享规则:
 /// `did:{method}:{child_label}.{zone_id}`。
 ///
-/// 这是 name resolution(zone 内嵌 device 文档缓存)、identity path 和
-/// kRPC S2S service DID 派生共用的唯一算法
-/// (doc/krpc-s2s-payload-encryption-TODO.md §6.1);
-/// 各处不得再自行拼接字符串。
+/// 这是 provisioning / app runtime 在进入协议层之前使用的二级名字 helper，
+/// 同时供 name resolution 与 identity path 复用。kRPC S2S 只接收这里已经
+/// 形成的完整 DID，不参与 appid + zone DID 的拼装。
 ///
 /// `child_label` 必须是合法的单级 DNS-safe label:
 /// 仅 `[a-z0-9-]`、长度 1..=63、不以 `-` 开头/结尾、不含 `.`。
@@ -456,6 +455,84 @@ pub fn validate_zone_child_label(label: &str) -> NSResult<()> {
         )));
     }
     Ok(())
+}
+
+/// 严格解析可用于 wire/config 边界的 canonical DID。
+///
+/// 当前 canonical 形式只接受可见 ASCII、`did:` 前缀、全小写字母数字 method
+/// 和非空 id；fragment (`#kid`) 不是 DID 身份的一部分，必须由 document 内部
+/// 的 verification method 语义处理，不能出现在此边界。
+pub fn parse_canonical_did(value: &str) -> NSResult<DID> {
+    if value.is_empty() || !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(NSError::InvalidDID(
+            "canonical DID must contain only visible ASCII".to_string(),
+        ));
+    }
+    if value.contains('#') {
+        return Err(NSError::InvalidDID(
+            "DID fragments are not accepted at this identity boundary".to_string(),
+        ));
+    }
+    let Some(rest) = value.strip_prefix("did:") else {
+        return Err(NSError::InvalidDID(
+            "canonical DID must start with 'did:'".to_string(),
+        ));
+    };
+    let Some((method, id)) = rest.split_once(':') else {
+        return Err(NSError::InvalidDID(
+            "canonical DID must include method and id".to_string(),
+        ));
+    };
+    if method.is_empty()
+        || !method
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'))
+    {
+        return Err(NSError::InvalidDID(format!(
+            "invalid canonical DID method {method:?}"
+        )));
+    }
+    if id.is_empty() {
+        return Err(NSError::InvalidDID(
+            "canonical DID id cannot be empty".to_string(),
+        ));
+    }
+    let mut index = 0;
+    let bytes = id.as_bytes();
+    while index < bytes.len() {
+        match bytes[index] {
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'.'
+            | b'-'
+            | b'_'
+            | b':' => index += 1,
+            b'%' if index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit() =>
+            {
+                index += 3;
+            }
+            _ => {
+                return Err(NSError::InvalidDID(
+                    "canonical DID id contains an invalid character or percent escape".to_string(),
+                ));
+            }
+        }
+    }
+    if id.ends_with(':') {
+        return Err(NSError::InvalidDID(
+            "canonical DID id cannot end with ':'".to_string(),
+        ));
+    }
+    let did = DID::new(method, id);
+    if did.to_string() != value {
+        return Err(NSError::InvalidDID(
+            "DID is not in canonical form".to_string(),
+        ));
+    }
+    Ok(did)
 }
 
 impl Serialize for DID {
@@ -915,6 +992,31 @@ mod tests {
         assert!(zone_child_did(&zone, "bad-").is_err());
         assert!(zone_child_did(&zone, &"a".repeat(64)).is_err());
         assert!(zone_child_did(&zone, &"a".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn canonical_did_parser_rejects_fragments_and_noncanonical_values() {
+        assert_eq!(
+            parse_canonical_did("did:bns:event-service.alice").unwrap(),
+            DID::new("bns", "event-service.alice")
+        );
+        assert_eq!(
+            parse_canonical_did("did:web:event-service.example.com").unwrap(),
+            DID::new("web", "event-service.example.com")
+        );
+        for bad in [
+            "",
+            "event-service.example.com",
+            "did:WEB:event-service.example.com",
+            "did:web:",
+            "did:web:event-service.example.com#main_key",
+            "did:web:event service.example.com",
+            "did:web:event-service.example.com/path",
+            "did:web:event-service.example.com%ZZ",
+            "did:web:event-service.example.com:",
+        ] {
+            assert!(parse_canonical_did(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

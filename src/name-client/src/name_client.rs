@@ -768,7 +768,7 @@ impl NameClient {
     }
 
     fn zone_child_did(zone_did: &DID, device_name: &str) -> Option<DID> {
-        // 共享派生规则下沉到 name-lib(kRPC S2S 的 service DID 派生复用同一算法)
+        // provisioning/name-resolution 的共享二级名字规则下沉到 name-lib。
         name_lib::zone_child_did(zone_did, device_name).ok()
     }
 
@@ -1358,6 +1358,40 @@ impl NameClient {
             .resolve_did_ex(did, doc_type, ResolvePolicy::default())
             .await?
             .document)
+    }
+
+    /// 解析指定 DID document 的默认 authentication Ed25519 公钥。
+    ///
+    /// 不识别 device/zone/app 等 document shape，也不接受调用方指定 kid：
+    /// document id 必须精确匹配请求 DID，默认 key 必须是 Ed25519。
+    pub async fn resolve_default_ed25519_key(
+        &self,
+        did: &DID,
+        source: ResolveSourcePolicy,
+    ) -> NSResult<[u8; 32]> {
+        let resolved = self
+            .resolve_did_ex(did, None, ResolvePolicy::default().with_source(source))
+            .await?;
+        let document = parse_did_doc(resolved.document).map_err(|err| {
+            NSError::InvalidParam(format!(
+                "invalid DID document for {}: {err}",
+                did.to_string()
+            ))
+        })?;
+        if document.get_id() != *did {
+            return Err(NSError::InvalidState(format!(
+                "DID document id {} does not match requested {}",
+                document.get_id().to_string(),
+                did.to_string()
+            )));
+        }
+        let (_, jwk) = document.get_auth_key(None).ok_or_else(|| {
+            NSError::NotFound(format!(
+                "default authentication Ed25519 key in {} (missing or invalid)",
+                did.to_string()
+            ))
+        })?;
+        jwk_to_ed25519_pk(&jwk)
     }
 }
 

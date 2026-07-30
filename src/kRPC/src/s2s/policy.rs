@@ -9,8 +9,7 @@ use super::error::{S2sError, S2sResult};
 use super::headers::TimeWindowPolicy;
 use super::{
     S2S_DEFAULT_MAX_BODY_SIZE, S2S_DEFAULT_MAX_HEADER_VALUE_LEN, S2S_DEFAULT_MAX_JSON_DEPTH,
-    S2S_DEFAULT_MAX_KEY_CANDIDATES, S2S_HARD_MAX_BODY_SIZE, S2S_HARD_MAX_FUTURE_CLOCK_SKEW_SECS,
-    S2S_HARD_MAX_KEY_CANDIDATES, S2S_HARD_MAX_LIFETIME_SECS,
+    S2S_HARD_MAX_BODY_SIZE, S2S_HARD_MAX_FUTURE_CLOCK_SKEW_SECS, S2S_HARD_MAX_LIFETIME_SECS,
 };
 use ipnet::IpNet;
 use name_lib::DID;
@@ -83,7 +82,9 @@ pub fn resolve_effective_source(
             ip: conn_ip,
             provenance: SourceIpProvenance::SocketPeer,
         }),
-        SourceIpPolicy::TrustedProxy { trusted_proxy_cidrs } => {
+        SourceIpPolicy::TrustedProxy {
+            trusted_proxy_cidrs,
+        } => {
             if trusted_proxy_cidrs.is_empty() {
                 // proxy allowlist 为空:配置校验会拒绝;运行时同样 fail closed
                 return Err(S2sError::PolicyViolation(
@@ -213,8 +214,6 @@ pub struct S2sResourceLimits {
     pub max_body_size: usize,
     pub max_header_value_len: usize,
     pub max_json_depth: usize,
-    /// 省略 key id 时 active/grace candidate 尝试上限(本地与对端各自适用)。
-    pub max_key_candidates: usize,
 }
 
 impl Default for S2sResourceLimits {
@@ -223,7 +222,6 @@ impl Default for S2sResourceLimits {
             max_body_size: S2S_DEFAULT_MAX_BODY_SIZE,
             max_header_value_len: S2S_DEFAULT_MAX_HEADER_VALUE_LEN,
             max_json_depth: S2S_DEFAULT_MAX_JSON_DEPTH,
-            max_key_candidates: S2S_DEFAULT_MAX_KEY_CANDIDATES,
         }
     }
 }
@@ -320,7 +318,10 @@ impl S2sServerSecurityPolicy {
                 }
             }
         }
-        if let SourceIpPolicy::TrustedProxy { trusted_proxy_cidrs } = &self.source_ip {
+        if let SourceIpPolicy::TrustedProxy {
+            trusted_proxy_cidrs,
+        } = &self.source_ip
+        {
             if trusted_proxy_cidrs.is_empty() {
                 return Err(S2sError::InvalidConfig(
                     "TrustedProxy requires non-empty trusted_proxy_cidrs".to_string(),
@@ -345,14 +346,6 @@ impl S2sServerSecurityPolicy {
             return Err(S2sError::InvalidConfig(format!(
                 "max_body_size must be 1..={}",
                 S2S_HARD_MAX_BODY_SIZE
-            )));
-        }
-        if self.limits.max_key_candidates == 0
-            || self.limits.max_key_candidates > S2S_HARD_MAX_KEY_CANDIDATES
-        {
-            return Err(S2sError::InvalidConfig(format!(
-                "max_key_candidates must be 1..={}",
-                S2S_HARD_MAX_KEY_CANDIDATES
             )));
         }
         if self.limits.max_json_depth == 0 || self.limits.max_header_value_len == 0 {
@@ -487,8 +480,14 @@ mod tests {
     fn default_policy_is_fail_closed() {
         let policy = S2sServerSecurityPolicy::default();
         policy.validate().unwrap();
-        assert!(matches!(policy.transport, S2sTransportAdmission::EncryptedOnly));
-        assert!(matches!(policy.peer_admission, PeerAdmissionPolicy::DenyAll));
+        assert!(matches!(
+            policy.transport,
+            S2sTransportAdmission::EncryptedOnly
+        ));
+        assert!(matches!(
+            policy.peer_admission,
+            PeerAdmissionPolicy::DenyAll
+        ));
         assert!(matches!(policy.source_ip, SourceIpPolicy::SocketPeerOnly));
         let src = EffectiveSource {
             ip: "127.0.0.1".parse().unwrap(),
@@ -496,7 +495,9 @@ mod tests {
         };
         // loopback 也不放行 plaintext(不自动信任 RFC1918/loopback)
         assert!(!policy.admits_plaintext(&src, "any-api"));
-        assert!(!policy.peer_admission.admits(&DID::new("web", "x.example.com")));
+        assert!(!policy
+            .peer_admission
+            .admits(&DID::new("web", "x.example.com")));
     }
 
     #[test]
@@ -529,13 +530,17 @@ mod tests {
     #[test]
     fn invalid_configs_rejected() {
         // 空 CIDR
-        assert!(S2sServerSecurityPolicy::trusted_network_plaintext::<_, &str>(vec![], ["a"]).is_err());
+        assert!(
+            S2sServerSecurityPolicy::trusted_network_plaintext::<_, &str>(vec![], ["a"]).is_err()
+        );
         // 空 API
-        assert!(S2sServerSecurityPolicy::trusted_network_plaintext::<_, &str>(
-            parse_cidrs(["10.0.0.0/8"]).unwrap(),
-            Vec::<&str>::new()
-        )
-        .is_err());
+        assert!(
+            S2sServerSecurityPolicy::trusted_network_plaintext::<_, &str>(
+                parse_cidrs(["10.0.0.0/8"]).unwrap(),
+                Vec::<&str>::new()
+            )
+            .is_err()
+        );
         // 全网段默认拒绝
         assert!(S2sServerSecurityPolicy::trusted_network_plaintext(
             parse_cidrs(["0.0.0.0/0"]).unwrap(),
@@ -556,11 +561,17 @@ mod tests {
         assert!(policy.is_err());
         // 超出 hard cap
         let mut limits = S2sResourceLimits::default();
-        limits.max_key_candidates = 100;
-        assert!(S2sServerSecurityPolicy::builder().limits(limits).build().is_err());
+        limits.max_body_size = S2S_HARD_MAX_BODY_SIZE + 1;
+        assert!(S2sServerSecurityPolicy::builder()
+            .limits(limits)
+            .build()
+            .is_err());
         let mut window = TimeWindowPolicy::default();
         window.max_lifetime_secs = 24 * 3600;
-        assert!(S2sServerSecurityPolicy::builder().message_window(window).build().is_err());
+        assert!(S2sServerSecurityPolicy::builder()
+            .message_window(window)
+            .build()
+            .is_err());
     }
 
     #[test]

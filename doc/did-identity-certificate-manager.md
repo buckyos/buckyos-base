@@ -215,8 +215,8 @@ capability      capability invocation / delegation key
 ```text
 server.fullchain.pem
 server.cert.pem
-server.keyref.json
-authentication.keyref.json
+server.private.pem
+authentication.private.pem
 assertion.meta.json
 ```
 
@@ -329,7 +329,6 @@ $BUCKYOS_ROOT/local/identity/
 $BUCKYOS_ROOT/security/
     node1.example.com/
         server.private.pem
-        server.keyref.json
 ```
 
 ### 6.2 DID 到目录的映射
@@ -427,14 +426,14 @@ did:bns:waterflier
 
 | 文件 | 语义 |
 |---|---|
-| `server.private.pem` | server 私钥文件；仅 `mode=file` 时存在 |
-| `server.keyref.json` | server key reference；必须存在 |
-| `client.private.pem` | client 私钥文件；仅 `mode=file` 时存在 |
-| `client.keyref.json` | client key reference；必须存在 |
-| `authentication.private.pem` | authentication 私钥文件；仅 `mode=file` 时存在 |
-| `authentication.keyref.json` | authentication key reference；必须存在 |
-| `assertion.private.pem` | assertion 私钥文件；仅 `mode=file` 时存在 |
-| `assertion.keyref.json` | assertion key reference；必须存在 |
+| `server.private.pem` | server 私钥文件；本地 file mode 的默认入口 |
+| `server.keyref.json` | server key reference；仅在直接私钥文件不存在时作为可选 fallback |
+| `client.private.pem` | client 私钥文件；本地 file mode 的默认入口 |
+| `client.keyref.json` | client key reference；仅在直接私钥文件不存在时作为可选 fallback |
+| `authentication.private.pem` | authentication 私钥文件；本地 Ed25519 身份的标准入口 |
+| `authentication.keyref.json` | authentication key reference；仅在直接私钥文件不存在时作为可选 fallback |
+| `assertion.private.pem` | assertion 私钥文件；本地 file mode 的默认入口 |
+| `assertion.keyref.json` | assertion key reference；仅在直接私钥文件不存在时作为可选 fallback |
 
 要求：
 
@@ -453,7 +452,7 @@ active root 中的文件表示当前可用材料。
 ```text
 1. 在同一文件系统中写入临时文件。
 2. fsync 临时文件和父目录。
-3. 校验 cert/keyref/metadata。
+3. 校验 cert、直接私钥（或缺失时的 keyref fallback）与 metadata。
 4. rename 到稳定文件名。
 5. 必要时通知服务 reload。
 ```
@@ -469,15 +468,23 @@ active root 中的文件表示当前可用材料。
 
 ## 7. Key Reference
 
-### 7.1 keyref 位置
+### 7.1 直接私钥与可选 keyref
 
-每个需要私钥能力的 usage 都必须有对应 keyref：
+本地可导出私钥使用稳定的直接文件作为默认入口：
+
+```text
+$BUCKYOS_SECURITY_ROOT/{dir_name}/{usage}.private.pem
+```
+
+只有直接私钥文件不存在时，helper 才允许回退到对应 keyref：
 
 ```text
 $BUCKYOS_SECURITY_ROOT/{dir_name}/{usage}.keyref.json
 ```
 
-public metadata 可以引用该 keyref 路径，但不应复制敏感 signer descriptor。
+因此 keyref 不是安装本地身份的必需文件。public metadata 可以引用可选 keyref
+路径，但不应复制敏感 signer descriptor。对 `authentication` 等 DID-native
+usage，文件查找必须精确匹配，不允许使用 wildcard 身份材料。
 
 示例：
 
@@ -488,7 +495,9 @@ $BUCKYOS_SECURITY_ROOT/node1.example.com/authentication.keyref.json
 
 ### 7.2 file mode
 
-传统私钥文件模式：
+传统私钥文件模式不需要 keyref。调用方直接读取稳定的
+`{usage}.private.pem`。下面的 keyref 仅用于需要以统一引用形式描述文件的
+兼容场景；helper 只会在直接文件不存在时读取它：
 
 ```json
 {
@@ -510,9 +519,10 @@ $BUCKYOS_SECURITY_ROOT/node1.example.com/authentication.keyref.json
 
 要求：
 
-1. `mode=file` 时，传统工具可以读取 `ref.path`。
-2. `ref.path` 应尽量指向同目录下的 `{usage}.private.pem`。
-3. helper 必须检查私钥 public key 与证书 public key 匹配。
+1. 直接私钥文件存在时，传统工具和 helper 都优先读取直接文件。
+2. 只有直接私钥文件不存在且 keyref 为 `mode=file` 时，传统工具可以读取 `ref.path`。
+3. `ref.path` 应尽量指向同目录下的 `{usage}.private.pem`。
+4. helper 必须检查私钥 public key 与证书 public key 匹配。
 
 ### 7.3 signer / remote mode
 
@@ -617,7 +627,7 @@ $BUCKYOS_IDENTITY_ROOT/{dir_name}/client.meta.json
     "cert": "server.cert.pem",
     "chain": "server.chain.pem",
     "fullchain": "server.fullchain.pem",
-    "key_ref": "${BUCKYOS_SECURITY_ROOT}/node1.example.com/server.keyref.json"
+    "private_key": "${BUCKYOS_SECURITY_ROOT}/node1.example.com/server.private.pem"
   },
   "did_binding": {
     "type": "did-web-domain",
@@ -724,7 +734,6 @@ $BUCKYOS_IDENTITY_ROOT/node1.example.com/server.fullchain.pem
 $BUCKYOS_IDENTITY_ROOT/node1.example.com/server.cert.pem
 $BUCKYOS_IDENTITY_ROOT/node1.example.com/server.chain.pem
 $BUCKYOS_IDENTITY_ROOT/node1.example.com/server.meta.json
-$BUCKYOS_SECURITY_ROOT/node1.example.com/server.keyref.json
 $BUCKYOS_SECURITY_ROOT/node1.example.com/server.private.pem
 ```
 
@@ -735,7 +744,9 @@ ssl_certificate     /buckyos/local/identity/node1.example.com/server.fullchain.p
 ssl_certificate_key /buckyos/security/node1.example.com/server.private.pem;
 ```
 
-如果 `server.keyref.json` 是 signer / remote 模式，传统 nginx 不能直接使用，必须通过 adapter、OpenSSL provider、PKCS#11 或其它兼容层暴露私钥能力。
+如果没有直接私钥文件、fallback keyref 又是 signer / remote 模式，传统 nginx
+不能直接使用，必须通过 adapter、OpenSSL provider、PKCS#11 或其它兼容层暴露
+私钥能力。
 
 ### 9.3 wildcard HTTPS 服务端证书
 
@@ -777,7 +788,7 @@ ACME provisioner 不是 identity manager 的核心部分，但必须能按路径
 ```text
 1. 读取 DID 或 host：did:web:node1.example.com
 2. 派生 raw_host_uri 和 dir_name：node1.example.com
-3. 生成或读取 server.keyref.json。
+3. 生成或读取 `server.private.pem`；不可导出私钥可改为安装 fallback keyref。
 4. 生成 CSR：
    - DNS SAN 必须包含 node1.example.com
    - URI SAN 可选包含 did:web:node1.example.com
@@ -792,13 +803,13 @@ ACME provisioner 不是 identity manager 的核心部分，但必须能按路径
 要求：
 
 1. ACME account key、challenge 状态、订单状态属于 provisioner state，应存放在 `$BUCKYOS_ROOT/var/identity/state/acme/`，不属于 active identity material。
-2. active path 只暴露最终可用的证书、链、metadata 和 keyref。
+2. active path 只暴露最终可用的证书、链、metadata、直接私钥或可选 keyref。
 3. 续期失败不得破坏现有 active 文件。
 4. 新证书激活前必须检查：
    - 证书 parse 成功；
    - 当前时间在 `not_before` / `not_after` 范围内；
    - `DNS SAN` 覆盖 DID 派生出的 host 或 wildcard pattern；
-   - 证书公钥与 keyref 指向的私钥能力匹配；
+   - 证书公钥与直接私钥或 fallback keyref 指向的私钥能力匹配；
    - fullchain 构造成功。
 
 ### 9.5 mTLS 客户端证书
@@ -817,7 +828,6 @@ $BUCKYOS_IDENTITY_ROOT/node1.example.com/client.cert.pem
 $BUCKYOS_IDENTITY_ROOT/node1.example.com/client.fullchain.pem
 $BUCKYOS_IDENTITY_ROOT/node1.example.com/client.ca.pem
 $BUCKYOS_IDENTITY_ROOT/node1.example.com/client.meta.json
-$BUCKYOS_SECURITY_ROOT/node1.example.com/client.keyref.json
 $BUCKYOS_SECURITY_ROOT/node1.example.com/client.private.pem
 ```
 
@@ -826,6 +836,20 @@ $BUCKYOS_SECURITY_ROOT/node1.example.com/client.private.pem
 ```text
 URI SAN: did:web:node1.example.com
 ```
+
+### 9.6 kRPC S2S 标准 DID 身份
+
+给定任意 canonical DID `D`，kRPC S2S 的本地 Ed25519 身份只使用以下标准入口：
+
+```text
+$BUCKYOS_IDENTITY_ROOT/{encode(D)}/did.json
+$BUCKYOS_SECURITY_ROOT/{encode(D)}/authentication.private.pem
+```
+
+`did.json` 的 `id` 必须等于 `D`，默认 authentication verification method 必须是
+Ed25519，私钥派生出的公钥必须与该 verification method 一致。直接私钥文件缺失时
+可以读取精确路径下的 `authentication.keyref.json` fallback；直接文件一旦存在就
+不得被 keyref 覆盖。S2S 不使用 wildcard、服务专用 key ID 或并行身份目录。
 
 ---
 
@@ -883,8 +907,8 @@ pub struct X509Paths {
     pub fullchain: PathBuf,
     pub ca: Option<PathBuf>,
     pub metadata: PathBuf,
-    pub keyref: PathBuf,
-    pub private_key: Option<PathBuf>,
+    pub keyref: Option<PathBuf>,
+    pub private_key: PathBuf,
 }
 
 impl IdentityRoots {
@@ -892,6 +916,8 @@ impl IdentityRoots {
     pub fn dir_name(&self, did_or_hostname: &str) -> Result<String>;
     pub fn public_dir(&self, did_or_hostname: &str) -> Result<PathBuf>;
     pub fn security_dir(&self, did_or_hostname: &str) -> Result<PathBuf>;
+    pub fn did_document_file(&self, did: &str) -> Result<PathBuf>;
+    pub fn authentication_private_key_file(&self, did: &str) -> Result<PathBuf>;
     pub fn public_file(
         &self,
         did_or_hostname: &str,
@@ -916,7 +942,8 @@ Path Helper 只做确定性路径计算，不访问网络，不申请证书，�
 2. API 不应要求 DID 已经安装。
 3. API 必须返回稳定路径，便于调用方拼给传统工具。
 4. API 不暴露 hash / alias / expression path。
-5. API 必须支持 exact/wildcard 匹配查询，并返回匹配类型、`raw_host_uri` 与 `dir_name`。
+5. API 只对 X.509 server/client usage 支持 exact/wildcard 匹配；DID document、
+   authentication、assertion、key-agreement 和 capability 必须 exact-only。
 
 ### 10.3 KeyRef Helper
 
@@ -942,7 +969,8 @@ impl IdentityRoots {
 }
 ```
 
-`private_key_file_for_legacy_tool` 在 signer / remote mode 时必须返回明确错误：
+`private_key_file_for_legacy_tool` 必须先尝试稳定的直接私钥路径；只有该文件不存在
+时才解析 keyref。在 signer / remote mode 时必须返回明确错误：
 
 ```text
 PrivateKeyNotExportable
@@ -979,7 +1007,7 @@ impl IdentityRoots {
 PEM 是否可解析
 证书是否在有效期内
 证书 SAN 是否覆盖 DID 派生出的 host 或 wildcard pattern
-证书 public key 是否匹配 keyref
+证书 public key 是否匹配直接私钥或 fallback keyref
 metadata 是否与证书内容一致
 ```
 
@@ -1014,7 +1042,7 @@ Identity Manager 职责：
 ```text
 定义 active path
 校验证书 metadata
-提供 keyref
+提供直接私钥优先、keyref fallback 的访问 helper
 提供 path / validation / status helper
 ```
 
@@ -1116,8 +1144,9 @@ Renewal Watcher 职责：
 1. 私钥不得出现在 public identity root 下。
 2. 私钥文件必须设置最小可读权限。
 3. 支持不可导出 key，通过 signer endpoint 或 remote Meta 使用。
-4. keyref 必须包含 public key fingerprint，便于检查 cert/key 匹配。
-5. key rotation 不得静默覆盖正在使用的 key；必须先生成新 keyref 和新证书，再切换 active 文件。
+4. keyref 存在时必须包含 public key fingerprint，便于检查 cert/key 匹配。
+5. key rotation 不得静默产生不一致的 active view；必须先生成匹配的新私钥和证书，
+   再原子替换稳定文件。使用 keyref fallback 时同样适用。
 
 ### 13.2 权限要求
 
@@ -1150,7 +1179,7 @@ did:web:alice.example.com 使用了 bob.example.com 的证书
 路径 dir_name 与 metadata.dir_name 不一致
 metadata.raw_host_uri 与 canonical DID 不一致
 cert SAN 不包含 DID 派生 host 或 wildcard pattern
-keyref 指向的私钥与证书公钥不匹配
+直接私钥或 fallback keyref 指向的私钥与证书公钥不匹配
 URI SAN 中的 DID 与 metadata.did 不一致
 ```
 
@@ -1185,7 +1214,7 @@ renewal failed
 | `CertificateNotYetValid` | 证书尚未生效 | 不激活或等待 |
 | `CertificateRevoked` | 上游吊销 | disable active files |
 | `DidBindingMismatch` | DID 与证书绑定不一致 | 禁止激活 |
-| `KeyMismatch` | 证书公钥与 keyref 不匹配 | 禁止激活 |
+| `KeyMismatch` | 证书公钥与直接私钥或 fallback keyref 不匹配 | 禁止激活 |
 | `WildcardMismatch` | wildcard 目录或 SAN 与 host 不匹配 | 回退或报错 |
 
 ---
@@ -1202,7 +1231,7 @@ DID / hostname -> raw host URI -> encoded dir name
 exact / wildcard 目录匹配
 usage -> 平铺文件路径
 metadata schema
-keyref schema
+直接私钥路径与可选 keyref fallback schema
 ```
 
 ### M1：X.509 安装与状态检查
@@ -1212,7 +1241,7 @@ keyref schema
 ```text
 install-x509 helper / provisioner interface
 parse cert metadata
-check cert/keyref match
+check cert/direct-private-key-or-keyref match
 check DNS SAN for did:web host
 write flat active files
 ```
@@ -1368,7 +1397,6 @@ server fullchain 的稳定路径：
 
 /buckyos/security/node1.example.com/
   server.private.pem
-  server.keyref.json
 ```
 
 ### 17.4 metadata 关键内容
@@ -1385,7 +1413,7 @@ server fullchain 的稳定路径：
   },
   "paths": {
     "fullchain": "server.fullchain.pem",
-    "key_ref": "/buckyos/security/node1.example.com/server.keyref.json"
+    "private_key": "/buckyos/security/node1.example.com/server.private.pem"
   },
   "did_binding": {
     "type": "did-web-domain",
@@ -1408,7 +1436,10 @@ BuckyOS Rust 服务：
 ```rust
 let roots = IdentityRoots::from_env_or_buckyos_root()?;
 let paths = roots.x509_paths("did:web:node1.example.com", IdentityUsage::Server)?;
-let keyref = roots.load_keyref(&paths.keyref)?;
+let private_key = roots.private_key_file_for_legacy_tool(
+    "did:web:node1.example.com",
+    IdentityUsage::Server,
+)?;
 ```
 
 ---

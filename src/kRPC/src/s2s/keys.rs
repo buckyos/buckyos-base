@@ -16,7 +16,6 @@
 use super::codec::{canonical_sort_peers, CanonicalEncoder};
 use super::error::{S2sError, S2sResult};
 use super::{S2S_DOMAIN_AEAD_KEY, S2S_DOMAIN_ED25519_KEY, S2S_DOMAIN_KDF_SALT};
-use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use hkdf::Hkdf;
@@ -47,7 +46,7 @@ impl MessageKind {
 ///
 /// - 不实现 `Debug`(内容)、`Display`、`Serialize`、`Clone`;
 /// - drop 时 zeroize。
-pub struct SecretEd25519Key {
+pub(crate) struct SecretEd25519Key {
     seed: [u8; 32],
 }
 
@@ -64,12 +63,12 @@ impl std::fmt::Debug for SecretEd25519Key {
 }
 
 impl SecretEd25519Key {
-    pub fn from_seed(seed: [u8; 32]) -> Self {
+    pub(crate) fn from_seed(seed: [u8; 32]) -> Self {
         SecretEd25519Key { seed }
     }
 
     /// 从 PKCS#8 PEM(`-----BEGIN PRIVATE KEY-----`)解出 Ed25519 seed。
-    pub fn from_pkcs8_pem(pem: &str) -> S2sResult<Self> {
+    pub(crate) fn from_pkcs8_pem(pem: &str) -> S2sResult<Self> {
         let start = pem.find("-----BEGIN PRIVATE KEY-----");
         let end = pem.find("-----END PRIVATE KEY-----");
         let (Some(start), Some(end)) = (start, end) else {
@@ -91,7 +90,7 @@ impl SecretEd25519Key {
     }
 
     /// Ed25519 公钥(32 bytes)。
-    pub fn public_key(&self) -> [u8; 32] {
+    pub(crate) fn public_key(&self) -> [u8; 32] {
         let sk = ed25519_dalek::SigningKey::from_bytes(&self.seed);
         sk.verifying_key().to_bytes()
     }
@@ -134,7 +133,7 @@ pub fn ed25519_key_fingerprint(ed25519_public: &[u8; 32]) -> [u8; 32] {
 
 /// 用 Ed25519 私钥直接执行 static-static X25519 DH(provider 实现用;
 /// 内部先做 libsodium 兼容的 seed→X25519 转换,不导出中间私钥)。
-pub fn ed25519_static_diffie_hellman(
+pub(crate) fn ed25519_static_diffie_hellman(
     local_key: &SecretEd25519Key,
     peer_x25519_public: &[u8; 32],
 ) -> S2sResult<Zeroizing<[u8; 32]>> {
@@ -202,84 +201,6 @@ pub fn derive_aead_key(
     hk.expand(&info, okm.as_mut())
         .expect("hkdf expand 32 bytes cannot fail");
     okm
-}
-
-/// 本地密钥候选(active first,grace newest first;fingerprint 唯一标识)。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct S2sLocalKeyHandle {
-    /// 显式 key id;`None` 表示默认 active key。
-    pub key_id: Option<String>,
-    pub ed25519_public: [u8; 32],
-    pub fingerprint: [u8; 32],
-}
-
-impl S2sLocalKeyHandle {
-    pub fn from_public(key_id: Option<String>, ed25519_public: [u8; 32]) -> Self {
-        let fingerprint = ed25519_key_fingerprint(&ed25519_public);
-        S2sLocalKeyHandle {
-            key_id,
-            ed25519_public,
-            fingerprint,
-        }
-    }
-}
-
-/// key agreement capability(§6.3):
-/// 用指定 local key 与 peer X25519 public key 派生 shared secret。
-///
-/// - 不向调用方返回 raw private key,兼容 file、TPM/HSM/TEE 或独立 key agent;
-/// - 只支持 sign 的 provider 必须返回 `KeyAgreementNotSupported`,
-///   不得导出或伪造私钥;
-/// - `local_key_candidates` 返回有界候选:active first、grace newest first。
-#[async_trait]
-pub trait S2sKeyAgreementProvider: Send + Sync {
-    async fn local_key_candidates(&self) -> S2sResult<Vec<S2sLocalKeyHandle>>;
-
-    /// 以 fingerprint 指定本地 key(fingerprint 是 KDF/cache 的 key commitment)。
-    async fn diffie_hellman(
-        &self,
-        local_key_fingerprint: &[u8; 32],
-        peer_x25519_public: &[u8; 32],
-    ) -> S2sResult<Zeroizing<[u8; 32]>>;
-}
-
-/// 显式传入 Ed25519 私钥的 provider(mode=file / 测试用)。
-pub struct ExplicitEd25519Provider {
-    key: SecretEd25519Key,
-    handle: S2sLocalKeyHandle,
-}
-
-impl ExplicitEd25519Provider {
-    pub fn new(key: SecretEd25519Key, key_id: Option<String>) -> Self {
-        let public = key.public_key();
-        let handle = S2sLocalKeyHandle::from_public(key_id, public);
-        ExplicitEd25519Provider { key, handle }
-    }
-
-    pub fn handle(&self) -> &S2sLocalKeyHandle {
-        &self.handle
-    }
-}
-
-#[async_trait]
-impl S2sKeyAgreementProvider for ExplicitEd25519Provider {
-    async fn local_key_candidates(&self) -> S2sResult<Vec<S2sLocalKeyHandle>> {
-        Ok(vec![self.handle.clone()])
-    }
-
-    async fn diffie_hellman(
-        &self,
-        local_key_fingerprint: &[u8; 32],
-        peer_x25519_public: &[u8; 32],
-    ) -> S2sResult<Zeroizing<[u8; 32]>> {
-        if local_key_fingerprint != &self.handle.fingerprint {
-            return Err(S2sError::KeyNotFound(
-                "local key fingerprint does not match".to_string(),
-            ));
-        }
-        let x_secret = self.key.x25519_static_secret();
-        x25519_diffie_hellman(&x_secret, peer_x25519_public)
-    }
 }
 
 /// 派生 key cache 的 key(§6.6:绑定 profile version、双方 did 与实际参与
@@ -365,9 +286,9 @@ impl DerivedKeyCache {
     /// key retire 时按 fingerprint 主动失效(§6.6/§14)。
     pub fn invalidate_fingerprint(&self, fingerprint: &[u8; 32]) {
         let mut inner = self.inner.lock().unwrap();
-        inner.map.retain(|k, _| {
-            k.from_fingerprint != *fingerprint && k.to_fingerprint != *fingerprint
-        });
+        inner
+            .map
+            .retain(|k, _| k.from_fingerprint != *fingerprint && k.to_fingerprint != *fingerprint);
         let map = &inner.map;
         let retained: VecDeque<DerivedKeyCacheKey> = inner
             .order
@@ -579,23 +500,6 @@ mod tests {
         cache.invalidate_fingerprint(&[2u8; 32]);
         assert!(cache.get(&k2, 10).is_none());
         assert!(cache.get(&k3, 10).is_some());
-    }
-
-    #[tokio::test]
-    async fn explicit_provider_dh_and_candidates() {
-        let key = SecretEd25519Key::from_seed(test_seed(3));
-        let peer = SecretEd25519Key::from_seed(test_seed(9));
-        let peer_x = ed25519_pk_to_x25519_pk(&peer.public_key()).unwrap();
-        let provider = ExplicitEd25519Provider::new(key, None);
-        let candidates = provider.local_key_candidates().await.unwrap();
-        assert_eq!(candidates.len(), 1);
-        let ss = provider
-            .diffie_hellman(&candidates[0].fingerprint, &peer_x)
-            .await
-            .unwrap();
-        assert_ne!(*ss, [0u8; 32]);
-        // 错误 fingerprint 拒绝
-        assert!(provider.diffie_hellman(&[0u8; 32], &peer_x).await.is_err());
     }
 
     #[test]

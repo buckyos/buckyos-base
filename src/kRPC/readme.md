@@ -117,20 +117,11 @@ client:
 ```rust
 use kRPC::{kRPC, KrpcTransportSecurity};
 use kRPC::s2s::*;
+use name_lib::zone_child_did;
 
-let local = S2sLocalIdentityConfig::new(
-    "event-producer",                 // local_service_appid
-    current_zone_did,                 // 二者派生 canonical service DID
-    S2sLocalKeySource::Provider { provider },  // 或 ExplicitEd25519
-);
-// 推荐:target DID + target 公钥都是确定值,来自 verified service
-// descriptor;transport 发送路径不做任何隐式解析
-let config = S2sClientConfig::with_pinned_key(
-    local,
-    target_service_did,
-    target_service_public_key,        // [u8; 32] Ed25519 公钥,构造时校验
-);
-// 动态部署可改用 S2sClientConfig::with_resolver(local, did, resolver)
+let local_did = zone_child_did(&current_zone_did, "event-producer")?;
+let target_did = zone_child_did(&current_zone_did, "event-service")?;
+let config = S2sClientConfig::new(local_did, target_did);
 let client = kRPC::new_with_transport(
     "http://203.0.113.10:18080/s2s/event-report-v1",
     session_token,
@@ -143,14 +134,20 @@ client.probe_s2s(Some("event-report-v1")).await?; // 加密探测
 server（`buckyos-http-server`）:
 
 ```rust
-let ctx = S2sRpcServerContext::builder("event-service", current_zone_did)
-    .key_agreement_provider(identity_manager_provider) // name-client 提供
-    .peer_key_resolver(resolver)
+let service_did = zone_child_did(&current_zone_did, "event-service")?;
+let ctx = S2sRpcServerContext::builder(service_did)
     .security_policy(S2sServerSecurityPolicy::public_internet_default())
     .build().await?;
 // 在 /s2s/ 路由内:
 serve_http_by_s2s_rpc_handler(req, info, &my_handler, &ctx).await
 ```
+
+本地身份只从标准路径加载：
+`$BUCKYOS_IDENTITY_ROOT/{encode(DID)}/did.json` 与
+`$BUCKYOS_SECURITY_ROOT/{encode(DID)}/authentication.private.pem`。
+远端默认 authentication Ed25519 公钥统一由 `NameClient` 解析。
+wire 上的 `From`/`To` 都是 canonical DID，不接受 `#kid`；调用方也不再注入
+公钥、resolver 或自定义本地 key source。
 
 安全默认 fail closed：`/s2s/` 只接受加密请求、不信任 forwarded source、
 peer DenyAll;明文只能通过显式 CIDR + API allowlist 放行且不产生

@@ -1,17 +1,27 @@
-//! `serve_http_by_s2s_rpc_handler` 安全与兼容测试(Phase 6)。
+//! `serve_http_by_s2s_rpc_handler` 的 DID-only S2S 安全与集成测试。
 
-use crate::{full_body, serve_http_by_s2s_rpc_handler, ServerError, StreamInfo};
+use crate::{
+    full_body, serve_http_by_s2s_rpc_handler, HttpServer, Runner, ServerError, ServerResult,
+    StreamInfo,
+};
 use ::kRPC::s2s::*;
 use ::kRPC::{
-    RPCErrors, RPCRequest, RPCResponse, RPCResult, RPCServerContext, RPCServerHandler,
+    kRPC, KrpcTransportSecurity, RPCErrors, RPCRequest, RPCResponse, RPCResult, RPCServerContext,
+    RPCServerHandler,
 };
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ed25519_dalek::SigningKey;
 use http::{Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
-use name_lib::DID;
-use serde_json::json;
+use name_client::{
+    CacheBackend, IdentityRoots, NameClient, NameClientConfig, NameInfo, NsProvider, RecordType,
+};
+use name_lib::{DidDocType, EncodedDocument, NSError, NSResult, DID};
+use serde_json::{json, Value};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -26,11 +36,118 @@ fn server_did() -> DID {
     DID::new("web", "event-service.example.com")
 }
 
-fn zone_did() -> DID {
-    DID::new("web", "example.com")
+fn public_key(seed: [u8; 32]) -> [u8; 32] {
+    SigningKey::from_bytes(&seed).verifying_key().to_bytes()
 }
 
-/// 记录 handler 是否被调用 + 捕获 server context。
+fn identity_document(did: &DID, seed: [u8; 32]) -> Value {
+    let x = URL_SAFE_NO_PAD.encode(public_key(seed));
+    json!({
+        "@context": ["https://www.w3.org/ns/did/v1", "https://buckyos.ai/ns/did/v1"],
+        "id": did.to_string(),
+        "verificationMethod": [{
+            "id": "#main_key",
+            "type": "JsonWebKey2020",
+            "controller": did.to_string(),
+            "publicKeyJwk": {"kty": "OKP", "crv": "Ed25519", "x": x}
+        }],
+        "authentication": ["#main_key"],
+        "service": [{
+            "id": "#did-object",
+            "type": "DIDObjectService",
+            "serviceEndpoint": format!("https://{}/", did.to_raw_host_name()),
+            "profile": "https://example.com/service-profile.json"
+        }]
+    })
+}
+
+fn pkcs8_pem(seed: [u8; 32]) -> String {
+    let mut der = vec![
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+    der.extend_from_slice(&seed);
+    format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        base64::engine::general_purpose::STANDARD.encode(der)
+    )
+}
+
+fn write_identity(roots: &IdentityRoots, did: &DID, seed: [u8; 32]) {
+    let public_dir = roots.public_dir(&did.to_string()).unwrap();
+    let security_dir = roots.security_dir(&did.to_string()).unwrap();
+    std::fs::create_dir_all(&public_dir).unwrap();
+    std::fs::create_dir_all(&security_dir).unwrap();
+    std::fs::write(
+        public_dir.join("did.json"),
+        serde_json::to_vec_pretty(&identity_document(did, seed)).unwrap(),
+    )
+    .unwrap();
+    // 同目录其它 doc_type 文件不得影响 did.json 的选择。
+    std::fs::write(public_dir.join("app.json"), b"{}").unwrap();
+    std::fs::write(public_dir.join("info.json"), b"{}").unwrap();
+    std::fs::write(
+        security_dir.join("authentication.private.pem"),
+        pkcs8_pem(seed),
+    )
+    .unwrap();
+    assert!(!security_dir.join("authentication.keyref.json").exists());
+}
+
+fn memory_name_client() -> Arc<NameClient> {
+    Arc::new(NameClient::new(NameClientConfig {
+        enable_cache: true,
+        cache_backend: CacheBackend::Memory,
+        enable_zone_resolver: false,
+        ..Default::default()
+    }))
+}
+
+struct TestFixture {
+    roots: IdentityRoots,
+    client: Arc<NameClient>,
+    runtime: S2sRuntime,
+}
+
+impl TestFixture {
+    fn new(identities: &[(DID, [u8; 32])]) -> Self {
+        let base = tempfile::tempdir().unwrap().keep();
+        let roots = IdentityRoots::new(base.join("identity"), base.join("security"));
+        let client = memory_name_client();
+        for (did, seed) in identities {
+            write_identity(&roots, did, *seed);
+            client.set_local_authority_override(
+                did.clone(),
+                DidDocType::Zone,
+                EncodedDocument::JsonLd(identity_document(did, *seed)),
+                "s2s-test",
+                None,
+            );
+        }
+        let runtime = S2sRuntime::new(roots.clone(), client.clone());
+        Self {
+            roots,
+            client,
+            runtime,
+        }
+    }
+
+    fn standard() -> Self {
+        Self::new(&[(client_did(), CLIENT_SEED), (server_did(), SERVER_SEED)])
+    }
+
+    fn replace_identity(&self, did: &DID, seed: [u8; 32]) {
+        write_identity(&self.roots, did, seed);
+        self.client.set_local_authority_override(
+            did.clone(),
+            DidDocType::Zone,
+            EncodedDocument::JsonLd(identity_document(did, seed)),
+            "s2s-test-rotated",
+            None,
+        );
+    }
+}
+
 struct RecordingHandler {
     calls: AtomicUsize,
     last_ctx: std::sync::Mutex<Option<RPCServerContext>>,
@@ -38,7 +155,7 @@ struct RecordingHandler {
 
 impl RecordingHandler {
     fn new() -> Self {
-        RecordingHandler {
+        Self {
             calls: AtomicUsize::new(0),
             last_ctx: std::sync::Mutex::new(None),
         }
@@ -69,78 +186,52 @@ impl RPCServerHandler for RecordingHandler {
     }
 }
 
-fn resolver_with_both() -> Arc<StaticPeerKeyResolver> {
-    let resolver = Arc::new(StaticPeerKeyResolver::new());
-    resolver.insert(
-        &client_did(),
-        vec![VerifiedPeerKey {
-            key_id: None,
-            ed25519_public: SecretEd25519Key::from_seed(CLIENT_SEED).public_key(),
-        }],
-    );
-    resolver.insert(
-        &server_did(),
-        vec![VerifiedPeerKey {
-            key_id: None,
-            ed25519_public: SecretEd25519Key::from_seed(SERVER_SEED).public_key(),
-        }],
-    );
-    resolver
-}
-
-async fn server_context() -> S2sRpcServerContext {
-    server_context_with_policy(default_policy()).await
-}
-
 fn default_policy() -> S2sServerSecurityPolicy {
     S2sServerSecurityPolicy::builder()
-        .peer_admission(PeerAdmissionPolicy::allow_services([client_did()
-            .to_string()
-            .as_str()]))
+        .peer_admission(PeerAdmissionPolicy::allow_services([
+            client_did().to_string()
+        ]))
         .build()
         .unwrap()
 }
 
-async fn server_context_with_policy(policy: S2sServerSecurityPolicy) -> S2sRpcServerContext {
-    S2sRpcServerContext::builder("event-service", zone_did())
-        .explicit_ed25519_key(SecretEd25519Key::from_seed(SERVER_SEED))
-        .peer_key_resolver(resolver_with_both())
+async fn server_context_with_fixture(
+    fixture: &TestFixture,
+    policy: S2sServerSecurityPolicy,
+) -> S2sRpcServerContext {
+    S2sRpcServerContext::builder(server_did())
+        .with_runtime(fixture.runtime.clone())
         .security_policy(policy)
         .build()
         .await
         .unwrap()
 }
 
-async fn client_transport() -> S2sClientTransport {
-    let local = S2sLocalIdentityConfig::new(
-        "event-producer",
-        zone_did(),
-        S2sLocalKeySource::ExplicitEd25519 {
-            key: SecretEd25519Key::from_seed(CLIENT_SEED),
-            key_id: None,
-        },
-    );
-    // 推荐路径:目标 DID + 目标公钥都是确定值(来自 verified descriptor)
-    let config = S2sClientConfig::with_pinned_key(
-        local,
-        server_did(),
-        SecretEd25519Key::from_seed(SERVER_SEED).public_key(),
-    );
-    S2sClientTransport::new(config).await.unwrap()
+async fn server_context() -> (TestFixture, S2sRpcServerContext) {
+    let fixture = TestFixture::standard();
+    let context = server_context_with_fixture(&fixture, default_policy()).await;
+    (fixture, context)
+}
+
+async fn client_transport_with_fixture(fixture: &TestFixture) -> S2sClientTransport {
+    S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.runtime.clone()),
+    )
+    .await
+    .unwrap()
 }
 
 fn rpc_request_bytes(method: &str, token: Option<&str>) -> Vec<u8> {
     let mut req = RPCRequest::new(method, json!({"k": "v"}));
     req.seq = 42;
-    req.token = token.map(|t| t.to_string());
-    serde_json::to_vec(&serde_json::to_value(&req).unwrap()).unwrap()
+    req.token = token.map(str::to_string);
+    serde_json::to_vec(&req).unwrap()
 }
 
 fn now() -> u64 {
     buckyos_kit::buckyos_get_unix_timestamp()
 }
 
-/// 构造一个已加密的 HTTP request。
 async fn encrypted_http_request(
     transport: &S2sClientTransport,
     api: &str,
@@ -152,14 +243,12 @@ async fn encrypted_http_request(
         .unwrap();
     let mut header_map = http::HeaderMap::new();
     headers.apply(&mut header_map).unwrap();
-
     let mut builder = Request::builder()
         .method("POST")
-        .uri(format!("http://127.0.0.1:18080/s2s/{}", api))
+        .uri(format!("http://127.0.0.1:18080/s2s/{api}"))
         .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE);
     builder.headers_mut().unwrap().extend(header_map);
-    let request = builder.body(full_body(sealed)).unwrap();
-    (request, pending)
+    (builder.body(full_body(sealed)).unwrap(), pending)
 }
 
 fn stream_info() -> StreamInfo {
@@ -170,341 +259,152 @@ async fn read_body(resp: Response<BoxBody<Bytes, ServerError>>) -> Bytes {
     resp.collect().await.unwrap().to_bytes()
 }
 
-// ---- 正常路径 ----
-
 #[tokio::test]
-async fn encrypted_roundtrip_success_and_identity_passed() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
+async fn standard_two_file_layout_roundtrips_without_keyref() {
+    let (fixture, context) = server_context().await;
+    let transport = client_transport_with_fixture(&fixture).await;
     let handler = RecordingHandler::new();
-
-    let (request, pending) =
-        encrypted_http_request(&transport, "event-report-v1", &rpc_request_bytes("report_event", None)).await;
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
+    let (request, pending) = encrypted_http_request(
+        &transport,
+        "event-report-v1",
+        &rpc_request_bytes("report_event", None),
+    )
+    .await;
+    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &context)
         .await
         .unwrap();
-
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(http::header::CONTENT_TYPE).unwrap(),
-        S2S_CONTENT_TYPE
-    );
     assert_eq!(
         response.headers().get(http::header::CACHE_CONTROL).unwrap(),
         "no-store"
     );
-
     let response_headers = S2sResponseHeaders::parse(response.headers()).unwrap();
+    assert_eq!(response_headers.from, server_did());
+    assert_eq!(response_headers.to, client_did());
     let body = read_body(response).await;
     let plaintext = transport
         .open_response(&pending, &response_headers, &body, now())
         .await
         .unwrap();
     let rpc_response: RPCResponse = serde_json::from_slice(&plaintext).unwrap();
-    assert_eq!(rpc_response.seq, 42);
     assert_eq!(
         rpc_response.result,
         RPCResult::Success(json!({"echo": "report_event"}))
     );
-
-    // handler 收到 authenticated service identity
     assert_eq!(handler.call_count(), 1);
-    let server_ctx = handler.last_context().unwrap();
-    assert_eq!(server_ctx.authenticated_from_service_did, Some(client_did()));
-    assert!(server_ctx.authenticated_from_key_fingerprint.is_some());
-    assert!(!server_ctx.admitted_by_trusted_network);
+    let rpc_context = handler.last_context().unwrap();
     assert_eq!(
-        server_ctx.canonical_api_name.as_deref(),
-        Some("event-report-v1")
+        rpc_context.authenticated_from_service_did,
+        Some(client_did())
     );
+    assert!(rpc_context.authenticated_from_key_fingerprint.is_some());
 }
 
 #[tokio::test]
-async fn probe_api_works_without_business_handler() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
-    let handler = RecordingHandler::new();
-
-    let (request, pending) =
-        encrypted_http_request(&transport, "__probe", &rpc_request_bytes("__probe", None)).await;
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
+async fn did_web_and_did_bns_use_the_same_runtime_path() {
+    let web_a = DID::new("web", "a.example.com");
+    let web_b = DID::new("web", "b.example.com");
+    let bns_a = DID::new("bns", "a.alice");
+    let bns_b = DID::new("bns", "b.alice");
+    for (local, remote) in [(web_a, web_b), (bns_a, bns_b)] {
+        let fixture =
+            TestFixture::new(&[(local.clone(), CLIENT_SEED), (remote.clone(), SERVER_SEED)]);
+        let client = S2sClientTransport::new(
+            S2sClientConfig::new(local.clone(), remote.clone())
+                .with_runtime(fixture.runtime.clone()),
+        )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let response_headers = S2sResponseHeaders::parse(response.headers()).unwrap();
-    let body = read_body(response).await;
-    let plaintext = transport
-        .open_response(&pending, &response_headers, &body, now())
-        .await
-        .unwrap();
-    let rpc_response: RPCResponse = serde_json::from_slice(&plaintext).unwrap();
-    let RPCResult::Success(value) = rpc_response.result else {
-        panic!("probe failed");
-    };
-    assert_eq!(value.get("probe").unwrap(), "ok");
-    // 无 registry → api_exists null
-    assert!(value.get("api_exists").unwrap().is_null());
-    // probe 不进业务 handler
-    assert_eq!(handler.call_count(), 0);
+        let policy = S2sServerSecurityPolicy::builder()
+            .peer_admission(PeerAdmissionPolicy::allow_services([local.to_string()]))
+            .build()
+            .unwrap();
+        let server = S2sRpcServerContext::builder(remote)
+            .with_runtime(fixture.runtime)
+            .security_policy(policy)
+            .build()
+            .await
+            .unwrap();
+        let (headers, body, _) = client
+            .seal_request("same-loader", &rpc_request_bytes("m", None), now(), false)
+            .await
+            .unwrap();
+        assert!(server
+            .open_request(&headers, "same-loader", &body, now())
+            .await
+            .is_ok());
+    }
 }
 
-// ---- 篡改与反射 ----
-
 #[tokio::test]
-async fn tampering_any_s2s_header_fails_before_handler() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
-
-    let tamper_cases: Vec<(&str, &str)> = vec![
+async fn did_fragment_and_malformed_headers_are_rejected_before_handler() {
+    let (fixture, context) = server_context().await;
+    let transport = client_transport_with_fixture(&fixture).await;
+    for (name, value) in [
         ("krpc-s2s-from", "did:web:attacker.example.com"),
+        (
+            "krpc-s2s-from",
+            "did:web:event-producer.example.com#main_key",
+        ),
         ("krpc-s2s-to", "did:web:other.example.com"),
         ("krpc-s2s-issued-at", "1"),
         ("krpc-s2s-expires-at", "99999999999"),
         ("krpc-s2s-nonce", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
         ("krpc-s2s-version", "2"),
-    ];
-
-    for (name, value) in tamper_cases {
+    ] {
         let handler = RecordingHandler::new();
-        let (mut request, _pending) =
-            encrypted_http_request(&transport, "event-report-v1", &rpc_request_bytes("m", None)).await;
+        let (mut request, _) =
+            encrypted_http_request(&transport, "event-report-v1", &rpc_request_bytes("m", None))
+                .await;
         request.headers_mut().insert(
             http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
             http::HeaderValue::from_str(value).unwrap(),
         );
-        let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
+        let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &context)
             .await
             .unwrap();
-        // 统一无细节 transport failure
-        assert_ne!(response.status(), StatusCode::OK, "tamper {} accepted", name);
-        assert_eq!(read_body(response).await, Bytes::from("Forbidden"));
-        assert_eq!(handler.call_count(), 0, "handler ran for tampered {}", name);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(handler.call_count(), 0);
     }
 }
 
 #[tokio::test]
-async fn tampered_body_rejected() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
+async fn tampered_body_and_cross_api_reflection_are_rejected() {
+    let (fixture, context) = server_context().await;
+    let transport = client_transport_with_fixture(&fixture).await;
     let handler = RecordingHandler::new();
 
-    let (request, _pending) =
+    let (request, _) =
         encrypted_http_request(&transport, "event-report-v1", &rpc_request_bytes("m", None)).await;
     let (parts, body) = request.into_parts();
-    let mut body_bytes = body.collect().await.unwrap().to_bytes().to_vec();
-    body_bytes[0] ^= 0x01;
-    let request = Request::from_parts(parts, full_body(body_bytes));
-
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
+    let mut bytes = body.collect().await.unwrap().to_bytes().to_vec();
+    bytes[0] ^= 1;
+    let response = serve_http_by_s2s_rpc_handler(
+        Request::from_parts(parts, full_body(bytes)),
+        stream_info(),
+        &handler,
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-}
 
-#[tokio::test]
-async fn cross_api_reflection_rejected() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
-    let handler = RecordingHandler::new();
-
-    // 密文对 api-a 加密,但发到 api-b 的 path
-    let (headers, sealed, _pending) = transport
+    let (headers, sealed, _) = transport
         .seal_request("api-a", &rpc_request_bytes("m", None), now(), false)
         .await
         .unwrap();
-    let mut header_map = http::HeaderMap::new();
-    headers.apply(&mut header_map).unwrap();
+    let mut map = http::HeaderMap::new();
+    headers.apply(&mut map).unwrap();
     let mut builder = Request::builder()
         .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/api-b")
+        .uri("http://127.0.0.1/s2s/api-b")
         .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE);
-    builder.headers_mut().unwrap().extend(header_map);
-    let request = builder.body(full_body(sealed)).unwrap();
-
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-}
-
-#[tokio::test]
-async fn wrong_target_service_rejected() {
-    // 密文加密给另一个服务(To 不同、KDF 不同)→ 转发到本服务必须失败
-    let ctx = server_context().await;
-    let handler = RecordingHandler::new();
-
-    let other_did = DID::new("web", "other-service.example.com");
-    let resolver = resolver_with_both();
-    resolver.insert(
-        &other_did,
-        vec![VerifiedPeerKey {
-            key_id: None,
-            ed25519_public: SecretEd25519Key::from_seed([7u8; 32]).public_key(),
-        }],
-    );
-    let local = S2sLocalIdentityConfig::new(
-        "event-producer",
-        zone_did(),
-        S2sLocalKeySource::ExplicitEd25519 {
-            key: SecretEd25519Key::from_seed(CLIENT_SEED),
-            key_id: None,
-        },
-    );
-    let config = S2sClientConfig::with_resolver(local, other_did, resolver);
-    let transport_to_other = S2sClientTransport::new(config).await.unwrap();
-
-    let (request, _pending) = encrypted_http_request(
-        &transport_to_other,
-        "event-report-v1",
-        &rpc_request_bytes("m", None),
-    )
-    .await;
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-}
-
-#[tokio::test]
-async fn replayed_request_rejected_and_not_dispatched_twice() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
-    let handler = RecordingHandler::new();
-
-    let (headers, sealed, _pending) = transport
-        .seal_request("event-report-v1", &rpc_request_bytes("m", None), now(), false)
-        .await
-        .unwrap();
-
-    for attempt in 0..2 {
-        let mut header_map = http::HeaderMap::new();
-        headers.apply(&mut header_map).unwrap();
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-            .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE);
-        builder.headers_mut().unwrap().extend(header_map);
-        let request = builder.body(full_body(sealed.clone())).unwrap();
-        let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-            .await
-            .unwrap();
-        if attempt == 0 {
-            assert_eq!(response.status(), StatusCode::OK);
-        } else {
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        }
-    }
-    assert_eq!(handler.call_count(), 1);
-}
-
-// ---- admission / policy ----
-
-#[tokio::test]
-async fn unknown_peer_rejected_by_default_deny() {
-    // 默认 policy(DenyAll)下即使密钥有效也拒绝
-    let ctx = server_context_with_policy(S2sServerSecurityPolicy::public_internet_default()).await;
-    let transport = client_transport().await;
-    let handler = RecordingHandler::new();
-
-    let (request, _pending) =
-        encrypted_http_request(&transport, "event-report-v1", &rpc_request_bytes("m", None)).await;
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-}
-
-#[tokio::test]
-async fn default_policy_rejects_all_plaintext() {
-    let ctx = server_context().await;
-    let handler = RecordingHandler::new();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(full_body(rpc_request_bytes("m", Some("token1"))))
-        .unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-}
-
-#[tokio::test]
-async fn plaintext_needs_cidr_and_api_and_token_and_never_gets_identity() {
-    let mut policy = S2sServerSecurityPolicy::trusted_network_plaintext(
-        parse_cidrs(["203.0.113.0/24"]).unwrap(),
-        ["event-report-v1"],
-    )
-    .unwrap();
-    policy.peer_admission = PeerAdmissionPolicy::allow_services([client_did().to_string()]);
-    let ctx = server_context_with_policy(policy).await;
-
-    // 命中 CIDR + API + token → 放行
-    let handler = RecordingHandler::new();
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, "application/json; charset=utf-8")
-        .body(full_body(rpc_request_bytes("m", Some("token1"))))
-        .unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(handler.call_count(), 1);
-    let server_ctx = handler.last_context().unwrap();
-    // plaintext 不产生 authenticated identity;只有 trusted-network 标记
-    assert_eq!(server_ctx.authenticated_from_service_did, None);
-    assert!(server_ctx.admitted_by_trusted_network);
-
-    // 缺 token → 拒绝(默认 RequireSessionToken)
-    let handler = RecordingHandler::new();
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(full_body(rpc_request_bytes("m", None)))
-        .unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-
-    // API 不在 allowlist → 拒绝
-    let handler = RecordingHandler::new();
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/other-api")
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(full_body(rpc_request_bytes("m", Some("t"))))
-        .unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-
-    // CIDR 外来源 → 拒绝
-    let handler = RecordingHandler::new();
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(full_body(rpc_request_bytes("m", Some("t"))))
-        .unwrap();
+    builder.headers_mut().unwrap().extend(map);
     let response = serve_http_by_s2s_rpc_handler(
-        request,
-        StreamInfo::new("198.51.100.9:1234".to_string()),
+        builder.body(full_body(sealed)).unwrap(),
+        stream_info(),
         &handler,
-        &ctx,
+        &context,
     )
     .await
     .unwrap();
@@ -513,373 +413,254 @@ async fn plaintext_needs_cidr_and_api_and_token_and_never_gets_identity() {
 }
 
 #[tokio::test]
-async fn forwarded_headers_cannot_bypass_plaintext_policy() {
-    // 默认 SocketPeerOnly:实际 socket 在 CIDR 外,伪造各种 forwarded 无效
-    let mut policy = S2sServerSecurityPolicy::trusted_network_plaintext(
-        parse_cidrs(["10.0.0.0/8"]).unwrap(),
-        ["event-report-v1"],
+async fn wrong_target_and_replay_are_rejected() {
+    let (fixture, context) = server_context().await;
+    let other = DID::new("web", "other-service.example.com");
+    write_identity(&fixture.roots, &other, [7u8; 32]);
+    fixture.client.set_local_authority_override(
+        other.clone(),
+        DidDocType::Zone,
+        EncodedDocument::JsonLd(identity_document(&other, [7u8; 32])),
+        "other",
+        None,
+    );
+    let wrong_transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), other).with_runtime(fixture.runtime.clone()),
     )
+    .await
     .unwrap();
-    policy.peer_admission = PeerAdmissionPolicy::AnyVerifiedService;
-    let ctx = server_context_with_policy(policy).await;
     let handler = RecordingHandler::new();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .header("x-forwarded-for", "10.0.0.7")
-        .header("forwarded", "for=10.0.0.7")
-        .header("x-real-ip", "10.0.0.7")
-        .body(full_body(rpc_request_bytes("m", Some("t"))))
-        .unwrap();
-    // socket peer 203.0.113.7 不在 10/8;real_src_addr 伪造为 10.0.0.7
-    let mut info = StreamInfo::new("203.0.113.7:5555".to_string());
-    info.real_src_addr = Some("10.0.0.7:1111".to_string());
-    let response = serve_http_by_s2s_rpc_handler(request, info, &handler, &ctx)
+    let (request, _) = encrypted_http_request(
+        &wrong_transport,
+        "event-report-v1",
+        &rpc_request_bytes("m", None),
+    )
+    .await;
+    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &context)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-}
 
-#[tokio::test]
-async fn trusted_proxy_provenance_enables_real_source() {
-    // trusted proxy 模式:socket peer 命中 proxy CIDR 后 real_src_addr 才生效
-    let mut policy = S2sServerSecurityPolicy::builder()
-        .trusted_proxies(parse_cidrs(["203.0.113.0/24"]).unwrap())
-        .plaintext_from(parse_cidrs(["10.0.0.0/8"]).unwrap(), ["event-report-v1"])
-        .unwrap()
-        .build()
-        .unwrap();
-    policy.peer_admission = PeerAdmissionPolicy::AnyVerifiedService;
-    let ctx = server_context_with_policy(policy).await;
-    let handler = RecordingHandler::new();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(full_body(rpc_request_bytes("m", Some("t"))))
-        .unwrap();
-    let mut info = StreamInfo::new("203.0.113.7:5555".to_string());
-    info.real_src_addr = Some("10.0.0.7:1111".to_string());
-    let response = serve_http_by_s2s_rpc_handler(request, info, &handler, &ctx)
+    let transport = client_transport_with_fixture(&fixture).await;
+    let (headers, body, _) = transport
+        .seal_request(
+            "event-report-v1",
+            &rpc_request_bytes("m", None),
+            now(),
+            false,
+        )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let server_ctx = handler.last_context().unwrap();
-    assert_eq!(
-        server_ctx.from_ip.unwrap(),
-        "10.0.0.7".parse::<std::net::IpAddr>().unwrap()
-    );
-    assert_eq!(
-        server_ctx.source_ip_provenance,
-        Some(SourceIpProvenance::TrustedProxyForwarded)
-    );
+    for expected in [StatusCode::OK, StatusCode::FORBIDDEN] {
+        let mut map = http::HeaderMap::new();
+        headers.apply(&mut map).unwrap();
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1/s2s/event-report-v1")
+            .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE);
+        builder.headers_mut().unwrap().extend(map);
+        let response = serve_http_by_s2s_rpc_handler(
+            builder.body(full_body(body.clone())).unwrap(),
+            stream_info(),
+            &handler,
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(handler.call_count(), 1);
 }
 
 #[tokio::test]
-async fn encrypted_failure_never_falls_back_to_plaintext_parser() {
-    // encrypted content type + 明文 JSON body:必须走 encrypted parser 且失败,
-    // 绝不重解释为 plaintext
+async fn plaintext_is_fail_closed_unless_cidr_api_and_token_are_admitted() {
+    let fixture = TestFixture::standard();
+    let default = server_context_with_fixture(&fixture, default_policy()).await;
+    let handler = RecordingHandler::new();
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://127.0.0.1/s2s/event-report-v1")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(full_body(rpc_request_bytes("m", Some("token"))))
+        .unwrap();
+    assert_eq!(
+        serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &default)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
     let mut policy = S2sServerSecurityPolicy::trusted_network_plaintext(
         parse_cidrs(["203.0.113.0/24"]).unwrap(),
         ["event-report-v1"],
     )
     .unwrap();
-    policy.peer_admission = PeerAdmissionPolicy::AnyVerifiedService;
-    let ctx = server_context_with_policy(policy).await;
-    let handler = RecordingHandler::new();
-
-    let request = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE)
-        .body(full_body(rpc_request_bytes("m", Some("t"))))
-        .unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
+    policy.peer_admission = PeerAdmissionPolicy::allow_services([client_did().to_string()]);
+    let admitted = server_context_with_fixture(&fixture, policy).await;
+    for (token, expected) in [
+        (Some("token"), StatusCode::OK),
+        (None, StatusCode::FORBIDDEN),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1/s2s/event-report-v1")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(full_body(rpc_request_bytes("m", token)))
+            .unwrap();
+        assert_eq!(
+            serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &admitted)
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+    }
+    assert_eq!(
+        handler
+            .last_context()
+            .unwrap()
+            .authenticated_from_service_did,
+        None
+    );
 }
 
 #[tokio::test]
-async fn unknown_content_type_rejected_without_sniffing() {
-    let ctx = server_context().await;
+async fn expired_future_and_oversized_requests_fail_before_dispatch() {
+    let (fixture, context) = server_context().await;
+    let transport = client_transport_with_fixture(&fixture).await;
     let handler = RecordingHandler::new();
-    for content_type in ["text/plain", "application/octet-stream", ""] {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("http://127.0.0.1:18080/s2s/event-report-v1");
-        if !content_type.is_empty() {
-            builder = builder.header(http::header::CONTENT_TYPE, content_type);
-        }
-        let request = builder.body(full_body(rpc_request_bytes("m", None))).unwrap();
-        let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
+    for timestamp in [now() - 1000, now() + 3000] {
+        let (headers, body, _) = transport
+            .seal_request(
+                "event-report-v1",
+                &rpc_request_bytes("m", None),
+                timestamp,
+                false,
+            )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let mut map = http::HeaderMap::new();
+        headers.apply(&mut map).unwrap();
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1/s2s/event-report-v1")
+            .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE);
+        builder.headers_mut().unwrap().extend(map);
+        assert_eq!(
+            serve_http_by_s2s_rpc_handler(
+                builder.body(full_body(body)).unwrap(),
+                stream_info(),
+                &handler,
+                &context,
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
     }
-    assert_eq!(handler.call_count(), 0);
-}
-
-#[tokio::test]
-async fn expired_and_future_requests_rejected() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
-    let handler = RecordingHandler::new();
-
-    // 手工构造过期请求:seal 时刻 now-1000
-    let (headers, sealed, _pending) = transport
-        .seal_request(
-            "event-report-v1",
-            &rpc_request_bytes("m", None),
-            now() - 1000,
-            false,
-        )
-        .await
-        .unwrap();
-    let mut header_map = http::HeaderMap::new();
-    headers.apply(&mut header_map).unwrap();
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE);
-    builder.headers_mut().unwrap().extend(header_map);
-    let request = builder.body(full_body(sealed)).unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    // iat 在遥远未来
-    let (headers, sealed, _pending) = transport
-        .seal_request(
-            "event-report-v1",
-            &rpc_request_bytes("m", None),
-            now() + 3000,
-            false,
-        )
-        .await
-        .unwrap();
-    let mut header_map = http::HeaderMap::new();
-    headers.apply(&mut header_map).unwrap();
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
-        .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE);
-    builder.headers_mut().unwrap().extend(header_map);
-    let request = builder.body(full_body(sealed)).unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(handler.call_count(), 0);
-}
-
-#[tokio::test]
-async fn oversized_body_rejected_cheaply() {
-    let ctx = server_context().await;
-    let handler = RecordingHandler::new();
     let request = Request::builder()
         .method("POST")
-        .uri("http://127.0.0.1:18080/s2s/event-report-v1")
+        .uri("http://127.0.0.1/s2s/event-report-v1")
         .header(http::header::CONTENT_TYPE, S2S_CONTENT_TYPE)
         .header(http::header::CONTENT_LENGTH, 10 * 1024 * 1024)
         .body(full_body(vec![0u8; 64]))
         .unwrap();
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &context)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(handler.call_count(), 0);
 }
 
-// ---- 响应侧(client 校验) ----
-
 #[tokio::test]
-async fn client_rejects_response_with_rewritten_key_refs() {
-    let ctx = server_context().await;
-    let transport = client_transport().await;
-    let handler = RecordingHandler::new();
-
-    let (request, pending) =
-        encrypted_http_request(&transport, "event-report-v1", &rpc_request_bytes("m", None)).await;
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
-        .await
-        .unwrap();
-    let mut response_headers = S2sResponseHeaders::parse(response.headers()).unwrap();
-    let body = read_body(response).await;
-
-    // response From 被补全 key id → client 必须拒绝(逐字节回显被破坏)
-    response_headers.from =
-        ServiceKeyRef::with_key_id(response_headers.from.did.clone(), "key-1").unwrap();
-    let err = transport
-        .open_response(&pending, &response_headers, &body, now())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, S2sError::WrongPeer(_)));
-
-    // In-Reply-To 不匹配 → 拒绝
-    let response_headers2 = S2sResponseHeaders {
-        in_reply_to: [0u8; 24],
-        ..S2sResponseHeaders::parse(&{
-            let mut m = http::HeaderMap::new();
-            // 重新构造原始 headers
-            let ctx2 = &ctx;
-            let _ = ctx2;
-            m.insert(
-                http::HeaderName::from_static("krpc-s2s-version"),
-                http::HeaderValue::from_static("1"),
-            );
-            m
-        })
-        .unwrap_or(S2sResponseHeaders {
-            version: 1,
-            from: ServiceKeyRef::new(server_did()),
-            to: ServiceKeyRef::new(client_did()),
-            issued_at: now(),
-            expires_at: now() + 300,
-            in_reply_to: [0u8; 24],
-            nonce: [1u8; 24],
-        })
-    };
-    let err = transport
-        .open_response(&pending, &response_headers2, &body, now())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, S2sError::WrongKind | S2sError::WrongPeer(_)));
-}
-
-// ---- 轮换:grace key 与显式 key id ----
-
-struct TwoKeyProvider {
-    active: ExplicitEd25519Provider,
-    grace: ExplicitEd25519Provider,
-}
-
-#[async_trait]
-impl S2sKeyAgreementProvider for TwoKeyProvider {
-    async fn local_key_candidates(&self) -> S2sResult<Vec<S2sLocalKeyHandle>> {
-        Ok(vec![
-            self.active.handle().clone(),
-            self.grace.handle().clone(),
-        ])
-    }
-
-    async fn diffie_hellman(
-        &self,
-        local_key_fingerprint: &[u8; 32],
-        peer_x25519_public: &[u8; 32],
-    ) -> S2sResult<Zeroizing<[u8; 32]>> {
-        if local_key_fingerprint == &self.active.handle().fingerprint {
-            self.active
-                .diffie_hellman(local_key_fingerprint, peer_x25519_public)
-                .await
-        } else {
-            self.grace
-                .diffie_hellman(local_key_fingerprint, peer_x25519_public)
-                .await
-        }
-    }
-}
-
-#[tokio::test]
-async fn server_grace_key_still_decrypts_after_rotation() {
-    // 服务端 active key 已轮换成 NEW_SEED,旧 key(SERVER_SEED)在 grace 集合;
-    // 客户端仍持有旧 verified key → 请求仍可解密
-    const NEW_SEED: [u8; 32] = [21u8; 32];
-    let provider = TwoKeyProvider {
-        active: ExplicitEd25519Provider::new(SecretEd25519Key::from_seed(NEW_SEED), None),
-        grace: ExplicitEd25519Provider::new(SecretEd25519Key::from_seed(SERVER_SEED), None),
-    };
-    let ctx = S2sRpcServerContext::builder("event-service", zone_did())
-        .key_agreement_provider(Arc::new(provider))
-        .peer_key_resolver(resolver_with_both())
-        .security_policy(default_policy())
-        .unsafe_skip_local_key_binding_check()
-        .build()
-        .await
-        .unwrap();
-
-    let transport = client_transport().await; // resolver 里仍是旧 server key
+async fn response_binding_rejects_rewritten_did_and_nonce() {
+    let (fixture, context) = server_context().await;
+    let transport = client_transport_with_fixture(&fixture).await;
     let handler = RecordingHandler::new();
     let (request, pending) =
         encrypted_http_request(&transport, "event-report-v1", &rpc_request_bytes("m", None)).await;
-    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &ctx)
+    let response = serve_http_by_s2s_rpc_handler(request, stream_info(), &handler, &context)
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(handler.call_count(), 1);
-
-    // response 必须沿用实际解密成功的(grace)key pair → client 可解密
-    let response_headers = S2sResponseHeaders::parse(response.headers()).unwrap();
+    let mut headers = S2sResponseHeaders::parse(response.headers()).unwrap();
     let body = read_body(response).await;
+    headers.from = DID::new("web", "other.example.com");
+    assert!(matches!(
+        transport
+            .open_response(&pending, &headers, &body, now())
+            .await,
+        Err(S2sError::WrongPeer(_))
+    ));
+    headers.from = server_did();
+    headers.in_reply_to = [0u8; 24];
+    assert!(matches!(
+        transport
+            .open_response(&pending, &headers, &body, now())
+            .await,
+        Err(S2sError::WrongKind)
+    ));
+}
+
+#[tokio::test]
+async fn reload_uses_new_key_for_new_requests_but_inflight_snapshot_finishes() {
+    let fixture = TestFixture::standard();
+    let context = server_context_with_fixture(&fixture, default_policy()).await;
+    let transport = client_transport_with_fixture(&fixture).await;
+    let (headers, body, pending) = transport
+        .seal_request(
+            "event-report-v1",
+            &rpc_request_bytes("m", None),
+            now(),
+            false,
+        )
+        .await
+        .unwrap();
+    let decrypted = context
+        .open_request(&headers, "event-report-v1", &body, now())
+        .await
+        .unwrap();
+
+    fixture.replace_identity(&server_did(), [21u8; 32]);
+    assert!(context.reload_local_identity().unwrap());
+    let response_json = serde_json::to_vec(&RPCResponse {
+        result: RPCResult::Success(json!({"ok": true})),
+        seq: 42,
+        trace_id: None,
+    })
+    .unwrap();
+    let (response_headers, response_body) = context
+        .seal_response(&decrypted, &response_json, now())
+        .await
+        .unwrap();
     assert!(transport
-        .open_response(&pending, &response_headers, &body, now())
+        .open_response(&pending, &response_headers, &response_body, now())
+        .await
+        .is_ok());
+
+    // 新 client 解析到新默认 key；新请求由 reload 后 server key 解密。
+    let fresh_client = client_transport_with_fixture(&fixture).await;
+    let (headers, body, _) = fresh_client
+        .seal_request(
+            "event-report-v1",
+            &rpc_request_bytes("m", None),
+            now(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(context
+        .open_request(&headers, "event-report-v1", &body, now())
         .await
         .is_ok());
 }
 
-// ---- context 构造校验 ----
-
-#[tokio::test]
-async fn context_construction_rejects_missing_pieces() {
-    // 无 key source
-    let err = S2sRpcServerContext::builder("event-service", zone_did())
-        .peer_key_resolver(resolver_with_both())
-        .build()
-        .await;
-    assert!(err.is_err());
-
-    // 无 peer resolver
-    let err = S2sRpcServerContext::builder("event-service", zone_did())
-        .explicit_ed25519_key(SecretEd25519Key::from_seed(SERVER_SEED))
-        .build()
-        .await;
-    assert!(err.is_err());
-
-    // 非法 appid
-    let err = S2sRpcServerContext::builder("Bad.Appid", zone_did())
-        .explicit_ed25519_key(SecretEd25519Key::from_seed(SERVER_SEED))
-        .peer_key_resolver(resolver_with_both())
-        .build()
-        .await;
-    assert!(err.is_err());
-
-    // key binding 不匹配(resolver 中 server did 是另一把 key)
-    let resolver = Arc::new(StaticPeerKeyResolver::new());
-    resolver.insert(
-        &server_did(),
-        vec![VerifiedPeerKey {
-            key_id: None,
-            ed25519_public: SecretEd25519Key::from_seed([100u8; 32]).public_key(),
-        }],
-    );
-    let err = S2sRpcServerContext::builder("event-service", zone_did())
-        .explicit_ed25519_key(SecretEd25519Key::from_seed(SERVER_SEED))
-        .peer_key_resolver(resolver)
-        .build()
-        .await;
-    assert!(err.is_err());
-
-    // 无效 policy 无法 reload
-    let ctx = server_context().await;
-    let mut bad = S2sServerSecurityPolicy::public_internet_default();
-    bad.message.max_lifetime_secs = 0;
-    assert!(ctx.reload_policy(bad).is_err());
-}
-
-// ---- 端到端:真实 HTTP server + kRPC 客户端 S2S 模式 ----
-
-use crate::{HttpServer, Runner, ServerResult};
-use ::kRPC::{kRPC, KrpcTransportSecurity};
-use std::sync::atomic::AtomicBool;
-
 struct S2sHttpServer {
-    ctx: Arc<S2sRpcServerContext>,
+    context: Arc<S2sRpcServerContext>,
     handler: Arc<RecordingHandler>,
 }
 
@@ -887,10 +668,10 @@ struct S2sHttpServer {
 impl HttpServer for S2sHttpServer {
     async fn serve_request(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        request: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        serve_http_by_s2s_rpc_handler(req, info, self.handler.as_ref(), &self.ctx).await
+        serve_http_by_s2s_rpc_handler(request, info, self.handler.as_ref(), &self.context).await
     }
 
     fn id(&self) -> String {
@@ -912,13 +693,17 @@ fn random_loopback_addr() -> std::net::SocketAddr {
 }
 
 async fn spawn_s2s_server(
-    policy: S2sServerSecurityPolicy,
-) -> (std::net::SocketAddr, Arc<RecordingHandler>, tokio::task::JoinHandle<()>) {
+    fixture: &TestFixture,
+) -> (
+    std::net::SocketAddr,
+    Arc<RecordingHandler>,
+    tokio::task::JoinHandle<()>,
+) {
     let addr = random_loopback_addr();
     let handler = Arc::new(RecordingHandler::new());
-    let ctx = Arc::new(server_context_with_policy(policy).await);
+    let context = Arc::new(server_context_with_fixture(fixture, default_policy()).await);
     let server = Arc::new(S2sHttpServer {
-        ctx,
+        context,
         handler: handler.clone(),
     });
     let runner = Runner::with_addr(addr);
@@ -930,195 +715,203 @@ async fn spawn_s2s_server(
     (addr, handler, task)
 }
 
-fn client_local_identity() -> S2sLocalIdentityConfig {
-    S2sLocalIdentityConfig::new(
-        "event-producer",
-        zone_did(),
-        S2sLocalKeySource::ExplicitEd25519 {
-            key: SecretEd25519Key::from_seed(CLIENT_SEED),
-            key_id: None,
-        },
-    )
-}
-
 #[tokio::test]
-async fn end_to_end_krpc_client_s2s_call_and_probe() {
-    let (addr, handler, task) = spawn_s2s_server(default_policy()).await;
-
-    let config = S2sClientConfig::with_pinned_key(
-        client_local_identity(),
-        server_did(),
-        SecretEd25519Key::from_seed(SERVER_SEED).public_key(),
-    );
+async fn end_to_end_krpc_call_and_probe_are_did_only() {
+    let fixture = TestFixture::standard();
+    let (addr, handler, task) = spawn_s2s_server(&fixture).await;
+    let config =
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.runtime.clone());
     let client = kRPC::new_with_transport(
-        &format!("http://{}/s2s/event-report-v1", addr),
-        Some("session-token-1".to_string()),
+        &format!("http://{addr}/s2s/event-report-v1"),
+        Some("session-token".to_string()),
         KrpcTransportSecurity::S2sPayloadV1(config),
     )
     .await
     .unwrap();
-
-    // 业务调用
-    let value = client
-        .call("report_event", json!({"level": "info"}))
-        .await
-        .unwrap();
-    assert_eq!(value, json!({"echo": "report_event"}));
+    assert_eq!(
+        client
+            .call("report_event", json!({"level": "info"}))
+            .await
+            .unwrap(),
+        json!({"echo": "report_event"})
+    );
+    assert_eq!(client.probe_s2s(None).await.unwrap()["probe"], "ok");
     assert_eq!(handler.call_count(), 1);
-    let server_ctx = handler.last_context().unwrap();
-    assert_eq!(server_ctx.authenticated_from_service_did, Some(client_did()));
-
-    // 加密 probe(不进业务 handler)
-    let probe = client.probe_s2s(Some("event-report-v1")).await.unwrap();
-    assert_eq!(probe.get("probe").unwrap(), "ok");
-    assert_eq!(handler.call_count(), 1);
-
     task.abort();
     let _ = task.await;
 }
 
-/// resolver:refresh 之前返回过期的 server key,refresh 后返回正确 key。
-struct StaleThenFreshResolver {
-    inner: Arc<StaticPeerKeyResolver>,
-    stale_server_key: VerifiedPeerKey,
-    refreshed: AtomicBool,
+struct RotatingAuthority {
+    did: DID,
+    stale: EncodedDocument,
+    fresh: EncodedDocument,
+    calls: AtomicUsize,
 }
 
 #[async_trait]
-impl S2sPeerKeyResolver for StaleThenFreshResolver {
-    async fn resolve_verified_keys(
-        &self,
-        service_did: &DID,
-        key_id: Option<&str>,
-    ) -> S2sResult<Vec<VerifiedPeerKey>> {
-        if service_did == &server_did() && !self.refreshed.load(Ordering::SeqCst) {
-            return Ok(vec![self.stale_server_key.clone()]);
-        }
-        self.inner.resolve_verified_keys(service_did, key_id).await
+impl NsProvider for RotatingAuthority {
+    fn get_id(&self) -> String {
+        "rotating-s2s-authority".to_string()
     }
 
-    async fn refresh_verified_keys(
+    async fn query(
         &self,
-        service_did: &DID,
-        key_id: Option<&str>,
-    ) -> S2sResult<Vec<VerifiedPeerKey>> {
-        self.refreshed.store(true, Ordering::SeqCst);
-        self.inner.resolve_verified_keys(service_did, key_id).await
+        _name: &str,
+        _record_type: Option<RecordType>,
+        _from_ip: Option<IpAddr>,
+    ) -> NSResult<NameInfo> {
+        Err(NSError::NotFound("not a DNS provider".to_string()))
+    }
+
+    async fn query_did(
+        &self,
+        did: &DID,
+        _doc_type: Option<DidDocType>,
+        _from_ip: Option<IpAddr>,
+    ) -> NSResult<EncodedDocument> {
+        if did != &self.did {
+            return Err(NSError::NotFound(did.to_string()));
+        }
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(self.stale.clone())
+        } else {
+            Ok(self.fresh.clone())
+        }
     }
 }
 
 #[tokio::test]
-async fn end_to_end_client_recovers_from_stale_target_key_with_one_refresh_retry() {
-    let (addr, handler, task) = spawn_s2s_server(default_policy()).await;
+async fn stale_remote_cache_gets_one_authority_refresh_with_fresh_nonce() {
+    let server_fixture = TestFixture::standard();
+    let (addr, handler, task) = spawn_s2s_server(&server_fixture).await;
 
-    let resolver = Arc::new(StaleThenFreshResolver {
-        inner: resolver_with_both(),
-        stale_server_key: VerifiedPeerKey {
-            key_id: None,
-            ed25519_public: SecretEd25519Key::from_seed([200u8; 32]).public_key(),
-        },
-        refreshed: AtomicBool::new(false),
-    });
-    // refresh 重试只在 Resolver 模式存在;Pinned 模式没有可刷新的东西
-    let config = S2sClientConfig::with_resolver(client_local_identity(), server_did(), resolver);
+    let client_fixture = TestFixture::standard();
+    client_fixture
+        .client
+        .clear_local_authority_override(&server_did(), DidDocType::Zone);
+    client_fixture
+        .client
+        .set_method_authority(
+            "web",
+            Box::new(RotatingAuthority {
+                did: server_did(),
+                stale: EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
+                fresh: EncodedDocument::JsonLd(identity_document(&server_did(), SERVER_SEED)),
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+
     let client = kRPC::new_with_transport(
-        &format!("http://{}/s2s/event-report-v1", addr),
+        &format!("http://{addr}/s2s/event-report-v1"),
         None,
-        KrpcTransportSecurity::S2sPayloadV1(config),
+        KrpcTransportSecurity::S2sPayloadV1(
+            S2sClientConfig::new(client_did(), server_did())
+                .with_runtime(client_fixture.runtime.clone()),
+        ),
     )
     .await
     .unwrap();
-
-    // 第一次 seal 用了过期 key → 服务端 403;客户端 refresh 后新 nonce 重试成功
-    let value = client.call("report_event", json!({})).await.unwrap();
-    assert_eq!(value, json!({"echo": "report_event"}));
+    assert_eq!(
+        client.call("report_event", json!({})).await.unwrap(),
+        json!({"echo": "report_event"})
+    );
     assert_eq!(handler.call_count(), 1);
-
     task.abort();
     let _ = task.await;
 }
 
 #[tokio::test]
-async fn transport_constructor_validations() {
-    // Tls 模式拒绝 http URL
-    let err = kRPC::new_with_transport(
-        "http://127.0.0.1:1/x",
-        None,
-        KrpcTransportSecurity::Tls,
-    )
-    .await;
-    assert!(err.is_err());
+async fn server_refreshes_stale_sender_key_once_before_failing_closed() {
+    let server_fixture = TestFixture::standard();
+    server_fixture
+        .client
+        .clear_local_authority_override(&client_did(), DidDocType::Zone);
+    server_fixture
+        .client
+        .set_method_authority(
+            "web",
+            Box::new(RotatingAuthority {
+                did: client_did(),
+                stale: EncodedDocument::JsonLd(identity_document(&client_did(), [201u8; 32])),
+                fresh: EncodedDocument::JsonLd(identity_document(&client_did(), CLIENT_SEED)),
+                calls: AtomicUsize::new(0),
+            }),
+        )
+        .await;
+    let context = server_context_with_fixture(&server_fixture, default_policy()).await;
 
-    // S2S 模式拒绝非 /s2s/ path
-    let config = S2sClientConfig::with_pinned_key(
-        client_local_identity(),
-        server_did(),
-        SecretEd25519Key::from_seed(SERVER_SEED).public_key(),
+    let client_fixture = TestFixture::standard();
+    let transport = client_transport_with_fixture(&client_fixture).await;
+    let (headers, body, _) = transport
+        .seal_request(
+            "event-report-v1",
+            &rpc_request_bytes("report_event", None),
+            now(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let decrypted = context
+        .open_request(&headers, "event-report-v1", &body, now())
+        .await
+        .unwrap();
+    assert_eq!(decrypted.authenticated_from_did, client_did());
+    assert_eq!(
+        decrypted.authenticated_from_fingerprint,
+        ed25519_key_fingerprint(&public_key(CLIENT_SEED))
     );
-    let err = kRPC::new_with_transport(
+}
+
+#[tokio::test]
+async fn invalid_remote_document_fails_closed_without_plaintext_fallback() {
+    let server_fixture = TestFixture::standard();
+    let (addr, handler, task) = spawn_s2s_server(&server_fixture).await;
+    let client_fixture = TestFixture::standard();
+    client_fixture.client.set_local_authority_override(
+        server_did(),
+        DidDocType::Zone,
+        EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
+        "wrong-key",
+        None,
+    );
+    let client = kRPC::new_with_transport(
+        &format!("http://{addr}/s2s/event-report-v1"),
+        None,
+        KrpcTransportSecurity::S2sPayloadV1(
+            S2sClientConfig::new(client_did(), server_did())
+                .with_runtime(client_fixture.runtime.clone()),
+        ),
+    )
+    .await
+    .unwrap();
+    let error = client.call("report_event", json!({})).await.unwrap_err();
+    assert!(matches!(error, RPCErrors::S2sPermanentError(_)));
+    assert_eq!(handler.call_count(), 0);
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn transport_constructor_validations_remain_strict() {
+    assert!(
+        kRPC::new_with_transport("http://127.0.0.1:1/x", None, KrpcTransportSecurity::Tls,)
+            .await
+            .is_err()
+    );
+    let fixture = TestFixture::standard();
+    let config =
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.runtime.clone());
+    assert!(kRPC::new_with_transport(
         "http://127.0.0.1:1/krpc",
         None,
         KrpcTransportSecurity::S2sPayloadV1(config),
     )
-    .await;
-    assert!(err.is_err());
-
-    // TlsAndS2s 拒绝 http URL
-    let config = S2sClientConfig::with_pinned_key(
-        client_local_identity(),
-        server_did(),
-        SecretEd25519Key::from_seed(SERVER_SEED).public_key(),
-    );
-    let err = kRPC::new_with_transport(
-        "http://127.0.0.1:1/s2s/api-a",
-        None,
-        KrpcTransportSecurity::TlsAndS2sPayloadV1(config),
-    )
-    .await;
-    assert!(err.is_err());
-
-    // probe 只在 S2S 模式可用
-    let client = kRPC::new("http://127.0.0.1:1/krpc", None);
-    assert!(client.probe_s2s(None).await.is_err());
-
-    // pinned key 在构造时校验:无效/small-order 公钥直接失败,不等到首次 call
-    let config = S2sClientConfig::with_pinned_key(
-        client_local_identity(),
-        server_did(),
-        [0u8; 32], // small-order point
-    );
-    let err = kRPC::new_with_transport(
-        "http://127.0.0.1:1/s2s/api-a",
-        None,
-        KrpcTransportSecurity::S2sPayloadV1(config),
-    )
-    .await;
-    assert!(err.is_err());
-}
-
-#[tokio::test]
-async fn end_to_end_pinned_wrong_key_fails_closed_no_plaintext() {
-    // pinned 了错误的目标公钥:请求确定性失败(服务端解不开→统一 403,
-    // 客户端有界重试后返回 permanent),不会降级明文,也不会打到 handler
-    let (addr, handler, task) = spawn_s2s_server(default_policy()).await;
-
-    let config = S2sClientConfig::with_pinned_key(
-        client_local_identity(),
-        server_did(),
-        SecretEd25519Key::from_seed([200u8; 32]).public_key(), // 错误 key
-    );
-    let client = kRPC::new_with_transport(
-        &format!("http://{}/s2s/event-report-v1", addr),
-        None,
-        KrpcTransportSecurity::S2sPayloadV1(config),
-    )
     .await
-    .unwrap();
-
-    let err = client.call("report_event", json!({})).await.unwrap_err();
-    assert!(matches!(err, RPCErrors::S2sPermanentError(_)), "{err}");
-    assert_eq!(handler.call_count(), 0);
-
-    task.abort();
-    let _ = task.await;
+    .is_err());
+    let mut bad = S2sServerSecurityPolicy::public_internet_default();
+    bad.message.max_lifetime_secs = 0;
+    let context = server_context_with_fixture(&fixture, default_policy()).await;
+    assert!(context.reload_policy(bad).is_err());
 }

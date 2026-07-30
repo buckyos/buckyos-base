@@ -36,10 +36,14 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+zeroize = { workspace = true }
+rustls = { workspace = true }
 
 name-lib = { workspace = true }
 buckyos-kit = { workspace = true }
-kRPC = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rcgen = "0.14"

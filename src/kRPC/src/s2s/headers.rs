@@ -6,20 +6,20 @@
 
 use super::codec::{decode_nonce, encode_nonce};
 use super::error::{S2sError, S2sResult};
-use super::service_key_ref::ServiceKeyRef;
 use super::{
     HEADER_S2S_EXPIRES_AT, HEADER_S2S_FROM, HEADER_S2S_IN_REPLY_TO, HEADER_S2S_ISSUED_AT,
     HEADER_S2S_NONCE, HEADER_S2S_PREFIX, HEADER_S2S_TO, HEADER_S2S_VERSION,
     S2S_DEFAULT_MAX_HEADER_VALUE_LEN, S2S_NONCE_LEN, S2S_PROFILE_VERSION,
 };
 use http::HeaderMap;
+use name_lib::{parse_canonical_did, DID};
 
 /// request 侧结构化 S2S Header。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct S2sRequestHeaders {
     pub version: u32,
-    pub from: ServiceKeyRef,
-    pub to: ServiceKeyRef,
+    pub from: DID,
+    pub to: DID,
     pub issued_at: u64,
     pub expires_at: u64,
     pub nonce: [u8; S2S_NONCE_LEN],
@@ -29,8 +29,8 @@ pub struct S2sRequestHeaders {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct S2sResponseHeaders {
     pub version: u32,
-    pub from: ServiceKeyRef,
-    pub to: ServiceKeyRef,
+    pub from: DID,
+    pub to: DID,
     pub issued_at: u64,
     pub expires_at: u64,
     pub in_reply_to: [u8; S2S_NONCE_LEN],
@@ -123,13 +123,13 @@ fn parse_decimal_u64(name: &str, s: &str) -> S2sResult<u64> {
     if s.len() > 1 && s.starts_with('0') {
         return Err(invalid(name, "leading zero"));
     }
-    s.parse::<u64>().map_err(|_| invalid(name, "integer overflow"))
+    s.parse::<u64>()
+        .map_err(|_| invalid(name, "integer overflow"))
 }
 
-fn parse_key_ref(headers: &HeaderMap, name: &str, max_len: usize) -> S2sResult<ServiceKeyRef> {
+fn parse_did(headers: &HeaderMap, name: &str, max_len: usize) -> S2sResult<DID> {
     let value = get_single(headers, name, max_len)?;
-    ServiceKeyRef::parse(&value)
-        .map_err(|e| invalid(name, format!("{}", e)))
+    parse_canonical_did(&value).map_err(|e| invalid(name, e.to_string()))
 }
 
 fn parse_nonce_header(headers: &HeaderMap, name: &str) -> S2sResult<[u8; S2S_NONCE_LEN]> {
@@ -142,10 +142,12 @@ impl S2sRequestHeaders {
     pub fn parse(headers: &HeaderMap) -> S2sResult<Self> {
         reject_unknown_s2s_headers(headers, &REQUEST_ALLOWED)?;
         let version = parse_version(headers)?;
-        let from = parse_key_ref(headers, HEADER_S2S_FROM, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
-        let to = parse_key_ref(headers, HEADER_S2S_TO, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
-        let issued_at =
-            parse_decimal_u64(HEADER_S2S_ISSUED_AT, &get_single(headers, HEADER_S2S_ISSUED_AT, 20)?)?;
+        let from = parse_did(headers, HEADER_S2S_FROM, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
+        let to = parse_did(headers, HEADER_S2S_TO, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
+        let issued_at = parse_decimal_u64(
+            HEADER_S2S_ISSUED_AT,
+            &get_single(headers, HEADER_S2S_ISSUED_AT, 20)?,
+        )?;
         let expires_at = parse_decimal_u64(
             HEADER_S2S_EXPIRES_AT,
             &get_single(headers, HEADER_S2S_EXPIRES_AT, 20)?,
@@ -164,8 +166,8 @@ impl S2sRequestHeaders {
     /// 写入 HTTP HeaderMap(客户端发送用)。
     pub fn apply(&self, headers: &mut HeaderMap) -> S2sResult<()> {
         put_header(headers, HEADER_S2S_VERSION, &self.version.to_string())?;
-        put_header(headers, HEADER_S2S_FROM, &self.from.to_wire_string())?;
-        put_header(headers, HEADER_S2S_TO, &self.to.to_wire_string())?;
+        put_header(headers, HEADER_S2S_FROM, &self.from.to_string())?;
+        put_header(headers, HEADER_S2S_TO, &self.to.to_string())?;
         put_header(headers, HEADER_S2S_ISSUED_AT, &self.issued_at.to_string())?;
         put_header(headers, HEADER_S2S_EXPIRES_AT, &self.expires_at.to_string())?;
         put_header(headers, HEADER_S2S_NONCE, &encode_nonce(&self.nonce))?;
@@ -177,10 +179,12 @@ impl S2sResponseHeaders {
     pub fn parse(headers: &HeaderMap) -> S2sResult<Self> {
         reject_unknown_s2s_headers(headers, &RESPONSE_ALLOWED)?;
         let version = parse_version(headers)?;
-        let from = parse_key_ref(headers, HEADER_S2S_FROM, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
-        let to = parse_key_ref(headers, HEADER_S2S_TO, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
-        let issued_at =
-            parse_decimal_u64(HEADER_S2S_ISSUED_AT, &get_single(headers, HEADER_S2S_ISSUED_AT, 20)?)?;
+        let from = parse_did(headers, HEADER_S2S_FROM, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
+        let to = parse_did(headers, HEADER_S2S_TO, S2S_DEFAULT_MAX_HEADER_VALUE_LEN)?;
+        let issued_at = parse_decimal_u64(
+            HEADER_S2S_ISSUED_AT,
+            &get_single(headers, HEADER_S2S_ISSUED_AT, 20)?,
+        )?;
         let expires_at = parse_decimal_u64(
             HEADER_S2S_EXPIRES_AT,
             &get_single(headers, HEADER_S2S_EXPIRES_AT, 20)?,
@@ -200,8 +204,8 @@ impl S2sResponseHeaders {
 
     pub fn apply(&self, headers: &mut HeaderMap) -> S2sResult<()> {
         put_header(headers, HEADER_S2S_VERSION, &self.version.to_string())?;
-        put_header(headers, HEADER_S2S_FROM, &self.from.to_wire_string())?;
-        put_header(headers, HEADER_S2S_TO, &self.to.to_wire_string())?;
+        put_header(headers, HEADER_S2S_FROM, &self.from.to_string())?;
+        put_header(headers, HEADER_S2S_TO, &self.to.to_string())?;
         put_header(headers, HEADER_S2S_ISSUED_AT, &self.issued_at.to_string())?;
         put_header(headers, HEADER_S2S_EXPIRES_AT, &self.expires_at.to_string())?;
         put_header(
@@ -217,10 +221,7 @@ impl S2sResponseHeaders {
 fn put_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> S2sResult<()> {
     let value = http::HeaderValue::from_str(value)
         .map_err(|e| invalid(name, format!("cannot encode: {}", e)))?;
-    headers.insert(
-        http::HeaderName::from_static(name),
-        value,
-    );
+    headers.insert(http::HeaderName::from_static(name), value);
     Ok(())
 }
 
@@ -270,10 +271,7 @@ pub fn parse_media_type(content_type: &str) -> Option<String> {
     if essence.is_empty() || !essence.contains('/') {
         return None;
     }
-    if !essence
-        .bytes()
-        .all(|b| (0x21..=0x7e).contains(&b))
-    {
+    if !essence.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
         return None;
     }
     Some(essence.to_ascii_lowercase())
@@ -287,8 +285,8 @@ mod tests {
     fn sample() -> S2sRequestHeaders {
         S2sRequestHeaders {
             version: 1,
-            from: ServiceKeyRef::new(DID::new("web", "a.example.com")),
-            to: ServiceKeyRef::new(DID::new("web", "b.example.com")),
+            from: DID::new("web", "a.example.com"),
+            to: DID::new("web", "b.example.com"),
             issued_at: 1785100000,
             expires_at: 1785100300,
             nonce: [7u8; 24],
@@ -352,7 +350,11 @@ mod tests {
                 http::HeaderName::from_static(HEADER_S2S_ISSUED_AT),
                 http::HeaderValue::from_str(bad).unwrap(),
             );
-            assert!(S2sRequestHeaders::parse(&map).is_err(), "should reject {:?}", bad);
+            assert!(
+                S2sRequestHeaders::parse(&map).is_err(),
+                "should reject {:?}",
+                bad
+            );
         }
 
         // OWS 移除后可解析
@@ -409,8 +411,8 @@ mod tests {
     fn response_headers_roundtrip() {
         let resp = S2sResponseHeaders {
             version: 1,
-            from: ServiceKeyRef::new(DID::new("web", "b.example.com")),
-            to: ServiceKeyRef::new(DID::new("web", "a.example.com")),
+            from: DID::new("web", "b.example.com"),
+            to: DID::new("web", "a.example.com"),
             issued_at: 1785100001,
             expires_at: 1785100301,
             in_reply_to: [7u8; 24],
@@ -420,5 +422,16 @@ mod tests {
         resp.apply(&mut map).unwrap();
         let parsed = S2sResponseHeaders::parse(&map).unwrap();
         assert_eq!(parsed, resp);
+    }
+
+    #[test]
+    fn did_fragments_are_rejected() {
+        let mut map = HeaderMap::new();
+        sample().apply(&mut map).unwrap();
+        map.insert(
+            http::HeaderName::from_static(HEADER_S2S_FROM),
+            http::HeaderValue::from_static("did:web:a.example.com#main_key"),
+        );
+        assert!(S2sRequestHeaders::parse(&map).is_err());
     }
 }

@@ -14,8 +14,8 @@ pub enum S2sError {
     /// Header 缺失、重复、超长、含控制字符或无法解析。
     #[error("invalid s2s header {name}: {reason}")]
     InvalidHeader { name: String, reason: String },
-    #[error("invalid service key ref: {0}")]
-    InvalidServiceKeyRef(String),
+    #[error("invalid canonical DID: {0}")]
+    InvalidDid(String),
     #[error("invalid api name: {0}")]
     InvalidApiName(String),
     /// 时间窗口校验失败(`exp<=iat`、超过 max lifetime、iat 超前、已过期)。
@@ -80,7 +80,7 @@ impl S2sError {
         match self {
             S2sError::UnknownVersion(_) => "unknown_version",
             S2sError::InvalidHeader { .. } => "invalid_header",
-            S2sError::InvalidServiceKeyRef(_) => "invalid_key_ref",
+            S2sError::InvalidDid(_) => "invalid_did",
             S2sError::InvalidApiName(_) => "invalid_api_name",
             S2sError::ExpiredMessage(_) => "expired",
             S2sError::WrongPeer(_) => "wrong_peer",

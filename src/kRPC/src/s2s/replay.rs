@@ -16,11 +16,11 @@ use std::sync::Mutex;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReplayKey {
     pub version: u32,
-    /// wire 形式 canonical from key ref。
-    pub from_key_ref: String,
+    /// wire 形式 canonical From DID。
+    pub from_did: String,
     /// AEAD 实际成功的 sender key fingerprint。
     pub from_fingerprint: [u8; 32],
-    pub to_key_ref: String,
+    pub to_did: String,
     pub to_fingerprint: [u8; 32],
     pub nonce: [u8; S2S_NONCE_LEN],
 }
@@ -98,9 +98,9 @@ mod tests {
     fn key(nonce_fill: u8) -> ReplayKey {
         ReplayKey {
             version: 1,
-            from_key_ref: "did:web:a.example.com".to_string(),
+            from_did: "did:web:a.example.com".to_string(),
             from_fingerprint: [1u8; 32],
-            to_key_ref: "did:web:b.example.com".to_string(),
+            to_did: "did:web:b.example.com".to_string(),
             to_fingerprint: [2u8; 32],
             nonce: [nonce_fill; 24],
         }
@@ -127,7 +127,10 @@ mod tests {
         let now = buckyos_kit::buckyos_get_unix_timestamp();
         // 填满(已过期 entry)
         for i in 0..16 {
-            assert!(store.check_and_insert(&key(i), now.saturating_sub(10)).await.unwrap());
+            assert!(store
+                .check_and_insert(&key(i), now.saturating_sub(10))
+                .await
+                .unwrap());
         }
         // 过期 entry 被清理后可继续插入
         assert!(store.check_and_insert(&key(100), now + 600).await.unwrap());

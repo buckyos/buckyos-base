@@ -5,8 +5,8 @@
 //! Ed25519→X25519 static-static DH + HKDF-SHA-256 派生,对每个 kRPC JSON
 //! Payload 独立执行 XChaCha20-Poly1305 AEAD。没有在线握手,也没有加密 session。
 //!
-//! 本模块只定义协议基元与 trait(codec、密钥、AAD、seal/open、policy、
-//! replay、context);HTTP 入口在 `buckyos-http-server` 的
+//! 本模块定义协议基元与 DID-only runtime（codec、密钥、AAD、seal/open、
+//! policy、replay、context）；HTTP 入口在 `buckyos-http-server` 的
 //! `serve_http_by_s2s_rpc_handler`。
 
 mod aad;
@@ -17,12 +17,10 @@ mod error;
 mod headers;
 mod identity;
 mod keys;
-mod peer;
 mod policy;
 mod replay;
 mod seal;
 mod server_ctx;
-mod service_key_ref;
 
 pub use aad::*;
 pub use api_name::*;
@@ -32,16 +30,10 @@ pub use error::*;
 pub use headers::*;
 pub use identity::*;
 pub use keys::*;
-pub use peer::*;
 pub use policy::*;
 pub use replay::*;
 pub use seal::*;
 pub use server_ctx::*;
-pub use service_key_ref::*;
-
-/// `S2sKeyAgreementProvider` 返回值用的 zeroize-on-drop 容器(re-export,
-/// 便于下游实现 provider trait)。
-pub use zeroize::Zeroizing;
 
 /// v1 唯一版本号。版本号唯一决定算法套件,不做协商。
 pub const S2S_PROFILE_VERSION: u32 = 1;
@@ -86,7 +78,6 @@ pub const S2S_DEFAULT_MAX_LIFETIME_SECS: u64 = 300;
 pub const S2S_DEFAULT_FUTURE_CLOCK_SKEW_SECS: u64 = 60;
 pub const S2S_DEFAULT_MAX_BODY_SIZE: usize = 1024 * 1024;
 pub const S2S_DEFAULT_MAX_JSON_DEPTH: usize = 64;
-pub const S2S_DEFAULT_MAX_KEY_CANDIDATES: usize = 2;
 /// 单个 S2S Header value 的默认长度上限。
 pub const S2S_DEFAULT_MAX_HEADER_VALUE_LEN: usize = 1024;
 
@@ -94,11 +85,5 @@ pub const S2S_DEFAULT_MAX_HEADER_VALUE_LEN: usize = 1024;
 pub const S2S_HARD_MAX_LIFETIME_SECS: u64 = 3600;
 pub const S2S_HARD_MAX_FUTURE_CLOCK_SKEW_SECS: u64 = 600;
 pub const S2S_HARD_MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
-pub const S2S_HARD_MAX_KEY_CANDIDATES: usize = 8;
-
-/// ServiceKeyRef wire 形式的长度上限(canonical did + 可选 `#key_id`)。
-pub const S2S_MAX_KEY_REF_LEN: usize = 512;
-/// key id 的长度上限。
-pub const S2S_MAX_KEY_ID_LEN: usize = 64;
 /// canonical API name 的长度上限。
 pub const S2S_MAX_API_NAME_LEN: usize = 128;

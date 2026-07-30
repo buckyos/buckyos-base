@@ -7,7 +7,6 @@ mod dns_provider;
 mod doc_cache;
 mod https_provider;
 mod identity_mgr;
-mod identity_s2s;
 mod local_ns_provider;
 mod name_client;
 mod name_query;
@@ -26,7 +25,6 @@ pub use dns_provider::*;
 pub use doc_cache::*;
 pub use https_provider::*;
 pub use identity_mgr::*;
-pub use identity_s2s::*;
 use jsonwebtoken::DecodingKey;
 pub use local_ns_provider::*;
 pub use name_client::*;
@@ -191,7 +189,7 @@ pub async fn resolve_ips(name: &str) -> NSResult<Vec<IpAddr>> {
     client.resolve_ips(name).await
 }
 
-fn get_name_client() -> Option<&'static NameClient> {
+pub fn get_name_client() -> Option<&'static NameClient> {
     let client = GLOBAL_NAME_CLIENT.get();
     return client;
 }
@@ -275,49 +273,6 @@ pub async fn resolve_auth_key(did: &DID, kid: Option<&str>) -> NSResult<Decoding
         return Ok(auth_key.0);
     }
     return Err(NSError::NotFound("Invalid kid".to_string()));
-}
-
-pub async fn resolve_ed25519_exchange_key(remote_did: &DID) -> NSResult<[u8; 32]> {
-    //return #auth-key
-    if let Some(auth_key) = remote_did.get_ed25519_auth_key() {
-        return Ok(auth_key);
-    }
-
-    let client = get_name_client();
-    if client.is_none() {
-        let msg = "Name client not init yet".to_string();
-        error!("{}", msg);
-        return Err(NSError::InvalidState(msg));
-    }
-    let client = client.unwrap();
-    let did_doc = client.resolve_did(remote_did, None).await?;
-    let exchange_key = resolve_exchange_key_from_doc(&did_doc)?;
-    if exchange_key.is_some() {
-        let exchange_key = exchange_key.unwrap();
-        let exchange_key = jwk_to_ed25519_pk(&exchange_key.1)?;
-        return Ok(exchange_key);
-    }
-    return Err(NSError::NotFound("Invalid did document".to_string()));
-}
-
-fn resolve_exchange_key_from_doc(
-    did_doc: &EncodedDocument,
-) -> NSResult<Option<(DecodingKey, jsonwebtoken::jwk::Jwk)>> {
-    let doc_value = did_doc.clone().to_json_value()?;
-    if doc_value.get("device_type").is_some() {
-        let device_document = DeviceDocument::decode(did_doc, None)?;
-        return Ok(device_document.get_exchange_key(None));
-    }
-    if doc_value.get("hostname").is_some() {
-        let zone_document = ZoneDocument::decode(did_doc, None)?;
-        let Some(gateway_name) = zone_document.get_default_zone_gateway() else {
-            return Ok(None);
-        };
-        return Ok(zone_document
-            .get_device_document(&gateway_name)
-            .and_then(|device_document| device_document.get_exchange_key(None)));
-    }
-    Ok(None)
 }
 
 pub async fn resolve_did(did: &DID, doc_type: Option<DidDocType>) -> NSResult<EncodedDocument> {
