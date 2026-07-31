@@ -121,7 +121,12 @@ use name_lib::zone_child_did;
 
 let local_did = zone_child_did(&current_zone_did, "event-producer")?;
 let target_did = zone_child_did(&current_zone_did, "event-service")?;
-let config = S2sClientConfig::new(local_did, target_did);
+// 每个产品用自己的 cluster_config 结构实现 S2sPublicKeyProvider。
+let config = S2sClientConfig::for_cluster(
+    local_did,
+    target_did,
+    cluster_public_keys.clone(),
+);
 let client = kRPC::new_with_transport(
     "http://203.0.113.10:18080/s2s/event-report-v1",
     session_token,
@@ -135,7 +140,10 @@ server（`buckyos-http-server`）:
 
 ```rust
 let service_did = zone_child_did(&current_zone_did, "event-service")?;
-let ctx = S2sRpcServerContext::builder(service_did)
+let ctx = S2sRpcServerContext::cluster_builder(
+    service_did,
+    cluster_public_keys.clone(),
+)
     .security_policy(S2sServerSecurityPolicy::public_internet_default())
     .build().await?;
 // 在 /s2s/ 路由内:
@@ -145,9 +153,14 @@ serve_http_by_s2s_rpc_handler(req, info, &my_handler, &ctx).await
 本地身份只从标准路径加载：
 `$BUCKYOS_IDENTITY_ROOT/{encode(DID)}/did.json` 与
 `$BUCKYOS_SECURITY_ROOT/{encode(DID)}/authentication.private.pem`。
-远端默认 authentication Ed25519 公钥统一由 `NameClient` 解析。
+远端默认 authentication Ed25519 公钥优先从产品实现的
+`S2sPublicKeyProvider` 加载；base 库不规定 cluster_config 的结构。Provider
+明确返回 `NotManaged` 时才回退到 `NameClient`，`Err` 必须 fail closed。产品在
+原子发布自己的配置 snapshot 后推进 `S2sProviderChangeToken`；既有
+transport/context 会在下一次操作前拒绝旧 generation。正常 request 只读取内存
+snapshot，不重复解析或查询 Provider。
 wire 上的 `From`/`To` 都是 canonical DID，不接受 `#kid`；调用方也不再注入
-公钥、resolver 或自定义本地 key source。
+单个 pinned 公钥、key-id resolver 或自定义本地 key source。
 
 安全默认 fail closed：`/s2s/` 只接受加密请求、不信任 forwarded source、
 peer DenyAll;明文只能通过显式 CIDR + API allowlist 放行且不产生

@@ -1,17 +1,21 @@
 //! `S2sRpcServerContext`：服务端 S2S transport 无关引擎。
 //!
-//! Context 只接收自己的完整 DID。请求路径从 NameClient 解析 sender 的当前
-//! 默认 key，并为整个 request/response 生命周期持有 local key snapshot。
+//! Context accepts only its own complete DID. Remote callers use the shared Provider-first
+//! identity cache; each authenticated request/response keeps immutable local and remote state.
 
 use super::aad::{build_request_aad, build_response_aad};
 use super::codec::generate_nonce;
 use super::error::{S2sError, S2sResult};
 use super::headers::{validate_time_window, S2sRequestHeaders, S2sResponseHeaders};
-use super::identity::{RemoteDefaultKey, S2sLocalIdentity, S2sLocalKeySnapshot, S2sRuntime};
+use super::identity::{
+    RemoteDefaultKey, S2sLocalIdentity, S2sLocalKeySnapshot, S2sRemoteIdentityMetricsSnapshot,
+    S2sRuntime,
+};
 use super::keys::{
     derive_aead_key, ed25519_pk_to_x25519_pk, DerivedKeyCache, DerivedKeyCacheKey, MessageKind,
 };
 use super::policy::S2sServerSecurityPolicy;
+use super::provider::S2sPublicKeyProvider;
 use super::replay::{MemoryReplayStore, ReplayKey, S2sReplayStore};
 use super::seal::{aead_open, aead_seal};
 use super::S2S_PROFILE_VERSION;
@@ -47,20 +51,33 @@ pub struct S2sRpcServerContext {
 }
 
 impl S2sRpcServerContext {
-    /// 使用系统 IdentityRoots 与全局 NameClient 构造 DID-only server。
-    pub async fn from_did(local_service_did: DID) -> S2sResult<Self> {
-        Self::builder(local_service_did).build().await
+    /// Explicit generic/non-cluster construction using system roots and NameClient.
+    pub async fn from_did_with_name_client_fallback(local_service_did: DID) -> S2sResult<Self> {
+        Self::builder(local_service_did)
+            .with_system_name_client_fallback()
+            .build()
+            .await
     }
 
     pub fn builder(local_service_did: DID) -> S2sRpcServerContextBuilder {
         S2sRpcServerContextBuilder {
             local_service_did,
             runtime: None,
+            public_key_provider: None,
+            allow_system_name_client_fallback: false,
             replay_store: None,
             policy: None,
             api_registry: None,
             derived_cache: None,
         }
+    }
+
+    /// Strong cluster construction: Provider is installed before the context can be built.
+    pub fn cluster_builder(
+        local_service_did: DID,
+        public_key_provider: Arc<dyn S2sPublicKeyProvider>,
+    ) -> S2sRpcServerContextBuilder {
+        Self::builder(local_service_did).public_key_provider(public_key_provider)
     }
 
     pub fn local_service_did(&self) -> &DID {
@@ -69,6 +86,10 @@ impl S2sRpcServerContext {
 
     pub fn api_registry(&self) -> Option<&Arc<dyn S2sApiRegistry>> {
         self.api_registry.as_ref()
+    }
+
+    pub fn remote_identity_metrics(&self) -> S2sRemoteIdentityMetricsSnapshot {
+        self.local.runtime().remote_identity_metrics()
     }
 
     pub fn policy_snapshot(&self) -> Arc<S2sServerSecurityPolicy> {
@@ -89,6 +110,19 @@ impl S2sRpcServerContext {
         } else {
             Ok(false)
         }
+    }
+
+    /// 重新读取指定 peer 的 Provider（优先）或 NameClient fallback，并清理
+    /// 被替换 fingerprint 的派生密钥缓存。
+    pub async fn reload_remote_identity(&self, remote_did: &DID) -> S2sResult<bool> {
+        let remote_identity = self.local.runtime().remote_identity_handle(remote_did)?;
+        let (changed, retired, _) = remote_identity
+            .reload(ResolveSourcePolicy::RemoteAuthority)
+            .await?;
+        if let Some(retired) = retired {
+            self.derived_cache.invalidate_fingerprint(&retired);
+        }
+        Ok(changed)
     }
 
     async fn derive_key_cached(
@@ -161,11 +195,13 @@ impl S2sRpcServerContext {
         }
 
         let local_key = self.local.current_key_snapshot();
-        let mut remote_key = self
-            .local
-            .runtime()
-            .resolve_remote_key(&headers.from, ResolveSourcePolicy::BestAvailable)
+        let remote_identity = self.local.runtime().remote_identity_handle(&headers.from)?;
+        let (mut remote_key, retired) = remote_identity
+            .snapshot(ResolveSourcePolicy::BestAvailable)
             .await?;
+        if let Some(retired) = retired {
+            self.derived_cache.invalidate_fingerprint(&retired);
+        }
         let from_wire = headers.from.to_string();
         let to_wire = headers.to.to_string();
         let aad = build_request_aad(
@@ -190,15 +226,14 @@ impl S2sRpcServerContext {
             Err(S2sError::DecryptFailed) => {
                 // BestAvailable 可能仍持有轮换前的 peer key。只向权威源刷新一次；
                 // 认证仍失败就立即 fail closed，不枚举其它候选。
-                let refreshed = self
-                    .local
-                    .runtime()
-                    .resolve_remote_key(&headers.from, ResolveSourcePolicy::RemoteAuthority)
-                    .await?;
-                if refreshed.fingerprint != remote_key.fingerprint {
-                    self.derived_cache
-                        .invalidate_fingerprint(&remote_key.fingerprint);
-                }
+                let Some(refreshed) = remote_identity
+                    .refresh_after_failure(remote_key.as_ref())
+                    .await?
+                else {
+                    return Err(S2sError::DecryptFailed);
+                };
+                self.derived_cache
+                    .invalidate_fingerprint(&remote_key.fingerprint);
                 let refreshed_key = self
                     .derive_key_cached(
                         &local_key,
@@ -324,6 +359,8 @@ pub fn json_value_depth(value: &Value) -> usize {
 pub struct S2sRpcServerContextBuilder {
     local_service_did: DID,
     runtime: Option<S2sRuntime>,
+    public_key_provider: Option<Arc<dyn S2sPublicKeyProvider>>,
+    allow_system_name_client_fallback: bool,
     replay_store: Option<Arc<dyn S2sReplayStore>>,
     policy: Option<S2sServerSecurityPolicy>,
     api_registry: Option<Arc<dyn S2sApiRegistry>>,
@@ -334,6 +371,21 @@ impl S2sRpcServerContextBuilder {
     /// 测试/嵌入场景注入独立 roots 与 NameClient。
     pub fn with_runtime(mut self, runtime: S2sRuntime) -> Self {
         self.runtime = Some(runtime);
+        self
+    }
+
+    /// 安装查询产品确定性配置 snapshot 的 peer 公钥 Provider。
+    pub fn public_key_provider(
+        mut self,
+        public_key_provider: Arc<dyn S2sPublicKeyProvider>,
+    ) -> Self {
+        self.public_key_provider = Some(public_key_provider);
+        self
+    }
+
+    /// Explicit generic/non-cluster mode. This is never selected implicitly.
+    pub fn with_system_name_client_fallback(mut self) -> Self {
+        self.allow_system_name_client_fallback = true;
         self
     }
 
@@ -362,9 +414,22 @@ impl S2sRpcServerContextBuilder {
             .map_err(|err| S2sError::InvalidDid(err.to_string()))?;
         let policy = self.policy.unwrap_or_default();
         policy.validate()?;
-        let runtime = match self.runtime {
-            Some(runtime) => runtime,
-            None => S2sRuntime::system()?,
+        let runtime = match (self.runtime, self.public_key_provider) {
+            (Some(runtime), Some(provider)) => runtime.with_public_key_provider(provider),
+            (Some(runtime), None) => runtime,
+            (None, Some(provider)) => {
+                S2sRuntime::system_provider_with_name_client_fallback(provider)?
+            }
+            (None, None) if self.allow_system_name_client_fallback => {
+                S2sRuntime::system_name_client_fallback()?
+            }
+            (None, None) => {
+                return Err(S2sError::InvalidConfig(
+                    "S2S server requires a cluster Provider, an injected runtime, or explicit \
+                     system NameClient fallback"
+                        .to_string(),
+                ))
+            }
         };
         let local = S2sLocalIdentity::load(self.local_service_did, runtime)?;
         Ok(S2sRpcServerContext {

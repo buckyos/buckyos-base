@@ -330,7 +330,9 @@ pub struct X509PathMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityStatus {
-    pub installed: bool,
+    /// Public certificate/metadata material is present. This does not imply a usable local
+    /// identity because the matching private capability may be absent.
+    pub material_present: bool,
     pub locally_usable: bool,
     pub match_type: Option<String>,
     pub expired: bool,
@@ -441,7 +443,10 @@ impl IdentityRoots {
         )
     }
 
-    pub fn find_identity_dir(&self, did_or_hostname: &str) -> NSResult<IdentityDirMatch> {
+    /// Finds a directory containing local identity material.
+    ///
+    /// A public-only directory is material presence, not an installed/usable local identity.
+    pub fn find_identity_material_dir(&self, did_or_hostname: &str) -> NSResult<IdentityDirMatch> {
         let exact_raw_host_uri = self.raw_host_uri(did_or_hostname)?;
         let exact = self.dir_match(IdentityMatchType::Exact, exact_raw_host_uri.clone())?;
         if exact.public_dir.exists() || exact.security_dir.exists() {
@@ -547,8 +552,11 @@ impl IdentityRoots {
         Ok(keyref.access)
     }
 
-    /// 加载 exact `did.json`，校验 document id，并返回标准默认 authentication key。
-    pub fn load_default_ed25519_public_key(&self, did: &DID) -> NSResult<[u8; 32]> {
+    /// Reads the public side of one Local Identity for private-key binding validation.
+    ///
+    /// This deliberately remains private: remote DID trust must use NameClient or an S2S
+    /// public-key Provider, never `IdentityRoots`.
+    fn load_local_default_ed25519_public_key(&self, did: &DID) -> NSResult<[u8; 32]> {
         let path = self.did_document_file(did)?;
         let content = fs::read_to_string(&path).map_err(|err| {
             NSError::ReadLocalFileError(format!("read DID document {}: {err}", path.display()))
@@ -591,8 +599,11 @@ impl IdentityRoots {
 
     /// 加载 direct PKCS#8 PEM（或 direct 缺失时的 file keyref fallback），并校验
     /// 私钥导出的 Ed25519 公钥等于 exact `did.json` 的默认 authentication key。
-    pub fn load_default_ed25519_private_key(&self, did: &DID) -> NSResult<LocalEd25519IdentityKey> {
-        let expected_public = self.load_default_ed25519_public_key(did)?;
+    pub fn load_local_default_ed25519_identity(
+        &self,
+        did: &DID,
+    ) -> NSResult<LocalEd25519IdentityKey> {
+        let expected_public = self.load_local_default_ed25519_public_key(did)?;
         let access = self.resolve_private_key_access(did)?;
         let key_path = match access {
             KeyAccess::File { path, format } => {
@@ -692,7 +703,7 @@ impl IdentityRoots {
         let private_key =
             self.find_security_file(did_or_hostname, usage, IdentityMaterial::PrivateKey);
 
-        let installed = fullchain.is_ok() || cert.is_ok() || metadata.is_ok();
+        let material_present = fullchain.is_ok() || cert.is_ok() || metadata.is_ok();
         let match_type = fullchain
             .as_ref()
             .ok()
@@ -778,7 +789,7 @@ impl IdentityRoots {
             }
         }
 
-        let locally_usable = installed
+        let locally_usable = material_present
             && pem_ok
             && (private_key.is_ok() || keyref.is_ok())
             && metadata.is_ok()
@@ -790,7 +801,7 @@ impl IdentityRoots {
             && not_before_valid;
 
         Ok(IdentityStatus {
-            installed,
+            material_present,
             locally_usable,
             match_type,
             expired,
@@ -800,14 +811,6 @@ impl IdentityRoots {
             key_matches_certificate,
             did_binding_valid,
         })
-    }
-
-    pub async fn check_x509_remote_status(
-        &self,
-        did_or_hostname: &str,
-        usage: IdentityUsage,
-    ) -> NSResult<IdentityStatus> {
-        self.check_x509_local_status(did_or_hostname, usage)
     }
 
     pub fn did_web_document_url(&self, did_or_hostname: &str) -> NSResult<String> {
@@ -1640,7 +1643,9 @@ mod tests {
 
         let public_dir = roots.public_dir("example.com:3000").unwrap();
         fs::create_dir_all(&public_dir).unwrap();
-        let matched = roots.find_identity_dir("example.com:3000").unwrap();
+        let matched = roots
+            .find_identity_material_dir("example.com:3000")
+            .unwrap();
         assert_eq!(matched.match_type, IdentityMatchType::Exact);
         assert_eq!(matched.raw_host_uri, "example.com:3000");
         assert_eq!(matched.dir_name, "example.com%3A3000");
@@ -1862,7 +1867,7 @@ mod tests {
         let status = roots
             .check_x509_local_status("node1.example.com", IdentityUsage::Server)
             .unwrap();
-        assert!(status.installed);
+        assert!(status.material_present);
         assert!(status.locally_usable);
         assert_eq!(status.match_type.as_deref(), Some("exact"));
         assert!(!status.expired);
@@ -1937,7 +1942,7 @@ mod tests {
         fs::write(public_dir.join("app.json"), "{}").unwrap();
         fs::write(public_dir.join("info.json"), "{}").unwrap();
 
-        let loaded = roots.load_default_ed25519_private_key(&did).unwrap();
+        let loaded = roots.load_local_default_ed25519_identity(&did).unwrap();
         assert_eq!(loaded.did(), &did);
         assert_eq!(
             loaded.public_key(),
@@ -1984,7 +1989,7 @@ mod tests {
             KeyAccess::File { path, .. }
                 if path == security_dir.join("authentication.private.pem")
         ));
-        assert!(roots.load_default_ed25519_private_key(&did).is_ok());
+        assert!(roots.load_local_default_ed25519_identity(&did).is_ok());
     }
 
     #[test]
@@ -2025,7 +2030,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             roots
-                .load_default_ed25519_private_key(&did)
+                .load_local_default_ed25519_identity(&did)
                 .unwrap()
                 .public_key(),
             SigningKey::from_bytes(&[5u8; 32])
@@ -2052,7 +2057,7 @@ mod tests {
         )
         .unwrap();
         assert!(roots
-            .load_default_ed25519_private_key(&did)
+            .load_local_default_ed25519_identity(&did)
             .unwrap_err()
             .to_string()
             .contains("does not match requested"));
@@ -2063,7 +2068,7 @@ mod tests {
         )
         .unwrap();
         assert!(roots
-            .load_default_ed25519_private_key(&did)
+            .load_local_default_ed25519_identity(&did)
             .unwrap_err()
             .to_string()
             .contains("does not match"));
@@ -2076,7 +2081,7 @@ mod tests {
         )
         .unwrap();
         assert!(roots
-            .load_default_ed25519_public_key(&did)
+            .load_local_default_ed25519_public_key(&did)
             .unwrap_err()
             .to_string()
             .contains("Ed25519"));
@@ -2142,9 +2147,30 @@ mod tests {
         )
         .unwrap();
         assert!(roots
-            .load_default_ed25519_private_key(&did)
+            .load_local_default_ed25519_identity(&did)
             .unwrap_err()
             .to_string()
             .contains("KeyAgreementNotSupported"));
+    }
+
+    #[test]
+    fn public_only_material_is_not_a_usable_local_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = roots(&tmp);
+        let did = DID::new("web", "peer-only.example.com");
+        let public_dir = roots.public_dir(&did.to_string()).unwrap();
+        fs::create_dir_all(&public_dir).unwrap();
+        fs::write(
+            public_dir.join("did.json"),
+            serde_json::to_vec_pretty(&test_did_document(&did, [8u8; 32])).unwrap(),
+        )
+        .unwrap();
+
+        assert!(roots.find_identity_material_dir(&did.to_string()).is_ok());
+        assert!(roots
+            .load_local_default_ed25519_identity(&did)
+            .unwrap_err()
+            .to_string()
+            .contains("authentication private key"));
     }
 }

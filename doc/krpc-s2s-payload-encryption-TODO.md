@@ -55,14 +55,25 @@ $BUCKYOS_SECURITY_ROOT/{encode(D)}/authentication.private.pem
 
 ### 2.3 远端身份
 
-远端公钥统一调用：
+远端公钥的加载顺序固定为：
 
-```rust
-NameClient::resolve_default_ed25519_key(did, source).await
-```
+1. 产品实现的 `S2sPublicKeyProvider`：按完整 target DID 查询产品已经加载的
+   不可变 cluster_config snapshot；base 库不规定 cluster_config 结构；
+2. Provider 明确返回 `S2sProviderLookup::NotManaged` 时，才调用
+   `NameClient::resolve_default_ed25519_key(did, source)`；
+3. 结果以 provenance / revision / generation / fingerprint 进入 S2S 的
+   DID → public key 内存缓存。
 
+`Managed` 表示该产品配置是此 DID 的权威确定性来源，不再访问 NameClient。
+Provider 报错、managed-but-missing、禁用或撤销必须 fail closed。产品在原子替换
+自己的 snapshot 后调用 `S2sProviderChangeToken::mark_published(generation)`；
+base cache 只读取 generation token，不需要理解产品配置。NameClient fallback 的
 解析结果必须满足 DID document id、默认 authentication verification method 和
-Ed25519 曲线检查。业务层不能注入另一套 peer resolver 或旁路公钥。
+Ed25519 曲线检查。
+
+Provider 不是 key-id resolver：输入始终是完整 DID，输出始终是该 DID 当前唯一的
+默认 Ed25519 公钥。固定 target 的 client 在 transport 构造阶段加载一次；server
+在首次见到 caller DID 时加载一次，正常 request 热路径只访问内存缓存。
 
 ## 3. 密码学
 
@@ -112,7 +123,11 @@ service identity。forwarded source 默认不可信。
 ## 5. Client API
 
 ```rust
-let config = S2sClientConfig::new(local_did, remote_did);
+let config = S2sClientConfig::for_cluster(
+    local_did,
+    remote_did,
+    product_cluster_public_keys,
+);
 let client = kRPC::new_with_transport(
     endpoint,
     session_token,
@@ -120,32 +135,37 @@ let client = kRPC::new_with_transport(
 ).await?;
 ```
 
-`S2sClientConfig` 只描述本地 DID、远端 DID、运行时和安全限制。构造时不接受
-raw private key、remote public key、key ID 或自定义 resolver。
+`S2sClientConfig` 只描述本地 DID、远端 DID、运行时、安全限制和可选的确定性
+public-key Provider。构造时不接受 raw private key、单个 pinned public key、
+key ID 或自定义 key-id resolver。
 
 发送流程：
 
 1. 从标准路径加载本地身份。
-2. 用 `NameClient` BestAvailable 解析远端默认 Ed25519 key。
+2. 构造 transport 时按 Provider → NameClient 顺序加载并缓存 target key。
 3. 生成新 nonce、AAD 和 ciphertext。
 4. 校验响应 DID、方向、request nonce、时间与 AEAD。
 
 ## 6. Server API
 
 ```rust
-let ctx = S2sRpcServerContext::builder(local_did)
+let ctx = S2sRpcServerContext::cluster_builder(
+    local_did,
+    product_cluster_public_keys,
+)
     .security_policy(S2sServerSecurityPolicy::public_internet_default())
     .build().await?;
 ```
 
-或：
+generic / non-cluster 模式必须显式选择 NameClient-only：
 
 ```rust
-let ctx = S2sRpcServerContext::from_did(local_did).await?;
+let ctx = S2sRpcServerContext::from_did_with_name_client_fallback(local_did).await?;
 ```
 
-server 从标准路径加载本地身份，从 `NameClient` 解析请求 `From` DID。成功解密后
-把认证身份放入 request context；响应使用该请求解密时捕获的本地密钥快照。
+server 从标准路径加载本地身份，按 Provider → NameClient 顺序加载请求 `From`
+DID 并缓存。成功解密后把认证身份放入 request context；响应使用该请求解密时
+捕获的本地密钥快照。
 
 ## 7. rotation 与 retry
 
@@ -163,12 +183,15 @@ reload 流程是：
 
 ### 7.2 远端 rotation
 
-首次使用 BestAvailable 结果。若认证解密失败：
+每次新协议操作先比较内存 generation token；generation 变化时 singleflight
+重载该 DID，旧 snapshot 不再用于新请求。若认证解密失败：
 
-1. 仅允许一次 `RemoteAuthority` 强制刷新；
-2. 若 fingerprint 改变，清理旧派生缓存；
-3. client 以全新 nonce 重新 seal；server 用新 key 再尝试 decrypt；
-4. 第二次失败后返回认证错误，不继续重试，不降级明文。
+1. Provider-backed snapshot 在 generation 未变化时不重新查询；
+2. NameClient-backed snapshot 按 DID singleflight，并受 authority refresh
+   cooldown 限制；
+3. 只有 fingerprint 确实改变才清理旧派生缓存并允许一次 retry；
+4. client 以全新 nonce 重新 seal；server 用新 key 再尝试 decrypt；
+5. 相同 fingerprint 或第二次失败立即返回认证错误，不继续重试，不降级明文。
 
 ## 8. replay、限制与错误
 
@@ -192,6 +215,13 @@ replay key 至少包含 direction、双方 DID、request nonce 与时间 bucket�
 当前测试覆盖：
 
 - 标准两文件 roundtrip，完全不依赖 keyref；
+- cluster_config Provider 优先于 NameClient，且正常 request 不重复查询 Provider；
+- Provider-only runtime 不要求初始化 NameClient；
+- Provider Managed / NotManaged / Err 三态和 invalid managed 配置 fail closed；
+- 独立 client/server IdentityRoots，恶意 peer `did.json` 不影响 remote trust；
+- 并发 cold load 按 DID singleflight；
+- generation rotation、撤销、Managed/NotManaged 切换使既有 handle 失效；
+- Provider generation gate 与 NameClient cooldown 限制恶意密文解析次数；
 - `did:web` / `did:bns` 同路径；
 - fragment、畸形 DID、错误目标拒绝；
 - body、path、API、nonce、response binding 篡改拒绝；

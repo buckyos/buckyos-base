@@ -21,9 +21,10 @@ use name_client::{
 };
 use name_lib::{DidDocType, EncodedDocument, NSError, NSResult, DID};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 const CLIENT_SEED: [u8; 32] = [3u8; 32];
 const SERVER_SEED: [u8; 32] = [9u8; 32];
@@ -104,18 +105,27 @@ fn memory_name_client() -> Arc<NameClient> {
 }
 
 struct TestFixture {
-    roots: IdentityRoots,
+    client_roots: IdentityRoots,
+    server_roots: IdentityRoots,
     client: Arc<NameClient>,
-    runtime: S2sRuntime,
 }
 
 impl TestFixture {
     fn new(identities: &[(DID, [u8; 32])]) -> Self {
+        assert_eq!(identities.len(), 2, "fixture requires client and server");
         let base = tempfile::tempdir().unwrap().keep();
-        let roots = IdentityRoots::new(base.join("identity"), base.join("security"));
+        let client_roots =
+            IdentityRoots::new(base.join("client-identity"), base.join("client-security"));
+        let server_roots =
+            IdentityRoots::new(base.join("server-identity"), base.join("server-security"));
         let client = memory_name_client();
-        for (did, seed) in identities {
-            write_identity(&roots, did, *seed);
+        for (index, (did, seed)) in identities.iter().enumerate() {
+            let roots = if index == 0 {
+                &client_roots
+            } else {
+                &server_roots
+            };
+            write_identity(roots, did, *seed);
             client.set_local_authority_override(
                 did.clone(),
                 DidDocType::Zone,
@@ -124,11 +134,10 @@ impl TestFixture {
                 None,
             );
         }
-        let runtime = S2sRuntime::new(roots.clone(), client.clone());
         Self {
-            roots,
+            client_roots,
+            server_roots,
             client,
-            runtime,
         }
     }
 
@@ -137,7 +146,17 @@ impl TestFixture {
     }
 
     fn replace_identity(&self, did: &DID, seed: [u8; 32]) {
-        write_identity(&self.roots, did, seed);
+        let roots = if self
+            .client_roots
+            .authentication_private_key_file(did)
+            .unwrap()
+            .is_file()
+        {
+            &self.client_roots
+        } else {
+            &self.server_roots
+        };
+        write_identity(roots, did, seed);
         self.client.set_local_authority_override(
             did.clone(),
             DidDocType::Zone,
@@ -145,6 +164,152 @@ impl TestFixture {
             "s2s-test-rotated",
             None,
         );
+    }
+
+    fn client_runtime(&self) -> S2sRuntime {
+        S2sRuntime::name_client_fallback(self.client_roots.clone(), self.client.clone())
+    }
+
+    fn server_runtime(&self) -> S2sRuntime {
+        S2sRuntime::name_client_fallback(self.server_roots.clone(), self.client.clone())
+    }
+}
+
+#[derive(Clone)]
+enum ProductPeerState {
+    Active { key: [u8; 32], revision: u64 },
+    Disabled,
+}
+
+#[derive(Clone)]
+struct ProductClusterSnapshot {
+    generation: u64,
+    peers: HashMap<DID, ProductPeerState>,
+}
+
+/// Test product's cluster_config adapter. The base library deliberately knows nothing about
+/// `ProductClusterSnapshot`; a real product maps its own immutable configuration the same way.
+struct ClusterConfigPublicKeyProvider {
+    snapshot: RwLock<Arc<ProductClusterSnapshot>>,
+    token: S2sProviderChangeToken,
+    calls: AtomicUsize,
+}
+
+impl ClusterConfigPublicKeyProvider {
+    fn new(entries: impl IntoIterator<Item = (DID, [u8; 32])>) -> Self {
+        let peers = entries
+            .into_iter()
+            .map(|(did, key)| (did, ProductPeerState::Active { key, revision: 1 }))
+            .collect();
+        Self {
+            snapshot: RwLock::new(Arc::new(ProductClusterSnapshot {
+                generation: 1,
+                peers,
+            })),
+            token: S2sProviderChangeToken::fixed(1),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn set(&self, did: DID, public_key: [u8; 32]) {
+        let current = self.snapshot.read().unwrap().clone();
+        let generation = current.generation + 1;
+        let mut peers = current.peers.clone();
+        peers.insert(
+            did,
+            ProductPeerState::Active {
+                key: public_key,
+                revision: generation,
+            },
+        );
+        self.publish(generation, peers);
+    }
+
+    fn disable(&self, did: DID) {
+        let current = self.snapshot.read().unwrap().clone();
+        let generation = current.generation + 1;
+        let mut peers = current.peers.clone();
+        peers.insert(did, ProductPeerState::Disabled);
+        self.publish(generation, peers);
+    }
+
+    fn release(&self, did: &DID) {
+        let current = self.snapshot.read().unwrap().clone();
+        let generation = current.generation + 1;
+        let mut peers = current.peers.clone();
+        peers.remove(did);
+        self.publish(generation, peers);
+    }
+
+    fn publish(&self, generation: u64, peers: HashMap<DID, ProductPeerState>) {
+        *self.snapshot.write().unwrap() = Arc::new(ProductClusterSnapshot { generation, peers });
+        self.token.mark_published(generation).unwrap();
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl S2sPublicKeyProvider for ClusterConfigPublicKeyProvider {
+    fn lookup(&self, target_did: &DID) -> S2sResult<S2sProviderLookup> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let snapshot = self.snapshot.read().unwrap().clone();
+        match snapshot.peers.get(target_did) {
+            Some(ProductPeerState::Active { key, revision }) => Ok(S2sProviderLookup::Managed {
+                key: S2sPeerPublicKey::new(*key, *revision),
+                generation: snapshot.generation,
+            }),
+            Some(ProductPeerState::Disabled) => Err(S2sError::PublicKeyProvider(
+                "product cluster_config disabled this DID".to_string(),
+            )),
+            None => Ok(S2sProviderLookup::NotManaged {
+                generation: snapshot.generation,
+            }),
+        }
+    }
+
+    fn change_token(&self) -> S2sProviderChangeToken {
+        self.token.clone()
+    }
+}
+
+enum FixedProviderResult {
+    Managed([u8; 32]),
+    NotManaged,
+    Error,
+}
+
+struct FixedProvider {
+    result: FixedProviderResult,
+    token: S2sProviderChangeToken,
+}
+
+impl FixedProvider {
+    fn new(result: FixedProviderResult) -> Self {
+        Self {
+            result,
+            token: S2sProviderChangeToken::fixed(1),
+        }
+    }
+}
+
+impl S2sPublicKeyProvider for FixedProvider {
+    fn lookup(&self, _target_did: &DID) -> S2sResult<S2sProviderLookup> {
+        match self.result {
+            FixedProviderResult::Managed(key) => Ok(S2sProviderLookup::Managed {
+                key: S2sPeerPublicKey::new(key, 1),
+                generation: 1,
+            }),
+            FixedProviderResult::NotManaged => Ok(S2sProviderLookup::NotManaged { generation: 1 }),
+            FixedProviderResult::Error => Err(S2sError::PublicKeyProvider(
+                "managed configuration is invalid".to_string(),
+            )),
+        }
+    }
+
+    fn change_token(&self) -> S2sProviderChangeToken {
+        self.token.clone()
     }
 }
 
@@ -200,7 +365,7 @@ async fn server_context_with_fixture(
     policy: S2sServerSecurityPolicy,
 ) -> S2sRpcServerContext {
     S2sRpcServerContext::builder(server_did())
-        .with_runtime(fixture.runtime.clone())
+        .with_runtime(fixture.server_runtime())
         .security_policy(policy)
         .build()
         .await
@@ -215,7 +380,7 @@ async fn server_context() -> (TestFixture, S2sRpcServerContext) {
 
 async fn client_transport_with_fixture(fixture: &TestFixture) -> S2sClientTransport {
     S2sClientTransport::new(
-        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.runtime.clone()),
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.client_runtime()),
     )
     .await
     .unwrap()
@@ -301,6 +466,444 @@ async fn standard_two_file_layout_roundtrips_without_keyref() {
 }
 
 #[tokio::test]
+async fn cluster_config_provider_is_prioritized_and_not_queried_per_request() {
+    let fixture = TestFixture::standard();
+    // NameClient 故意提供错误 key，证明 Provider 命中后不会访问该 fallback。
+    fixture.client.set_local_authority_override(
+        server_did(),
+        DidDocType::Zone,
+        EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
+        "wrong-fallback",
+        None,
+    );
+    fixture.client.set_local_authority_override(
+        client_did(),
+        DidDocType::Zone,
+        EncodedDocument::JsonLd(identity_document(&client_did(), [201u8; 32])),
+        "wrong-fallback",
+        None,
+    );
+
+    let provider = Arc::new(ClusterConfigPublicKeyProvider::new([
+        (client_did(), public_key(CLIENT_SEED)),
+        (server_did(), public_key(SERVER_SEED)),
+    ]));
+    let transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did())
+            .with_runtime(fixture.client_runtime())
+            .with_public_key_provider(provider.clone()),
+    )
+    .await
+    .unwrap();
+    // 固定 target 在构造时加载一次。
+    assert_eq!(provider.calls(), 1);
+
+    let context = S2sRpcServerContext::builder(server_did())
+        .with_runtime(fixture.server_runtime())
+        .public_key_provider(provider.clone())
+        .security_policy(default_policy())
+        .build()
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let (headers, sealed, pending) = transport
+            .seal_request("provider-cache", b"request", now(), false)
+            .await
+            .unwrap();
+        let opened = context
+            .open_request(&headers, "provider-cache", &sealed, now())
+            .await
+            .unwrap();
+        assert_eq!(opened.plaintext, b"request");
+        let (response_headers, response_body) = context
+            .seal_response(&opened, b"response", now())
+            .await
+            .unwrap();
+        assert_eq!(
+            transport
+                .open_response(&pending, &response_headers, &response_body, now())
+                .await
+                .unwrap(),
+            b"response"
+        );
+    }
+    // server 第一次见到 caller DID 时查一次；后续 request 只命中 S2S 内存缓存。
+    assert_eq!(provider.calls(), 2);
+
+    provider.set(server_did(), public_key([33u8; 32]));
+    assert!(transport.reload_remote_identity().await.unwrap());
+    assert_eq!(provider.calls(), 3);
+    assert!(!transport.reload_remote_identity().await.unwrap());
+    assert_eq!(provider.calls(), 4);
+}
+
+#[tokio::test]
+async fn provider_only_runtime_does_not_require_name_client() {
+    let fixture = TestFixture::standard();
+    let provider = Arc::new(ClusterConfigPublicKeyProvider::new([
+        (client_did(), public_key(CLIENT_SEED)),
+        (server_did(), public_key(SERVER_SEED)),
+    ]));
+    let client_runtime = S2sRuntime::provider_only(fixture.client_roots.clone(), provider.clone());
+    let server_runtime = S2sRuntime::provider_only(fixture.server_roots.clone(), provider.clone());
+    let transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(client_runtime),
+    )
+    .await
+    .unwrap();
+    let context = S2sRpcServerContext::builder(server_did())
+        .with_runtime(server_runtime)
+        .security_policy(default_policy())
+        .build()
+        .await
+        .unwrap();
+
+    let (headers, sealed, _) = transport
+        .seal_request("provider-only", b"request", now(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        context
+            .open_request(&headers, "provider-only", &sealed, now())
+            .await
+            .unwrap()
+            .plaintext,
+        b"request"
+    );
+}
+
+#[tokio::test]
+async fn provider_three_state_semantics_are_fail_closed() {
+    let fixture = TestFixture::standard();
+
+    let not_managed_runtime = S2sRuntime::provider_with_name_client_fallback(
+        fixture.client_roots.clone(),
+        Arc::new(FixedProvider::new(FixedProviderResult::NotManaged)),
+        fixture.client.clone(),
+    );
+    let fallback_transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(not_managed_runtime),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fallback_transport
+            .remote_identity_snapshot()
+            .await
+            .unwrap()
+            .provenance,
+        RemoteKeyProvenance::NameClient
+    );
+    assert_eq!(
+        fallback_transport
+            .remote_identity_metrics()
+            .name_client_fallbacks,
+        1
+    );
+
+    for provider in [
+        Arc::new(FixedProvider::new(FixedProviderResult::Error)),
+        Arc::new(FixedProvider::new(FixedProviderResult::Managed([0u8; 32]))),
+    ] {
+        let runtime = S2sRuntime::provider_with_name_client_fallback(
+            fixture.client_roots.clone(),
+            provider,
+            fixture.client.clone(),
+        );
+        let metrics_runtime = runtime.clone();
+        let error = S2sClientTransport::new(
+            S2sClientConfig::new(client_did(), server_did()).with_runtime(runtime),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error,
+            S2sError::PublicKeyProvider(_) | S2sError::InvalidKey(_)
+        ));
+        assert_eq!(
+            metrics_runtime
+                .remote_identity_metrics()
+                .name_client_fallbacks,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_ignores_malicious_peer_document_in_local_identity_root() {
+    let fixture = TestFixture::standard();
+    let peer_public_dir = fixture
+        .client_roots
+        .public_dir(&server_did().to_string())
+        .unwrap();
+    std::fs::create_dir_all(&peer_public_dir).unwrap();
+    std::fs::write(
+        peer_public_dir.join("did.json"),
+        serde_json::to_vec_pretty(&identity_document(&server_did(), [200u8; 32])).unwrap(),
+    )
+    .unwrap();
+    assert!(!fixture
+        .client_roots
+        .authentication_private_key_file(&server_did())
+        .unwrap()
+        .exists());
+    assert!(!fixture
+        .server_roots
+        .authentication_private_key_file(&client_did())
+        .unwrap()
+        .exists());
+
+    let provider = Arc::new(ClusterConfigPublicKeyProvider::new([
+        (client_did(), public_key(CLIENT_SEED)),
+        (server_did(), public_key(SERVER_SEED)),
+    ]));
+    let transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(S2sRuntime::provider_only(
+            fixture.client_roots.clone(),
+            provider.clone(),
+        )),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        transport
+            .remote_identity_snapshot()
+            .await
+            .unwrap()
+            .ed25519_public,
+        public_key(SERVER_SEED)
+    );
+}
+
+#[tokio::test]
+async fn provider_generation_rotates_and_revokes_existing_transports() {
+    let fixture = TestFixture::standard();
+    let provider = Arc::new(ClusterConfigPublicKeyProvider::new([
+        (client_did(), public_key(CLIENT_SEED)),
+        (server_did(), public_key(SERVER_SEED)),
+    ]));
+    let transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(S2sRuntime::provider_only(
+            fixture.client_roots.clone(),
+            provider.clone(),
+        )),
+    )
+    .await
+    .unwrap();
+    let context = S2sRpcServerContext::builder(server_did())
+        .with_runtime(S2sRuntime::provider_only(
+            fixture.server_roots.clone(),
+            provider.clone(),
+        ))
+        .security_policy(default_policy())
+        .build()
+        .await
+        .unwrap();
+
+    let (old_headers, _, old_pending) = transport
+        .seal_request("rotated-provider", b"request", now(), false)
+        .await
+        .unwrap();
+    let rotated_seed = [33u8; 32];
+    fixture.replace_identity(&server_did(), rotated_seed);
+    assert!(context.reload_local_identity().unwrap());
+    provider.set(server_did(), public_key(rotated_seed));
+
+    let provider_calls_before_retry = provider.calls();
+    let (headers, sealed, _) = transport
+        .seal_request_after_remote_key_failure(
+            "rotated-provider",
+            b"request",
+            now(),
+            old_pending.remote_fingerprint(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(headers.nonce, old_headers.nonce);
+    assert_eq!(
+        provider.calls(),
+        provider_calls_before_retry + 1,
+        "a generation already published before retry must satisfy refresh without a second lookup"
+    );
+    assert_eq!(
+        context
+            .open_request(&headers, "rotated-provider", &sealed, now())
+            .await
+            .unwrap()
+            .plaintext,
+        b"request"
+    );
+    assert_eq!(
+        transport.remote_identity_snapshot().await.unwrap().revision,
+        Some(2)
+    );
+
+    // Omitting a previously managed DID creates a fail-closed tombstone, not fallback.
+    provider.disable(server_did());
+    assert!(matches!(
+        transport
+            .seal_request("revoked-provider", b"request", now(), false)
+            .await,
+        Err(S2sError::PublicKeyProvider(_))
+    ));
+}
+
+#[tokio::test]
+async fn provider_management_domain_changes_replace_fallback_cache_entries() {
+    let fixture = TestFixture::standard();
+    let provider = Arc::new(ClusterConfigPublicKeyProvider::new(std::iter::empty::<(
+        DID,
+        [u8; 32],
+    )>()));
+    let transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(
+            S2sRuntime::provider_with_name_client_fallback(
+                fixture.client_roots.clone(),
+                provider.clone(),
+                fixture.client.clone(),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        transport
+            .remote_identity_snapshot()
+            .await
+            .unwrap()
+            .provenance,
+        RemoteKeyProvenance::NameClient
+    );
+
+    provider.set(server_did(), public_key(SERVER_SEED));
+    assert_eq!(
+        transport
+            .remote_identity_snapshot()
+            .await
+            .unwrap()
+            .provenance,
+        RemoteKeyProvenance::ClusterConfig
+    );
+
+    provider.release(&server_did());
+    assert_eq!(
+        transport
+            .remote_identity_snapshot()
+            .await
+            .unwrap()
+            .provenance,
+        RemoteKeyProvenance::NameClient
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_cold_requests_use_one_provider_lookup_per_did() {
+    let fixture = TestFixture::standard();
+    let provider = Arc::new(ClusterConfigPublicKeyProvider::new([
+        (client_did(), public_key(CLIENT_SEED)),
+        (server_did(), public_key(SERVER_SEED)),
+    ]));
+    let transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(S2sRuntime::provider_only(
+            fixture.client_roots.clone(),
+            provider.clone(),
+        )),
+    )
+    .await
+    .unwrap();
+    let context = Arc::new(
+        S2sRpcServerContext::builder(server_did())
+            .with_runtime(S2sRuntime::provider_only(
+                fixture.server_roots.clone(),
+                provider.clone(),
+            ))
+            .security_policy(default_policy())
+            .build()
+            .await
+            .unwrap(),
+    );
+
+    let mut requests = Vec::new();
+    for _ in 0..24 {
+        let (headers, body, _) = transport
+            .seal_request("cold-singleflight", b"request", now(), false)
+            .await
+            .unwrap();
+        requests.push((headers, body));
+    }
+    let mut tasks = Vec::new();
+    for (headers, body) in requests {
+        let context = context.clone();
+        tasks.push(tokio::spawn(async move {
+            context
+                .open_request(&headers, "cold-singleflight", &body, now())
+                .await
+        }));
+    }
+    for task in tasks {
+        assert_eq!(task.await.unwrap().unwrap().plaintext, b"request");
+    }
+    // One lookup for the client's fixed target, one singleflight lookup for the server's caller.
+    assert_eq!(provider.calls(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_ciphertext_does_not_requery_unchanged_provider_generation() {
+    let fixture = TestFixture::standard();
+    let provider = Arc::new(ClusterConfigPublicKeyProvider::new([
+        (client_did(), public_key(CLIENT_SEED)),
+        (server_did(), public_key(SERVER_SEED)),
+    ]));
+    let transport = S2sClientTransport::new(
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(S2sRuntime::provider_only(
+            fixture.client_roots.clone(),
+            provider.clone(),
+        )),
+    )
+    .await
+    .unwrap();
+    let context = Arc::new(
+        S2sRpcServerContext::builder(server_did())
+            .with_runtime(S2sRuntime::provider_only(
+                fixture.server_roots.clone(),
+                provider.clone(),
+            ))
+            .security_policy(default_policy())
+            .build()
+            .await
+            .unwrap(),
+    );
+    let (headers, mut body, _) = transport
+        .seal_request("invalid-ciphertext", b"request", now(), false)
+        .await
+        .unwrap();
+    *body.last_mut().unwrap() ^= 1;
+
+    let mut tasks = Vec::new();
+    for _ in 0..24 {
+        let context = context.clone();
+        let headers = headers.clone();
+        let body = body.clone();
+        tasks.push(tokio::spawn(async move {
+            context
+                .open_request(&headers, "invalid-ciphertext", &body, now())
+                .await
+        }));
+    }
+    for task in tasks {
+        assert!(matches!(task.await.unwrap(), Err(S2sError::DecryptFailed)));
+    }
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(
+        context.remote_identity_metrics().refresh_attempts,
+        0,
+        "unchanged Provider generation must not enter authority refresh"
+    );
+}
+
+#[tokio::test]
 async fn did_web_and_did_bns_use_the_same_runtime_path() {
     let web_a = DID::new("web", "a.example.com");
     let web_b = DID::new("web", "b.example.com");
@@ -311,7 +914,7 @@ async fn did_web_and_did_bns_use_the_same_runtime_path() {
             TestFixture::new(&[(local.clone(), CLIENT_SEED), (remote.clone(), SERVER_SEED)]);
         let client = S2sClientTransport::new(
             S2sClientConfig::new(local.clone(), remote.clone())
-                .with_runtime(fixture.runtime.clone()),
+                .with_runtime(fixture.client_runtime()),
         )
         .await
         .unwrap();
@@ -320,7 +923,7 @@ async fn did_web_and_did_bns_use_the_same_runtime_path() {
             .build()
             .unwrap();
         let server = S2sRpcServerContext::builder(remote)
-            .with_runtime(fixture.runtime)
+            .with_runtime(fixture.server_runtime())
             .security_policy(policy)
             .build()
             .await
@@ -416,7 +1019,6 @@ async fn tampered_body_and_cross_api_reflection_are_rejected() {
 async fn wrong_target_and_replay_are_rejected() {
     let (fixture, context) = server_context().await;
     let other = DID::new("web", "other-service.example.com");
-    write_identity(&fixture.roots, &other, [7u8; 32]);
     fixture.client.set_local_authority_override(
         other.clone(),
         DidDocType::Zone,
@@ -425,7 +1027,7 @@ async fn wrong_target_and_replay_are_rejected() {
         None,
     );
     let wrong_transport = S2sClientTransport::new(
-        S2sClientConfig::new(client_did(), other).with_runtime(fixture.runtime.clone()),
+        S2sClientConfig::new(client_did(), other).with_runtime(fixture.client_runtime()),
     )
     .await
     .unwrap();
@@ -720,7 +1322,7 @@ async fn end_to_end_krpc_call_and_probe_are_did_only() {
     let fixture = TestFixture::standard();
     let (addr, handler, task) = spawn_s2s_server(&fixture).await;
     let config =
-        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.runtime.clone());
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.client_runtime());
     let client = kRPC::new_with_transport(
         &format!("http://{addr}/s2s/event-report-v1"),
         Some("session-token".to_string()),
@@ -780,6 +1382,83 @@ impl NsProvider for RotatingAuthority {
     }
 }
 
+struct CountingStableAuthority {
+    did: DID,
+    document: EncodedDocument,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl NsProvider for CountingStableAuthority {
+    fn get_id(&self) -> String {
+        "counting-stable-s2s-authority".to_string()
+    }
+
+    async fn query(
+        &self,
+        _name: &str,
+        _record_type: Option<RecordType>,
+        _from_ip: Option<IpAddr>,
+    ) -> NSResult<NameInfo> {
+        Err(NSError::NotFound("not a DNS provider".to_string()))
+    }
+
+    async fn query_did(
+        &self,
+        did: &DID,
+        _doc_type: Option<DidDocType>,
+        _from_ip: Option<IpAddr>,
+    ) -> NSResult<EncodedDocument> {
+        if did != &self.did {
+            return Err(NSError::NotFound(did.to_string()));
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.document.clone())
+    }
+}
+
+#[tokio::test]
+async fn invalid_ciphertext_name_client_refresh_is_cooldown_bounded() {
+    let server_fixture = TestFixture::standard();
+    server_fixture
+        .client
+        .clear_local_authority_override(&client_did(), DidDocType::Zone);
+    let authority_calls = Arc::new(AtomicUsize::new(0));
+    server_fixture
+        .client
+        .set_method_authority(
+            "web",
+            Box::new(CountingStableAuthority {
+                did: client_did(),
+                document: EncodedDocument::JsonLd(identity_document(&client_did(), CLIENT_SEED)),
+                calls: authority_calls.clone(),
+            }),
+        )
+        .await;
+    let context = server_context_with_fixture(&server_fixture, default_policy()).await;
+
+    let client_fixture = TestFixture::standard();
+    let transport = client_transport_with_fixture(&client_fixture).await;
+    let (headers, mut body, _) = transport
+        .seal_request("authority-cooldown", b"request", now(), false)
+        .await
+        .unwrap();
+    *body.last_mut().unwrap() ^= 1;
+    for _ in 0..16 {
+        assert!(matches!(
+            context
+                .open_request(&headers, "authority-cooldown", &body, now())
+                .await,
+            Err(S2sError::DecryptFailed)
+        ));
+    }
+    assert!(
+        authority_calls.load(Ordering::SeqCst) <= 2,
+        "cold load plus one authority refresh is the upper bound"
+    );
+    assert_eq!(context.remote_identity_metrics().refresh_attempts, 1);
+}
+
 #[tokio::test]
 async fn stale_remote_cache_gets_one_authority_refresh_with_fresh_nonce() {
     let server_fixture = TestFixture::standard();
@@ -807,7 +1486,7 @@ async fn stale_remote_cache_gets_one_authority_refresh_with_fresh_nonce() {
         None,
         KrpcTransportSecurity::S2sPayloadV1(
             S2sClientConfig::new(client_did(), server_did())
-                .with_runtime(client_fixture.runtime.clone()),
+                .with_runtime(client_fixture.client_runtime()),
         ),
     )
     .await
@@ -881,7 +1560,7 @@ async fn invalid_remote_document_fails_closed_without_plaintext_fallback() {
         None,
         KrpcTransportSecurity::S2sPayloadV1(
             S2sClientConfig::new(client_did(), server_did())
-                .with_runtime(client_fixture.runtime.clone()),
+                .with_runtime(client_fixture.client_runtime()),
         ),
     )
     .await
@@ -902,7 +1581,7 @@ async fn transport_constructor_validations_remain_strict() {
     );
     let fixture = TestFixture::standard();
     let config =
-        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.runtime.clone());
+        S2sClientConfig::new(client_did(), server_did()).with_runtime(fixture.client_runtime());
     assert!(kRPC::new_with_transport(
         "http://127.0.0.1:1/krpc",
         None,

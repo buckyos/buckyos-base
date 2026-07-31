@@ -340,13 +340,27 @@ impl kRPC {
             .map_err(|err| RPCErrors::ParseRequestError(format!("{}", err)))?;
 
         let mut last_err: Option<RPCErrors> = None;
-        for attempt in 0..2 {
-            let refresh = attempt > 0;
+        let mut failed_remote_fingerprint = None;
+        for _ in 0..2 {
             let now = buckyos_kit::buckyos_get_unix_timestamp();
-            let (headers, sealed, pending) = transport
-                .seal_request(canonical_api, &request_json, now, refresh)
-                .await
-                .map_err(map_s2s_error)?;
+            let (headers, sealed, pending) = match failed_remote_fingerprint {
+                Some(fingerprint) => {
+                    transport
+                        .seal_request_after_remote_key_failure(
+                            canonical_api,
+                            &request_json,
+                            now,
+                            fingerprint,
+                        )
+                        .await
+                }
+                None => {
+                    transport
+                        .seal_request(canonical_api, &request_json, now, false)
+                        .await
+                }
+            }
+            .map_err(map_s2s_error)?;
 
             let mut header_map = http::HeaderMap::new();
             headers
@@ -380,6 +394,7 @@ impl kRPC {
                     "s2s transport rejected: {}",
                     status
                 )));
+                failed_remote_fingerprint = Some(pending.remote_fingerprint());
                 continue;
             }
 
@@ -430,6 +445,7 @@ impl kRPC {
                     last_err = Some(RPCErrors::S2sPermanentError(
                         "response decrypt failed".to_string(),
                     ));
+                    failed_remote_fingerprint = Some(pending.remote_fingerprint());
                     continue;
                 }
                 Err(err) => return Err(map_s2s_error(err)),

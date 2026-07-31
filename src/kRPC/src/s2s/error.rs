@@ -46,6 +46,12 @@ pub enum S2sError {
     /// 找不到指定 key(本地或对端)。
     #[error("key not found: {0}")]
     KeyNotFound(String),
+    /// 产品 Provider 管理状态错误、禁用、损坏或暂时不可用。
+    #[error("s2s public-key provider failed: {0}")]
+    PublicKeyProvider(String),
+    /// 有界 refresh 没有得到不同的可信 fingerprint，因此不应重发密文。
+    #[error("remote key did not change after bounded refresh")]
+    RemoteKeyUnchanged,
     /// 无效 Ed25519 公钥或 non-contributory(all-zero)DH 输出。
     #[error("invalid or non-contributory key: {0}")]
     InvalidKey(String),
@@ -92,6 +98,8 @@ impl S2sError {
             S2sError::KeyAgreementNotSupported(_) => "key_agreement_not_supported",
             S2sError::PrivateKeyNotUsableForS2s(_) => "private_key_not_usable",
             S2sError::KeyNotFound(_) => "key_not_found",
+            S2sError::PublicKeyProvider(_) => "public_key_provider",
+            S2sError::RemoteKeyUnchanged => "remote_key_unchanged",
             S2sError::InvalidKey(_) => "invalid_key",
             S2sError::PolicyViolation(_) => "policy_violation",
             S2sError::InvalidConfig(_) => "invalid_config",

@@ -3,6 +3,8 @@
 > 文件状态：Draft v0.2  
 > 目标读者：BuckyOS / OOD runtime、身份系统、证书自动化、服务运行环境、Rust SDK 开发者  
 > 核心结论：本组件首先是一套**本地身份材料路径协议**。初始化后它只关心两个根目录：公开身份文件存放处和 `security` 存放区。两个根目录内部都按 `DID::to_raw_host_uri()` 得到 host URI，再把整个 host URI 编码成合法单级目录名，目录下按 usage 平铺文件。
+>
+> **范围说明：本组件管理的全部都是当前运行环境持有的 Local Identity。** public identity root 中的 DID document、公钥和证书，是本地身份在“别人问我是谁”时用于对外回复或证明自己的公开材料；security root 中保存与该身份对应的私钥或本机获授权调用的私钥能力。两者分目录是为了建立不同的文件权限边界，并不表示这里同时维护一个任意 DID 的公共信息目录。一个身份进入本管理器时必须具有对应的私钥能力，不存在只保存公钥或 DID document、却没有私钥能力的受管身份。仅根据 DID 查询他人的 DID document、公钥或 verification method 属于 DID resolver / name service 的职责，不在本文范围内。
 
 ---
 
@@ -406,14 +408,14 @@ did:bns:waterflier
 | `server.cert.pem` | server leaf certificate |
 | `server.chain.pem` | server intermediate chain，不包含 leaf |
 | `server.fullchain.pem` | server leaf + intermediate chain，供 nginx / haproxy 等使用 |
-| `server.ca.pem` | server peer CA bundle 或 trust anchor；可选 |
+| `server.ca.pem` | 本地 server 证书对应的 issuer / validation chain；可选，不是 peer trust store |
 | `server.public.pem` | server public key；可选 |
 | `server.csr.pem` | 最近一次 server CSR；可选 |
 | `server.meta.json` | server certificate metadata |
 | `client.cert.pem` | client leaf certificate |
 | `client.chain.pem` | client intermediate chain |
 | `client.fullchain.pem` | client leaf + intermediate chain |
-| `client.ca.pem` | client trust anchor 或 peer CA bundle |
+| `client.ca.pem` | 本地 client 证书对应的 issuer / validation chain；可选，不是 peer trust store |
 | `client.meta.json` | client certificate metadata |
 | `authentication.verification-method.json` | DID authentication verification method 副本 |
 | `authentication.public.jwk` | authentication public key；可选 |
@@ -982,7 +984,7 @@ Status helper 用于自动化工具链，不在传统工具热路径中强制调
 
 ```rust
 pub struct IdentityStatus {
-    pub installed: bool,
+    pub material_present: bool,
     pub locally_usable: bool,
     pub match_type: Option<String>,
     pub expired: bool,
@@ -995,10 +997,13 @@ pub struct IdentityStatus {
 
 impl IdentityRoots {
     pub fn check_x509_local_status(&self, did_or_hostname: &str, usage: IdentityUsage) -> Result<IdentityStatus>;
-    pub async fn check_x509_remote_status(&self, did_or_hostname: &str, usage: IdentityUsage) -> Result<IdentityStatus>;
     pub fn parse_x509_metadata(&self, did_or_hostname: &str, usage: IdentityUsage) -> Result<X509Metadata>;
 }
 ```
+
+`material_present` 只表示本地 public certificate / metadata 已存在；只有
+`locally_usable` 同时验证了匹配的 private capability，才能表示当前环境可使用该
+Local Identity。只有 public directory 或 `did.json` 不能称为已安装身份。
 
 本地检查包括：
 
@@ -1011,14 +1016,10 @@ PEM 是否可解析
 metadata 是否与证书内容一致
 ```
 
-远程检查可以包括：
-
-```text
-OCSP / CRL
-DID document 解析
-DID document 与证书 fingerprint / SPKI 绑定检查
-上游集群 CA 状态
-```
+OCSP / CRL、远端 DID resolution、peer trust store，以及检查“本地身份在远端发布面
+是否已生效”都属于独立的 resolver / publication automation。它们可以读取本地
+metadata 作为期望值，但不得通过 `IdentityRoots` 查询任意 peer，也不得把 peer CA
+bundle 写入 Local Identity root。
 
 ---
 

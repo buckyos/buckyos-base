@@ -88,8 +88,8 @@ Ed25519-to-X25519 流程需要 key-agreement 能力；只有 sign 能力的 sign
 | `src/name-client/src/identity_s2s.rs` | 为 S2S 单独加载 mandatory keyref、校验 fingerprint、维护 active/grace provider | 删除整个 S2S 专用 adapter；复用标准 DID document、默认密钥和 IdentityRoots 路径 |
 | `src/kRPC/src/s2s/identity.rs` | `S2sLocalIdentityConfig` 同时接收 appid、zone DID 和 key source，并重新派生/证明身份 | kRPC 只接收已经形成的 local DID；删除第二套 identity config |
 | `src/kRPC/src/s2s/identity.rs` | `VerifyAgainst`、`CallerAsserted`、`UnsafeSkip` 允许多条身份绑定路径 | 只保留标准校验：本地私钥必须匹配本地 `did.json` 默认公钥 |
-| `src/kRPC/src/s2s/peer.rs` | `S2sPeerKeyResolver`、`VerifiedPeerKey` 和 `StaticPeerKeyResolver` 构成平行的 DID key resolver | production 路径直接调用 `NameClient` 的标准 DID 默认公钥解析；测试也用标准 provider/fixture |
-| `src/kRPC/src/s2s/client.rs` | remote key 可在 `Pinned` 和自定义 `Resolver` 间选择，还可另填 `remote_key_id` | client 只接收 remote DID；统一经 NameClient 解析默认 key |
+| `src/kRPC/src/s2s/peer.rs` | `S2sPeerKeyResolver`、`VerifiedPeerKey` 和 `StaticPeerKeyResolver` 构成平行的 DID key resolver | production 路径使用产品的 DID-only Provider；仅 NotManaged 回退 NameClient |
+| `src/kRPC/src/s2s/client.rs` | remote key 可在 `Pinned` 和自定义 `Resolver` 间选择，还可另填 `remote_key_id` | client 只接收 remote DID；统一走 Provider-first remote identity source |
 | `src/kRPC/src/s2s/server_ctx.rs` | builder 要求 appid + zone DID + local key source + peer resolver，并在请求路径遍历 key candidates | builder 只接收 local DID；标准 roots/resolution 是默认且唯一的 production 路径 |
 | `src/kRPC/src/s2s/service_key_ref.rs` | 自定义 `ServiceKeyRef { did, key_id }` 和 `DID#kid` wire grammar | From/To 直接使用 canonical DID；如需严格 wire parser，应把通用 canonical DID 校验放到 name-lib |
 | `src/kRPC/src/s2s/service_key_ref.rs` | kRPC 内再次提供 `derive_service_did(appid, zone_did)` | 删除；只在上层调用 `name_lib::zone_child_did` |
@@ -126,10 +126,10 @@ provisioning / app runtime
         +-------------------------+
         |                         |
         v                         v
-IdentityRoots                 NameClient
-local did.json + PEM          remote DID resolution
-        |                         |
-        +-----------+-------------+
+IdentityRoots        PublicKeyProvider        NameClient
+local did.json+PEM   cluster_config lookup    DID fallback
+        |                    |                    |
+        +--------------------+--------------------+
                     v
                kRPC S2S
         local DID + remote DID only
@@ -148,7 +148,9 @@ local did.json + PEM          remote DID resolution
   - 远端 DID document 解析、缓存和 authority refresh。
 - `kRPC`
   - S2S wire、key agreement、KDF、AEAD、replay 和请求生命周期；
-  - 不定义 app identity、不派生名字、不定义另一套 peer trust source。
+  - 不定义 app identity、不派生名字；
+  - 定义一个只按完整 DID 查询默认 Ed25519 公钥的确定性 Provider 接口，
+    供 cluster_config 实现；它不是 key-id resolver。
 - `buckyos-http-server`
   - 接收 service DID 并组装 HTTP/kRPC；
   - 不再接收 appid + zone DID + key provider + peer resolver 的组合。
@@ -161,8 +163,8 @@ name-lib <- name-client <- kRPC <- buckyos-http-server
 
 执行时先删除 `name-client -> kRPC` 的唯一用途
 `identity_s2s.rs`，再让 kRPC 的 S2S 默认 feature 依赖 name-client，避免循环。
-如果需要 feature gating，只允许隐藏依赖成本，不得重新引入 resolver/provider
-作为普通调用方必须理解的 production API。
+如果需要 feature gating，只允许隐藏依赖成本，不得重新引入 key-id resolver、
+pinned key 或 caller-asserted trust path。
 
 ## 5. 目标 API 形状
 
@@ -173,10 +175,15 @@ name-lib <- name-client <- kRPC <- buckyos-http-server
 let local_did = zone_child_did(&zone_did, appid)?;
 
 // S2S server 只接收自己的 DID。
-let server = S2sRpcServerContext::from_did(local_did).await?;
+let server = S2sRpcServerContext::cluster_builder(local_did, product_provider)
+    .build().await?;
 
 // S2S client 只接收通信双方的 DID。
-let client = S2sClientConfig::new(local_did, remote_did);
+let client = S2sClientConfig::for_cluster(
+    local_did,
+    remote_did,
+    product_provider,
+);
 ```
 
 允许测试和嵌入场景传入独立 `IdentityRoots` / `NameClient` instance，但应放在
@@ -189,6 +196,12 @@ let client = S2sClientConfig::new(local_did, remote_did);
 - unsafe skip；
 - S2S 专用 peer resolver；
 - active/grace candidate list。
+
+每个产品必须用自己的 cluster_config 结构实现 `S2sPublicKeyProvider`；base
+不定义产品配置 schema。Provider 只接收完整 target DID，并返回 `Managed` 或
+`NotManaged`；只有 `NotManaged` 才回退到 NameClient，`Err` fail closed。产品在
+原子发布配置后推进 generation token。固定 target 在 client transport 构造时加载
+一次；server 对 caller DID 缓存，不能在每个 request 上重复解析 DID document。
 
 NameClient 应提供一个标准方法，语义类似：
 
@@ -235,7 +248,8 @@ fn resolve_private_key_access(&self, did: &DID) -> NSResult<KeyAccess>;
   snapshot 最后一个引用释放时旧 secret 自动 zeroize。
 - server 不为“将来收到的新请求”维护全局 grace key list。
 - client 使用缓存中的 remote default key 解密/校验失败时，可以：
-  1. 用 `ResolveSourcePolicy::RemoteAuthority` 强制刷新 DID；
+  1. 先重新读取 Provider；Provider 不管理该 DID 时用
+     `ResolveSourcePolicy::RemoteAuthority` 强制刷新 DID；
   2. 使用新 nonce 只重试一次；
   3. 仍失败则返回原始类别的安全错误。
 - fingerprint 继续区分派生 key cache entry，但不出现在 From/To key reference 中。
@@ -272,6 +286,10 @@ in-flight request 生命周期，不再需要公开 `#kid`。
   转换；删除 document-shape 特判。
 - [x] normal resolve 使用 `BestAvailable`。
 - [x] 有界 refresh/retry 使用 `RemoteAuthority`，不得偷偷回落到 pinned key。
+- [x] S2S 增加 DID-only `S2sPublicKeyProvider`，cluster_config Provider 优先，
+  Provider miss 才回落 NameClient。
+- [x] 固定 client target 在 transport 构造时加载一次；server 按 caller DID
+  缓存，正常 request 不重复解析公钥。
 - [x] 将 S2S wire 所需的 canonical DID 校验下沉为 name-lib 通用 helper；
   保留 kRPC 的 header 长度限制。
 
@@ -346,6 +364,8 @@ in-flight request 生命周期，不再需要公开 `#kid`。
 - [x] malformed/non-canonical/超长 DID header 继续被拒绝。
 - [x] public S2S client/server API 不需要 appid、zone DID、raw key、key id、
   pinned key 或 resolver。
+- [x] cluster_config 风格 Provider 优先于 NameClient，且 Provider-only runtime
+  不要求初始化 NameClient。
 - [x] `appid + zone_did` 只在上层 helper 测试中出现。
 
 ### 轮换
@@ -362,7 +382,8 @@ in-flight request 生命周期，不再需要公开 `#kid`。
 以下条件全部成立才算完成：
 
 - [x] 给定 local DID，系统能从标准两文件布局自动得到并验证本地默认身份。
-- [x] 给定 remote DID，系统能通过 NameClient 自动解析默认 Ed25519 公钥。
+- [x] 给定 remote DID，系统优先通过确定性 Provider 加载默认 Ed25519 公钥，
+  Provider miss 时通过 NameClient 解析。
 - [x] S2S public API 和 wire 中不存在独立 `kid`。
 - [x] S2S public API 中不存在 appid + zone DID 的身份拼装。
 - [x] production code 中不存在 S2S 专用 peer resolver、pinned key trust path 或
