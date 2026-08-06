@@ -180,6 +180,15 @@ pub async fn resolve_ip(name: &str) -> NSResult<IpAddr> {
     client.resolve_ip(name).await
 }
 
+pub async fn resolve_ip_with_options(name: &str, options: ResolveIpOptions) -> NSResult<IpAddr> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not init yet".to_string()));
+    }
+    let client = client.unwrap();
+    client.resolve_ip_with_options(name, options).await
+}
+
 pub async fn resolve_ips(name: &str) -> NSResult<Vec<IpAddr>> {
     let client = get_name_client();
     if client.is_none() {
@@ -187,6 +196,18 @@ pub async fn resolve_ips(name: &str) -> NSResult<Vec<IpAddr>> {
     }
     let client = client.unwrap();
     client.resolve_ips(name).await
+}
+
+pub async fn resolve_ips_with_options(
+    name: &str,
+    options: ResolveIpOptions,
+) -> NSResult<Vec<IpAddr>> {
+    let client = get_name_client();
+    if client.is_none() {
+        return Err(NSError::NotFound("Name client not init yet".to_string()));
+    }
+    let client = client.unwrap();
+    client.resolve_ips_with_options(name, options).await
 }
 
 pub fn get_name_client() -> Option<&'static NameClient> {

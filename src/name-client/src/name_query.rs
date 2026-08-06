@@ -237,6 +237,28 @@ impl NameQuery {
         }
 
         let doc_type = doc_type.unwrap_or_default();
+
+        // Info 是 same-zone 私有发现文档，绝不能进入 method authority / supplement
+        // provider 管线。允许的调用由 NameClient 在本机 cache + Zone Resolver
+        // (`LocalAndZone`) 层完成；这里的硬门禁保证 WebProvider、upper resolver、
+        // BNS 或公网 method authority 即使被误注册/误调用也收到 zero request。
+        if doc_type == DidDocType::Info {
+            debug!(
+                "skip public provider routing for private info document {}#{}",
+                did.to_string(),
+                doc_type
+            );
+            return Ok(ResolveOutcome::NoAnswer {
+                authority_unknown: false,
+                authority_missing: false,
+                last_error: Some(NSError::Disabled(format!(
+                    "public provider routing is disabled for private info document {}#{}",
+                    did.to_string(),
+                    doc_type
+                ))),
+            });
+        }
+
         let methods = self.methods.read().await;
         let Some(method_providers) = methods.get(&did.method) else {
             return Err(NSError::NotFound(format!(
@@ -245,8 +267,8 @@ impl NameQuery {
             )));
         };
 
-        // 免验证的 Info 类 doc_type 按 method 契约事先声明,走独立轻量路径。
-        // 外层 NameClient 负责进程内与本机持久化 cache。
+        // 其它显式配置为免验证的 doc_type 仍走独立轻量路径。Info 已在上面的
+        // 私有信道硬门禁终止，不可能走到 method provider。
         if method_providers.no_proof_doc_types.contains(&doc_type) {
             return self
                 .resolve_unproof_info(method_providers, did, &doc_type, &policy)
@@ -2141,34 +2163,38 @@ mod tests {
     // ---- Info 免验证路径 ----
 
     #[tokio::test]
-    async fn info_doc_type_uses_unproof_path() {
+    async fn info_doc_type_never_enters_public_provider_routes() {
         let q = NameQuery::new();
         let did = DID::new("web", "device.example");
-        let info_doc = EncodedDocument::JsonLd(json!({
-            "iat": 100,
-            "exp": 200,
-            "info": true
-        }));
+        let authority_calls = Arc::new(AtomicUsize::new(0));
+        let supplement_calls = Arc::new(AtomicUsize::new(0));
 
         q.set_method_authority(
             "web",
-            Box::new(DocProvider::new("authority").with_doc(did.clone(), "info", info_doc.clone())),
+            Box::new(CountingMissProvider::new(
+                "public-authority",
+                authority_calls.clone(),
+            )),
+        )
+        .await;
+        q.add_method_supplement(
+            "web",
+            Box::new(CountingMissProvider::new(
+                "public-supplement",
+                supplement_calls.clone(),
+            )),
         )
         .await;
 
         let outcome = resolve(&q, &did, DidDocType::Info, ResolvePolicy::default())
             .await
             .unwrap();
-        let ResolveOutcome::Resolved(resolved) = outcome else {
-            panic!("expected resolved");
+        let ResolveOutcome::NoAnswer { last_error, .. } = outcome else {
+            panic!("expected provider routing to be disabled");
         };
-        assert_eq!(resolved.document, info_doc);
-        assert_eq!(
-            resolved.resolution_metadata.evidence,
-            Some(BodyEvidence::UnproofInfo)
-        );
-        assert_eq!(resolved.document_metadata.buckyos.doc_type, "info");
-        assert_eq!(resolved.document_metadata.buckyos.document_status, None);
+        assert!(matches!(last_error, Some(NSError::Disabled(_))));
+        assert_eq!(authority_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(supplement_calls.load(Ordering::SeqCst), 0);
     }
 
     // ---- 本地覆盖 ----
@@ -2254,85 +2280,6 @@ mod tests {
             )
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn current_zone_bootstrap_supplement_is_scoped_to_exact_policy_did() {
-        let q = NameQuery::new();
-        let current_zone = DID::new("web", "current.example");
-        let other_zone = DID::new("web", "other.example");
-
-        let bootstrap_current =
-            EncodedDocument::JsonLd(json!({"marker": "current-zone-bootstrap"}));
-        let bootstrap_other =
-            EncodedDocument::JsonLd(json!({"marker": "must-not-leak-to-other-zone"}));
-        let normal_current = EncodedDocument::JsonLd(json!({"marker": "normal-current"}));
-        let normal_other = EncodedDocument::JsonLd(json!({"marker": "normal-other"}));
-
-        q.add_current_zone_bootstrap_supplement(
-            "web",
-            Box::new(
-                DocProvider::new("dns-bootstrap")
-                    .with_doc(current_zone.clone(), "info", bootstrap_current.clone())
-                    .with_doc(other_zone.clone(), "info", bootstrap_other),
-            ),
-        )
-        .await;
-        q.add_method_supplement(
-            "web",
-            Box::new(
-                DocProvider::new("normal-supplement")
-                    .with_doc(current_zone.clone(), "info", normal_current.clone())
-                    .with_doc(other_zone.clone(), "info", normal_other.clone()),
-            ),
-        )
-        .await;
-
-        let current_policy = ResolvePolicy::default().with_current_zone(current_zone.clone());
-        let current = q
-            .query_did_ex(
-                &current_zone,
-                Some(DidDocType::Info),
-                current_policy.clone(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(current.document, bootstrap_current);
-        assert_eq!(
-            current.resolution_metadata.resolver_id.as_deref(),
-            Some("dns-bootstrap")
-        );
-
-        // 同一 policy 传播到其它 DID 时,bootstrap supplement 必须跳过,并继续
-        // 后面的正常 supplement。
-        let other = q
-            .query_did_ex(&other_zone, Some(DidDocType::Info), current_policy)
-            .await
-            .unwrap();
-        assert_eq!(other.document, normal_other);
-        assert_eq!(
-            other.resolution_metadata.resolver_id.as_deref(),
-            Some("normal-supplement")
-        );
-
-        // 普通 resolve 的默认 policy 没有 current-zone 上下文,即使请求 DID
-        // 恰好相同也不能访问 bootstrap supplement。
-        let current_without_bootstrap = q
-            .query_did_ex(
-                &current_zone,
-                Some(DidDocType::Info),
-                ResolvePolicy::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(current_without_bootstrap.document, normal_current);
-        assert_eq!(
-            current_without_bootstrap
-                .resolution_metadata
-                .resolver_id
-                .as_deref(),
-            Some("normal-supplement")
-        );
     }
 
     #[tokio::test]
