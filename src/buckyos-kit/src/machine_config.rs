@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 
-const DEFAULT_BNS_HOST: &str = "bns.buckyos.ai";
+const DEFAULT_BNS_HOST: &str = "web3.buckyos.ai";
 
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct BuckyOSMachineConfig {

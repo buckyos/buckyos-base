@@ -252,6 +252,38 @@ impl DID {
         })
     }
 
+    /// 将用户输入的友好名字推断为完整 DID。
+    ///
+    /// 未带 `did:` 前缀时，单段或两段名字按 BNS 处理，三段及以上名字按
+    /// Web 域名处理：
+    ///
+    /// - `app1.owner` -> `did:bns:app1.owner`
+    /// - `app1.example.com` -> `did:web:app1.example.com`
+    ///
+    /// 已经是完整 DID 的输入会被严格校验后原样返回。该 helper 只用于用户
+    /// 输入边界；协议层仍应直接使用 canonical DID。
+    pub fn from_friendly_name(input: &str) -> NSResult<Self> {
+        let value = input.trim();
+        if value.starts_with("did:") {
+            return parse_canonical_did(value);
+        }
+        if value.is_empty() {
+            return Err(NSError::InvalidDID(
+                "friendly DID name cannot be empty".to_string(),
+            ));
+        }
+
+        let labels: Vec<&str> = value.split('.').collect();
+        if labels.iter().any(|label| label.is_empty()) {
+            return Err(NSError::InvalidDID(format!(
+                "friendly DID name {value:?} contains an empty label"
+            )));
+        }
+
+        let method = if labels.len() >= 3 { "web" } else { "bns" };
+        parse_canonical_did(&format!("did:{method}:{value}"))
+    }
+
     pub fn to_string(&self) -> String {
         format!("did:{}:{}", self.method, self.id)
     }
@@ -957,6 +989,26 @@ mod tests {
         assert_eq!(did_str, "did:web:waterflier.buckyos.io");
         let host_name = did.to_host_name_by_bridge("web3.buckyos.io");
         assert_eq!(host_name, "waterflier.buckyos.io");
+    }
+
+    #[test]
+    fn test_did_from_friendly_name() {
+        assert_eq!(
+            DID::from_friendly_name("app1.owner").unwrap(),
+            DID::new("bns", "app1.owner")
+        );
+        assert_eq!(
+            DID::from_friendly_name("app1.example.com").unwrap(),
+            DID::new("web", "app1.example.com")
+        );
+        assert_eq!(
+            DID::from_friendly_name(" did:web:app1.example.com ").unwrap(),
+            DID::new("web", "app1.example.com")
+        );
+
+        assert!(DID::from_friendly_name("").is_err());
+        assert!(DID::from_friendly_name("app1..example.com").is_err());
+        assert!(DID::from_friendly_name("did:web:").is_err());
     }
 
     #[test]
