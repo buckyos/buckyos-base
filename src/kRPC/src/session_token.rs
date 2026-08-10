@@ -1,7 +1,7 @@
 use crate::{RPCErrors, Result};
 use buckyos_kit::buckyos_get_unix_timestamp;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use log::{debug, warn};
+use log::debug;
 use name_lib::decode_jwt_claim_without_verify;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::HashMap;
@@ -174,8 +174,7 @@ impl RPCSessionToken {
             })?;
 
         if header.kid.is_some() {
-            warn!("JWT kid could be none at specific key verify model");
-            //return Err(RPCErrors::InvalidToken("JWT kid is not allowed at specific key verify_model".to_string()));
+            debug!("JWT kid is ignored when verifying with an explicitly provided key");
         }
 
         let mut validation = Validation::new(header.alg);
