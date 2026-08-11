@@ -6,7 +6,7 @@ BNS使用智能合约作为底层，完整的支持了 name(did:bns:$name) -> di
 
 ### 去中心化的实现 name->did-document 的可信查询
 基于智能合约的特性
-- 通过name可以得到可信的owner（OwnerConfig,包含公钥）
+- 通过name可以得到可信的owner（OwnerDocument,包含公钥）
 - 智能合约保障了只有Owner才能更新did-document，并通过Owner公钥对DID-Document的JWT进行传播验证
 
 比现在的DNS协议可靠（防篡改）
@@ -26,7 +26,7 @@ BNS通过合约机制，允许任何人“注册”新名字，并将名字绑�
 ## 实际使用
 
 - 创建用户 （通常zonename和用户名相同）
-创建did:bns:$zonename 默认段 -> zone-document , 附加段(owner) -> owner-config
+创建did:bns:$zonename 默认段 -> zone-document , 附加段(owner) -> owner-document
 
 
 ### pkg的did
@@ -37,12 +37,11 @@ BNS通过合约机制，允许任何人“注册”新名字，并将名字绑�
 did:bns:$appname 默认段 -> app-config
 
 在系统内，可以加载的app都是需要PkgId的（在zone内repo上保持唯一即可）
-一般是构成 nightly-linux-amd64.$zonename-$appname 这样的PkgName,PkgSimpleName是$zonename-$appname
+一般是构成 nightly-linux-amd64.$username-$appname 这样的PkgName,PkgSimpleName是$username-$appname
 
 - 提交应用
 提交应用需要 “源” 提交`PkgSimpleName`,并依次提交 平台名.PkgSimpleName#版本号 => AppDoc的映射
-一般的源，会根据did:bns:$appname.$zonename 对收到的appdoc进行验证，但源也有随意收入的权利
-
+一般的源，会根据did:bns:$appname.$username 对收到的appdoc进行验证，但源也有随意收录的权利
 
 - 安装应用
 用户通常可以基于 PkgId + 源 来

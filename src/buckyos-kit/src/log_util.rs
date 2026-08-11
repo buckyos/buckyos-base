@@ -1,7 +1,6 @@
 use crate::{get_buckyos_dev_user_home, get_buckyos_log_dir, get_buckyos_root_dir, get_version};
 use flexi_logger::{
-    Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, LoggerHandle, Naming,
-    WriteMode,
+    Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, LoggerHandle, Naming, WriteMode,
 };
 use log::{LevelFilter, Record};
 use once_cell::sync::OnceCell;
@@ -212,7 +211,10 @@ fn resolve_app_name(app_name: &str) -> String {
     let candidate = if app_name.trim().is_empty() {
         std::env::current_exe()
             .ok()
-            .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().to_string()))
+            .and_then(|path| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+            })
             .unwrap_or_else(|| "app".to_string())
     } else {
         app_name.trim().to_string()

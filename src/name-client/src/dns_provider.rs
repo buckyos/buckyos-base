@@ -6,14 +6,14 @@ use std::str::FromStr;
 
 use buckyos_kit::buckyos_get_unix_timestamp;
 use hickory_resolver::config::*;
-use hickory_resolver::proto::rr::{RData, RecordType as HickoryRecordType};
 use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::rr::{RData, RecordType as HickoryRecordType};
 use hickory_resolver::proto::xfer::Protocol;
 use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
-use crate::{NameInfo, NsProvider, RecordType, DEFAULT_DID_DOC_TYPE};
+use crate::{DidDocType, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
@@ -69,6 +69,10 @@ impl NsProvider for DnsProvider {
         return "dns provider".to_string();
     }
 
+    fn methods(&self) -> Vec<String> {
+        vec!["web".to_string()]
+    }
+
     async fn query(
         &self,
         name: &str,
@@ -80,10 +84,16 @@ impl NsProvider for DnsProvider {
         match record_type.unwrap_or(RecordType::A) {
             RecordType::TXT => {
                 //TODO: 这里似乎有崩溃bug，需要排查
-                info!("dns query TXT: {}", name);
+                debug!("dns query TXT: {}", name);
                 let response = resolver.txt_lookup(name).await;
                 if response.is_err() {
                     let err = response.err().unwrap();
+                    // NoRecordsFound/NXDOMAIN 是 DNS 渠道的权威回答("没有"),
+                    // 必须与传输失败(没得到回答)区分:前者是 NotFound,
+                    // 后者才是 Failed(简化文档 2.1 节的 DR/unknown 二分)。
+                    if err.is_no_records_found() {
+                        return Err(NSError::NotFound(format!("no TXT record for {}", name)));
+                    }
                     warn!("lookup txt failed! {}", err.to_string());
                     return Err(NSError::Failed(format!("lookup txt failed! {}", err)));
                 }
@@ -100,7 +110,7 @@ impl NsProvider for DnsProvider {
                     txt_vec.push(txt);
                 }
 
-                info!("lookup txt success! {}", name);
+                debug!("lookup txt success! {}", name);
                 let ttl = response
                     .as_lookup()
                     .record_iter()
@@ -114,14 +124,13 @@ impl NsProvider for DnsProvider {
                     txt: txt_vec,
                     caa: Vec::new(),
                     ptr_records: Vec::new(),
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
                 return Ok(name_info);
             }
             RecordType::CAA => {
-                info!("dns query CAA: {}", name);
+                debug!("dns query CAA: {}", name);
                 let response = resolver.lookup(name, HickoryRecordType::CAA).await;
                 if response.is_err() {
                     let err = response.err().unwrap();
@@ -130,7 +139,11 @@ impl NsProvider for DnsProvider {
                 }
 
                 let response = response.unwrap();
-                let ttl = response.record_iter().next().map(|r| r.ttl()).unwrap_or(300);
+                let ttl = response
+                    .record_iter()
+                    .next()
+                    .map(|r| r.ttl())
+                    .unwrap_or(300);
                 let caa = response
                     .iter()
                     .filter_map(|rdata| match rdata {
@@ -145,7 +158,6 @@ impl NsProvider for DnsProvider {
                     txt: Vec::new(),
                     caa,
                     ptr_records: Vec::new(),
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
@@ -157,7 +169,7 @@ impl NsProvider for DnsProvider {
                 return Ok(name_info);
             }
             RecordType::A | RecordType::AAAA => {
-                info!("dns query ip: {}", name);
+                debug!("dns query ip: {}", name);
                 let response = resolver.lookup_ip(name).await;
                 if response.is_err() {
                     return Err(NSError::Failed(format!(
@@ -183,14 +195,13 @@ impl NsProvider for DnsProvider {
                     txt: Vec::new(),
                     caa: Vec::new(),
                     ptr_records: Vec::new(),
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
                 return Ok(name_info);
             }
             RecordType::PTR => {
-                info!("dns query PTR: {}", name);
+                debug!("dns query PTR: {}", name);
 
                 let ip = IpAddr::from_str(name).map_err(|e| {
                     NSError::InvalidParam(format!(
@@ -221,7 +232,6 @@ impl NsProvider for DnsProvider {
                     txt: Vec::new(),
                     caa: Vec::new(),
                     ptr_records,
-                    did_documents: HashMap::new(),
                     iat: buckyos_get_unix_timestamp(),
                     ttl: Some(ttl),
                 };
@@ -239,29 +249,23 @@ impl NsProvider for DnsProvider {
     async fn query_did(
         &self,
         did: &DID,
-        doc_type: Option<&str>,
+        doc_type: Option<DidDocType>,
         from_ip: Option<IpAddr>,
     ) -> NSResult<EncodedDocument> {
         info!("NsProvider query did: {} ...", did.to_host_name());
 
-        let name_info = self
-            .query(&did.to_host_name(), Some(RecordType::TXT), None)
-            .await?;
-
-        //info!("NsProvicer will parse_txt_record_to_did_document... for {}",did.to_host_name());
-
-        //识别TXT记录中的特殊记录
-        let new_name_info = name_info.parse_txt_record_to_did_document()?;
-
-        let doc_type = doc_type.unwrap_or(DEFAULT_DID_DOC_TYPE);
-        let did_document = new_name_info.get_did_document(doc_type);
-        if did_document.is_some() {
+        let doc_type = doc_type.unwrap_or_default();
+        let did_documents = self
+            .query_did_documents(did, from_ip)
+            .await?
+            .unwrap_or_default();
+        if let Some(did_document) = did_documents.get(doc_type.as_str()) {
             info!(
                 "NsProvider::query_did{}: DID Document found: {}",
                 did.to_host_name(),
                 doc_type
             );
-            return Ok(did_document.unwrap().clone());
+            return Ok(did_document.clone());
         }
         warn!(
             "NsProvider::query_did{}: DID Document not found: {}",
@@ -272,6 +276,17 @@ impl NsProvider for DnsProvider {
             "DID Document not found: {}",
             doc_type
         )));
+    }
+
+    async fn query_did_documents(
+        &self,
+        did: &DID,
+        from_ip: Option<IpAddr>,
+    ) -> NSResult<Option<HashMap<String, EncodedDocument>>> {
+        let name_info = self
+            .query(&did.to_host_name(), Some(RecordType::TXT), from_ip)
+            .await?;
+        Ok(Some(name_info.parse_txt_record_to_did_documents()?))
     }
 }
 
@@ -329,7 +344,7 @@ mod tests {
         let result = dns_provider
             .query_did(
                 &DID::from_str("did:web:test.buckyos.io").unwrap(),
-                Some("boot"),
+                Some(DidDocType::Boot),
                 None,
             )
             .await;
@@ -341,7 +356,7 @@ mod tests {
         let result = dns_provider
             .query_did(
                 &DID::from_str("did:web:test.buckyos.io").unwrap(),
-                Some("owner"),
+                Some(DidDocType::Owner),
                 None,
             )
             .await;

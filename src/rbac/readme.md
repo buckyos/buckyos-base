@@ -1,7 +1,7 @@
 # rbac (Role Based Access Control)
 本模块基于标准的RBAC模型提供了基础的权限控制组件，其核心是
 ```rust
-pub enforce(app_id,user_id,res_path,action_name) -> bool;
+pub enforce(user_id, app_id, res_path, action_name, sudo_mode) -> bool;
 ```
 用来判断当前用户是否有权限对资源进行某个动作。
 
@@ -36,19 +36,19 @@ guest(匿名用户):只能访问公开的数据
 3. 特定device上的额文件，其路径为 fs://$device_id:/xxxx
 
 
-权限控制使用5个参数
-(domain,userid,appid,action,resource)
+权限控制使用4个核心参数：
+(userid,appid,resource,action)
 
 我希望实现的效果是
 主要的p是基于role的，比如有app_service, user
 新建用户和新建app时，只是把userid和appid加入到role里去就可以使用了
 userid是必须传的，不传就是guest用户
-appid可以不传，或则传system(代表未指定app) 
+appid是必须传的，不再支持不传或使用system代表未指定app
 通过appid和userid确认的权限是取交集的，比如user允许访问的资源，appid不允许访问，那么就是不允许
 一个典型的例子：有一个目录
 dfs://home/:userid/:appid/imgages
-此时(buckyos,alice,system,read,dfs://home/alice/app1/images)是允许的
-而(buckyos,alice,app2,read,dfs://home/alice/app1/images）是拒绝的
+此时(alice,app1,read,dfs://home/alice/app1/images)是允许的
+而(alice,app2,read,dfs://home/alice/app1/images）是拒绝的
 
 根据上面定义，其权限配置如下：
 ``` model.conf
@@ -106,4 +106,3 @@ g, app, app_service, zone_id
 
 
 ```
-

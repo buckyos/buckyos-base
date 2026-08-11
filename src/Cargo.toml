@@ -8,11 +8,12 @@ members = [
     "./buckyos-tracing",
     "./debug-lib",
     "./kRPC",
+    "./buckyos-http-server",
     "./rbac",
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 
 [workspace.dependencies]
 # Async runtime and utilities
@@ -20,6 +21,7 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 async-recursion = "1.1"
 futures = "0.3"
+futures-util = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -49,8 +51,14 @@ curve25519-dalek = "4.1"
 ed25519_to_curve25519 = "0.2"
 #openssl = { version = "0.10", features = ["vendored"] }
 sha2 = "0.10"
+sha3 = "0.10"
 hmac = "0.12"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+ipnet = "2"
 hex = "0.4"
+bitcoin = { version = "0.31.1", features = ["rand-std", "serde"] }
 
 # Encoding
 base64 = "0.22"
@@ -67,9 +75,18 @@ mini-moka = "0.10"
 # JSON utilities
 json_value_merge = "2.0"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # HTTP clients and servers
 reqwest = { version = "0.12", default-features = false, features = ["json","rustls-tls-native-roots"] }
+http = "1.4"
+hyper = { version = "1.8", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+httpdate = "1.0"
+mime_guess = "2.0"
+percent-encoding = "2.3"
+tokio-util = { version = "0.7", features = ["full"] }
 
 # DNS
 hickory-resolver = { version = "0.25", features = ["tls-ring", "webpki-roots"] }
@@ -83,7 +100,7 @@ backtrace = "0.3"
 casbin = { version = "2.9", features = ["logging","explain"] }
 nvml-wrapper = "0.11"
 bip39 = "2.0"
-cfg-if = "1.0"
+sfo-result = "0.2"
 
 # Internal workspace dependencies
 buckyos-kit = { path = "./buckyos-kit" }
@@ -91,6 +108,7 @@ buckyos-tracing = { path = "./buckyos-tracing" }
 name-lib = { path = "./name-lib" }
 name-client = { path = "./name-client" }
 kRPC = { path = "./kRPC" }
+buckyos-http-server = { path = "./buckyos-http-server" }
 rbac = { path = "./rbac" }
 debug-lib = { path = "./debug-lib" }
 

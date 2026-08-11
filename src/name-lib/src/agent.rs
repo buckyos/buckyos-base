@@ -8,8 +8,9 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, default_context,
-    DIDDocumentTrait, EncodedDocument, NSError, NSResult, ServiceNode, VerificationMethodNode, DID,
+    decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, default_agent_context,
+    ensure_jwt_iat_derivable, DIDContext, DIDDocumentTrait, DidDocType, EncodedDocument, NSError,
+    NSResult, ServiceNode, VerificationMethodNode, DID,
 };
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -36,8 +37,8 @@ pub struct AgentHttpServicePorts {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct AgentDocument {
-    #[serde(rename = "@context", default = "default_context")]
-    pub context: String,
+    #[serde(rename = "@context", default = "default_agent_context")]
+    pub context: DIDContext,
     pub id: DID,
     #[serde(rename = "verificationMethod")]
     verification_method: Vec<VerificationMethodNode>,
@@ -45,15 +46,26 @@ pub struct AgentDocument {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     assertion_method: Vec<String>,
+    #[serde(rename = "capabilityInvocation")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    capability_invocation: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     service: Vec<ServiceNode>,
     pub exp: u64,
     pub iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub version_seq: Option<u64>,
     #[serde(flatten)]
     pub extra_info: HashMap<String, serde_json::Value>,
 
     //--------------------------------
+    #[serde(rename = "keyScope", alias = "buckyos:scopes")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub key_scope: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub support_public_access: bool,
     #[serde(default)]
@@ -80,15 +92,18 @@ impl AgentDocument {
         }];
 
         Self {
-            context: default_context(),
+            context: default_agent_context(),
             id,
             verification_method,
             authentication: vec!["#main_key".to_string()],
             assertion_method: vec!["#main_key".to_string()],
+            capability_invocation: vec!["#main_key".to_string()],
             service: vec![],
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 10,
             iat: buckyos_get_unix_timestamp(),
+            version_seq: Some(0),
             extra_info: HashMap::new(),
+            key_scope: HashMap::new(),
             support_public_access: false,
             contact: AgentContactInfo::default(),
             owner,
@@ -150,6 +165,14 @@ impl DIDDocumentTrait for AgentDocument {
         self.id.clone()
     }
 
+    fn get_owner_did(&self) -> Option<DID> {
+        Some(self.owner.clone())
+    }
+
+    fn get_doc_type(&self) -> DidDocType {
+        DidDocType::custom("agent")
+    }
+
     fn get_auth_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
         if self.verification_method.is_empty() {
             return None;
@@ -185,8 +208,22 @@ impl DIDDocumentTrait for AgentDocument {
         None
     }
 
-    fn get_exchange_key(&self, kid: Option<&str>) -> Option<(DecodingKey, Jwk)> {
-        self.get_auth_key(kid)
+    fn get_key_ids_by_scope(&self, scope: &str) -> Option<&[String]> {
+        self.key_scope.get(scope).map(Vec::as_slice)
+    }
+
+    fn has_key_scope(&self) -> bool {
+        !self.key_scope.is_empty()
+    }
+
+    fn get_standard_scope_key_ids(&self) -> Option<&[String]> {
+        if !self.capability_invocation.is_empty() {
+            Some(self.capability_invocation.as_slice())
+        } else if !self.authentication.is_empty() {
+            Some(self.authentication.as_slice())
+        } else {
+            None
+        }
     }
 
     fn get_iss(&self) -> Option<String> {
@@ -201,10 +238,15 @@ impl DIDDocumentTrait for AgentDocument {
         Some(self.iat)
     }
 
+    fn get_version_seq(&self) -> Option<u64> {
+        self.version_seq
+    }
+
     fn encode(&self, key: Option<&EncodingKey>) -> NSResult<EncodedDocument> {
         if key.is_none() {
             return Err(NSError::Failed("No key provided".to_string()));
         }
+        ensure_jwt_iat_derivable("AgentDocument", Some(self.iat), Some(self.exp))?;
         let key = key.unwrap();
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = None;
@@ -229,6 +271,7 @@ impl DIDDocumentTrait for AgentDocument {
                     serde_json::from_value(json_result).map_err(|error| {
                         NSError::Failed(format!("Failed to decode agent doc:{}", error))
                     })?;
+                ensure_jwt_iat_derivable("AgentDocument", Some(result.iat), Some(result.exp))?;
                 Ok(result)
             }
             EncodedDocument::JsonLd(json_value) => {

@@ -33,6 +33,9 @@ buckyos-kit = { workspace = true }
 bip39 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+sha3 = { workspace = true }
+bitcoin = { workspace = true }
+hex = { workspace = true }
 
 [features]
 config_tests = []

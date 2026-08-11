@@ -4,15 +4,22 @@
 mod agent;
 mod device;
 mod did;
+mod did_object_card;
+pub mod key_scope;
+mod object_profile;
 mod user;
+mod user_profile;
 mod utility;
 mod zone;
 
 pub use agent::*;
 pub use device::*;
 pub use did::*;
+pub use did_object_card::*;
+pub use object_profile::*;
 use serde::{Deserialize, Serialize};
-pub use user::OwnerConfig;
+pub use user::{OwnerDocument, OwnerWallet};
+pub use user_profile::*;
 pub use utility::*;
 pub use zone::*;
 
@@ -24,27 +31,27 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 
-pub static CURRENT_DEVICE_CONFIG: OnceCell<DeviceConfig> = OnceCell::new();
+pub static CURRENT_DEVICE_DOCUMENT: OnceCell<DeviceDocument> = OnceCell::new();
 pub const DEFAULT_EXPIRE_TIME: u64 = 3600 * 24 * 365 * 5;
 
-pub fn try_load_current_device_config_from_env() -> NSResult<()> {
+pub fn try_load_current_device_document_from_env() -> NSResult<()> {
     let device_doc = env::var("BUCKYOS_THIS_DEVICE");
     if device_doc.is_err() {
         return Err(NSError::NotFound("BUCKY_DEVICE_DOC not set".to_string()));
     }
     let device_doc = device_doc.unwrap();
 
-    let device_config = serde_json::from_str(device_doc.as_str());
-    if device_config.is_err() {
+    let device_document = serde_json::from_str(device_doc.as_str());
+    if device_document.is_err() {
         warn!("parse device_doc format error");
         return Err(NSError::Failed("device_doc format error".to_string()));
     }
-    let device_config: DeviceConfig = device_config.unwrap();
-    let set_result = CURRENT_DEVICE_CONFIG.set(device_config);
+    let device_document: DeviceDocument = device_document.unwrap();
+    let set_result = CURRENT_DEVICE_DOCUMENT.set(device_document);
     if set_result.is_err() {
-        warn!("Failed to set CURRENT_DEVICE_CONFIG");
+        warn!("Failed to set CURRENT_DEVICE_DOCUMENT");
         return Err(NSError::Failed(
-            "Failed to set CURRENT_DEVICE_CONFIG".to_string(),
+            "Failed to set CURRENT_DEVICE_DOCUMENT".to_string(),
         ));
     }
     Ok(())
@@ -54,7 +61,7 @@ pub fn try_load_current_device_config_from_env() -> NSResult<()> {
 #[derive(Deserialize, Debug, Serialize)]
 pub struct NodeIdentityConfig {
     pub zone_did: DID,                            // $name.buckyos.org or did:ens:$name
-    pub owner_public_key: jsonwebtoken::jwk::Jwk, //owner is zone_owner, must same as zone_config.default_auth_key
+    pub owner_public_key: jsonwebtoken::jwk::Jwk, //owner is zone_owner, must same as zone_document.default_auth_key
     pub owner_did: DID,                           //owner's did
     pub device_doc_jwt: String,                   //device document,jwt string,siged by owner
     pub device_mini_doc_jwt: String,              //device mini document,jwt string,siged by owner

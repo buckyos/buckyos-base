@@ -12,13 +12,13 @@
 
 ## 几个关键的provider与协议
 
-解析器0. 基于智能合约(BNS)的协议，协议上。是一个运行在current zone的http 解析器
-解析器1. 基于dns协议的did-doc解析器（目前主力)
+解析器0. 基于智能合约(BNS)的协议，实现上。是一个运行在current zone的http 解析器(内部会根据区块链状态构造可信索引)
+解析器1. 基于dns协议的did-doc解析器（目前主力)-> 只能解析ZoneDocument
 解析器2. 基于http的did-doc解析器，与0的协议基本相同，但更适合查询did:bns:$objname.$zonename 这种zone内的二级对象
 - "https://{provider}/1.0/identifiers/{did?type=doc_type}", 
 这种URL适合在有明确的provider的情况下查询任意did
-- "https://{hostname}/.well-known/did.json","https://{hostname}/.well-known/doc-type.json","https://{hostname}/{did_inner_path}/did.json"
-这种URL适合在没有provider的情况下，根据来自did的hostname,查询Zone内的did
+- "https://{hostname}/.well-known/did.json","https://{hostname}/.well-known/{doc_type}[.json|.jwt]","https://{hostname}/{did_inner_path}/{doc_type}[.json|.jwt]"
+这种URL适合在没有provider的情况下，根据来自did的hostname,查询Zone内的did；其中did.json是W3C did:web兼容入口(JSON/JSON-LD)，BuckyOS扩展的{doc_type}可以无后缀自动识别JSON/JWT，也可以用.json/.jwt强类型后缀
 解析器3. 基于udp广播的did-doc解析器，通过udp在局域网（或地址范围）广播查询请求，期待任意设备响应并返回
 
 给定一个did,解析器2如何在provider为NULL时解析出did-doc? 
@@ -84,8 +84,8 @@
 
 ## 如何在bns合约中支持did:web:xxx 的解析？不能支持解析，但可以支持对owner的深度解析
 - did:web:test.buckyos.io的owner如何指定？
-  - 在DNS Record中，添加OWNER的意义：可以通过BNS合约得到完整的OwnerConfig,有更丰富的信息，并且在OwnerConfig与PKX冲突的情况下，提示攻击风险
-- 标准的智能合约是能拥有did:web:xxx的，必须是其拥有者修改DNS Record来建立到BNS OwnerConfig的关系
+  - 在DNS Record中，添加OWNER的意义：可以通过BNS合约得到完整的OwnerDocument,有更丰富的信息，并且在OwnerDocument与PKX冲突的情况下，提示攻击风险
+- 标准的智能合约是能拥有did:web:xxx的，必须是其拥有者修改DNS Record来建立到BNS OwnerDocument的关系
 
 ## did-doc缓存设计：
 
@@ -106,47 +106,47 @@
 因为历史原因，BuckyOS内置关键类型的DIDDocument，一般称作XXXConfig
 并不是所有的did都可以与host之间完美互转。只有“顶层对象”才可以实现，非顶层对象did可以转换成一个url(buckyos目前只在内部使用该url,不鼓励发布该URL)
 
-### OwnerConfig 
+### OwnerDocument 
 - 无ip (不能与一个Owner建立连接)
 - did:bns:$name, did:bns:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc.$name, did:web:$hostname(不推荐)
   - doc_type = "owner"，由于`did:bns:$name` 默认doc_type是zone,所以这里几乎是一直要填写的
-- did:bns:$name:users:root，did:web:$hostname:users:root 也能拿到Zone的OwnerConfig，此时不需要doc-type
-- OwnerConfig(由公钥构造时可以无签名)
+- did:bns:$name:users:root，did:web:$hostname:users:root 也能拿到Zone的OwnerDocument，此时不需要doc-type
+- OwnerDocument(由公钥构造时可以无签名)
 
 ```json
 
 ```
 
-### ZoneBootConfig
+### ZoneBootDocument
 - 无ip
 - did:bns:$name,did:web:$hostname
   - doc_type = "boot"
-- ZoneBootConfig，有Owner的签名
+- ZoneBootDocument，有Owner的签名
 因为要保存到TXT Record中，所以json设计非常紧凑。
-正常逻辑不使用ZoneBootConfig,而是基于ZoneBootConfig构造ZoneConfig后使用
+正常逻辑不使用ZoneBootDocument,而是基于ZoneBootDocument构造ZoneDocument后使用
 ```json
 ```
 
 
-### ZoneConfig
+### ZoneDocument
 - 有ip,有exchange_key
 - did:bns:$name,did:web:$hostname
   - doc_type = "zone" (也是默认doc-type,一般无需填写)
-- ZoneConfig（由ZoneBootConfig构造时可以无签名)
+- ZoneDocument（由ZoneBootDocument构造时可以无签名)
 
 ```json
 ```
 
-### DeviceMiniConfig
+### DeviceMiniDocument
 - did 无 （在常规逻辑中无法看到MiniConfig，也不应该去查询）
   - doc_type = 无，
 - 有Owner的签名
 因为要保存到TXT Record种，所以json设计非常紧凑
-正常逻辑不使用DeviceMiniConfig,而是基于DeviceMiniConfig构造的DeviceConfig后使用
+正常逻辑不使用DeviceMiniDocument,而是基于DeviceMiniDocument构造的DeviceDocument后使用
 ```json
 ```
 
-### DeviceConfig
+### DeviceDocument
 - 有ip,有exchange_key
 - did:bns:$name,did:web:$hostname
   - doc_type = $devcie_friendly_name，(比如ood1,ood2)
@@ -154,15 +154,15 @@
   - doc_type = 无，使用二级did的时候，名字是精确的所以也可以不指定
   - 没必要支持did:dev:$pubkey:$hostname?
 - 注意device-did的确定，可能会深刻的影响rtcp stack中的session管理
-- 由MiniConfig构造时无签名，但大多数时候，都是使用有签名的DeviceConfig.
+- 由MiniConfig构造时无签名，但大多数时候，都是使用有签名的DeviceDocument.
 
-注意当DeviceConfig中包含address的时候，说明该Device的netid是WAN，其resolve-ip的结果与resolve-did相关
+注意当DeviceDocument中包含address的时候，说明该Device的netid是WAN，其resolve-ip的结果与resolve-did相关
 ```json
 ```
 
 问题：
 当有两个名字指向同一个DevcieConfig时，Cache系统如何识别？
-当与Zone外设备连接时，DeviceConfig中不需要有太多的隐私信息？
+当与Zone外设备连接时，DeviceDocument中不需要有太多的隐私信息？
 
 ### DeviceInfo
 DeviceInfo是由Device自己签名构造的，包含Device实时信息的DeviceInfo，通常不参与resolve-did,但会参与resolve-ip
@@ -183,8 +183,8 @@ service-info没有直接包含ip,而是说明提供服务的具体device did,再
 - did:bns:$name:users:$username
 - UserConfig（应有所在zone的owner签名)
 UserConfig通过Zone的技术设施，创建的只属于某个Zone的用户（传统的互联网账号都属于这一类）
-当这个用户在BNS上有注册时，应该通过AlsoKnownAs说明其Global的身份，并使用从BNS查询得到的OwnerConfig来代替UserConfig
+当这个用户在BNS上有注册时，应该通过AlsoKnownAs说明其Global的身份，并使用从BNS查询得到的OwnerDocument来代替UserConfig
 
 ```json
 ```
-- UserConfig + OwnerConfig的联合登录流程实例
+- UserConfig + OwnerDocument的联合登录流程实例
