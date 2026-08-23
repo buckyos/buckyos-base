@@ -320,10 +320,11 @@ impl DID {
             break;
         }
 
-        if host_name.ends_with(".did") {
-            let parts: Vec<&str> = host_name.split('.').collect();
-            if parts.len() == 3 {
-                return Some(DID::new(parts[1].to_string().as_str(), parts[0]));
+        if let Some(without_suffix) = host_name.strip_suffix(".did") {
+            if let Some((id, method)) = without_suffix.rsplit_once('.') {
+                if !id.is_empty() && !method.is_empty() {
+                    return Some(DID::new(method, id));
+                }
             }
         }
 
@@ -392,10 +393,11 @@ impl DID {
     }
 
     fn from_host_name(host_name: &str) -> Option<Self> {
-        if host_name.ends_with(".did") {
-            let parts: Vec<&str> = host_name.split('.').collect();
-            if parts.len() == 3 {
-                return Some(DID::new(parts[1].to_string().as_str(), parts[0]));
+        if let Some(without_suffix) = host_name.strip_suffix(".did") {
+            if let Some((id, method)) = without_suffix.rsplit_once('.') {
+                if !id.is_empty() && !method.is_empty() {
+                    return Some(DID::new(method, id));
+                }
             }
         }
 
@@ -960,6 +962,10 @@ mod tests {
         assert_eq!(did.id, "abcdef");
         let did_str = did.to_string();
         assert_eq!(did_str, "did:dev:abcdef");
+
+        let did = DID::from_str("filebrowser.buckyos.bns.did").unwrap();
+        assert_eq!(did, DID::new("bns", "filebrowser.buckyos"));
+        assert_eq!(did.to_raw_host_name(), "filebrowser.buckyos.bns.did");
 
         let did = DID::from_str("did:bns:app1.waterflier").unwrap();
         assert_eq!(did.method, "bns");
