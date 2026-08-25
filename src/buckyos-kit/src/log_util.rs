@@ -130,7 +130,11 @@ pub fn init_logging(app_name: &str, is_service: bool) {
             },
             Cleanup::KeepLogFiles(settings.max_files),
         )
-        .write_mode(WriteMode::BufferAndFlush)
+        // LOGGER_STATE is static and is not dropped during normal process teardown.
+        // Buffered modes can therefore lose the last log records when a short-lived
+        // process returns before the periodic flush runs. Fatal startup errors must
+        // be persisted even when the process exits immediately.
+        .write_mode(WriteMode::Direct)
         .cleanup_in_background_thread(true);
 
     let handle = match logger.start() {
@@ -381,6 +385,47 @@ fn parse_human_size(raw: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IMMEDIATE_EXIT_TEST_ENV: &str = "BUCKYOS_TEST_IMMEDIATE_LOG_EXIT";
+    const IMMEDIATE_EXIT_TEST_APP: &str = "immediate-exit-log-test";
+    const IMMEDIATE_EXIT_TEST_MESSAGE: &str = "fatal startup error before immediate exit";
+
+    #[test]
+    fn test_log_is_persisted_before_immediate_process_exit() {
+        if std::env::var_os(IMMEDIATE_EXIT_TEST_ENV).is_some() {
+            init_logging(IMMEDIATE_EXIT_TEST_APP, true);
+            error!("{}", IMMEDIATE_EXIT_TEST_MESSAGE);
+            std::process::exit(0);
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("log_util::tests::test_log_is_persisted_before_immediate_process_exit")
+            .arg("--nocapture")
+            .env(IMMEDIATE_EXIT_TEST_ENV, "1")
+            .env("BUCKYOS_ROOT", temp_dir.path())
+            .env("BUCKY_LOG", "trace")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child process failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let log_dir = temp_dir.path().join("logs").join(IMMEDIATE_EXIT_TEST_APP);
+        let log_contents = fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+
+        assert!(
+            log_contents.contains(IMMEDIATE_EXIT_TEST_MESSAGE),
+            "fatal log record was not persisted before process exit; log contents: {log_contents:?}"
+        );
+    }
 
     #[test]
     fn test_resolve_app_name() {
