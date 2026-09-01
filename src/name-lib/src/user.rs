@@ -22,6 +22,16 @@ pub struct OwnerWallet {
     pub address: String,
 }
 
+pub const ZONE_BINDING_MODEL_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerZoneBindingState {
+    Legacy,
+    BoundV2,
+    UnboundV2,
+    UnsupportedVersion(u32),
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct OwnerDocument {
     #[serde(rename = "@context", default = "default_owner_context")]
@@ -68,6 +78,9 @@ pub struct OwnerDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub meta: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub zone_binding_model_version: Option<u32>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub binded_zone_list: Vec<DID>,
@@ -151,6 +164,7 @@ impl OwnerDocument {
             valid_iat: None,
             avatar: None,
             meta: None,
+            zone_binding_model_version: Some(ZONE_BINDING_MODEL_VERSION),
             wallets: HashMap::new(),
             key_scope: HashMap::new(),
             extra_info: HashMap::new(),
@@ -159,22 +173,54 @@ impl OwnerDocument {
     }
 
     pub fn set_default_zone_did(&mut self, default_zone_did: DID) {
+        self.zone_binding_model_version = Some(ZONE_BINDING_MODEL_VERSION);
         self.binded_zone_list
             .retain(|zone_did| zone_did != &default_zone_did);
-        self.binded_zone_list.insert(0, default_zone_did.clone());
+        self.binded_zone_list.insert(0, default_zone_did);
 
+        self.sync_last_doc_service();
+    }
+
+    pub fn remove_bound_zone(&mut self, zone_did: &DID) -> bool {
+        let previous_len = self.binded_zone_list.len();
+        self.binded_zone_list
+            .retain(|bound_zone_did| bound_zone_did != zone_did);
+        let removed = self.binded_zone_list.len() != previous_len;
+
+        self.zone_binding_model_version = Some(ZONE_BINDING_MODEL_VERSION);
+        self.sync_last_doc_service();
+        removed
+    }
+
+    pub fn zone_binding_state(&self, zone_did: &DID) -> OwnerZoneBindingState {
+        match self.zone_binding_model_version {
+            None => OwnerZoneBindingState::Legacy,
+            Some(ZONE_BINDING_MODEL_VERSION) => {
+                if self.is_bound_to_zone(zone_did) {
+                    OwnerZoneBindingState::BoundV2
+                } else {
+                    OwnerZoneBindingState::UnboundV2
+                }
+            }
+            Some(version) => OwnerZoneBindingState::UnsupportedVersion(version),
+        }
+    }
+
+    fn sync_last_doc_service(&mut self) {
         let last_doc_service_id = format!("{}#lastDoc", self.id.to_string());
         self.service
             .retain(|service| service.id != last_doc_service_id);
-        self.service.push(ServiceNode {
-            id: format!("{}#lastDoc", self.id.to_string()),
-            service_type: "DIDDoc".to_string(),
-            service_endpoint: format!(
-                "https://{}/resolve/{}",
-                default_zone_did.to_host_name(),
-                self.id.to_string()
-            ),
-        });
+        if let Some(default_zone_did) = self.binded_zone_list.first().cloned() {
+            self.service.push(ServiceNode {
+                id: last_doc_service_id,
+                service_type: "DIDDoc".to_string(),
+                service_endpoint: format!(
+                    "https://{}/resolve/{}",
+                    default_zone_did.to_host_name(),
+                    self.id.to_string()
+                ),
+            });
+        }
     }
 
     pub fn load_owner_document(file_path: &PathBuf) -> NSResult<OwnerDocument> {
@@ -447,6 +493,127 @@ mod tests {
 
         assert_eq!(owner_document, decoded);
         assert_eq!(encoded, token2);
+    }
+
+    #[test]
+    fn owner_document_zone_binding_v2_transitions_are_explicit_and_idempotent() {
+        let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
+            {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }
+        ))
+        .unwrap();
+        let mut owner_document = OwnerDocument::new(
+            DID::new("bns", "lzc"),
+            "lzc".to_string(),
+            "zhicong liu".to_string(),
+            public_key_jwk,
+        );
+        let zone1 = DID::new("bns", "zone1");
+        let zone2 = DID::new("web", "zone2.example.com");
+
+        assert_eq!(
+            owner_document.zone_binding_state(&zone1),
+            OwnerZoneBindingState::UnboundV2
+        );
+        let initial_json = serde_json::to_value(&owner_document).unwrap();
+        assert_eq!(
+            initial_json["zone_binding_model_version"],
+            json!(ZONE_BINDING_MODEL_VERSION)
+        );
+        assert!(initial_json.get("binded_zone_list").is_none());
+
+        owner_document.service.push(ServiceNode {
+            id: "did:bns:lzc#profile".to_string(),
+            service_type: "Profile".to_string(),
+            service_endpoint: "https://profile.example.com/lzc".to_string(),
+        });
+
+        owner_document.set_default_zone_did(zone1.clone());
+        let first_bind = owner_document.clone();
+        owner_document.set_default_zone_did(zone1.clone());
+        assert_eq!(owner_document, first_bind);
+        assert_eq!(
+            owner_document.zone_binding_state(&zone1),
+            OwnerZoneBindingState::BoundV2
+        );
+
+        owner_document.set_default_zone_did(zone2.clone());
+        assert_eq!(
+            owner_document.binded_zone_list,
+            vec![zone2.clone(), zone1.clone()]
+        );
+        assert!(owner_document.remove_bound_zone(&zone1));
+        assert_eq!(owner_document.get_default_zone_did(), Some(zone2.clone()));
+        assert!(owner_document.is_bound_to_zone(&zone2));
+
+        owner_document.set_default_zone_did(zone1.clone());
+        assert!(owner_document.remove_bound_zone(&zone1));
+        assert_eq!(owner_document.get_default_zone_did(), Some(zone2.clone()));
+        let last_doc = owner_document
+            .service
+            .iter()
+            .find(|service| service.id == "did:bns:lzc#lastDoc")
+            .unwrap();
+        assert_eq!(
+            last_doc.service_endpoint,
+            "https://zone2.example.com/resolve/did:bns:lzc"
+        );
+
+        assert!(owner_document.remove_bound_zone(&zone2));
+        assert!(owner_document.binded_zone_list.is_empty());
+        assert!(owner_document
+            .service
+            .iter()
+            .all(|service| service.id != "did:bns:lzc#lastDoc"));
+        assert!(owner_document
+            .service
+            .iter()
+            .any(|service| service.id == "did:bns:lzc#profile"));
+        assert_eq!(
+            owner_document.zone_binding_state(&zone2),
+            OwnerZoneBindingState::UnboundV2
+        );
+        assert!(!owner_document.remove_bound_zone(&zone2));
+    }
+
+    #[test]
+    fn owner_document_zone_binding_state_distinguishes_legacy_and_future_versions() {
+        let public_key_jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(json!(
+            {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8"
+            }
+        ))
+        .unwrap();
+        let owner_document = OwnerDocument::new(
+            DID::new("bns", "lzc"),
+            "lzc".to_string(),
+            "zhicong liu".to_string(),
+            public_key_jwk,
+        );
+        let zone = DID::new("bns", "lzc");
+
+        let mut legacy_json = serde_json::to_value(&owner_document).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("zone_binding_model_version");
+        let legacy: OwnerDocument = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            legacy.zone_binding_state(&zone),
+            OwnerZoneBindingState::Legacy
+        );
+
+        let mut future = owner_document;
+        future.zone_binding_model_version = Some(ZONE_BINDING_MODEL_VERSION + 1);
+        assert_eq!(
+            future.zone_binding_state(&zone),
+            OwnerZoneBindingState::UnsupportedVersion(ZONE_BINDING_MODEL_VERSION + 1)
+        );
     }
 
     #[test]
