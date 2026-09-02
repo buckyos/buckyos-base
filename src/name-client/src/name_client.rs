@@ -656,9 +656,7 @@ impl NameClient {
         let mut real_name = name.to_string();
         if name.starts_with("did") {
             if let Ok(name_did) = DID::from_str(name) {
-                if name_did.method.as_str() == "web" {
-                    real_name = name_did.id.clone();
-                }
+                real_name = name_did.to_host_name();
             }
         }
 
@@ -669,16 +667,9 @@ impl NameClient {
     pub async fn resolve(&self, name: &str, record_type: Option<RecordType>) -> NSResult<NameInfo> {
         let mut real_name = name.to_string();
         if name.starts_with("did") {
-            let name_did = DID::from_str(name);
-            if name_did.is_ok() {
-                let name_did = name_did.unwrap();
-                if name_did.method.as_str() == "web" {
-                    info!(
-                        "resolve did:web is some as resolve host: {}",
-                        name_did.id.as_str()
-                    );
-                    real_name = name_did.id.clone();
-                }
+            if let Ok(name_did) = DID::from_str(name) {
+                real_name = name_did.to_host_name();
+                info!("resolve {} as host: {}", name, real_name);
             }
         }
 
@@ -3227,7 +3218,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[tokio::test]
-    async fn resolve_did_web_normalizes_to_host_name() {
+    async fn resolve_did_normalizes_to_host_name() {
         let called_name = Arc::new(Mutex::new(None));
         let provider = NameMockProvider {
             called_name: called_name.clone(),
@@ -3245,6 +3236,14 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         let observed = called_name.lock().await.clone().unwrap();
         assert_eq!(observed, "example.com".to_string());
+
+        let bns_did = DID::from_str("did:bns:ood1.alice").unwrap();
+        let expected_bns_host = bns_did.to_host_name();
+        let result = client.resolve(&bns_did.to_string(), None).await.unwrap();
+        assert_eq!(result.name, expected_bns_host);
+
+        let observed = called_name.lock().await.clone().unwrap();
+        assert_eq!(observed, expected_bns_host);
     }
 
     // ---- add_provider 兼容注册 ----
