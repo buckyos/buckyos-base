@@ -32,7 +32,7 @@ guest(匿名用户):只能访问公开的数据
 
 我们目前有3类资源，其URL如下：
 1. 保存在SystemConfig里的配置文件，其路径为 kv://xxxx
-2. 保持在dfs上的文件，其路径为 dfs://xxxx
+2. 保存在 CYFS 文件系统上的文件，其路径为 cyfs:///xxxx
 3. 特定device上的额文件，其路径为 fs://$device_id:/xxxx
 
 
@@ -46,9 +46,9 @@ userid是必须传的，不传就是guest用户
 appid是必须传的，不再支持不传或使用system代表未指定app
 通过appid和userid确认的权限是取交集的，比如user允许访问的资源，appid不允许访问，那么就是不允许
 一个典型的例子：有一个目录
-dfs://home/:userid/:appid/imgages
-此时(alice,app1,read,dfs://home/alice/app1/images)是允许的
-而(alice,app2,read,dfs://home/alice/app1/images）是拒绝的
+cyfs:///home/:userid/:appid/imgages
+此时(alice,app1,read,cyfs:///home/alice/app1/images)是允许的
+而(alice,app2,read,cyfs:///home/alice/app1/images）是拒绝的
 
 根据上面定义，其权限配置如下：
 ``` model.conf
@@ -74,28 +74,28 @@ m = g(r.sub, p.sub, r.dom) && keyMatch2(r.obj, p.obj) && (r.act == p.act || keyM
 # 定义常见的权限集
 # ReadWrite 权限包括 read 和 write
 p, owner, kv://*, ReadWrite, zone_id
-p, owner, dfs://*, ReadWrite, zone_id
+p, owner, cyfs:///*, ReadWrite, zone_id
 p, owner, fs://$device_id:/, ReadWrite, zone_id
 
 p, kernel, kv://*, ReadWrite, zone_id
-p, kernel, dfs://*, ReadWrite, zone_id
+p, kernel, cyfs:///*, ReadWrite, zone_id
 p, kernel, fs://$device_id:/, ReadWrite, zone_id
 
 p, frame, kv://*, ReadWrite, zone_id
-p, frame, dfs://*, ReadWrite, zone_id
+p, frame, cyfs:///*, ReadWrite, zone_id
 p, frame, fs://$device_id:/, ReadWrite, zone_id
 
 p, sudo_user, kv://*, ReadWrite, zone_id
-p, sudo_user, dfs://*, ReadWrite, zone_id
+p, sudo_user, cyfs:///*, ReadWrite, zone_id
 p, sudo_user, fs://$device_id:/, ReadWrite, zone_id
 
-p, user, dfs://homes/$userid, ReadWrite, zone_id
+p, user, cyfs:///homes/$userid, ReadWrite, zone_id
 
-p, app_service, dfs://homes/$userid, ReadWrite, zone_id
+p, app_service, cyfs:///homes/$userid, ReadWrite, zone_id
 
-p, limit_user, dfs://homes/$userid, ReadOnly, zone_id
+p, limit_user, cyfs:///homes/$userid, ReadOnly, zone_id
 
-p, guest, dfs://public, ReadOnly, zone_id
+p, guest, cyfs:///public, ReadOnly, zone_id
 
 # 定义操作集
 g, alice, owner, zone_id
