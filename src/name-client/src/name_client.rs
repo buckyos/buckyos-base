@@ -1224,6 +1224,10 @@ impl NameClient {
             return;
         };
 
+        if zone.id.method == "bns" {
+            return;
+        }
+
         for (device_name, device_document) in zone.devices.iter() {
             let Some(device_did) = Self::zone_child_did(&zone.id, device_name) else {
                 continue;
@@ -1649,6 +1653,9 @@ impl NameClient {
                 }
                 // 权威源明确 Missing:旧的 positive cache 与权威答复矛盾,不兜底。
                 if authority_missing {
+                    if self.config.enable_cache {
+                        self.doc_cache.delete(did.clone(), doc_type.clone());
+                    }
                     return Err(last_error.unwrap_or_else(|| {
                         NSError::NotFound(format!(
                             "{}#{} missing in method authority",
@@ -2830,6 +2837,46 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         assert!(client.doc_cache.get(&did, None).is_none());
     }
 
+    #[test]
+    fn bns_embedded_device_cannot_replace_authoritative_negative() {
+        let client = mem_client();
+        let (_, jwk) = name_lib::generate_ed25519_key_pair();
+        let parent = DID::new("bns", "alice");
+        let mut zone = ZoneDocument::new(
+            parent.clone(),
+            parent.clone(),
+            serde_json::from_value(jwk.clone()).unwrap(),
+        );
+        let mut device = DeviceDocument::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+        device.id = DID::new("bns", "ood1.alice");
+        device.owner = parent.clone();
+        device.zone_did = Some(parent);
+        zone.devices.insert("ood1".into(), device.clone());
+        client.doc_cache.replace_with_negative(
+            &device.id,
+            None,
+            &DocumentStatus::Revoked,
+            "revoked device slot",
+        );
+        client.cache_embedded_zone_devices(
+            &DidDocType::Zone,
+            &EncodedDocument::JsonLd(serde_json::to_value(&zone).unwrap()),
+            CacheEvidence::Published,
+        );
+        assert!(client
+            .doc_cache
+            .lookup(&device.id, None)
+            .unwrap()
+            .is_negative());
+        client.doc_cache.delete(device.id.clone(), None);
+        client.cache_embedded_zone_devices(
+            &DidDocType::Zone,
+            &EncodedDocument::JsonLd(serde_json::to_value(&zone).unwrap()),
+            CacheEvidence::Published,
+        );
+        assert!(client.doc_cache.lookup(&device.id, None).is_none());
+    }
+
     #[tokio::test]
     async fn authority_missing_does_not_fallback_to_stale_positive_cache() {
         let client = mem_client();
@@ -2853,6 +2900,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         let err = client.resolve_did(&did, None).await.unwrap_err();
         assert!(matches!(err, NSError::NotFound(_)));
+        assert!(client.doc_cache.lookup(&did, None).is_none());
     }
 
     #[tokio::test]
