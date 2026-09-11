@@ -1,9 +1,10 @@
 use crate::{get_buckyos_dev_user_home, get_buckyos_log_dir, get_buckyos_root_dir, get_version};
-use flexi_logger::{
-    Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, Logger, LoggerHandle, Naming, WriteMode,
-};
+use flexi_logger::{DeferredNow, Duplicate, Logger, LoggerHandle};
+
+mod rotating_writer;
 use log::{LevelFilter, Record};
 use once_cell::sync::OnceCell;
+use rotating_writer::RotatingWriter;
 use std::{
     collections::HashMap,
     fs,
@@ -101,10 +102,23 @@ pub fn init_logging(app_name: &str, is_service: bool) {
         return;
     }
 
-    let file_spec = FileSpec::default()
-        .directory(log_dir.clone())
-        .basename(format!("{}.{}", resolved_app_name, pid))
-        .suffix("log");
+    let writer = match RotatingWriter::new(
+        log_dir.clone(),
+        format!("{}.{}", resolved_app_name, pid),
+        settings.max_file_size,
+        settings.max_files,
+    ) {
+        Ok(writer) => writer,
+        Err(err) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Failed to open log file for {}: {}",
+                resolved_app_name,
+                err
+            );
+            return;
+        }
+    };
 
     let logger = match Logger::try_with_str(settings.level.to_string()) {
         Ok(logger) => logger,
@@ -117,25 +131,12 @@ pub fn init_logging(app_name: &str, is_service: bool) {
         }
     };
 
+    // Keep synchronous writes: the static handle is not dropped on process exit.
+    // Our writer handles rotation I/O errors without poisoning flexi_logger's state.
     let logger = logger
         .format(log_format)
-        .log_to_file(file_spec)
-        .append()
-        .duplicate_to_stdout(Duplicate::All)
-        .rotate(
-            Criterion::Size(settings.max_file_size),
-            Naming::TimestampsCustomFormat {
-                current_infix: Some(""),
-                format: "r%Y%m%d_%H%M%S_%6f",
-            },
-            Cleanup::KeepLogFiles(settings.max_files),
-        )
-        // LOGGER_STATE is static and is not dropped during normal process teardown.
-        // Buffered modes can therefore lose the last log records when a short-lived
-        // process returns before the periodic flush runs. Fatal startup errors must
-        // be persisted even when the process exits immediately.
-        .write_mode(WriteMode::Direct)
-        .cleanup_in_background_thread(true);
+        .log_to_writer(Box::new(writer))
+        .duplicate_to_stdout(Duplicate::All);
 
     let handle = match logger.start() {
         Ok(handle) => handle,
@@ -184,8 +185,14 @@ pub fn init_log_panic() {
             "panic occurred".to_string()
         };
 
-        error!("[PANIC] unwrap/panic failed at {} - {}", location, message);
-        eprintln!("[PANIC] unwrap/panic failed at {} - {}", location, message);
+        // A panic can originate while a logger lock is held. Never re-enter the
+        // logger here, and do not panic again if stderr is unavailable.
+        let _ = writeln!(
+            std::io::stderr(),
+            "[PANIC] unwrap/panic failed at {} - {}",
+            location,
+            message
+        );
     }));
 }
 

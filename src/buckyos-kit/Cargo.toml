@@ -10,6 +10,7 @@ authors = ["BuckyOS DAO","@waterflier"]
 chrono = { workspace = true }
 
 [dependencies]
+chrono = { workspace = true }
 thiserror = { workspace = true }
 sysinfo = { workspace = true }
 serde = { workspace = true }
@@ -30,3 +31,6 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
