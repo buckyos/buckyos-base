@@ -155,6 +155,7 @@ Accept: application/did-resolution
       "docType": "zone",
       "documentStatus": "active",   // active | missing | revoked | tombstoned | migrated | expired
       "documentVersion": 1751500000, // = 当前发布文档的 iat（见下方语义说明）
+      "registryVersion": 3,        // 可选：BNS 登记序号，仅用于展示和历史导航
       "authoritySeq": 9,
       "effectiveOwner": "did:bns:waterflier", // 权威源的 owner 绑定，可以不带文档本体单独返回
       "docHash": "sha256:...",      // 可选：已发布 body 的内容哈希锚点（编码后文档字符串的 sha256）
@@ -176,6 +177,10 @@ Accept: application/did-resolution
 guard、强制项都不再读取）。`authoritySeq` 保留为权威源自身的变更序号（owner binding 变更等），
 与文档 revision 无关。
 
+BNS 登记序号不进入 `documentVersion`；单独放在可选的 `buckyos.registryVersion` 中，
+仅供 WebUI 展示和登记历史导航。无法通过 `document_iat` 得出 iat 时，省略 `documentVersion`
+和 `versionId`，不回落到登记序号；登记序号为 0（从未发布）时也省略 `registryVersion`。
+
 ### 时间维度字段（`checkedAt` / `validUntil`）
 
 为 Zone Resolver 等 shared cache/control plane 转述权威判断而扩展（verify 家族的
@@ -190,17 +195,18 @@ guard、强制项都不再读取）。`authoritySeq` 保留为权威源自身的
 
 ### 字段 ↔ Rust 类型对照表
 
-随 `PublishedState` 裁剪（resolve_did 简化,只保留有真实生产者/消费者的字段），客户端只消费下表
-字段；旧草案中的 `previousVersion` / `nextVersionId` / `lineageEpoch` / `ownerSource` /
+随 `PublishedState` 裁剪（resolve_did 简化,只保留有真实生产者/消费者的字段），下表列出客户端
+消费字段及 WebUI 专用扩展；旧草案中的 `previousVersion` / `nextVersionId` / `lineageEpoch` / `ownerSource` /
 `authorityRoot` / `canonicalId` / `equivalentId` **不再被消费**，服务端可以不实现（返回了也会被
 忽略，不会报错）。
 
 | JSON 字段（camelCase） | Rust 字段（`PublishedState`，见 `https_provider.rs` 的 `BuckyosMetadataWire`） | 说明 |
 | --- | --- | --- |
-| `didDocumentMetadata.versionId` | `document_version` | 字符串化的 `u64`（`documentVersion` 的后备来源） |
+| `didDocumentMetadata.versionId` | `document_version` | = `documentVersion` 的字符串形式 |
 | `didDocumentMetadata.buckyos.docType` | `doc_type` | |
 | `didDocumentMetadata.buckyos.documentStatus` | `document_status`（`DocumentStatus` 枚举） | 见第 4 节映射 |
 | `didDocumentMetadata.buckyos.documentVersion` | `document_version` | = 当前发布文档的 iat（见上节语义） |
+| `didDocumentMetadata.buckyos.registryVersion` | —（`PublishedState` 不消费） | 可选 `u64`，BNS 登记序号，仅供 WebUI 展示和历史导航；不参与文档 revision 比较 |
 | `didDocumentMetadata.buckyos.authoritySeq` | `authority_seq` | 权威源自身变更序号，与文档 revision 无关 |
 | `didDocumentMetadata.buckyos.effectiveOwner` | `effective_owner`（`DID`） | 权威源的 owner 绑定；候选文档的 `doc.owner` 必须与它一致（expected_owner 硬规则） |
 | `didDocumentMetadata.buckyos.docHash` | `document_ref.content_hash` | 已发布 body 的锚点；见第 6 节。Zone Resolver 客户端不再丢弃该字段（snapshot 的 candidate hash 绑定与 freshness 比较使用它） |
