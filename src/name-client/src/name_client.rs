@@ -3009,6 +3009,44 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     #[tokio::test]
+    async fn owner_unbind_refreshes_after_ttl_with_new_iat() {
+        let client = mem_client();
+        let did = DID::new("web", "owner.example");
+        let zone = DID::new("web", "zone.example");
+        let now = buckyos_get_unix_timestamp();
+        let key = EncodingKey::from_ed_pem(TEST_OWNER_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        let mut owner = OwnerDocument::new(
+            did.clone(), "alice".to_string(), "Alice".to_string(), test_owner_public_jwk(),
+        );
+        owner.iat = now - 2;
+        owner.set_default_zone_did(zone.clone());
+        let bound = owner.encode(Some(&key)).unwrap();
+        assert!(owner.remove_bound_zone(&zone));
+        owner.iat += 1;
+        let unbound = owner.encode(Some(&key)).unwrap();
+        client.set_method_authority("web", Box::new(MockAuthority::ok(unbound.clone()))).await;
+
+        for (expires_at, expected, status) in [
+            (now + 60, &bound, CacheStatus::Hit),
+            (now - 1, &unbound, CacheStatus::Refresh),
+        ] {
+            client.doc_cache.insert(
+                did.clone(), Some(DidDocType::Owner), bound.clone(), expires_at, CacheEvidence::Published,
+            );
+            let resolved = client.resolve_did_ex(
+                &did, Some(DidDocType::Owner), ResolvePolicy::default(),
+            ).await.unwrap();
+            assert_eq!(&resolved.document, expected);
+            assert_eq!(resolved.resolution_metadata.cache_status, Some(status));
+        }
+        let cached = client.resolve_did_ex(
+            &did, Some(DidDocType::Owner), ResolvePolicy::default(),
+        ).await.unwrap();
+        assert_eq!(cached.document, unbound);
+        assert_eq!(cached.resolution_metadata.cache_status, Some(CacheStatus::Hit));
+    }
+
+    #[tokio::test]
     async fn local_authority_override_wins_over_provider_and_skips_normal_cache() {
         let client = client_with_temp_cache(CacheBackend::Filesystem);
         let did = DID::from_str("did:web:example.com").unwrap();
