@@ -35,7 +35,7 @@
 # 是否要求 Zone helper 自己检查 no_request，且 owner 派生 opts、动态 provider 发现也原样继承访问限制？
 # 现有 provider.rs::ResolvePolicy 保留 LocalAndZone、without_zone_resolver、descend 环路保护及 current-zone 限制；
 # 这些约束在新 opts 中如何表达，尤其 Zone 服务内部调用和 owner 递归不能重新查询自己？
-# 回答:访问locker不算是request, 之前的设计太复杂了
+# 回答:访问locker不算是发起request, 之前的设计太复杂了，现在参考修改/etc/hosts和自建dns server的心智模型进行了简化
 
 
 def resolve_did_ex(did,doc_type,opts):
@@ -45,7 +45,7 @@ def resolve_did_ex(did,doc_type,opts):
     # REVIEW Q04 [P2，返回闭环] 权威文档（特别是 owner）若按来源视为验证通过，谁负责同时更新 best？
     # commit 的说明只更新 latest/closest，而这里 owner 直接返回，resolve_did 却只读 best，可能取不到 owner。
     # need_latest 未满足时允许返回仅有 best 的结果吗？建议明确“返回事实”与“目标已满足”的判断契约。
-    # 回答：owner_doc作为信任根正常情况下要么通过locker设置，要么从权威源设置
+    # 回答：owner_doc作为信任根正常情况下要么通过locker设置，要么从权威源获取（因此没有best 只会是latest）
     if opts.need_latest():
         if doc_result.latest:
             return doc_result
@@ -60,6 +60,7 @@ def resolve_did_ex(did,doc_type,opts):
     # REVIEW Q05 [P1，候选选择] 是否按 iat 降序验证，且不能低于已有 best？例如 V3 缺 owner、V2 验证通过，
     # “删除所有剩余候选”会丢掉刚保留的 V3，是否只清理已确定无效/不再需要的候选？
     # 每轮须把当前 doc 传给 _verify_document_ex；验证后的 best/候选删除也要提交，_get_document 中的保存早于验证。
+    # 回答：总要有一个地方删除condidates, 大部分情况下,best一旦选中，其它的都不会被使用了。如果best被revoke,也就是再走有一次resolve流程
     for iat,(doc,source) in doc_result.condidates
         if source.need_verify()
             verify_result = _verify_document_ex(did,doc_type,doc_result,publish_info,opts)
@@ -86,6 +87,7 @@ def _get_document(did,doc_type,opts):
     # REVIEW Q06 [P1，锁的约束] lock 是“获取时优先返回”，还是也约束 verify 收到的确切文档？
     # 例如锁 V1 后直接 verify(V2)，当前 verify 没读 body lock，仍可能接纳 V2。只锁 body 是否还读取发布负状态？
     # 请明确锁的覆盖列及解锁效果；模拟 owner 验出的子文档不能在解锁后无条件沿用为生产信任（见 Q09/Q17）。
+    # 回答: 锁的效果相当于传统的/etc/hosts配置，能确保必定返回
     if opts.allow_local_lock():
         doc_reuslt = local_locked.get_document(did,doc_type)
         if doc_result:
@@ -104,6 +106,8 @@ def _get_document(did,doc_type,opts):
     # REVIEW Q07 [P1，未知与否定] publish_info 可能因断网、no_request、method 不支持而缺失，不能直接等同禁用。
     # 能否区分 Unknown / 明确无发布记录 / Active / 禁用或撤销，并说明 DID 级禁用是否覆盖所有 doc_type？
     # 现有 name_query.rs 区分 NoAnswer 与 Negative；新设计放开“权威未知仍可验签”可以成立，但要保留这一区别。
+    # 回答：publish_info无法获取（这里是等于None）是NoAnswer，属于常态,Negative作为publish_info的内部状态了
+    
     if !publish_info.is_enable():
         doc_result.state = disable
         update_doc_result(doc_result,opts)
@@ -149,6 +153,7 @@ def get_document_by_provider(provider,did,doc_type,opts):
     # REVIEW Q08 [P2，缓存期限] cache miss、Unknown 的短期退避和明确 NotExist 的缓存是否分别处理？
     # get_publish_info 返回的过期材料、doc_result 中的 latest/best 也需保留原 checked_at/valid_until；
     # 否则 provider TTL 过期后，旧 latest 仍可能经 merge 和快速路径无限续用。文档 exp 应作为独立的硬期限。
+    # 回答：这种多来源的best select操作没必要追求强一致性，在当前的各种要素作用下best就好了。（类似DNS不会要求一个页面上同时解析多个域名的结果完全一致）
     if now() > ttl :
         local_cache.remove_resolve_result(cache_key)
         # 通过provider发起请求
@@ -168,11 +173,17 @@ def verify_document(did,doc_type,doc_body,opts):
     # REVIEW Q09 [P1，快速路径门禁] 所有成功出口之前，是否统一检查请求 DID/doc_type、文档 exp、已知禁用/撤销，
     # 以及本次 scope 下的锁/owner 约束？缓存相等只证明曾被接纳；owner 提高撤销线或解除测试锁后应失效。
     # 现有 verify_context.rs::verify_did_document 检查身份/类型/exp/负状态，name_client.rs 缓存命中也跑 owner replay guard。
+    # 回答：TODO 这里之前的考虑是只有触发过resolve_did,才会真正的改变verify_document的结果... 
+    #     这里要深度思考一下这个设计是否正确
     doc_result = get_doc_result(did,doc_type,opts)
     # == 是做json 语义比较，JSON和jwt也可以比较
     # REVIEW Q10 [P1，确切输入] 如果保留 payload 但替换 JWT 签名，JSON 语义相等会让坏签名命中 best/latest。
     # 是否改为按确切 artifact 的 hash 复用验证证据？现有 provider.rs::document_content_hash 对 JWT 原文取 hash，
     # 对 JSON 规范化序列化后取 hash；JSON/JWT 可比较业务内容，但不能因此继承彼此的签名或发布证明。
+    # 回答：现在系统优先解决自己能用最低的成本完成可信解析的问题，不强调能成为别人的源（因此会比较愿意删除condidate），
+    #       内核完成后，未来估计是通过zone-resolve来强化自己成为普通源的能力（让网络里有更多的普通源）
+
+    
     if doc_result.latest == doc_body:
         verify_result.is_latest = true
     if doc_result.best == doc_body:
@@ -195,13 +206,15 @@ def verify_document(did,doc_type,doc_body,opts):
 
 def _verify_document_ex(did,doc_type,doc_body,doc_result,publish_info,opts):
     verify_result.is_best = false # 是能看到的最新版本
-    verify_result.is_signed = false # 有有效的owner签名
+    verify_result.is_signed = false # 创建时有有效的owner签名
     verify_result.is_latest = false # 是当前发布的最新版本
     verify_result.is_published = false # 曾经发布过
     verify_result.is_revoked = false # 已经被吊销
     # REVIEW Q11 [P1，成功含义] success() 的真值规则是什么？is_published 与 is_revoked 可以同时成立，
     # is_latest 也未必满足 need_best；是否先产出 Valid / Invalid(reason) / Unknown(dependency)，再判断选择目标？
     # 历史发布不应让已撤销文档提前成功，缺 owner 也不应与坏签名一样删除候选。所有入口应使用同一规则。
+    # 回答：这个success一般是根据opts得到了best/latest/closet即可算成功 
+    
     
     if doc_result.latest == doc_body:
         verify_result.is_latest = true
@@ -214,6 +227,8 @@ def _verify_document_ex(did,doc_type,doc_body,doc_result,publish_info,opts):
     if doc_body.is_json():
         return error("验证失败:doc需要有效的签名")
 
+    expected_owner = get_expected_owner(did)  
+
     # 正常情况下无法得到publish_info是正常的，一旦存在主要是做负面判断
     if publish_info:
         expected_owner = publish_info.owner
@@ -224,6 +239,7 @@ def _verify_document_ex(did,doc_type,doc_body,doc_result,publish_info,opts):
         # REVIEW Q12 [已确认语义，P1：流程待调整] 已发布 V1、未发布 V2 验证通过时，应允许 best=V2、latest=V1。
         # 下面的 else 不能仅因 V2 未发布就报 hash 错误，应继续验证；须区分未发布、查询未知和同版本 hash 冲突。
         # 这是相对现有 name_query.rs 解析路径要求命中已知锚点的行为变化；已知禁用/撤销仍需检查。
+        # 回答 这里的语义是：通过iat查询回来了is_published（latest是最新已发布）,但是发布记录里的hash和当前doc_body不同，那就必然是错了（还挺严重)
         if publish_info.is_published(hash(doc_body)):
             verify_result.is_published = True
             if publish_info.is_latest:
@@ -244,6 +260,8 @@ def _verify_document_ex(did,doc_type,doc_body,doc_result,publish_info,opts):
     # 历史 owner 可提供当时的公钥，但其旧撤销线不能覆盖当前已知撤销：旧私钥还能签出回填旧 iat 的新 JWT。
     # 是否保留当前 owner/绑定的负面约束，再单独选择历史验签材料？历史验签成功不等于当前可用于认证。
     # 现有 NsProvider 没有历史查询参数；OwnerDocument 有历史 key，新增 closest 还需约定历史不可得时的 Unknown 行为。
+    # 回答 verify_result 把是否曾经发布，创建时的签名是否正确，当前是否有效（有没有被撤销）分开了，比如一个通过mini_iat撤销的doc(通常都未发布)是:
+    #  is_best = false,is_latest = false,is_signed = true,is_published = false,is_revoked = true
     get_owner_doc_opts = opts.create_get_owner_opts()
     if opts.allow_veirfy_iat():
         get_owner_doc_opts.set_closest_iat(doc_body.iat)
@@ -255,15 +273,16 @@ def _verify_document_ex(did,doc_type,doc_body,doc_result,publish_info,opts):
            owner_doc =  owner_doc_result.closest
         else:
            owner_doc = owner_doc_result.latest
+        
+        if !verify_jwt(doc_body,owner_doc.get_public_key):
+            return error("验证失败: 签名错误")
 
         # 执行验证
         # REVIEW Q13 续：现有 user.rs::validate_jwt_revocation 用 valid_iat，拒绝 iat <= valid_iat；
         # 此处 mini_iat 使用 <。这是字段重命名且边界改变，还是伪代码简写？应明确等于撤销线时的结果。
-        if doc_body.iat < owner_doc.mini_iat:
-            return error("验证失败: did_doc已经被吊销,签发时间早于owner要求的最小iat")
-        
-        if !verify_jwt(doc_body,owner_doc.get_public_key):
-            return error("验证失败: 签名错误")
+        # 回答 已修复
+        if doc_body.iat <= owner_doc.mini_iat:
+            verify_result.is_revoked = true
 
         verify_result.is_signed = True
         if doc_result.is_best(doc_body.iat):
@@ -303,6 +322,8 @@ def doc_result.merge(self,old_doc_result):
     # REVIEW Q14 [P1，合并规则] 这里没保留 old.best/state；本轮网络 Unknown 时，已有 best/禁用记忆是否会丢失？
     # closest 依赖目标 iat，不能把 closest(100) 直接合并给 closest(200)；是按目标分槽，还是存历史后每次选择？
     # latest 的有效期/来源、同 iat 冲突和旧负状态也需要明确合并规则，不能仅在字段为 None 时补旧值（见 Q08）。
+    # 回答：这是一个减少伪代码长度的辅助函数，通常有closest的时候，old_doc_result和self都在一个context
+    
     if self.latest == None:
         self.latest = old_doc_result.latest
     
@@ -314,15 +335,17 @@ def doc_result.merge(self,old_doc_result):
 def doc_result.commit(self,resolve_result,source_type,opts):
     # 得到resolve_result,注意解析结果有 OK | Unknonw | NotExist ，不要搞错了
     # source_type 如果是 权威源，则会更新 latest 和 closet
-    # source_type 如果是 可信源，则会更新 latest
+    # source_type 如果是 可信源，则会更新 latest(协议暂未支持) 和 best
     # REVIEW Q01 续：这里的 trust 是有正式发布授权的代理，还是只获准提供可接受文档的源？后者不应凭来源更新 latest。
-    # 否则，只是增加condidate        
+    # 否则，只是增加condidate 
+    # 回答：我更新了说明       
     pass
 
 def get_expected_owner(did):
     # REVIEW Q15 [P1，owner 推导] 这个 helper 尚未接入验证；无 publish_info 时 expected_owner 没有来源。
     # 现有 provider.rs::structural_owner 只对 did:bns 子名字取 upper_did，did:web 和 BNS 一级名不按此规则推导。
     # 是否保留 method 规则 + 可信绑定？当前分支对有上级名字返回自身，且不能用候选自报 owner 填补可信绑定缺口。
+    # 回答：伪代码写漏了，我补充了
     result_did = did.get_upper()
     if result_did == None:
         return upper_did
@@ -344,6 +367,8 @@ def _get_did_providers(did,doc_type,opts):
     # 现有 lib.rs 把 did:bns 的 WebProvider 注册为 NeedProof 补充源；升级为 trust 会扩大站点的权限。
     # 若确实委托免签，需明确 DID/doc_type 范围，并让缓存记录所依赖的 owner 绑定版本，unbind 后撤销该信任。
     # owner 本身仍须从权威/显式本地信任取得，否则为了找可信站点又解析同一个 owner，会形成循环。
+    # 回答：实际情况是,bns因为成本问题只有user/owner doc,其它的doc其实都是通过trust provider分发的。（算best不算iat,这也是为什么现在使用best成为默认策略）
+    #       设计上，trust源查询的结果不需要用签名验证，但也不算是正式发布（我在考虑如果trust上支持正式的publish info 才算发布）
 
 
 def local_cache.get_publish_info(did,doc_type,opts):
@@ -358,6 +383,10 @@ def local_cache.get_publish_info(did,doc_type,opts):
 # update 是整份覆盖还是在存储内原子合并？V2/V3 并发验证、V3 先提交时，V2 必须得到“已落后”的结果而非覆盖 V3。
 # 还需明确内存/磁盘是同一状态的两层还是两个独立空间，以及版本基线是否随 body 淘汰；这不只是多发网络请求的差别。
 # 现有 doc_cache.rs 的 merge_verdict 可参考；单个文件 rename 原子并不保证跨进程的读-比较-写原子。
+# 回答：在这里说的是语义，本地磁盘实现用sqlite会比较简单。内存里的原子性靠数据库设计保证。
+#       这里有一个重要的基础语义，name_client对实质性的resolve/verify操作应该幂等的只有一个，后续操作block住再执行可以直接复用上一次行动的结果cache
+
+
 def get_doc_result(did,doc_type,opts):
     if opts.allow_local_cache:
         return doc_result_db.get_doc_result(did,doc_type)
@@ -390,6 +419,7 @@ def on_rtcp_hello(hello):
     # best 记录看到且验证通过的版本，握手随后被拒绝不否定该事实；此前建议必须延后更新 best 的理由不成立。
     # 现有 rtcp.rs 在业务准入后提交缓存，迁移时需区分 best 的更新与连接准入；持钥证明及授权仍独立执行。
     # 当前入站验证使用 LocalAndZone，这里改为全禁网络会要求提前具备 owner 材料；缺材料应如何反馈/补齐？
+    # 回答：简化rtcp协议内核的实现是设计目的之一，缺材料通过应用逻辑补齐。
     if hello.to != self.did:
         error("我不是你的目标")
     opts = Opts::default().not_allow_request()
@@ -401,6 +431,7 @@ def on_rtcp_hello(hello):
 def get_device_info(deviceName):
     # REVIEW Q19 [P2，Info 迁移] need_proof 已说明 Info 退出 DID Document 体系，但这里仍通过 resolve_did 获取。
     # 现有 name_client.rs 有独立的 resolve_unproof_info_with_cache 路径；本例改用什么入口，还是保留兼容路由？
+    # 回答：这里的意思是，通过Zone-resolve(zone locker)可以实现zone内的device info共享
     device_did = self.zone_did.child(deviceName)
     device_info = resolve_did(device_did,"device_info")
 
@@ -415,6 +446,7 @@ def get_user_profile(user_did):
     # REVIEW Q20 [P2，资料合并] 两种 doc_type 的 iat 能直接决定字段优先级吗？较新 profile 会覆盖 owner 的 name 等字段。
     # 现有 profile_resolver.rs::merge_profile_with_owner_document 始终让 owner 身份字段覆盖 profile；这是有意改变吗？
     # 同时“30s TTL”通常表示已缓存观察的刷新窗口，并不意味着任何新发布都至少等待 30s 才能被首次查询看到。
+    # 回答：iat就能决定新旧版本了，这是一个有意的改变，30s说的是产品口径的最坏情况
 
 ## 用户调整profile:任何did_doc的调整，都需要至少30s 才能生效，可以通过一些lock接口来在一些scop强制生效
 
@@ -433,6 +465,8 @@ def preinstall():
     # REVIEW Q01/Q02 续：iat=本机编译时间 会不会比正式新版本的签发 iat 更大，从而让只按 iat 升级永远选预装版本？
     # 是否保留上游版本时间，或明确正式版本替换预装版本的规则？无签名 JSON 的信任依据应继续标为本机预装。
     # 都是无签名的json格式app doc
+    # 回答：这正是目的，通过编译构造的app原理上肯定是比已经发布的版本更大的，但用户用源码构建后，也能得到后续自动更新的推送
+    #       无签名 JSON 的信任依据继续标为本机预装 ： 现在不区分复杂的信任依据，就是3档 
     app_docs = build_preinstall_app_docs()
     for app_doc_json in app_docs:
         commit_condidate_doc(app_doc_json.did,"app",app_doc_json,"trust")
