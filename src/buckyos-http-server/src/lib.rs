@@ -245,6 +245,9 @@ pub async fn hyper_serve_http1(
     server: Arc<dyn HttpServer>,
     info: StreamInfo,
 ) -> ServerResult<()> {
+    // `with_upgrades()` lets hyper hand the raw connection over once a
+    // handler answers 101 Switching Protocols (WebSocket / CONNECT).
+    // Without it hyper writes the 101 and then drops the connection.
     hyper::server::conn::http1::Builder::new()
         .serve_connection(
             TokioIo::new(stream),
@@ -254,6 +257,7 @@ pub async fn hyper_serve_http1(
                 async move { handle_request(req, server, info, false).await }
             }),
         )
+        .with_upgrades()
         .await
         .map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
 
@@ -266,8 +270,10 @@ async fn serve_auto_http(
     info: StreamInfo,
     add_http3_alt_svc: bool,
 ) -> ServerResult<()> {
+    // See hyper_serve_http1: upgrades must be enabled so 101 responses
+    // (WebSocket) keep the connection alive for the upgraded protocol.
     hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-        .serve_connection(
+        .serve_connection_with_upgrades(
             TokioIo::new(stream),
             hyper::service::service_fn(|req| {
                 let server = server.clone();
