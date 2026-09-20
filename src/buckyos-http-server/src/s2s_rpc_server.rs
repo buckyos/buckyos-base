@@ -8,7 +8,7 @@
 //! 安全规则:
 //! - encrypted parser 失败后**不会**把同一 Body 重新解释成 plaintext;
 //! - plaintext admission 或 encrypted authentication 完成前的错误返回统一、
-//!   短小、无敏感细节的 transport failure(内部 metric 记录低基数 reason);
+//!   短小、无敏感细节的 transport failure(内部 warn 日志记录低基数 reason);
 //! - source IP 只用带 provenance 的 resolver(`conn_src_addr` 优先,
 //!   `real_src_addr` 只在 socket peer 命中 trusted proxy CIDR 时使用);
 //! - 解密失败、replay、admission 失败都不会进入 `RPCHandler`。
@@ -32,14 +32,39 @@ use hyper::body::Bytes;
 use serde_json::Value;
 
 /// 统一、无细节的未认证 transport 拒绝(§9.4)。
-fn uniform_reject(reason: &S2sError) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
-    // 内部记录低基数 reason code;不把细节返回未认证调用方
-    log::debug!("s2s transport reject: {}", reason.reason_code());
+///
+/// 内部以 `warn` 记录低基数 `reason_code`(默认 `INFO` 级别可见),便于区分
+/// allowlist/content-type/key/时间窗/replay/admission 等配置类问题与真正的
+/// 密钥/加解密错误;`canonical_api` 只在路径已成功规范化为受限字符集后附加。
+/// 日志不含密钥材料或明文 body,响应体也不返回任何细节。
+fn reject_response(
+    reason_code: &'static str,
+    canonical_api: Option<&str>,
+) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    match canonical_api {
+        Some(api) => log::warn!(
+            "s2s transport reject: reason_code={} canonical_api={}",
+            reason_code,
+            api
+        ),
+        None => log::warn!("s2s transport reject: reason_code={}", reason_code),
+    }
     text_response(StatusCode::FORBIDDEN, "Forbidden")
 }
 
-fn uniform_reject_resp() -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
-    text_response(StatusCode::FORBIDDEN, "Forbidden")
+fn uniform_reject(
+    reason: &S2sError,
+    canonical_api: Option<&str>,
+) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    reject_response(reason.reason_code(), canonical_api)
+}
+
+/// `uniform_reject` 的无 `S2sError` 变体:用于 Body 读取/解析等内部类别。
+fn uniform_reject_resp(
+    reason_code: &'static str,
+    canonical_api: Option<&str>,
+) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    reject_response(reason_code, canonical_api)
 }
 
 /// v1 S2S 入口(命名与现有 `serve_http_by_rpc_handler` 一致)。
@@ -64,7 +89,7 @@ pub async fn serve_http_by_s2s_rpc_handler<T: RPCServerHandler + Send + Sync + '
     // canonical API path
     let canonical_api = match api_name_from_path(req.uri().path()) {
         Ok(api) => api,
-        Err(e) => return uniform_reject(&e),
+        Err(e) => return uniform_reject(&e, None),
     };
 
     // source IP:fail closed;不信任普通 forwarded header
@@ -74,7 +99,7 @@ pub async fn serve_http_by_s2s_rpc_handler<T: RPCServerHandler + Send + Sync + '
         info.real_src_addr.as_deref(),
     ) {
         Ok(source) => source,
-        Err(e) => return uniform_reject(&e),
+        Err(e) => return uniform_reject(&e, Some(&canonical_api)),
     };
 
     // Content-Length 预检(读取 Body 前)
@@ -85,7 +110,10 @@ pub async fn serve_http_by_s2s_rpc_handler<T: RPCServerHandler + Send + Sync + '
         .and_then(|s| s.trim().parse::<u64>().ok())
     {
         if len > policy.limits.max_body_size as u64 {
-            return uniform_reject(&S2sError::LimitExceeded("body too large".to_string()));
+            return uniform_reject(
+                &S2sError::LimitExceeded("body too large".to_string()),
+                Some(&canonical_api),
+            );
         }
     }
 
@@ -103,10 +131,13 @@ pub async fn serve_http_by_s2s_rpc_handler<T: RPCServerHandler + Send + Sync + '
         Some(S2S_PLAINTEXT_CONTENT_TYPE) => {
             serve_plaintext(req, source, canonical_api, rpc_handler, s2s_context).await
         }
-        _ => uniform_reject(&S2sError::InvalidHeader {
-            name: "content-type".to_string(),
-            reason: "unsupported media type".to_string(),
-        }),
+        _ => uniform_reject(
+            &S2sError::InvalidHeader {
+                name: "content-type".to_string(),
+                reason: "unsupported media type".to_string(),
+            },
+            Some(&canonical_api),
+        ),
     }
 }
 
@@ -122,33 +153,40 @@ async fn serve_plaintext<T: RPCServerHandler + Send + Sync + 'static>(
 
     // 1. effective source IP 与 canonical API 必须同时命中显式 allowlist
     if !policy.admits_plaintext(&source, &canonical_api) {
-        return uniform_reject(&S2sError::PolicyViolation(
-            "plaintext not admitted".to_string(),
-        ));
+        return uniform_reject(
+            &S2sError::PolicyViolation("plaintext not admitted".to_string()),
+            Some(&canonical_api),
+        );
     }
 
     // 2. 有界读取并解析完整 RPCRequest JSON
     let body_bytes = match read_body_with_limit(req, policy.limits.max_body_size).await {
         Ok(bytes) => bytes,
-        Err(_resp) => return uniform_reject_resp(),
+        Err(_resp) => {
+            return uniform_reject_resp("body_read_failed", Some(&canonical_api));
+        }
     };
     let Ok(parsed) = serde_json::from_slice::<Value>(&body_bytes) else {
-        return uniform_reject_resp();
+        return uniform_reject_resp("json_parse_failed", Some(&canonical_api));
     };
     if json_value_depth(&parsed) > policy.limits.max_json_depth {
-        return uniform_reject(&S2sError::LimitExceeded("json too deep".to_string()));
+        return uniform_reject(
+            &S2sError::LimitExceeded("json too deep".to_string()),
+            Some(&canonical_api),
+        );
     }
     let Ok(rpc_request) = serde_json::from_value::<RPCRequest>(parsed) else {
-        return uniform_reject_resp();
+        return uniform_reject_resp("request_decode_failed", Some(&canonical_api));
     };
 
     // 4. plaintext auth policy:安全默认要求 session token 存在
     if policy.plaintext_auth() == Some(PlaintextAuthPolicy::RequireSessionToken)
         && rpc_request.token.is_none()
     {
-        return uniform_reject(&S2sError::PolicyViolation(
-            "plaintext requires session token".to_string(),
-        ));
+        return uniform_reject(
+            &S2sError::PolicyViolation("plaintext requires session token".to_string()),
+            Some(&canonical_api),
+        );
     }
 
     // 3. plaintext 不产生 authenticated service identity
@@ -187,16 +225,18 @@ async fn serve_encrypted<T: RPCServerHandler + Send + Sync + 'static>(
     // 1. 只解析有界 KRPC-S2S-* Header(不解析加密 Body 内部 JSON)
     let headers = match S2sRequestHeaders::parse(req.headers()) {
         Ok(headers) => headers,
-        Err(e) => return uniform_reject(&e),
+        Err(e) => return uniform_reject(&e, Some(&canonical_api)),
     };
 
     // 3. 有界读取 binary Body,基本长度检查
     let body_bytes = match read_body_with_limit(req, policy.limits.max_body_size).await {
         Ok(bytes) => bytes,
-        Err(_resp) => return uniform_reject_resp(),
+        Err(_resp) => {
+            return uniform_reject_resp("body_read_failed", Some(&canonical_api));
+        }
     };
     if body_bytes.len() < S2S_TAG_LEN {
-        return uniform_reject(&S2sError::DecryptFailed);
+        return uniform_reject(&S2sError::DecryptFailed, Some(&canonical_api));
     }
 
     // 4–12. key selection、AAD、AEAD、时间窗、admission、replay(kRPC 引擎)
@@ -205,26 +245,30 @@ async fn serve_encrypted<T: RPCServerHandler + Send + Sync + 'static>(
         .await
     {
         Ok(decrypted) => decrypted,
-        Err(e) => return uniform_reject(&e),
+        Err(e) => return uniform_reject(&e, Some(&canonical_api)),
     };
 
     // 13. 解析内部 RPCRequest(depth limit)
     let Ok(parsed) = serde_json::from_slice::<Value>(&decrypted.plaintext) else {
-        return uniform_reject_resp();
+        return uniform_reject_resp("json_parse_failed", Some(&canonical_api));
     };
     if json_value_depth(&parsed) > policy.limits.max_json_depth {
-        return uniform_reject(&S2sError::LimitExceeded("json too deep".to_string()));
+        return uniform_reject(
+            &S2sError::LimitExceeded("json too deep".to_string()),
+            Some(&canonical_api),
+        );
     }
     let Ok(rpc_request) = serde_json::from_value::<RPCRequest>(parsed) else {
-        return uniform_reject_resp();
+        return uniform_reject_resp("request_decode_failed", Some(&canonical_api));
     };
 
     // 14. auth binding policy(authenticated identity 已确认,策略可要求 token)
     if policy.auth_binding == AuthBindingPolicy::RequireSessionToken && rpc_request.token.is_none()
     {
-        return uniform_reject(&S2sError::PolicyViolation(
-            "session token required".to_string(),
-        ));
+        return uniform_reject(
+            &S2sError::PolicyViolation("session token required".to_string()),
+            Some(&canonical_api),
+        );
     }
 
     let server_ctx = RPCServerContext {
@@ -254,10 +298,7 @@ async fn serve_encrypted<T: RPCServerHandler + Send + Sync + 'static>(
         .await
     {
         Ok(sealed) => sealed,
-        Err(e) => {
-            log::warn!("s2s seal response failed: {}", e.reason_code());
-            return uniform_reject_resp();
-        }
+        Err(e) => return uniform_reject(&e, Some(&canonical_api)),
     };
 
     let mut header_map = http::HeaderMap::new();
