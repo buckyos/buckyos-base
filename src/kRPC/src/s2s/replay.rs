@@ -9,8 +9,9 @@
 use super::error::{S2sError, S2sResult};
 use super::S2S_NONCE_LEN;
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// replay key(§10.1 冻结字段)。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -43,8 +44,30 @@ pub trait S2sReplayStore: Send + Sync {
 /// **不能抵御跨实例重放**:多实例生产环境必须换成共享 backend,或按 sender
 /// 稳定路由到同一实例。容量满且无可清理的过期 entry 时 fail closed。
 pub struct MemoryReplayStore {
-    inner: Mutex<HashMap<ReplayKey, u64>>,
+    inner: Mutex<MemoryReplayState>,
     capacity: usize,
+}
+
+#[derive(Default)]
+struct MemoryReplayState {
+    keys: HashSet<Arc<ReplayKey>>,
+    expirations: BTreeMap<u64, Vec<Arc<ReplayKey>>>,
+    stats: MemoryReplayStoreStats,
+    pressure_reported: bool,
+    full_reported: bool,
+}
+
+/// 单实例内存 store 的累计计数与最近一次操作后的占用快照。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemoryReplayStoreStats {
+    pub capacity: usize,
+    pub entries: usize,
+    pub high_watermark: usize,
+    pub inserted: u64,
+    pub replays: u64,
+    pub capacity_rejections: u64,
+    pub expired_entries: u64,
+    pub cleanup_nanos: u64,
 }
 
 pub const S2S_DEFAULT_REPLAY_CAPACITY: usize = 100_000;
@@ -52,7 +75,7 @@ pub const S2S_DEFAULT_REPLAY_CAPACITY: usize = 100_000;
 impl MemoryReplayStore {
     pub fn new_single_instance(capacity: usize) -> Self {
         MemoryReplayStore {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(MemoryReplayState::default()),
             capacity: capacity.max(16),
         }
     }
@@ -61,35 +84,92 @@ impl MemoryReplayStore {
         Self::new_single_instance(S2S_DEFAULT_REPLAY_CAPACITY)
     }
 
-    fn sweep_expired(map: &mut HashMap<ReplayKey, u64>, now: u64) {
-        map.retain(|_, retain_until| *retain_until > now);
+    pub fn stats(&self) -> S2sResult<MemoryReplayStoreStats> {
+        let state = self.inner.lock().map_err(|_| {
+            S2sError::ReplayStoreUnavailable("poisoned lock".to_string())
+        })?;
+        Ok(MemoryReplayStoreStats {
+            capacity: self.capacity,
+            entries: state.keys.len(),
+            ..state.stats
+        })
+    }
+
+    fn sweep_expired(state: &mut MemoryReplayState, now: u64) {
+        // 只访问已经到期的桶。满容量且无到期条目时不扫描 nonce 集合。
+        if !state.expirations.first_key_value().is_some_and(|(expiry, _)| *expiry <= now) {
+            return;
+        }
+        let started = Instant::now();
+        while state.expirations.first_key_value().is_some_and(|(expiry, _)| *expiry <= now) {
+            let (_, keys) = state.expirations.pop_first().expect("expiry bucket exists");
+            for key in keys {
+                state.keys.remove(&key);
+                state.stats.expired_entries = state.stats.expired_entries.saturating_add(1);
+            }
+        }
+        state.stats.cleanup_nanos = state.stats.cleanup_nanos.saturating_add(
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
+    }
+
+    fn check_and_insert_at(&self, key: &ReplayKey, retain_until: u64, now: u64) -> S2sResult<bool> {
+        let mut state = self.inner.lock().map_err(|_| {
+            S2sError::ReplayStoreUnavailable("poisoned lock".to_string())
+        })?;
+        Self::sweep_expired(&mut state, now);
+        if state.full_reported && state.keys.len() < self.capacity {
+            log::info!(
+                "s2s replay store recovered: entries={} capacity={} rejected={} expired={} cleanup_nanos={}",
+                state.keys.len(), self.capacity, state.stats.capacity_rejections,
+                state.stats.expired_entries, state.stats.cleanup_nanos,
+            );
+            state.full_reported = false;
+        }
+        if state.keys.len() < self.capacity - self.capacity / 4 {
+            state.pressure_reported = false;
+        }
+        if state.keys.contains(key) {
+            state.stats.replays = state.stats.replays.saturating_add(1);
+            return Ok(false);
+        }
+        if state.keys.len() >= self.capacity {
+            state.stats.capacity_rejections = state.stats.capacity_rejections.saturating_add(1);
+            if !state.full_reported {
+                log::warn!(
+                    "s2s replay store full: entries={} capacity={} next_expiry={:?}; rejecting encrypted requests",
+                    state.keys.len(), self.capacity, state.expirations.first_key_value().map(|(time, _)| time),
+                );
+                state.full_reported = true;
+            }
+            return Err(S2sError::ReplayStoreUnavailable("replay store full".to_string()));
+        }
+        let key = Arc::new(key.clone());
+        state.keys.insert(key.clone());
+        state.expirations.entry(retain_until).or_default().push(key);
+        state.stats.inserted = state.stats.inserted.saturating_add(1);
+        state.stats.high_watermark = state.stats.high_watermark.max(state.keys.len());
+        if !state.pressure_reported && state.keys.len() >= self.capacity - self.capacity / 5 {
+            log::warn!(
+                "s2s replay store pressure: entries={} capacity={} high_watermark={}",
+                state.keys.len(), self.capacity, state.stats.high_watermark,
+            );
+            state.pressure_reported = true;
+        }
+        Ok(true)
     }
 }
 
 #[async_trait]
 impl S2sReplayStore for MemoryReplayStore {
     async fn check_and_insert(&self, key: &ReplayKey, retain_until: u64) -> S2sResult<bool> {
-        let now = buckyos_kit::buckyos_get_unix_timestamp();
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| S2sError::ReplayStoreUnavailable("poisoned lock".to_string()))?;
-        if map.contains_key(key) {
-            return Ok(false);
-        }
-        if map.len() >= self.capacity {
-            Self::sweep_expired(&mut map, now);
-            if map.len() >= self.capacity {
-                // 满且不可清理:fail closed,不静默丢弃防护
-                return Err(S2sError::ReplayStoreUnavailable(
-                    "replay store full".to_string(),
-                ));
-            }
-        }
-        map.insert(key.clone(), retain_until);
-        Ok(true)
+        self.check_and_insert_at(key, retain_until, buckyos_kit::buckyos_get_unix_timestamp())
     }
 }
+
+#[cfg(test)]
+#[path = "replay_pressure_tests.rs"]
+mod pressure_tests;
 
 #[cfg(test)]
 mod tests {
