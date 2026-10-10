@@ -227,6 +227,12 @@ pub enum CacheWriteOutcome {
 
 verify 不调用 add_cache。组合 API 或上层应用在拿到验证结果后，显式决定写哪个 namespace。
 
+已有 Published 文档与再次提交的 Verified 文档编码内容完全相同时，返回
+`AlreadyPresent`，不重写文档、不降低证据、不延长缓存 TTL。高等级证据的不同内容仍
+压制低等级写入（`IgnoredOlder`）；同等级同 iat 不同内容仍为 `RejectedConflict`；
+负状态先于内容去重，不能用相同旧文档恢复已撤销身份。RTCP 在持钥证明后据此区分
+“当前内容已存在”和“候选被拒绝”，无需放宽身份校验。
+
 ## 证据来源分层与 Zone Resolver
 
 现有两级 cache 不能被抽象成完全相同的能力：

@@ -363,7 +363,7 @@ impl DIDDocumentCache {
 
     /// 合并写入(简化文档第 5 节的 did_cache_update):
     /// 负状态与本地覆盖屏蔽一切合并写入(本地覆盖根本不进这里);
-    /// 先比证据等级,同级只比 revision(iat + content hash,version_seq 已退出流程)。
+    /// 先比证据等级;低等级的相同内容已存在且不降级,同级只比 revision(iat + content hash)。
     ///
     /// `Unverified` 证据的写入走 Observed 旁路语义(doc/update-did-cache.md):
     /// 落 `unverified/` 命名空间,永远压不过 `verified/` 里的条目。
@@ -784,7 +784,7 @@ impl DIDDocumentCache {
 /// Phase 4;version_seq 已整体退出流程,不参与任何比较):
 ///
 /// 1. 负状态屏蔽一切,只有权威源的新 DR(Published 证据)能翻篇;
-/// 2. 更高证据等级直接胜出(权威结果永远能翻案),更低等级被忽略;
+/// 2. 更高证据等级直接胜出;更低等级的相同内容返回 AlreadyPresent,不同内容被忽略;
 /// 3. Info doc_type 的 `update_time` 合并规则独立保留(运行时观察信道,明确
 ///    排除在 DocumentRevision 契约外);
 /// 4. 命名对象(`is_named_obj_id`)同级不可替换:同 hash 视为已存在,不同内容
@@ -816,6 +816,8 @@ fn merge_verdict(
     if new_rank != current_rank {
         return if new_rank > current_rank {
             CacheWriteOutcome::ReplacedOlder
+        } else if document_content_hash(current_doc) == document_content_hash(new_doc) {
+            CacheWriteOutcome::AlreadyPresent
         } else {
             CacheWriteOutcome::IgnoredOlder
         };
@@ -1621,6 +1623,154 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
     }
 
     // ---- merge:先比证据等级,同级才比 version/iat ----
+
+    fn assert_verified_duplicate_preserves_published(cache: &DIDDocumentCache, did: &DID) {
+        let now = buckyos_get_unix_timestamp();
+        let exp = now + DEFAULT_EXPIRE_TIME;
+        let documents = [
+            EncodedDocument::JsonLd(json!({"id": did.to_string(), "iat": now, "exp": exp})),
+            EncodedDocument::Jwt(
+                encode(
+                    &Header::new(Algorithm::EdDSA),
+                    &json!({"id": did.to_string(), "iat": now, "exp": exp}),
+                    &owner_encoding_key(),
+                )
+                .unwrap(),
+            ),
+        ];
+        for document in documents {
+            cache.remove(&combine_key(did, Some(&DidDocType::Device)));
+            assert_eq!(
+                cache.update(
+                    did.clone(),
+                    Some(DidDocType::Device),
+                    document.clone(),
+                    exp,
+                    CacheEvidence::Published
+                ),
+                CacheWriteOutcome::Inserted
+            );
+            assert_eq!(
+                cache.update(
+                    did.clone(),
+                    Some(DidDocType::Device),
+                    document.clone(),
+                    exp + 100,
+                    CacheEvidence::Verified
+                ),
+                CacheWriteOutcome::AlreadyPresent
+            );
+            match cache.lookup(did, Some(DidDocType::Device)).unwrap() {
+                CacheLookup::Positive {
+                    doc,
+                    evidence,
+                    exp: cached_exp,
+                    ..
+                } => {
+                    assert_eq!(doc, document);
+                    assert_eq!(evidence, CacheEvidence::Published);
+                    assert_eq!(cached_exp, exp);
+                }
+                other => panic!("expected published document, got {:?}", other),
+            }
+            cache.replace_with_negative(
+                did,
+                Some(DidDocType::Device),
+                &DocumentStatus::Revoked,
+                "revoked",
+            );
+            assert_eq!(
+                cache.update(
+                    did.clone(),
+                    Some(DidDocType::Device),
+                    document,
+                    exp,
+                    CacheEvidence::Verified
+                ),
+                CacheWriteOutcome::BlockedByNegativeState
+            );
+        }
+    }
+
+    #[test]
+    fn mem_verified_duplicate_preserves_published() {
+        let (cache, did) = setup_mem_cache();
+        assert_verified_duplicate_preserves_published(&cache, &did);
+    }
+
+    #[test]
+    fn fs_verified_duplicate_preserves_published() {
+        let (_tmp, cache, did) = setup_fs_cache();
+        assert_verified_duplicate_preserves_published(&cache, &did);
+    }
+
+    #[test]
+    fn published_still_blocks_different_verified_documents() {
+        let (cache, did) = setup_mem_cache();
+        let now = buckyos_get_unix_timestamp();
+        let exp = now + DEFAULT_EXPIRE_TIME;
+        let published =
+            EncodedDocument::JsonLd(json!({"iat": now, "exp": exp, "marker": "published"}));
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                published.clone(),
+                exp,
+                CacheEvidence::Published
+            ),
+            CacheWriteOutcome::Inserted
+        );
+        for iat in [now - 1, now, now + 1] {
+            let candidate =
+                EncodedDocument::JsonLd(json!({"iat": iat, "exp": exp, "marker": "different"}));
+            assert_eq!(
+                cache.update(did.clone(), None, candidate, exp, CacheEvidence::Verified),
+                CacheWriteOutcome::IgnoredOlder
+            );
+            assert_eq!(positive_doc(&cache, &did), published);
+        }
+    }
+
+    #[test]
+    fn identical_published_document_upgrades_verified_evidence() {
+        let (cache, did) = setup_mem_cache();
+        let exp = buckyos_get_unix_timestamp() + DEFAULT_EXPIRE_TIME;
+        let document = build_zone_doc(&did, exp, "upgrade");
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                document.clone(),
+                exp,
+                CacheEvidence::Verified
+            ),
+            CacheWriteOutcome::Inserted
+        );
+        assert_eq!(
+            cache.update(
+                did.clone(),
+                None,
+                document.clone(),
+                exp + 100,
+                CacheEvidence::Published
+            ),
+            CacheWriteOutcome::ReplacedOlder
+        );
+        match cache.lookup(&did, None).unwrap() {
+            CacheLookup::Positive {
+                doc,
+                evidence,
+                exp: cached_exp,
+                ..
+            } => {
+                assert_eq!(doc, document);
+                assert_eq!(evidence, CacheEvidence::Published);
+                assert_eq!(cached_exp, exp + 100);
+            }
+            other => panic!("expected published document, got {:?}", other),
+        }
+    }
 
     #[test]
     fn evidence_rank_beats_freshness() {
