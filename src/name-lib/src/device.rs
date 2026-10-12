@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Deref;
 use std::process::Command;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::zone::{default_device_context, ServiceNode, VerificationMethodNode};
@@ -19,7 +20,7 @@ use crate::{
 };
 use nvml_wrapper::enum_wrappers::device::Clock;
 use nvml_wrapper::*;
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, System};
 
 pub enum DeviceType {
     OOD,    //run system config service
@@ -396,6 +397,184 @@ impl DIDDocumentTrait for DeviceDocument {
     // }
 }
 
+const DISK_TOPOLOGY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Keep one sampler in the reporting loop to retain the CPU baseline and
+/// cached capabilities. CPU usage is unknown until the minimum sampling
+/// interval has elapsed, then retains the last valid value between refreshes.
+pub struct DeviceSystemInfoSampler {
+    system: System,
+    disks: Disks,
+    last_cpu_refresh: Instant,
+    last_disk_topology_refresh: Instant,
+    arch: String,
+    base_os_info: String,
+    cpu_info: String,
+    cpu_num: u32,
+    cpu_mhz: u32,
+    cpu_usage: Option<f32>,
+    total_space: u64,
+    disk_usage: u64,
+    gpu: DeviceGpuSampler,
+}
+
+impl Default for DeviceSystemInfoSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeviceSystemInfoSampler {
+    pub fn new() -> Self {
+        let mut system = System::new();
+        system.refresh_cpu_specifics(CpuRefreshKind::everything());
+        let last_cpu_refresh = Instant::now();
+        let cpu_num = system.cpus().len() as u32;
+        let mut cpu_mhz: u32 = system.cpus().iter().map(|cpu| cpu.frequency() as u32).sum();
+        let mut cpu_mhz_last = system
+            .cpus()
+            .last()
+            .map(|cpu| cpu.frequency() as u32)
+            .unwrap_or(0);
+        let cpu_brand = system
+            .cpus()
+            .last()
+            .map(|cpu| cpu.brand())
+            .unwrap_or("Unknown");
+        if cpu_mhz < 1000 {
+            cpu_mhz = 2000 * cpu_num;
+            cpu_mhz_last = 2000;
+        }
+        let cpu_info = format!("{} @ {} MHz,({} cores)", cpu_brand, cpu_mhz_last, cpu_num);
+        let disks = Disks::new_with_refreshed_list();
+        let last_disk_topology_refresh = Instant::now();
+        Self {
+            system,
+            disks,
+            last_cpu_refresh,
+            last_disk_topology_refresh,
+            arch: System::cpu_arch().unwrap_or_default(),
+            base_os_info: format!(
+                "{} {} {}",
+                System::name().unwrap_or_default(),
+                System::os_version().unwrap_or_default(),
+                System::kernel_version().unwrap_or_default()
+            ),
+            cpu_info,
+            cpu_num,
+            cpu_mhz,
+            cpu_usage: None,
+            total_space: 0,
+            disk_usage: 0,
+            gpu: DeviceGpuSampler::new(),
+        }
+    }
+
+    fn refresh(&mut self) {
+        if self.last_cpu_refresh.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
+            self.system.refresh_cpu_usage();
+            self.last_cpu_refresh = Instant::now();
+            self.cpu_usage = Some(self.system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum());
+        }
+        self.system
+            .refresh_memory_specifics(MemoryRefreshKind::new().with_ram());
+        if self.last_disk_topology_refresh.elapsed() >= DISK_TOPOLOGY_REFRESH_INTERVAL {
+            self.disks.refresh_list();
+            self.last_disk_topology_refresh = Instant::now();
+        } else {
+            self.disks.refresh();
+        }
+        (self.total_space, self.disk_usage) =
+            self.disks
+                .list()
+                .iter()
+                .fold((0, 0), |(total_space, used_space), disk| {
+                    let total = disk.total_space();
+                    (
+                        total_space + total,
+                        used_space + total.saturating_sub(disk.available_space()),
+                    )
+                });
+        self.gpu.refresh();
+    }
+}
+
+struct DeviceGpuSampler {
+    nvml: Option<Nvml>,
+    info: String,
+    tflops: Option<f32>,
+    total_mem: Option<u64>,
+    used_mem: Option<u64>,
+    load: Option<f32>,
+}
+
+impl DeviceGpuSampler {
+    fn new() -> Self {
+        let mut result = Self {
+            nvml: Nvml::init().ok(),
+            info: "No GPU detected or unable to get GPU information".to_string(),
+            tflops: None,
+            total_mem: None,
+            used_mem: None,
+            load: None,
+        };
+        if let Some(device) = result
+            .nvml
+            .as_ref()
+            .and_then(|nvml| nvml.device_by_index(0).ok())
+        {
+            if let Ok(name) = device.name() {
+                result.info = format!("NVIDIA {}", name);
+            }
+            result.total_mem = device.memory_info().ok().map(|memory| memory.total);
+            if let (Ok(clock), Ok(cores)) = (device.clock_info(Clock::Graphics), device.num_cores())
+            {
+                result.tflops = Some((clock as f32 * cores as f32 * 2.0) / 1_000_000.0);
+            }
+            return result;
+        }
+        result.nvml = None;
+        #[cfg(target_os = "linux")]
+        if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !entry.file_name().to_string_lossy().starts_with("card") {
+                    continue;
+                }
+                if let Ok(vendor) = std::fs::read_to_string(path.join("device/vendor")) {
+                    let gpu_type = match vendor.trim() {
+                        "0x1002" => "AMD",
+                        "0x8086" => "Intel",
+                        _ => "Unknown",
+                    };
+                    result.info = match std::fs::read_to_string(path.join("device/device")) {
+                        Ok(device) => format!("{} GPU (Device ID: {})", gpu_type, device.trim()),
+                        Err(_) => format!("{} GPU", gpu_type),
+                    };
+                    break;
+                }
+            }
+        }
+        result
+    }
+
+    fn refresh(&mut self) {
+        self.used_mem = None;
+        self.load = None;
+        if let Some(device) = self
+            .nvml
+            .as_ref()
+            .and_then(|nvml| nvml.device_by_index(0).ok())
+        {
+            self.used_mem = device.memory_info().ok().map(|memory| memory.used);
+            self.load = device
+                .utilization_rates()
+                .ok()
+                .map(|utilization| utilization.gpu as f32);
+        }
+    }
+}
+
 // describe a device runtime info
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeviceInfo {
@@ -581,13 +760,25 @@ impl DeviceInfo {
         }
     }
 
+    /// Collect one standalone sample. Periodic callers should retain a
+    /// `DeviceSystemInfoSampler` and use `auto_fill_by_system_info_with_sampler`.
     pub async fn auto_fill_by_system_info(&mut self) -> NSResult<()> {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sampler = DeviceSystemInfoSampler::new();
+        tokio::time::sleep(
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.saturating_sub(sampler.last_cpu_refresh.elapsed()),
+        )
+        .await;
+        self.auto_fill_by_system_info_with_sampler(&mut sampler)
+            .await
+    }
+
+    pub async fn auto_fill_by_system_info_with_sampler(
+        &mut self,
+        sampler: &mut DeviceSystemInfoSampler,
+    ) -> NSResult<()> {
+        sampler.refresh();
 
         let discovered_ips = collect_reachable_ip_addrs();
-        // all_ip is meant to complement device_doc.ips (together they form the full ip set),
-        // so avoid storing ips that are already present in device_doc.ips.
         self.all_ip = discovered_ips
             .iter()
             .filter(|ip| !self.device_doc.ips.contains(ip))
@@ -597,142 +788,27 @@ impl DeviceInfo {
             push_unique_ip(&mut self.device_doc.ips, ip);
         }
 
-        // Get OS information
-        self.base_os_info = Some(format!(
-            "{} {} {}",
-            System::name().unwrap_or_default(),
-            System::os_version().unwrap_or_default(),
-            System::kernel_version().unwrap_or_default()
-        ));
-        // Get CPU information
-        let mut cpu_usage = 0.0;
-        let mut cpu_mhz: u32 = 0;
-        let mut cpu_mhz_last: u32 = 0;
-        let mut cpu_brand: String = "Unknown".to_string();
-        self.cpu_ratio = Some(1.0);
-        for cpu in sys.cpus() {
-            cpu_brand = cpu.brand().to_string();
-            cpu_usage += cpu.cpu_usage();
-            cpu_mhz += cpu.frequency() as u32;
-            cpu_mhz_last = cpu.frequency() as u32;
-        }
-        if cpu_mhz < 1000 {
-            cpu_mhz = 2000 * sys.cpus().len() as u32;
-            cpu_mhz_last = 2000;
-        }
-        self.cpu_info = Some(format!(
-            "{} @ {} MHz,({} cores)",
-            cpu_brand,
-            cpu_mhz_last,
-            sys.cpus().len()
-        ));
-        self.cpu_num = Some(sys.cpus().len() as u32);
-        self.cpu_mhz = Some(cpu_mhz);
-        self.cpu_usage = Some(cpu_usage);
-        // Get memory information
-        self.total_mem = Some(sys.total_memory());
-        self.mem_usage = Some(sys.used_memory());
-        // Get disk space information
-        let mut total_space = 0u64;
-        let mut used_space = 0u64;
-        let disks = Disks::new_with_refreshed_list();
-        for disk in disks.list() {
-            let total = disk.total_space();
-            let available = disk.available_space();
-            total_space += total;
-            used_space += total.saturating_sub(available);
-        }
-        self.total_space = Some(total_space);
-        self.disk_usage = Some(used_space);
-        // Get hostname if not already set
+        self.apply_system_sample(sampler);
         self.sys_hostname = Some(System::host_name().unwrap_or_default());
-
-        // First try NVIDIA GPU
-        let nvidia_info = match nvml_wrapper::Nvml::init() {
-            Ok(nvml) => {
-                if let Ok(device) = nvml.device_by_index(0) {
-                    // Get GPU name
-                    let name = device.name().ok();
-                    let memory = device.memory_info().ok();
-                    let utilization = device.utilization_rates().ok();
-                    let clock = device.clock_info(Clock::Graphics).ok();
-                    let cuda_cores = device.num_cores().ok();
-
-                    Some((name, memory, utilization, clock, cuda_cores))
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        };
-
-        if let Some((name, memory, utilization, clock, cuda_cores)) = nvidia_info {
-            // NVIDIA GPU found
-            self.gpu_info = name.map(|n| format!("NVIDIA {}", n));
-            if let Some(mem) = memory {
-                self.gpu_total_mem = Some(mem.total);
-                self.gpu_used_mem = Some(mem.used);
-            }
-            if let Some(util) = utilization {
-                self.gpu_load = Some(util.gpu as f32);
-            }
-            if let (Some(clock), Some(cores)) = (clock, cuda_cores) {
-                let tflops = (clock as f32 * cores as f32 * 2.0) / 1_000_000.0;
-                self.gpu_tflops = Some(tflops);
-            }
-        } else {
-            // Try to get basic GPU info from system
-            #[cfg(target_os = "linux")]
-            {
-                use std::fs;
-                use std::path::Path;
-
-                let gpu_dir = Path::new("/sys/class/drm");
-                if gpu_dir.exists() {
-                    if let Ok(entries) = fs::read_dir(gpu_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if let Some(name) = path.file_name() {
-                                if name.to_string_lossy().starts_with("card") {
-                                    // Try to read vendor name
-                                    if let Ok(vendor) =
-                                        fs::read_to_string(path.join("device/vendor"))
-                                    {
-                                        let vendor = vendor.trim();
-                                        let gpu_type = match vendor {
-                                            "0x1002" => "AMD",
-                                            "0x8086" => "Intel",
-                                            _ => "Unknown",
-                                        };
-
-                                        // Try to read device name
-                                        if let Ok(device) =
-                                            fs::read_to_string(path.join("device/device"))
-                                        {
-                                            self.gpu_info = Some(format!(
-                                                "{} GPU (Device ID: {})",
-                                                gpu_type,
-                                                device.trim()
-                                            ));
-                                        } else {
-                                            self.gpu_info = Some(format!("{} GPU", gpu_type));
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // If no GPU info was found
-        if self.gpu_info.is_none() {
-            self.gpu_info = Some("No GPU detected or unable to get GPU information".to_string());
-        }
-
         Ok(())
+    }
+
+    fn apply_system_sample(&mut self, sampler: &DeviceSystemInfoSampler) {
+        self.base_os_info = Some(sampler.base_os_info.clone());
+        self.cpu_info = Some(sampler.cpu_info.clone());
+        self.cpu_num = Some(sampler.cpu_num);
+        self.cpu_mhz = Some(sampler.cpu_mhz);
+        self.cpu_ratio = Some(1.0);
+        self.cpu_usage = sampler.cpu_usage;
+        self.total_mem = Some(sampler.system.total_memory());
+        self.mem_usage = Some(sampler.system.used_memory());
+        self.total_space = Some(sampler.total_space);
+        self.disk_usage = Some(sampler.disk_usage);
+        self.gpu_info = Some(sampler.gpu.info.clone());
+        self.gpu_tflops = sampler.gpu.tflops;
+        self.gpu_total_mem = sampler.gpu.total_mem;
+        self.gpu_used_mem = sampler.gpu.used_mem;
+        self.gpu_load = sampler.gpu.load;
     }
 
     pub fn is_wan_device(&self) -> bool {
@@ -1302,149 +1378,115 @@ impl Default for DeviceMiniInfo {
 
 impl DeviceMiniInfo {
     pub async fn auto_fill_by_system_info(&mut self) -> NSResult<()> {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sampler = DeviceSystemInfoSampler::new();
+        self.auto_fill_by_system_info_with_sampler(&mut sampler)
+            .await
+    }
 
-        self.arch = System::cpu_arch().unwrap_or_default();
-        // Get OS information
-        self.base_os_info = Some(format!(
-            "{} {} {}",
-            System::name().unwrap_or_default(),
-            System::os_version().unwrap_or_default(),
-            System::kernel_version().unwrap_or_default()
-        ));
-        // Get CPU information
-        let mut cpu_usage = 0.0;
-        let mut cpu_mhz: u32 = 0;
-        let mut cpu_mhz_last: u32 = 0;
-        let mut cpu_brand: String = "Unknown".to_string();
-        self.cpu_ratio = Some(1.0);
-        for cpu in sys.cpus() {
-            cpu_brand = cpu.brand().to_string();
-            cpu_usage += cpu.cpu_usage();
-            cpu_mhz += cpu.frequency() as u32;
-            cpu_mhz_last = cpu.frequency() as u32;
-        }
-        if cpu_mhz < 1000 {
-            cpu_mhz = 2000 * sys.cpus().len() as u32;
-            cpu_mhz_last = 2000;
-        }
-        self.cpu_info = Some(format!(
-            "{} @ {} MHz,({} cores)",
-            cpu_brand,
-            cpu_mhz_last,
-            sys.cpus().len()
-        ));
-        self.cpu_num = Some(sys.cpus().len() as u32);
-        self.cpu_mhz = Some(cpu_mhz);
-
-        // Get memory information
-        self.total_mem = Some(sys.total_memory());
-
-        // Get disk space information
-        let mut total_space = 0u64;
-        let mut used_space = 0u64;
-        let disks = Disks::new_with_refreshed_list();
-        for disk in disks.list() {
-            let total = disk.total_space();
-            let available = disk.available_space();
-            total_space += total;
-            used_space += total.saturating_sub(available);
-        }
-        self.total_space = Some(total_space);
-        self.disk_usage = Some(used_space);
-
-        // First try NVIDIA GPU
-        let nvidia_info = match nvml_wrapper::Nvml::init() {
-            Ok(nvml) => {
-                if let Ok(device) = nvml.device_by_index(0) {
-                    // Get GPU name
-                    let name = device.name().ok();
-                    let memory = device.memory_info().ok();
-                    let utilization = device.utilization_rates().ok();
-                    let clock = device.clock_info(Clock::Graphics).ok();
-                    let cuda_cores = device.num_cores().ok();
-
-                    Some((name, memory, utilization, clock, cuda_cores))
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        };
-
-        if let Some((name, memory, utilization, clock, cuda_cores)) = nvidia_info {
-            // NVIDIA GPU found
-            self.gpu_info = name.map(|n| format!("NVIDIA {}", n));
-            if let Some(mem) = memory {
-                self.gpu_total_mem = Some(mem.total);
-                self.gpu_used_mem = Some(mem.used);
-            }
-            if let Some(util) = utilization {
-                self.gpu_load = Some(util.gpu as f32);
-            }
-            if let (Some(clock), Some(cores)) = (clock, cuda_cores) {
-                let tflops = (clock as f32 * cores as f32 * 2.0) / 1_000_000.0;
-                self.gpu_tflops = Some(tflops);
-            }
-        } else {
-            // Try to get basic GPU info from system
-            #[cfg(target_os = "linux")]
-            {
-                use std::fs;
-                use std::path::Path;
-
-                let gpu_dir = Path::new("/sys/class/drm");
-                if gpu_dir.exists() {
-                    if let Ok(entries) = fs::read_dir(gpu_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if let Some(name) = path.file_name() {
-                                if name.to_string_lossy().starts_with("card") {
-                                    // Try to read vendor name
-                                    if let Ok(vendor) =
-                                        fs::read_to_string(path.join("device/vendor"))
-                                    {
-                                        let vendor = vendor.trim();
-                                        let gpu_type = match vendor {
-                                            "0x1002" => "AMD",
-                                            "0x8086" => "Intel",
-                                            _ => "Unknown",
-                                        };
-
-                                        // Try to read device name
-                                        if let Ok(device) =
-                                            fs::read_to_string(path.join("device/device"))
-                                        {
-                                            self.gpu_info = Some(format!(
-                                                "{} GPU (Device ID: {})",
-                                                gpu_type,
-                                                device.trim()
-                                            ));
-                                        } else {
-                                            self.gpu_info = Some(format!("{} GPU", gpu_type));
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // If no GPU info was found
-        if self.gpu_info.is_none() {
-            self.gpu_info = Some("No GPU detected or unable to get GPU information".to_string());
-        }
-
+    pub async fn auto_fill_by_system_info_with_sampler(
+        &mut self,
+        sampler: &mut DeviceSystemInfoSampler,
+    ) -> NSResult<()> {
+        sampler.refresh();
+        self.apply_system_sample(sampler);
         Ok(())
+    }
+
+    fn apply_system_sample(&mut self, sampler: &DeviceSystemInfoSampler) {
+        self.arch = sampler.arch.clone();
+        self.base_os_info = Some(sampler.base_os_info.clone());
+        self.cpu_info = Some(sampler.cpu_info.clone());
+        self.cpu_num = Some(sampler.cpu_num);
+        self.cpu_mhz = Some(sampler.cpu_mhz);
+        self.cpu_ratio = Some(1.0);
+        self.total_mem = Some(sampler.system.total_memory());
+        self.total_space = Some(sampler.total_space);
+        self.disk_usage = Some(sampler.disk_usage);
+        self.gpu_info = Some(sampler.gpu.info.clone());
+        self.gpu_tflops = sampler.gpu.tflops;
+        self.gpu_total_mem = sampler.gpu.total_mem;
+        self.gpu_used_mem = sampler.gpu.used_mem;
+        self.gpu_load = sampler.gpu.load;
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_system_sampler_retains_cpu_baseline_without_process_collection() {
+        let mut sampler = DeviceSystemInfoSampler::new();
+        assert!(sampler.system.processes().is_empty());
+        sampler.last_cpu_refresh = Instant::now();
+        let baseline = sampler.last_cpu_refresh;
+        sampler.refresh();
+        assert_eq!(sampler.cpu_usage, None);
+        assert_eq!(sampler.last_cpu_refresh, baseline);
+        assert!(sampler.system.processes().is_empty());
+
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        sampler.refresh();
+        let usage = sampler.cpu_usage.expect("the second CPU sample is valid");
+        assert!(usage.is_finite());
+        assert!(usage >= 0.0 && usage <= sampler.cpu_num as f32 * 100.0);
+        assert!(sampler.last_cpu_refresh > baseline);
+        assert!(sampler.system.processes().is_empty());
+
+        sampler.last_cpu_refresh = Instant::now();
+        let baseline = sampler.last_cpu_refresh;
+        sampler.refresh();
+        assert_eq!(sampler.cpu_usage, Some(usage));
+        assert_eq!(sampler.last_cpu_refresh, baseline);
+    }
+
+    #[test]
+    fn test_full_and_mini_device_info_use_the_same_sample() {
+        let mut sampler = DeviceSystemInfoSampler::new();
+        sampler.refresh();
+        let device_doc = DeviceDocument::new("test-device", "test-key".to_string());
+        let mut full = DeviceInfo::from_device_doc(&device_doc);
+        let mut mini = DeviceMiniInfo::default();
+        full.apply_system_sample(&sampler);
+        mini.apply_system_sample(&sampler);
+        let full_json = serde_json::to_value(&full).unwrap();
+        let mini_json = serde_json::to_value(&mini).unwrap();
+        for field in [
+            "base_os_info",
+            "cpu_info",
+            "cpu_num",
+            "cpu_mhz",
+            "cpu_ratio",
+            "total_mem",
+            "total_space",
+            "disk_usage",
+            "gpu_info",
+            "gpu_tflops",
+            "gpu_total_mem",
+            "gpu_used_mem",
+            "gpu_load",
+        ] {
+            assert_eq!(full_json.get(field), mini_json.get(field), "{field}");
+        }
+        assert!(mini_json.get("cpu_usage").is_none());
+        assert!(mini_json.get("mem_usage").is_none());
+        assert_eq!(full.mem_usage, Some(sampler.system.used_memory()));
+        assert!(full.disk_usage.unwrap() <= full.total_space.unwrap());
+    }
+
+    #[test]
+    fn test_system_sampler_refreshes_disk_topology_only_when_due() {
+        let mut sampler = DeviceSystemInfoSampler::new();
+        let discovered_at = sampler.last_disk_topology_refresh;
+        sampler.refresh();
+        assert_eq!(sampler.last_disk_topology_refresh, discovered_at);
+
+        sampler.last_disk_topology_refresh = Instant::now() - DISK_TOPOLOGY_REFRESH_INTERVAL;
+        sampler.refresh();
+        assert!(sampler.last_disk_topology_refresh > discovered_at);
+        let refreshed_at = sampler.last_disk_topology_refresh;
+        sampler.refresh();
+        assert_eq!(sampler.last_disk_topology_refresh, refreshed_at);
+    }
 
     #[tokio::test]
     async fn test_device_mini_info() {
