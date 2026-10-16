@@ -1,3 +1,4 @@
+use crate::disk_space::{distinct_disk_space, DiskSpaceSample};
 use buckyos_kit::*;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
@@ -485,16 +486,13 @@ impl DeviceSystemInfoSampler {
             self.disks.refresh();
         }
         (self.total_space, self.disk_usage) =
-            self.disks
-                .list()
-                .iter()
-                .fold((0, 0), |(total_space, used_space), disk| {
-                    let total = disk.total_space();
-                    (
-                        total_space + total,
-                        used_space + total.saturating_sub(disk.available_space()),
-                    )
-                });
+            distinct_disk_space(self.disks.list().iter().map(|disk| DiskSpaceSample {
+                device: disk.name().to_string_lossy().into_owned(),
+                file_system: disk.file_system().to_string_lossy().into_owned(),
+                mount_point: disk.mount_point().to_string_lossy().into_owned(),
+                total: disk.total_space(),
+                available: disk.available_space(),
+            }));
         self.gpu.refresh();
     }
 }

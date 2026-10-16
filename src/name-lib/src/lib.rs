@@ -3,6 +3,7 @@
 
 mod agent;
 mod device;
+mod disk_space;
 mod did;
 mod did_object_card;
 pub mod key_scope;
@@ -14,6 +15,7 @@ mod zone;
 
 pub use agent::*;
 pub use device::*;
+pub use disk_space::*;
 pub use did::*;
 pub use did_object_card::*;
 pub use object_profile::*;
