@@ -8,12 +8,35 @@ use casbin::{
 use lazy_static::lazy_static;
 use log::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-lazy_static! {
-    static ref SYS_ENFORCE: Arc<Mutex<Option<Enforcer>>> = { Arc::new(Mutex::new(None)) };
+mod matcher;
+
+pub use matcher::{matcher_cached_pattern_count, matcher_regex_compile_count};
+
+/// The process enforcer and the model/policy text it was built from.
+struct AppliedEnforcer {
+    enforcer: Enforcer,
+    model: String,
+    policy: String,
 }
+
+impl AppliedEnforcer {
+    fn is_built_from(&self, model_str: &str, policy_str: &str) -> bool {
+        self.model == model_str && self.policy == policy_str
+    }
+}
+
+lazy_static! {
+    static ref SYS_ENFORCE: Arc<Mutex<Option<AppliedEnforcer>>> = { Arc::new(Mutex::new(None)) };
+    /// Serializes builds, so concurrent applies of one policy build it once.
+    /// `enforce` only waits for the final swap, never for a build.
+    static ref BUILD_LOCK: Mutex<()> = Mutex::new(());
+}
+
+static ENFORCER_BUILDS: AtomicU64 = AtomicU64::new(0);
 
 pub enum SudoMode {
     None,
@@ -41,12 +64,13 @@ fn enforce_subject(
     }
 }
 
-pub async fn create_enforcer(
+async fn build_enforcer(
     model_str: &str,
     policy_str: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Enforcer, Box<dyn std::error::Error>> {
     let m = DefaultModel::from_str(model_str).await?;
     let mut e = Enforcer::new(m, MemoryAdapter::default()).await?;
+    matcher::install_cached_matchers(&mut e);
     for line in policy_str.lines() {
         let line = line.trim();
         if !line.is_empty() && !line.starts_with('#') {
@@ -58,18 +82,73 @@ pub async fn create_enforcer(
             }
         }
     }
-
-    let mut enforcer = SYS_ENFORCE.lock().await;
-    *enforcer = Some(e);
-    Ok(())
+    ENFORCER_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Ok(e)
 }
 
-pub async fn update_enforcer(
+/// Build the enforcer from `model_str`/`policy_str` and install it, even when
+/// the same text is already installed.
+pub async fn create_enforcer(
     model_str: &str,
     policy_str: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    return create_enforcer(model_str, policy_str).await;
+    let _build = BUILD_LOCK.lock().await;
+    let e = build_enforcer(model_str, policy_str).await?;
+    let mut enforcer = SYS_ENFORCE.lock().await;
+    *enforcer = Some(AppliedEnforcer {
+        enforcer: e,
+        model: model_str.to_string(),
+        policy: policy_str.to_string(),
+    });
+    Ok(())
 }
+
+/// Install the enforcer for `model_str`/`policy_str` unless it is already the
+/// installed one. Returns whether a new enforcer was built and installed.
+///
+/// A cache refresh that reads back the same policy is therefore free; any
+/// change of the text (a grant, a revocation, a removed policy tail) rebuilds.
+/// Callers that may race should serialize their read-then-apply, so an older
+/// read is never applied after a newer one.
+pub async fn apply_enforcer_policy(
+    model_str: &str,
+    policy_str: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if is_enforcer_built_from(model_str, policy_str).await {
+        return Ok(false);
+    }
+    let _build = BUILD_LOCK.lock().await;
+    if is_enforcer_built_from(model_str, policy_str).await {
+        return Ok(false);
+    }
+    let e = build_enforcer(model_str, policy_str).await?;
+    let mut enforcer = SYS_ENFORCE.lock().await;
+    *enforcer = Some(AppliedEnforcer {
+        enforcer: e,
+        model: model_str.to_string(),
+        policy: policy_str.to_string(),
+    });
+    info!(
+        "rbac enforcer rebuilt for changed policy, model_bytes={}, policy_bytes={}",
+        model_str.len(),
+        policy_str.len()
+    );
+    Ok(true)
+}
+
+async fn is_enforcer_built_from(model_str: &str, policy_str: &str) -> bool {
+    SYS_ENFORCE
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|applied| applied.is_built_from(model_str, policy_str))
+}
+
+/// Enforcers built since process start.
+pub fn enforcer_build_count() -> u64 {
+    ENFORCER_BUILDS.load(Ordering::Relaxed)
+}
+
 // Use the configured RBAC enforcer to enforce access control.
 pub async fn enforce(
     userid: &str,
@@ -78,12 +157,12 @@ pub async fn enforce(
     op_name: &str,
     sudo: Option<SudoMode>,
 ) -> bool {
-    let enforcer = SYS_ENFORCE.lock().await;
-    if enforcer.is_none() {
+    let applied = SYS_ENFORCE.lock().await;
+    let Some(applied) = applied.as_ref() else {
         error!("enforcer is not initialized");
         return false;
-    }
-    let enforcer = enforcer.as_ref().unwrap();
+    };
+    let enforcer = &applied.enforcer;
 
     //let roles = enforcer.get_roles_for_user(userid,None);
     //println!("roles for user {}: {:?}", userid, roles);

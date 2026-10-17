@@ -1,0 +1,121 @@
+p, system:scheduler, obj://config/system/content_registry,all,allow
+p, kernel, obj://config/system/content_registry,write|create|delete,deny
+p, system, obj://config/system/content_registry,write|create|delete,deny
+p, frame, obj://config/system/content_registry,write|create|delete,deny
+p, app, obj://config/system/content_registry,write|create|delete,deny
+p, system:control-panel, obj://config/users/{user}/content_defaults,read|write,allow
+p, kernel, obj://config/users/{user}/content_defaults,write,deny
+p, system, obj://config/users/{user}/content_defaults,write,deny
+p, frame, obj://config/users/{user}/content_defaults,write,deny
+p, app, obj://config/users/{user}/content_defaults,write,deny
+p, kernel, obj://*, all,allow
+p, ood, obj://*, all,allow
+p, root, obj://*, all,allow
+p, su_admin, obj://*, all,allow
+
+p, system, obj://dfs/security/*,all,deny
+p, system, obj://config/security/*,all,deny
+p, system, obj://*, all,allow
+
+p, frame, obj://config/boot/*, read,allow
+p, frame, obj://config/system/*,read,allow
+p, frame, obj://config/services/{frame}/*,all,allow
+p, frame, obj://config/services/{service}/info,read,allow
+p, frame, obj://config/users*,read,allow
+
+p, app, obj://config/system/content_registry,read,allow
+p, app, obj://config/users/{user}/content_defaults,read,allow
+p, users, obj://config/system/content_registry,read,allow
+p, users, obj://config/users/{users}/content_defaults,read|write,allow
+p, admin, obj://config/users/{admin}/content_defaults,read|write,allow
+p, app, obj://config/users/{user}/content_defaults,write,deny
+p, app, obj://config/boot/*, read,allow
+p, app, obj://config/users/{user}/apps/{app}/settings,read|write,allow
+p, app, obj://config/users/{user}/apps/{app}/spec,read,allow
+p, app, obj://config/users/{user}/apps/{app}/info,read|write,allow
+p, app, obj://config/services/{service}/info,read,allow
+p, app, obj://config/services/{app}@[^/@]+/instances/{node},write,allow
+
+# An App runtime is promoted to this role only when an AgentSpec binds to it.
+# AgentSpec is public runtime identity/configuration; the sibling private key
+# deliberately remains inaccessible to the runtime App principal.
+p, agent_runtime, obj://config/users/{user}/agents,read|list|query,allow
+p, agent_runtime, obj://config/users/{user}/agents/{agent}/spec,read,allow
+
+p, agent, obj://config/boot/*, read,allow
+p, agent, obj://config/users/{user}/agents/{agent}/settings,read|write,allow
+p, agent, obj://config/users/{user}/agents/{agent}/spec,read,allow
+p, agent, obj://config/users/{user}/agents/{agent}/info,read|write,allow
+p, agent, obj://config/users/{user}/agents/{agent}/profile,read|write,allow
+p, agent, obj://config/services/{service}/info,read,allow
+p, agent, obj://config/services/{agent}/instances/{node},write,allow
+
+p, admin,obj://config/boot/*, read,allow
+p, admin,obj://config/system/*,read,allow
+p, admin,obj://config/users/{admin}/*,read,allow
+p, admin,obj://config/users/{admin}/profile,read|write,allow
+p, admin,obj://config/users/{admin}/apps/{app}/{key},read|write,allow
+p, admin,obj://config/users/{admin}/agents,list|query,allow
+p, admin,obj://config/users/{admin}/agents/{agent}/{key},read|write,allow
+p, admin,obj://config/services/aicc/settings,read|write,allow
+p, admin,obj://config/services/aicc/driver_metadata_update,read|write,allow
+p, admin,obj://config/services/msg-center/settings,read|write,allow
+p, admin,obj://config/services/{service}/instances/{node},write,allow
+p, admin,obj://config/services/*,read,allow
+p, admin,obj://task/{admin},read,allow
+
+p, users,obj://config/boot/*, read,allow
+# p, su_user,obj://config/users/{user}/*,all,allow
+p, users,obj://config/users/{users}/*,read,allow
+p, users,obj://config/users/{users}/profile,read|write,allow
+p, users,obj://config/users/{users}/apps/{app}/{key},read|write,allow
+p, users,obj://config/users/{users}/agents,list|query,allow
+p, users,obj://config/users/{users}/agents/{agent}/{key},read|write,allow
+p, users,obj://config/services/{service}/info,read,allow
+p, users,obj://config/services/{service}/instances/{node},write,allow
+p, users,obj://task/{users},read,allow
+
+p, users,obj://msg-center/objects,read,allow
+p, admin,obj://msg-center/objects,read,allow
+p, users,obj://msg-center/inbox/*,read|write,allow
+p, users,obj://msg-center/sent/*,read|write,allow
+p, users,obj://msg-center/group_inbox/*,read,allow
+p, users,obj://msg-center/request_box/*,read|write,allow
+p, users,obj://msg-center/owners/*,read|write,allow
+p, users,obj://msg-center/group,create,allow
+p, admin,obj://msg-center/inbox/*,read|write,allow
+p, admin,obj://msg-center/sent/*,read|write,allow
+p, admin,obj://msg-center/group_inbox/*,read,allow
+p, admin,obj://msg-center/request_box/*,read|write,allow
+p, admin,obj://msg-center/owners/*,read|write,allow
+p, admin,obj://msg-center/group,create,allow
+p, users,obj://msg-center/notify,read|write,allow
+p, admin,obj://msg-center/notify,read|write,allow
+p, app,obj://msg-center/notify,read|write,allow
+p, frame,obj://msg-center/notify,read|write,allow
+p, system:opendan,obj://msg-center/*,all,allow
+p, system:msg-center,obj://msg-center/*,all,allow
+p, agent_runtime,obj://msg-center/*,all,allow
+p, agent,obj://msg-center/*,all,allow
+
+g, system:node-daemon, kernel
+g, system:scheduler, kernel
+g, system:system-config, kernel
+g, system:verify-hub, kernel
+g, system:cyfs-gateway, kernel
+g, system:buckycli, kernel
+
+g, system:task-manager, system
+g, system:kmsg, system
+g, system:control-panel, system
+
+g, system:repo-service, frame
+g, system:aicc, frame
+g, system:msg-center, frame
+g, system:opendan, frame
+g, system:slog-server, frame
+g, system:smb-service, frame
+g, system:nfs-server, frame
+g, system:aiworkspace, frame
+g, system:homestation, frame
+p, system:homestation, obj://msg-center/owners/*,read,allow
