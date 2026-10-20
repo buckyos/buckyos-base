@@ -20,15 +20,18 @@
 # trust 站点解绑只影响下一次 resolve 的来源列表，不撤销此前已取得的可信文档。
 # 旧文档仍受 exp、明确撤销和版本替换约束；解绑本身不降低其已记录的来源等级。
 
-# opts 中和版本有关的需求提取到 revesion 参数中；opts 只保留请求、缓存、locker 等控制。
+# opts 中和版本有关的需求提取到 revesion 参数中；opts 保留请求来源、预算、缓存、locker 等控制。
 # revesion=None 等价于 Revision.current()：同时获取 latest + best，owner 只获取 latest。
 # Revision.exact(iat, hash)：指定已发布版本；Revision.closest(iat)：最接近且严格早于 iat 的已发布版本。
 # exact/closest 需要 resolver 的 publish_info 协议回答相应查询；locker 可在本 scope 模拟。
 # 不支持/无回答时保留原因，不能退回当前版本，也不能把本机见过的最大历史版本当 closest。
 # doc.revision() 是文档身份 (iat, hash)，revesion 是查询条件，二者不要混用。
 # normalize/with/create_get_owner_opts 都返回副本；递归 owner 查询显式传自己的 revesion。
-# no_request 禁止普通 provider 网络查询，递归 owner 查询继承；local/Zone locker 访问是例外。
-# Zone locker 自己向外 resolve 时关闭 allow_zone_lock，避免请求自己；owner 递归同样保留该设置。
+# 副本继承同一 deadline、取消信号和来源/传输限制，只能收紧，不能通过递归或 fallback 恢复默认值。
+# no_request 禁止所有普通 provider（包括 authority）的网络查询，仍可读取允许的本机材料。
+# local locker 是本地访问；Zone locker 由 allow_zone_lock 单独控制，不受 no_request 开关控制，
+# 但必须服从同一传输限制和预算。严格不联网的调用同时设置 no_request + without_zone_lock。
+# Zone locker 自己向外 resolve 时关闭 allow_zone_lock；这只防再次选择自己，不能证明传输无环。
 # allow_local_cache 只决定普通缓存是否使用磁盘；内存缓存一直存在，不改变验证规则。
 # 不要求多个来源在同一时刻回答；已经知道的禁用/撤销和本地 exp 检查不能因缓存命中跳过。
 
@@ -47,6 +50,79 @@
 # exact/closest 还须有对应查询的发布依据；签名有效但目标发布无法确认时，success=False 并保留原因。
 # 签名正确但已撤销的文档可以返回 is_signed=True、is_revoked=True，其它选择标志为 False。
 
+# ---------- 请求来源与统一预算 ----------
+# 来源信任等级和网络访问许可是两个维度：trust/authority 不自动意味着传输不依赖待建隧道。
+# opts.network_sources 默认 all；authority_only 只允许普通 provider 中的 authority 发出请求。
+# 此限制在查询缓存之后、实际 I/O 之前执行，不删除已有 trust/normal 材料，也不改变 best 的定义。
+# 普通 resolve 仍收集 authority/trust/normal；authority Unknown 不构成全局停止补充源的规则。
+# opts.transport_policy 默认使用普通传输；RTCP 身份引导使用 independent_control_plane：
+# 仅允许本机可信配置声明、实际传输可保证不依赖目标隧道/Relay 转发入口的控制通道，未知则拒绝。
+# 此策略约束身份/地址材料获取；最后绑定已验证身份的目标 RTCP 拨号另受连接准入控制，
+# 其内部发现/补材料仍受该策略约束，不能借“最终拨号”例外恢复默认解析。
+# provider 名称、等级和远端自报字段不能证明通道独立；authority 的地址解析/代理也必须满足该约束。
+# 连接每一跳（DNS、代理、重定向、well-known/upper fallback、内部子查询）都执行同一限制；
+# 不支持传递限制的 provider/locker 在受限路径不可用，不能偷偷改用默认 HTTP 客户端。
+# 限制只约束此次获取，不把被禁止访问的站点标为不可信，也不凭缓存命中声明公网当前身份。
+# opts.force_authority_query 默认 False；显式要求本次权威回答时跳过权威查询缓存，但可复用已有 body。
+# 同一调用取得的精确回答可在 body/publish_info 间复用；记录本轮 receipt，跨调用缓存不能伪装成本轮查询。
+# reusable_query_answer 只查本轮材料：可按新 receipt 的精确 hash 复用已有合法 body，保留 body 原来源；
+# 不隐含联网、不刷新旧证据时间、不把 body 单独当作发布回答。缺少所问内容时返回 None。
+# 本轮 receipt 属于请求上下文，随递归继承且按 DID/doc_type/revesion/来源区分，不把缓存查询时间刷新为当前。
+# 最外层新调用建立新的 receipt 集合；复用配置 Opts 不得继承上次调用的“本轮回答”。
+#
+# normalize_opts 在最外层按 monotonic_now() + config.resolve_timeout 建立有限的绝对 deadline，
+# 有调用方截止时间时取更早者；已有 budget 时只继承/收紧，owner current/closest 和重试不续期。
+# 跨主机 locker 传剩余时长，由服务端按自己的单调时钟和本地上限收紧；不传可比较的绝对单调时钟值。
+# 客户端仍执行自己的 deadline/取消，服务端也须终止无用工作，不能靠转发获得新的一整份预算。
+# resolution_budget 包住整个操作，覆盖锁/并发许可等待、缓存 I/O、locker、provider、验证和提交。
+# 同步解析/验签限制输入大小、深度和 key 数量，计算分片检查预算；不能依赖异步超时抢占同步计算。
+# 每次请求的 connect/total timeout 取配置上限与剩余预算的较小值；provider 的内部重试共享剩余预算。
+# 单个来源超时可返回 Unknown 并在剩余预算内尝试下个允许来源；总预算耗尽抛 ResolutionDeadlineExceeded，
+# 取消抛 ResolutionCancelled，两者终止整次调用，不能 catch 后继续 fallback 或返回旧缓存冒充成功。
+# 两种终止均不声明 DID 不存在/禁用/撤销；已经完成的合法原子提交保留，未完成工作取消。
+# budget.run/上下文退出必须取消未共享的子任务、关闭未完成的连接并释放锁/许可，不能留下后台请求。
+# serialize_document 的锁获取也可取消并受该 deadline 限制；调用链 visited 不能识别新入站请求的网络环。
+# 同键串行可能把回流变成等待环，不能当作来源限制的替代；跨进程原子合并也不是网络防环。
+#
+# 并发合并覆盖身份解析阶段；共享任务须有有限自身预算，各等待者保留自己的 deadline/取消信号。
+# 合并键包含 scope/DID/doc_type/revesion 及来源/传输/证据要求，受限请求不能加入会访问目标站点的任务。
+# 单个等待者退出不取消其它有效等待者的任务，最后一个离开时取消无用任务；不能延长共享任务的期限。
+# 并发数/等待队列有上限，真实来源/传输失败按目标、来源及访问策略短期退避，错误日志限流。
+# 策略拒绝、调用者取消/预算不足不触发影响其它策略的共享退避；退避不能替代首次请求的门禁和超时。
+
+
+def request_source(source, operation, did, doc_type, revesion, opts):
+    opts.budget.check()  # 总 deadline/取消向外传播，不转为可继续回退的 Unknown。
+    if source.is_zone_locker():
+        allowed = opts.allow_zone_lock()
+        request_opts = opts.without_zone_lock()
+    else:
+        allowed = opts.allow_request() and (
+            opts.network_sources == "all" or source.is_authority()
+        )
+        request_opts = opts
+    if not allowed or not opts.transport_policy.permits(source):
+        reason = "本次请求的来源或传输策略不允许访问"
+        opts.record_unanswered(source, operation, reason, cacheable=False)
+        # 策略拒绝只记录本次诊断；不写共享负缓存，否则会影响允许访问此源的其它调用。
+        return Unknown(reason, cacheable=False)
+    query = source.get_document if operation == "document" else source.get_publish_info
+    # source 的实现接收并执行 request_opts，包含内部解析、每一跳的检查和剩余预算。
+    try:
+        raw = opts.budget.run(
+            lambda: query(did, doc_type, revesion, opts=request_opts),
+            connect_timeout=min(opts.connect_timeout, opts.budget.remaining()),
+            request_timeout=min(opts.request_timeout, opts.budget.remaining()),
+        )
+        # 统一回答带 body/publish_info/reason/cacheable；发布查询的 None 归一为真实来源的 NoAnswer。
+        return normalize_source_answer(raw, operation)
+    except SourceTimeout as err:
+        # 只捕获单个来源的超时；若总预算也已到期，check 必须向外抛终止错误。
+        opts.budget.check()
+        opts.record_unanswered(source, operation, str(err), cacheable=False)
+        return Unknown(str(err), cacheable=False)
+
+
 # ---------- 获取与选择 ----------
 def resolve_did_ex(did, doc_type, revesion=None, opts=None):
     revesion = normalize_revesion(revesion)  # None -> current；exact 必须同时有 iat/hash。
@@ -55,7 +131,7 @@ def resolve_did_ex(did, doc_type, revesion=None, opts=None):
     # 等待者重新读缓存并判断自己的输入/revesion/opts，不能复用另一份文档的验证成功。
     # 不持数据库事务等待 locker/provider；跨进程由提交时的原子合并裁决最终结果。
     # 递归 owner 使用另一文档键；保留调用链的环路检查，不在持有本键时再次进入本键。
-    with serialize_document(did, doc_type, opts):
+    with resolution_budget(opts), serialize_document(did, doc_type, opts):
         result, publish_info = _get_document(did, doc_type, revesion, opts)
         if result.locked:
             return result
@@ -68,6 +144,7 @@ def resolve_did_ex(did, doc_type, revesion=None, opts=None):
         # 同 iat 的候选逐个验证；无效候选不阻止同 iat 的合法文档。
         # current 检查所有候选；exact/closest 只检查对应发布查询选中的候选，缺依据则目标未满足。
         for doc, source in result.candidates.for_revesion(revesion, publish_info).descending_iat():
+            opts.budget.check()
             report = _verify_document_ex(did, doc_type, doc, result, publish_info, source, revesion, opts)
             if report.validity == "unknown":
                 continue
@@ -113,6 +190,7 @@ def _get_document(did, doc_type, revesion, opts):
     # 顺序：authority > trust > normal；owner 只查询 authority。
     # helper 可用已允许的本地材料构造源；内部递归查询仍继承 opts。
     for provider in _get_did_providers(did, doc_type, opts):
+        opts.budget.check()
         answer = get_document_by_provider(provider, did, doc_type, revesion, opts)
         # 一次回答可同时带 body 和 publish_info；拆开缓存，避免重复网络请求。
         result.commit(answer, provider, revesion, opts)
@@ -130,56 +208,72 @@ def _get_document(did, doc_type, revesion, opts):
 
 
 def get_locked_document(did, doc_type, revesion, opts):
+    opts.budget.check()
     # helper 将 Unknown/未覆盖归一为 None；明确的不存在/禁用仍是强制回答，不能当 miss 回退。
     if opts.allow_local_lock():
         answer = local_locked.get_document(did, doc_type, revesion, opts)
         if answer is not None:
             return answer.as_locked_result(revesion, opts)
     if opts.allow_zone_lock():
-        # locker 可以网络访问；服务端内部转发时必须关闭自己的 Zone locker。
-        answer = zone_locked.get_document(did, doc_type, revesion, opts.without_zone_lock())
+        # Unknown/未覆盖归一为 None；策略拒绝不伪造“不存在”的强制回答。
+        answer = locker_answer_or_none(
+            request_source(zone_locked, "document", did, doc_type, revesion, opts)
+        )
         if answer is not None:
             return answer.as_locked_result(revesion, opts)
     return None
 
 
 def get_document_by_provider(provider, did, doc_type, revesion, opts):
+    opts.budget.check()
+    current = opts.reusable_query_answer(provider, did, doc_type, revesion, "document")
+    if current is not None:
+        return current
     key = (opts.scope, provider.id, did, doc_type, revesion.cache_key())
     cached = local_cache(opts).get_resolve_result(key)
-    if cached is not None and cached.valid_until > now():
+    force_query = provider.is_authority() and opts.force_authority_query
+    if cached is not None and cached.valid_until > now() and not force_query:
         return cached.answer  # 不刷新原查询时间。
-    if not opts.allow_request():
-        return Unknown("provider 查询未获允许或缓存已过期")
     if not revesion.is_current() and not provider.supports_publish_info():
-        return Unknown("此来源不支持指定版本/closest 查询")
-    answer = provider.get_document(did, doc_type, revesion)
-    # OK / NotExist / Unknown 分开保存；Unknown 只短期退避，不能变成 NotExist/禁用。
-    local_cache(opts).set_resolve_result(key, answer, answer.cache_ttl())
+        return Unknown("此来源不支持指定版本/closest 查询", cacheable=False)
+    answer = request_source(provider, "document", did, doc_type, revesion, opts)
+    opts.record_query_answer(provider, did, doc_type, revesion, answer)
+    # OK / NotExist / 来源回答的 Unknown 分开保存；Unknown 只短期退避，不能变成 NotExist/禁用。
+    # 策略拒绝、调用预算/取消不得污染共享查询缓存；不能仅因构造了 Unknown 就缓存。
+    if answer.cacheable:
+        local_cache(opts).set_resolve_result(key, answer, answer.cache_ttl())
     return answer
 
 
 def get_publish_info(did, doc_type, revesion, opts):
+    opts.budget.check()
     # 只返回本次所问版本的信息；locker 对 body/publish_info 分别回答，缺席的列继续查。
     if opts.allow_local_lock():
-        answer = local_locked.get_publish_info(did, doc_type, revesion)
+        answer = local_locked.get_publish_info(did, doc_type, revesion, opts)
         if answer is not None:
             return answer
     if opts.allow_zone_lock():
-        answer = zone_locked.get_publish_info(did, doc_type, revesion, opts.without_zone_lock())
-        if answer is not None:
-            return answer
+        answer = request_source(zone_locked, "publish_info", did, doc_type, revesion, opts)
+        if answer.publish_info is not None:
+            return answer.publish_info
+    provider = get_method_authority(did)
+    if provider is not None:
+        current = opts.reusable_query_answer(provider, did, doc_type, revesion, "publish_info")
+        if current is not None:
+            return current.publish_info
     key = (opts.scope, did, doc_type, revesion.cache_key())
     cached = local_cache(opts).get_publish_info(key)
-    if cached is not None and cached.valid_until > now():
+    if cached is not None and cached.valid_until > now() and not opts.force_authority_query:
         return cached.info
-    if not opts.allow_request():
-        return None
-    provider = get_method_authority(did)
     if provider is None or not provider.supports_publish_info():
         return None
-    info = provider.get_publish_info(did, doc_type, revesion)
+    answer = request_source(provider, "publish_info", did, doc_type, revesion, opts)
+    info = answer.publish_info
     # 公共状态与 (iat, hash) 记录分别合并；未回答不撤销已知负状态，None 只作短期退避。
-    local_cache(opts).update_publish_info(key, info)
+    # None 的原因保留在本次诊断；只有真实来源的 NoAnswer 可缓存，策略拒绝/本地超时不能写入。
+    opts.record_query_answer(provider, did, doc_type, revesion, answer)
+    if answer.cacheable:
+        local_cache(opts).update_publish_info(key, info)
     return info
 
 
@@ -187,38 +281,40 @@ def get_publish_info(did, doc_type, revesion, opts):
 def verify_document(did, doc_type, doc_body, revesion=None, opts=None):
     revesion = normalize_revesion(revesion)
     opts = normalize_opts(opts, doc_type)
-    doc = parse_document(doc_body)  # 标准 DID Document JSON 或 JWT；提取字段不等于信任。
-    if not doc.matches(did, doc_type) or doc.iat is None:
-        return Invalid("文档身份、类型或 iat 不合法")
+    with resolution_budget(opts):
+        doc = parse_document(doc_body, opts=opts)  # 标准 JSON/JWT；受输入上限和预算约束，提取不等于信任。
+        if not doc.matches(did, doc_type) or doc.iat is None:
+            return Invalid("文档身份、类型或 iat 不合法")
 
-    with serialize_document(did, doc_type, opts):
-        result = get_doc_result(did, doc_type, opts)
-        refresh_known_constraints(result, opts)
-        # locker 仍优先；这里比较的是收到的文档，不能用锁定的另一份文档替代它。
-        locked = get_locked_document(did, doc_type, revesion, opts)
-        if locked is not None:
-            result = locked
-        cached = result.find_verified(doc.revision())
-        # reusable_for 检查来源范围、owner/locker 依赖，以及目标查询的发布依据是否仍可复用。
-        # 默认 best 的签名结论可复用，不为每次缓存命中强制刷新公网发布状态。
-        if cached is not None and cached.reusable_for(revesion, opts):
-            report = cached.report.copy_for(doc)
-            apply_known_constraints(report, doc, result, revesion, opts)
+        with serialize_document(did, doc_type, opts):
+            result = get_doc_result(did, doc_type, opts)
+            refresh_known_constraints(result, opts)
+            # locker 仍优先；这里比较的是收到的文档，不能用锁定的另一份文档替代它。
+            locked = get_locked_document(did, doc_type, revesion, opts)
+            if locked is not None:
+                result = locked
+            cached = result.find_verified(doc.revision())
+            # reusable_for 检查来源范围、owner/locker 依赖，以及目标查询的发布依据是否仍可复用。
+            # 默认 best 的签名结论可复用，不为每次缓存命中强制刷新公网发布状态。
+            # force_authority_query 时，缺本轮匹配 receipt 的旧验证结果不能让本次权威查询短路。
+            if cached is not None and cached.reusable_for(revesion, opts):
+                report = cached.report.copy_for(doc)
+                apply_known_constraints(report, doc, result, revesion, opts)
+                report.set_selection_flags(doc, result, revesion)
+                if report.success(revesion):
+                    return report
+
+            # 即便缓存命中失败，也可复用该确切文档原先取得的 authority/trust 来源材料。
+            # 验签所用 owner/locker 依据失效时不能改作免签来源；单纯解绑不抹掉已有 trust 来源。
+            source = reusable_source(cached, opts) if cached is not None else Source.normal()
+            info = get_publish_info(did, doc_type, revesion, opts)
+            report = _verify_document_ex(did, doc_type, doc, result, info, source, revesion, opts)
+            if not result.locked:
+                # 保存发布/撤销事实；只有 valid 的输入才可推进 best；不依赖业务准入结果。
+                result.apply_verification(doc, source, report, revesion)
+                result = update_doc_result(did, doc_type, result, opts)
             report.set_selection_flags(doc, result, revesion)
-            if report.success(revesion):
-                return report
-
-        # 即便缓存命中失败，也可复用该确切文档原先取得的 authority/trust 来源材料。
-        # 验签所用 owner/locker 依据失效时不能改作免签来源；单纯解绑不抹掉已有 trust 来源。
-        source = reusable_source(cached, opts) if cached is not None else Source.normal()
-        info = get_publish_info(did, doc_type, revesion, opts)
-        report = _verify_document_ex(did, doc_type, doc, result, info, source, revesion, opts)
-        if not result.locked:
-            # 保存发布/撤销事实；只有 valid 的输入才可推进 best；不依赖业务准入结果。
-            result.apply_verification(doc, source, report, revesion)
-            result = update_doc_result(did, doc_type, result, opts)
-        report.set_selection_flags(doc, result, revesion)
-        return report
+            return report
 
 
 def _verify_document_ex(did, doc_type, doc, result, publish_info, source, revesion, opts):
@@ -263,7 +359,7 @@ def _verify_document_ex(did, doc_type, doc, result, publish_info, source, revesi
     if doc.owner != expected_owner:
         return report.invalid("owner 不匹配")
 
-    owner_opts = opts.create_get_owner_opts()  # 继承请求/缓存/locker 限制及环路检查。
+    owner_opts = opts.create_get_owner_opts()  # 继承来源/传输/locker 限制、同一预算/取消信号及环路检查。
     current_revesion = Revision.current()
     signing_revesion = Revision.closest(doc.iat)  # 与调用方要查询哪个子文档版本无关。
     current = resolve_did_ex(expected_owner, "owner", revesion=current_revesion, opts=owner_opts)
@@ -275,7 +371,7 @@ def _verify_document_ex(did, doc_type, doc, result, publish_info, source, revesi
     # 历史查询只确认当时的材料，旧 owner 的 exp 不按“今天”判断；不能用当前 owner 冒充缺失的历史版本。
     if signing_owner is not None:
         # 这里只核验签名，exp/撤销单独判断，才能报告“历史签名正确、当前已撤销”。
-        if not verify_jwt_signature(doc, signing_owner.get_public_keys()):
+        if not verify_jwt_signature(doc, signing_owner.get_public_keys(), opts=opts):
             return report.invalid("签名错误")
         report.is_signed = True
     else:
@@ -371,6 +467,8 @@ def _get_did_providers(did, doc_type, opts):
     if doc_type == "owner":
         return available(authority)  # 不为查 owner 再通过同一 owner 构造 trust 源。
     # BNS owner 的绑定站点作为 trust，其它配置源为 normal；owner 材料获取继承 opts。
+    # 构造来源优先用本地材料；需要补 owner 时走带同一 opts 的 resolve，不能绕过 request_source。
+    # network_sources 不过滤已有来源缓存：authority_only 仍可复用本地材料，但不访问 trust/normal。
     return available(authority) + bound_trust_providers(did, opts) + normal_providers(did, opts)
 
 
@@ -391,26 +489,72 @@ def update_doc_result(did, doc_type, result, opts):
 def commit_candidate_doc(did, doc_type, doc_body, source, opts=None):
     opts = normalize_opts(opts, doc_type)
     # trust 只能由有权限的预装/配置入口指定，不能直接采用远端提交的 source 字符串。
-    with serialize_document(did, doc_type, opts):
+    with resolution_budget(opts), serialize_document(did, doc_type, opts):
         result = get_doc_result(did, doc_type, opts)
-        result.candidates.add(parse_document(doc_body), source)
+        result.candidates.add(parse_document(doc_body, opts=opts), source)
         update_doc_result(did, doc_type, result, opts)
 
 
 def remove_doc_result(did, doc_type, opts):
     # 删除普通文档缓存；不隐式解锁，不把已知禁用/撤销变成从未见过。
-    local_cache(opts).remove_document_bodies(opts.scope, did, doc_type)
+    opts = normalize_opts(opts, doc_type)
+    with resolution_budget(opts):
+        local_cache(opts).remove_document_bodies(opts.scope, did, doc_type)
 
 
 # ---------- 使用场景 ----------
-def on_rtcp_hello(hello):
+def open_rtcp_tunnel(remote_did, requirement, caller_opts=None):
+    # #207 的入口是 Relay 发起 RTCP 前解析目标，必须在这一阶段就限制来源：
+    # https://github.com/buckyos/cyfs-gateway/issues/207
+    opts = normalize_opts(caller_opts, "device")
+    opts = (
+        opts.with_network_sources("authority_only")
+        .with_transport_policy(independent_control_plane)
+        .without_zone_lock()
+    )
+    if requirement == "AuthorityCurrent":
+        opts = opts.without_local_lock().with_force_authority_query()
+    # 本示例固定关闭 Zone locker，caller_opts 的 allow_zone_lock 不会覆盖它。
+    # 其它显式允许 Zone locker 的模式只能选满足独立控制通道约束的 locker，并传递剩余预算/取消
+    # 和 without_zone_lock；仅使用 localhost 或关闭再次选 locker 都不充分。
+    # AuthorityCurrent 显式禁用两种 locker，以取得真实权威回答，不接受 scope 内模拟发布。
+    with resolution_budget(opts):
+        result = resolve_did_ex(remote_did, "device", opts=opts)
+        identity = select_rtcp_identity(result, requirement, opts)
+        if identity is None:
+            return error("目标身份材料不足或不满足 RTCP 身份要求", result.reason)
+        # select_rtcp_identity 是 RTCP 的证据门禁，不直接把普通 select(current) 的 best 当公网当前：
+        # AuthorityCurrent 从本轮真实 authority receipt 选择有效文档，检查精确 DID/type/iat/hash 绑定。
+        # 即使缓存 best 更新，也不能用它替换 receipt 指定的 body；旧 latest/Unknown 不满足本次确认。
+        # TrustedSnapshot 按自身准入策略检查允许的本地依据，不能因来源限制而放宽验证。
+        # 复用/建连携带这一确切身份快照；地址材料获取也继承来源/传输限制和剩余预算，
+        # 不在下层重新调用默认 resolve。实际 RTCP 建连仍完成持钥证明、身份绑定和业务准入。
+        return connect_rtcp_with_identity(remote_did, identity, opts=opts)
+
+
+def on_rtcp_hello(hello, caller_opts=None):
     if hello.to != self.did:
         return error("我不是你的目标")
-    opts = Opts.default().not_allow_request()
+    # 与 outbound 的握手共用剩余预算；新入站从握手入口建立有限预算，不信任对端指定更长的期限。
+    opts = normalize_opts(caller_opts, "device").not_allow_request().without_zone_lock()
     report = verify_document(hello.from_did, "device", hello.device_doc, opts=opts)
     if not report.success(Revision.current()):
         return error("device doc 验证失败", report.reason)
-    # 缺 owner 等材料由应用补齐再重试；RTCP 仍独立完成持钥证明和业务准入。
+    # 缺 owner 等材料先结束本次握手；应用可在独立、限并发且有退避的控制通道任务中补齐再重试。
+    # 独立任务可建立自己的有限预算，但继续使用独立通道限制，不在原请求链内放开来源调用默认 resolve。
+    # 不自动无限重试；RTCP 仍独立完成持钥证明和业务准入，同键锁等待也受握手剩余预算限制。
+
+
+# 设计验收（隔离环境；不向生产 Relay 制造回流）：
+# - 普通 current：authority 成功或 Unknown 后仍查询允许的 trust/normal，并能选出更高的有效 best。
+# - RTCP outbound：模拟 BNS 502/503、断连、不响应、坏身份；目标 HTTPS 指向同一 Relay，
+#   断言 trust/normal 网络调用为 0，且等待、连接、FD 在总预算内释放；另一合法 Zone 仍可用。
+# - no_request + without_zone_lock：冷缓存及 owner current/closest 均不联网，缺材料明确失败。
+# - 显式启用独立 Zone locker：body/publish_info 均执行传输门禁；禁止经目标隧道回流及重定向绕过。
+# - authority 自身的 DNS/代理/内部 fallback 需要目标 RTCP 时，受限请求直接拒绝，不因 authority 等级放行。
+# - 串行锁等待、owner 递归、多 provider 重试共用 deadline；超时/取消不残留请求或锁，
+#   不写禁用状态、不污染普通调用缓存；并发合并不跨访问策略复用网络任务。
+# - AuthorityCurrent 不接受模拟发布/旧 receipt/仅 trust best；有效身份、吊销与隧道复用仍按原准入要求检查。
 
 
 def get_device_info(device_name):
