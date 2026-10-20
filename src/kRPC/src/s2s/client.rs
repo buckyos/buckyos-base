@@ -18,7 +18,7 @@ use super::keys::{
 };
 use super::provider::S2sPublicKeyProvider;
 use super::{S2S_DEFAULT_MAX_LIFETIME_SECS, S2S_PROFILE_VERSION};
-use name_client::ResolveSourcePolicy;
+use name_client::ResolveOpts;
 use name_lib::{parse_canonical_did, DID};
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -163,7 +163,7 @@ impl S2sClientTransport {
         // 固定 target 的公钥在 transport 构造阶段只加载一次，request 热路径
         // 只读取内存快照。
         remote_identity
-            .snapshot(ResolveSourcePolicy::BestAvailable)
+            .snapshot(ResolveOpts::default())
             .await?;
         Ok(Self {
             local,
@@ -186,7 +186,7 @@ impl S2sClientTransport {
     pub async fn remote_identity_snapshot(&self) -> S2sResult<RemoteIdentitySnapshot> {
         let (snapshot, retired) = self
             .remote_identity
-            .snapshot(ResolveSourcePolicy::BestAvailable)
+            .snapshot(ResolveOpts::default())
             .await?;
         if let Some(retired) = retired {
             self.derived_cache.invalidate_fingerprint(&retired);
@@ -212,7 +212,7 @@ impl S2sClientTransport {
     pub async fn reload_remote_identity(&self) -> S2sResult<bool> {
         let (changed, retired, _) = self
             .remote_identity
-            .reload(ResolveSourcePolicy::RemoteAuthority)
+            .reload(ResolveOpts::default().with_force_authority_query())
             .await?;
         if let Some(retired) = retired {
             self.derived_cache.invalidate_fingerprint(&retired);
@@ -266,7 +266,7 @@ impl S2sClientTransport {
     ) -> S2sResult<(S2sRequestHeaders, Vec<u8>, S2sPendingRequest)> {
         let (mut remote_key, retired) = self
             .remote_identity
-            .snapshot(ResolveSourcePolicy::BestAvailable)
+            .snapshot(ResolveOpts::default())
             .await?;
         if let Some(retired) = retired {
             self.derived_cache.invalidate_fingerprint(&retired);

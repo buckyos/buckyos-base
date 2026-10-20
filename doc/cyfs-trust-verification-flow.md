@@ -1,5 +1,7 @@
 # CYFS 内容网络的去中心化可信验证流程
 
+> 本文是概念背景；DID 文档的获取与验证流程以 [resolve-did 协议冻结讨论](./resolve-did协议冻结讨论伪代码.md) 与 [resolve-did.py](./resolve-did.py) 为准。
+>
 > 依据语音记录整理。本文把语音识别中的“中/重/众”等统一整理为 **Zone**，把 “owner / on-site / exchange key / gateway / AppDoc / DeviceDocument / DIDDocument” 等概念按 CYFS 语境统一命名。本文重点不是重新定义协议字段，而是把真实运行环境里的**公钥查找、文档获取、签名验证、下载验证、RTCP 建链验证、开发模式例外**串成完整流程。
 
 ---

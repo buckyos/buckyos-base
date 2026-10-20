@@ -19,7 +19,7 @@ use super::provider::S2sPublicKeyProvider;
 use super::replay::{MemoryReplayStore, ReplayKey, S2sReplayStore};
 use super::seal::{aead_open, aead_seal};
 use super::S2S_PROFILE_VERSION;
-use name_client::ResolveSourcePolicy;
+use name_client::ResolveOpts;
 use name_lib::{parse_canonical_did, DID};
 use serde_json::Value;
 use std::sync::{Arc, RwLock};
@@ -117,7 +117,7 @@ impl S2sRpcServerContext {
     pub async fn reload_remote_identity(&self, remote_did: &DID) -> S2sResult<bool> {
         let remote_identity = self.local.runtime().remote_identity_handle(remote_did)?;
         let (changed, retired, _) = remote_identity
-            .reload(ResolveSourcePolicy::RemoteAuthority)
+            .reload(ResolveOpts::default().with_force_authority_query())
             .await?;
         if let Some(retired) = retired {
             self.derived_cache.invalidate_fingerprint(&retired);
@@ -197,7 +197,7 @@ impl S2sRpcServerContext {
         let local_key = self.local.current_key_snapshot();
         let remote_identity = self.local.runtime().remote_identity_handle(&headers.from)?;
         let (mut remote_key, retired) = remote_identity
-            .snapshot(ResolveSourcePolicy::BestAvailable)
+            .snapshot(ResolveOpts::default())
             .await?;
         if let Some(retired) = retired {
             self.derived_cache.invalidate_fingerprint(&retired);

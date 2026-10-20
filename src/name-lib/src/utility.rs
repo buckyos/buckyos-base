@@ -58,18 +58,25 @@ pub enum NSError {
     InvalidState(String),
     #[error("Owner conflict: {0}")]
     OwnerConflict(String),
-    /// `add_observed_cache` 写入前的快速校验未通过(格式无法解析、`id` 与声明的
-    /// did 不一致等),`unverified` 缓存未产生任何写入(doc/update-did-cache.md)。
-    #[error("unverified cache write rejected: {0}")]
+    /// 收件箱投递(`commit_candidate_doc`)前的快速校验未通过(格式无法解析、`id`
+    /// 与声明的 did 不一致等),没有产生任何写入。
+    #[error("candidate document rejected: {0}")]
     UnverifiedCacheWriteRejected(String),
-    /// lazy verify(verify_and_promote)所需条件暂不可用(owner document 拿不到、
-    /// 网络不可达)。unverified 候选保留,strict 解析按 cache miss 处理。
-    #[error("verify-and-promote unavailable: {0}")]
-    VerifyAndPromoteUnavailable(String),
-    /// lazy verify(verify_and_promote)明确失败。`code` 复用纯 verify
-    /// (`VerifyError::code`)的稳定错误码集合;unverified 候选已被删除。
-    #[error("verify-and-promote rejected: {code}: {detail}")]
-    VerifyAndPromoteRejected { code: String, detail: String },
+    /// 整次解析的有限预算耗尽(resolve-did 设计稿 §4 `ResolutionDeadlineExceeded`):
+    /// 终止整次调用,不回退、不返回旧缓存冒充成功,也不声明 DID 不存在/禁用。
+    #[error("resolution deadline exceeded: {0}")]
+    DeadlineExceeded(String),
+    /// 整次解析被调用方取消(设计稿 §4 `ResolutionCancelled`),同样终止整次调用。
+    #[error("resolution cancelled: {0}")]
+    Cancelled(String),
+}
+
+impl NSError {
+    /// 终止类错误:预算耗尽或取消。调用链上任何一层都不得把它们转成可继续
+    /// fallback 的 Unknown。
+    pub fn is_termination(&self) -> bool {
+        matches!(self, NSError::DeadlineExceeded(_) | NSError::Cancelled(_))
+    }
 }
 
 pub type NSResult<T> = Result<T, NSError>;

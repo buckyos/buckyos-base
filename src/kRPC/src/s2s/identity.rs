@@ -8,7 +8,7 @@ use super::error::{S2sError, S2sResult};
 use super::keys::{ed25519_key_fingerprint, ed25519_pk_to_x25519_pk};
 use super::provider::{S2sProviderChangeToken, S2sProviderLookup, S2sPublicKeyProvider};
 use name_client::{
-    get_name_client, IdentityRoots, LocalEd25519IdentityKey, NameClient, ResolveSourcePolicy,
+    get_name_client, IdentityRoots, LocalEd25519IdentityKey, NameClient, ResolveOpts,
 };
 use name_lib::{parse_canonical_did, DID};
 use std::collections::{HashMap, VecDeque};
@@ -265,7 +265,7 @@ impl S2sRemoteIdentitySource {
     async fn resolve(
         &self,
         entry: &Arc<RemoteIdentityEntry>,
-        fallback_source: ResolveSourcePolicy,
+        fallback_source: ResolveOpts,
     ) -> S2sResult<ResolvedRemote> {
         if let Some(snapshot) = self.fresh_snapshot(entry) {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +290,7 @@ impl S2sRemoteIdentitySource {
     async fn reload(
         &self,
         entry: &Arc<RemoteIdentityEntry>,
-        fallback_source: ResolveSourcePolicy,
+        fallback_source: ResolveOpts,
     ) -> S2sResult<RemoteReload> {
         let _load = entry.load_lock.lock().await;
         self.metrics
@@ -336,7 +336,7 @@ impl S2sRemoteIdentitySource {
         gate.last_attempt = Some(Instant::now());
 
         let reload = self
-            .reload(entry, ResolveSourcePolicy::RemoteAuthority)
+            .reload(entry, ResolveOpts::default().with_force_authority_query())
             .await?;
         if reload.current.fingerprint == observed.fingerprint {
             Ok(None)
@@ -370,7 +370,7 @@ impl S2sRemoteIdentitySource {
     async fn load(
         &self,
         did: &DID,
-        fallback_source: ResolveSourcePolicy,
+        fallback_source: ResolveOpts,
     ) -> S2sResult<RemoteDefaultKey> {
         validate_did(did)?;
         if let Some(provider) = self.provider.as_ref() {
@@ -415,7 +415,7 @@ impl S2sRemoteIdentitySource {
                             .fetch_add(1, Ordering::Relaxed);
                         let ed25519_public = name_client
                             .as_ref()
-                            .resolve_default_ed25519_key(did, fallback_source)
+                            .resolve_default_ed25519_key(did, fallback_source.clone())
                             .await
                             .map_err(map_identity_error)?;
                         if Some(generation) != self.provider_generation() {
@@ -448,7 +448,7 @@ impl S2sRemoteIdentitySource {
             .fetch_add(1, Ordering::Relaxed);
         let ed25519_public = name_client
             .as_ref()
-            .resolve_default_ed25519_key(did, fallback_source)
+            .resolve_default_ed25519_key(did, fallback_source.clone())
             .await
             .map_err(map_identity_error)?;
         RemoteIdentitySnapshot::new(
@@ -490,7 +490,7 @@ pub(crate) struct S2sRemoteIdentityHandle {
 impl S2sRemoteIdentityHandle {
     pub async fn snapshot(
         &self,
-        fallback_source: ResolveSourcePolicy,
+        fallback_source: ResolveOpts,
     ) -> S2sResult<(RemoteDefaultKey, Option<[u8; 32]>)> {
         let resolved = self.source.resolve(&self.entry, fallback_source).await?;
         Ok((resolved.current, resolved.retired))
@@ -498,7 +498,7 @@ impl S2sRemoteIdentityHandle {
 
     pub async fn reload(
         &self,
-        fallback_source: ResolveSourcePolicy,
+        fallback_source: ResolveOpts,
     ) -> S2sResult<(bool, Option<[u8; 32]>, RemoteDefaultKey)> {
         let result = self.source.reload(&self.entry, fallback_source).await?;
         let retired = result

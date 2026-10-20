@@ -13,26 +13,33 @@ use hickory_resolver::TokioResolver;
 use jsonwebtoken::DecodingKey;
 use serde_json::json;
 
+use crate::resolver::{Carrier, ResolveOpts, Revision, Source, SourceAnswer, SourceRef, SourceTier};
 use crate::{DidDocType, NameInfo, NsProvider, RecordType};
+use std::collections::HashMap as StdHashMap;
 use name_lib::*;
 pub struct DnsProvider {
     dns_server: Option<String>,
+    /// 一次 TXT 查询解析出的全部文档(owner / boot / zone / device)短期缓存,
+    /// 避免同一名字的多种类型查询重复发 DNS。
+    txt_cache: std::sync::Mutex<StdHashMap<String, (StdHashMap<String, EncodedDocument>, u64)>>,
 }
+
+const TXT_DOCS_CACHE_SECS: u64 = 30;
 
 impl DnsProvider {
     pub fn new(dns_server: Option<String>) -> Self {
-        Self { dns_server }
+        Self {
+            dns_server,
+            txt_cache: std::sync::Mutex::new(StdHashMap::new()),
+        }
     }
 
     pub fn new_with_config(config: serde_json::Value) -> NSResult<Self> {
-        let dns_server = config.get("dns_server");
-        if dns_server.is_some() {
-            let dns_server = dns_server.unwrap().as_str();
-            return Ok(Self {
-                dns_server: dns_server.map(|s| s.to_string()),
-            });
-        }
-        Ok(Self { dns_server: None })
+        let dns_server = config
+            .get("dns_server")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        Ok(Self::new(dns_server))
     }
 
     fn build_resolver(&self) -> NSResult<TokioResolver> {
@@ -69,10 +76,6 @@ impl NsProvider for DnsProvider {
         return "dns provider".to_string();
     }
 
-    fn methods(&self) -> Vec<String> {
-        vec!["web".to_string()]
-    }
-
     async fn query(
         &self,
         name: &str,
@@ -90,7 +93,7 @@ impl NsProvider for DnsProvider {
                     let err = response.err().unwrap();
                     // NoRecordsFound/NXDOMAIN 是 DNS 渠道的权威回答("没有"),
                     // 必须与传输失败(没得到回答)区分:前者是 NotFound,
-                    // 后者才是 Failed(简化文档 2.1 节的 DR/unknown 二分)。
+                    // 后者才是 Failed(设计稿 §2.2:NoAnswer 与"没有文档"的二分)。
                     if err.is_no_records_found() {
                         return Err(NSError::NotFound(format!("no TXT record for {}", name)));
                     }
@@ -246,47 +249,73 @@ impl NsProvider for DnsProvider {
         }
     }
 
-    async fn query_did(
+}
+
+
+impl DnsProvider {
+    /// 从 TXT 记录解析出该名字下的全部 DID 文档(owner / boot / zone / device)。
+    pub async fn query_did_documents(
         &self,
         did: &DID,
-        doc_type: Option<DidDocType>,
         from_ip: Option<IpAddr>,
-    ) -> NSResult<EncodedDocument> {
-        info!("NsProvider query did: {} ...", did.to_host_name());
-
-        let doc_type = doc_type.unwrap_or_default();
-        let did_documents = self
-            .query_did_documents(did, from_ip)
-            .await?
-            .unwrap_or_default();
-        if let Some(did_document) = did_documents.get(doc_type.as_str()) {
-            info!(
-                "NsProvider::query_did{}: DID Document found: {}",
-                did.to_host_name(),
-                doc_type
-            );
-            return Ok(did_document.clone());
+    ) -> NSResult<StdHashMap<String, EncodedDocument>> {
+        let host = did.to_host_name();
+        let now = buckyos_get_unix_timestamp();
+        if let Some((docs, until)) = self.txt_cache.lock().unwrap().get(&host).cloned() {
+            if until > now {
+                return Ok(docs);
+            }
         }
-        warn!(
-            "NsProvider::query_did{}: DID Document not found: {}",
-            did.to_host_name(),
-            doc_type
-        );
-        return Err(NSError::NotFound(format!(
-            "DID Document not found: {}",
-            doc_type
-        )));
+        let name_info = self.query(&host, Some(RecordType::TXT), from_ip).await?;
+        let docs = name_info.parse_txt_record_to_did_documents()?;
+        let mut cache = self.txt_cache.lock().unwrap();
+        if cache.len() > 256 {
+            cache.retain(|_, (_, until)| *until > now);
+        }
+        cache.insert(host, (docs.clone(), now + TXT_DOCS_CACHE_SECS));
+        Ok(docs)
+    }
+}
+
+/// DNS TXT 只用于 current-zone 自举(注册为 zone-bootstrap normal 来源):
+/// 没有发布状态机和负状态信令,只贡献候选。
+#[async_trait::async_trait]
+impl Source for DnsProvider {
+    fn id(&self) -> String {
+        "dns-provider".to_string()
     }
 
-    async fn query_did_documents(
+    async fn get_document(
         &self,
         did: &DID,
-        from_ip: Option<IpAddr>,
-    ) -> NSResult<Option<HashMap<String, EncodedDocument>>> {
-        let name_info = self
-            .query(&did.to_host_name(), Some(RecordType::TXT), from_ip)
-            .await?;
-        Ok(Some(name_info.parse_txt_record_to_did_documents()?))
+        doc_type: &DidDocType,
+        _revision: &Revision,
+        _opts: &ResolveOpts,
+    ) -> SourceAnswer {
+        let sref = SourceRef::provider(self.id(), SourceTier::Normal);
+        let own = match self.query_did_documents(did, None).await {
+            Ok(documents) => match documents.get(doc_type.as_str()) {
+                Some(doc) => return SourceAnswer::new(sref).with_body(doc.clone(), Carrier::Body),
+                None => SourceAnswer::no_answer(sref.clone(), format!("no {} document in TXT", doc_type)),
+            },
+            Err(NSError::NotFound(msg)) => SourceAnswer::no_answer(sref.clone(), msg),
+            Err(err) => SourceAnswer::failure(sref.clone(), err.to_string()),
+        };
+        // zone 的 TXT 里用 `DEV=` 携带子设备文档:`{device}.{zone}` 的 device 文档
+        // 在上级名字的记录中按设备名查找。
+        if matches!(doc_type, DidDocType::Device | DidDocType::Zone) {
+            if let Some(upper) = did.upper_did() {
+                let device_name = did.id.split('.').next().unwrap_or_default().to_string();
+                if !device_name.is_empty() {
+                    if let Ok(documents) = self.query_did_documents(&upper, None).await {
+                        if let Some(doc) = documents.get(&device_name) {
+                            return SourceAnswer::new(sref).with_body(doc.clone(), Carrier::Body);
+                        }
+                    }
+                }
+            }
+        }
+        own
     }
 }
 
@@ -296,6 +325,7 @@ mod tests {
 
     use super::*;
     use hickory_resolver::proto::xfer::Protocol;
+    use std::time::Duration;
 
     #[test]
     fn test_custom_dns_resolver_enables_edns0_and_tcp_fallback() {
@@ -329,52 +359,51 @@ mod tests {
         let result = result.unwrap();
         assert!(result.address.len() > 0, "address should not be empty");
 
-        let result = dns_provider
-            .query_did(
+        let answer = dns_provider
+            .get_document(
                 &DID::from_str("did:web:test.buckyos.io").unwrap(),
-                None,
-                None,
+                &DidDocType::Zone,
+                &Revision::current(),
+                &ResolveOpts::default().normalize(Duration::from_secs(10)),
             )
             .await;
-        assert!(result.is_ok(), "query_did should succeed");
-        let result = result.unwrap();
-        let result_str = result.to_string();
-        println!("* result_str: {}", result_str);
+        assert!(answer.body.is_some(), "get_document should succeed: {:?}", answer.reason);
+        println!("* result_str: {}", answer.body.unwrap().to_string());
 
-        let result = dns_provider
-            .query_did(
+        let answer = dns_provider
+            .get_document(
                 &DID::from_str("did:web:test.buckyos.io").unwrap(),
-                Some(DidDocType::Boot),
-                None,
+                &DidDocType::Boot,
+                &Revision::current(),
+                &ResolveOpts::default().normalize(Duration::from_secs(10)),
             )
             .await;
-        assert!(result.is_ok(), "query_did should succeed");
-        let result = result.unwrap();
-        let result_str = result.to_string();
-        println!("* result_str: {}", result_str);
+        assert!(answer.body.is_some(), "get_document should succeed: {:?}", answer.reason);
+        println!("* result_str: {}", answer.body.unwrap().to_string());
 
-        let result = dns_provider
-            .query_did(
+        let answer = dns_provider
+            .get_document(
                 &DID::from_str("did:web:test.buckyos.io").unwrap(),
-                Some(DidDocType::Owner),
-                None,
+                &DidDocType::Owner,
+                &Revision::current(),
+                &ResolveOpts::default().normalize(Duration::from_secs(10)),
             )
             .await;
-        assert!(result.is_ok(), "query_did should succeed");
-        let result = result.unwrap();
-        let result_str = result.to_string();
-        println!("* result_str: {}", result_str);
+        assert!(answer.body.is_some(), "get_document should succeed: {:?}", answer.reason);
+        println!("* result_str: {}", answer.body.unwrap().to_string());
 
-        let result = dns_provider
-            .query_did(
-                &DID::from_str(" filebrowser.buckyos.web3.devtests.org").unwrap(),
-                None,
-                None,
-            )
-            .await;
-        if result.is_err() {
-            let err = result.err().unwrap();
-            warn!("query_did failed! {}", err.to_string());
+        if let Ok(did) = DID::from_str("filebrowser.buckyos.web3.devtests.org") {
+            let answer = dns_provider
+                .get_document(
+                    &did,
+                    &DidDocType::Zone,
+                    &Revision::current(),
+                    &ResolveOpts::default().normalize(Duration::from_secs(10)),
+                )
+                .await;
+            if answer.body.is_none() {
+                warn!("get_document failed! {:?}", answer.reason);
+            }
         }
 
         println!("✓ test_dns_provider passed");

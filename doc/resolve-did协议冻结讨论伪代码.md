@@ -2,7 +2,7 @@
 
 > 设计稿，2026-10-20。依据 [resolve-did.py](./resolve-did.py) 伪代码整理，以 `62a5358` 为基线，补充本轮目录/路径入口及 HTTP body/header 文档承载约定。
 > 同日按 [resolve-did重构-TODO.md](./resolve-did重构-TODO.md) 的裁决回写：closest 推导规则（§1、§6）、`invalid` 负状态（§2.2）、`doc_type` 归一表（§2.4）、串行锁范围（§4、§5、§7）。wire 细节在 [HTTP DID Resolver API](./http_did_resolver_api.md)。
-> 本文定义目标行为，现有 Rust API 尚未实现这些保证。省略异步、数据库和 wire 格式；helper 名称遵循 Python 伪代码，不代表已有实现。
+> 2026-10-20 重构 M1–M6 已按本文实现于 `name-client/src/resolver/`（落点见 [resolve-did重构-TODO.md §2](./resolve-did重构-TODO.md)）。本文省略异步、数据库和 wire 格式；helper 名称已回写为实际 Rust 名（`revision` / `ResolveOpts` / `DocResult` / `DocStore` 等）。
 > 本次替换旧稿中的 `Current / StillValid / AtPublication`、验证后另行提交、当前 Owner 密钥统一验签等旧方案。版本查询、事实验证与业务准入分别按下文定义；与其他早期讨论稿冲突时，本轮核对以 `resolve-did.py` 为依据。
 
 讨论范围是需要信任验证的 DID Document。`Info` 等免验证类型继续走独立契约，不能作为身份凭据；`did:key / did:dev` 不作为这里的可信文档解析入口。本文不定义 method 发布交易或 Zone 管理 API。
@@ -14,19 +14,19 @@
 doc = resolve_did(did, doc_type)
 
 # 精确版本或严格早于指定时间的最近已发布版本。
-doc = resolve_did(did, doc_type, revesion=Revision.exact(iat, content_hash))
-doc = resolve_did(did, doc_type, revesion=Revision.closest(query_iat))
+doc = resolve_did(did, doc_type, revision=Revision.exact(iat, content_hash))
+doc = resolve_did(did, doc_type, revision=Revision.closest(query_iat))
 
 # 获取完整结果及原因，控制来源、传输、缓存、locker 和预算。
-result = resolve_did_ex(did, doc_type, revesion=None, opts=opts)
+result = resolve_did_ex(did, doc_type, revision=None, opts=opts)
 
 # 始终验证收到的确切文档；允许按 opts 补材料并更新解析缓存。
-report = verify_document(did, doc_type, received_body, revesion=None, opts=opts)
+report = verify_document(did, doc_type, received_body, revision=None, opts=opts)
 if report.success(Revision.current()):
     continue_business_admission(report)  # 持钥证明、连接授权等由业务负责
 ```
 
-参数名 `revesion` 沿用伪代码的拼写，表示**查询条件**；`doc.revision()` 表示文档身份 `(iat, content_hash)`，两者不能混用。未指定查询条件等价于 `Revision.current()`。便捷入口 `resolve_did` 默认启用本机 locker、Zone locker 和磁盘缓存。
+参数 `revision: Revision` 表示**查询条件**；`DocRevision`（`doc.revision()`）表示文档身份 `(iat, content_hash)`，两者不能混用。未指定查询条件等价于 `Revision.current()`。便捷入口 `resolve_did` 默认启用本机 locker、Zone locker 和磁盘缓存。
 
 | 查询/选择 | 含义 | 成功条件 |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ Owner 是信任根，只从 authority/locker 取得当前或指定的已发布�
 
 Locker 按 `/etc/hosts` 模型优先且强制回答，顺序为 **本机 locker > Zone locker > 普通缓存与 provider**。它不是第四档普通来源，结果不写入普通来源缓存；可以在 scope 内覆盖根材料或模拟发布，但不能冒充公网权威回答。
 
-Locker 的 Unknown/未覆盖允许继续查找；明确不存在或禁用仍是强制回答。body 与 publish_info 分别回答，缺席的列可继续向后查。锁定当前文档不能冒充 exact/closest 的历史目标，`as_locked_result` 同样按 revesion 匹配目标；验证输入时，也不能用另一份锁定文档的成功替代收到文档的判断。
+Locker 的 Unknown/未覆盖允许继续查找；明确不存在或禁用仍是强制回答。body 与 publish_info 分别回答，缺席的列可继续向后查。锁定当前文档不能冒充 exact/closest 的历史目标，`DocResult::locked_from` 同样按 revision 匹配目标；验证输入时，也不能用另一份锁定文档的成功替代收到文档的判断。
 
 本机配置与 Zone 管理权限分开：NameClient 消费 Zone 的查询接口，不因 `scope` 参数就获得远程写入权限。本文不补造统一 `sethost` 管理函数，也不继续引入旧稿的 `SeedObserved / SeedTrusted` 类型体系。
 
@@ -86,7 +86,7 @@ Locker 的 Unknown/未覆盖允许继续查找；明确不存在或禁用仍是�
 | `is_revoked / is_expired / is_disabled` | 当前已取得的撤销、时间和禁用事实；未检查的事实保留 unknown/reason |
 | `validity` | `valid / invalid / unknown`；缺必要材料是 unknown，确定的身份/hash/签名错误或过期、撤销、禁用是 invalid |
 | `is_best / is_latest / is_exact / is_closest` | 输入与可用选择的关系；invalid/unknown 时全部为 False |
-| `success(revesion)` | validity 为 valid 且命中目标；exact/closest 还必须有对应发布查询依据 |
+| `success(revision)` | validity 为 valid 且命中目标；exact/closest 还必须有对应发布查询依据 |
 
 因此，“签名正确”“当前有效”“命中查询目标”“业务允许使用”是不同结论。旧版可能 `is_signed=True` 且仍 valid，但不是 best；已撤销的旧版也可保留 `is_signed=True`，同时 validity 为 invalid、所有选择标志为 False。
 
@@ -146,7 +146,7 @@ def build_document_request_url(location, doc_type):
 
 这里的目录 helper 默认按上述规则补 `did.json`；已有目录显式类型文件继续遵守原发布契约。**兼容目标是保留旧接口和发布方式，同时增加新的对象入口与载体支持。** BNS authority 等现有 `/1.0/identifiers/{did}?type=...` resolver API 不变，根目录 `/.well-known/owner.json` 等类型文件也不变。旧路径型 `did:web` 的 `/{path}/did.json`、`/{path}/{doc_type}.json` 可按已知 method/provider 配置保留为兼容路由；新路径对象不无条件尝试这些后缀，兼容查询仍服从来源、传输和预算限制。
 
-这延续 [DID Object 协议](./did-object-protocol.md) 的 Object URL / Object DID / Card 模型，并细化其发现路由。该文档 §6.1 与 [HTTP resolver 文档](./http_did_resolver_api.md) §1.1 已于 2026-10-20 同步为上述规则；Rust 实现尚未同步。
+这延续 [DID Object 协议](./did-object-protocol.md) 的 Object URL / Object DID / Card 模型，并细化其发现路由。该文档 §6.1 与 [HTTP resolver 文档](./http_did_resolver_api.md) §1.1 已于 2026-10-20 同步为上述规则；Rust 实现见 `resolver/http.rs`（`DocumentLocation` / `build_document_request_url`）与 `web_provider.rs`。
 
 对象 Card 的 controller/Zone/Owner 是验证链。取得验签根材料时，应先建立可信绑定，再查询对应 Owner DID；不能把这个操作实现为给对象 URL 追加 `/owner.json`，也不能仅凭对象自报 controller 建立信任根。目录/路径分类本身不证明谁拥有对象。
 
@@ -211,7 +211,7 @@ def document_answer_from_http(response, expected_did, doc_type, opts):
 统一请求入口的关键逻辑如下：
 
 ```python
-def request_source(source, operation, did, doc_type, revesion, opts):
+def request_source(source, operation, did, doc_type, revision, opts):
     opts.budget.check()
     if source.is_zone_locker():
         allowed = opts.allow_zone_lock()
@@ -229,7 +229,7 @@ def request_source(source, operation, did, doc_type, revesion, opts):
     query = source.get_document if operation == "document" else source.get_publish_info
     try:
         raw = opts.budget.run(
-            lambda: query(did, doc_type, revesion, opts=request_opts),
+            lambda: query(did, doc_type, revision, opts=request_opts),
             connect_timeout=min(opts.connect_timeout, opts.budget.remaining()),
             request_timeout=min(opts.request_timeout, opts.budget.remaining()),
         )
@@ -244,14 +244,14 @@ def request_source(source, operation, did, doc_type, revesion, opts):
 
 `force_authority_query` 本身不关闭 locker，也不等于 RTCP 的公网当前身份门禁。要求真实权威当前证明时，还要关闭两种 locker，并检查本轮 receipt：
 
-- receipt 属于本次请求上下文，按 DID/doc_type/revesion/来源区分，递归共享；最外层新调用建立新的集合，复用 Opts 配置不能继承上轮 receipt。
+- receipt 属于本次请求上下文，按 DID/doc_type/revision/来源区分，递归共享；最外层新调用建立新的集合，复用 Opts 配置不能继承上轮 receipt。
 - `reusable_query_answer` 只复用本轮精确回答；body 与 publish_info 可共用一次回答。缺少所问内容时返回 None，不隐含联网。
 - 可按新 receipt 的精确 hash 使用已有合法 body，但保留 body 原来源及证据时间；旧 body、旧验证缓存或旧 latest 单独都不构成本轮权威确认。
 - 验证缓存若缺匹配本轮 receipt，不能让 `force_authority_query` 短路。
 
 ## 4. 整次调用共用有限预算
 
-`normalize_opts` 在最外层以 `monotonic_now() + config.resolve_timeout` 建立有限绝对 deadline，有调用方截止时间时取更早者。`normalize / with / create_get_owner_opts` 返回副本，但共享同一预算、取消信号和请求上下文；来源/传输限制只能收紧，Owner current/closest、fallback 和重试不能续期或恢复默认值。
+`ResolveOpts::normalize` 在最外层以 `monotonic_now() + config.resolve_timeout` 建立有限绝对 deadline，有调用方截止时间时取更早者。`normalize / with / create_get_owner_opts` 返回副本，但共享同一预算、取消信号和请求上下文；来源/传输限制只能收紧，Owner current/closest、fallback 和重试不能续期或恢复默认值。
 
 `resolution_budget` 覆盖锁与并发许可等待、缓存 I/O、locker/provider 查询、解析、验签和提交。同步计算也要限制输入大小、深度、key 数量并分片检查预算，不能只依赖异步超时。单次 connect/total timeout 取配置上限与剩余预算的较小值，provider 内部重试继续消耗同一剩余预算。
 
@@ -268,7 +268,7 @@ def request_source(source, operation, did, doc_type, revesion, opts):
 并发控制还需满足：
 
 1. 身份解析阶段也参与任务合并；共享任务有自己的有限预算，每个等待者保留自己的 deadline/取消信号，加入者不能延长任务期限。
-2. 合并键包含 scope/DID/doc_type/revesion 及来源、传输和证据要求；受限请求不能加入会访问目标站点的任务。
+2. 合并键包含 scope/DID/doc_type/revision 及来源、传输和证据要求；受限请求不能加入会访问目标站点的任务。
 3. 单个等待者离开不取消其它有效等待者的任务，最后一个等待者离开才取消无用任务；并发数和等待队列都有上限。
 4. 真实来源/传输失败按目标、来源和访问策略短期退避，错误日志限流；策略拒绝、调用取消或预算不足不能触发影响其它策略的共享退避。
 
@@ -281,42 +281,42 @@ def request_source(source, operation, did, doc_type, revesion, opts):
 以下是对应 Python 文件的流程摘录。helper 的完整约定仍以该文件相邻注释为准。
 
 ```python
-def resolve_did_ex(did, doc_type, revesion=None, opts=None):
-    revesion = normalize_revesion(revesion)
-    opts = normalize_opts(opts, doc_type)
+def resolve_did_ex(did, doc_type, revision=None, opts=None):
+    revision = normalize_revision(revision)
+    opts = ResolveOpts::normalize(opts, doc_type)
     with resolution_budget(opts):
-        # serialize_document 只在 _get_document 读缓存段和 update_doc_result 提交段内持有；
+        # serialize_document 只在 get_document 读缓存段和 update_doc_result 提交段内持有；
         # provider/locker I/O 与候选验证（含 Owner 递归）不持锁，由任务合并去重。
-        result, publish_info = _get_document(did, doc_type, revesion, opts)
+        result, publish_info = get_document(did, doc_type, revision, opts)
         if result.locked or result.state.is_disabled():
             return result
         if doc_type == "owner" or (
-            not revesion.is_current() and result.satisfies_published_target(revesion)
+            not revision.is_current() and result.satisfies_published_target(revision)
         ):
             return result
 
-        for doc, source in result.candidates.for_revesion(revesion, publish_info).descending_iat():
+        for doc, source in result.candidates.candidates_for(revision, publish_info).descending_iat():
             opts.budget.check()
-            report = _verify_document_ex(
-                did, doc_type, doc, result, publish_info, source, revesion, opts
+            report = verify_document_ex(
+                did, doc_type, doc, result, publish_info, source, revision, opts
             )
             if report.validity == "unknown":
                 continue
             result.candidates.remove(doc.revision())
             if report.validity == "invalid":
                 continue
-            result.accept_verified(doc, source, report, revesion)
-            if revesion.is_current() and result.best:
+            result.accept_verified(doc, source, report, revision)
+            if revision.is_current() and result.best:
                 break
-            if not revesion.is_current() and result.satisfies_published_target(revesion):
+            if not revision.is_current() and result.satisfies_published_target(revision):
                 break
 
-        if revesion.is_current() and result.best:
+        if revision.is_current() and result.best:
             result.candidates.clear()
         return update_doc_result(did, doc_type, result, opts)
 ```
 
-`_get_document` 先读取 locker；无覆盖时在串行锁内读取普通结果缓存并刷新已知时间、撤销和依赖约束，然后释放锁，查询并合并 publish_info。已知禁用直接提交返回，否则按 authority > trust > normal 遍历 provider，owner 只查询 authority；每个 provider 查询经 `merge_or_run`，合并键为 `(scope, provider, did, doc_type, revesion, 访问策略)`。每个回答可同时带 body 与 publish_info，拆开缓存以避免重复请求：
+`get_document` 先读取 locker；无覆盖时在串行锁内读取普通结果缓存并刷新已知时间、撤销和依赖约束，然后释放锁，查询并合并 publish_info。已知禁用直接提交返回，否则按 authority > trust > normal 遍历 provider，owner 只查询 authority；每个 provider 查询经 `TaskMerger::merge_or_run`，合并键为 `(scope, provider, did, doc_type, revision, 访问策略)`。每个回答可同时带 body 与 publish_info，拆开缓存以避免重复请求：
 
 - 只有 authority 的 publish_info 可合并普通来源的状态、发布依据和 owner 绑定。Unknown 不抹去已知事实。
 - body 先检查 DID/doc_type/iat、同 iat 的发布 hash、时间及已知撤销。authority 更新 latest 或历史；非 owner 的可用 authority/trust 文档也参与 best。
@@ -324,7 +324,7 @@ def resolve_did_ex(did, doc_type, revesion=None, opts=None):
 - 普通 current 继续收集允许的来源；owner 或 exact/closest 满足发布目标后可停止。
 - exact/closest 只检查对应发布查询选中的候选，缺发布依据时不以任意缓存版本代替目标；新回答可复用已有合法 body，无需重复下载。
 
-current 选出 best 后可清空候选，包括暂时缺材料的候选；best 后续失效再 resolve。本机以低成本使用为目标，不承诺保存完整历史或成为其它节点的文档源。失效或缺材料时，完整结果保留原因，`select(revesion)` 不能返回不满足条件的文档。
+current 选出 best 后可清空候选，包括暂时缺材料的候选；best 后续失效再 resolve。本机以低成本使用为目标，不承诺保存完整历史或成为其它节点的文档源。失效或缺材料时，完整结果保留原因，`select(revision)` 不能返回不满足条件的文档。
 
 ## 6. 验证确切输入与 Owner 的两次查询
 
@@ -351,12 +351,12 @@ if doc.owner != expected_owner:
     return report.invalid("owner 不匹配")
 
 owner_opts = opts.create_get_owner_opts()
-current_revesion = Revision.current()
-signing_revesion = Revision.closest(doc.iat)
-current = resolve_did_ex(expected_owner, "owner", revesion=current_revesion, opts=owner_opts)
-historical = resolve_did_ex(expected_owner, "owner", revesion=signing_revesion, opts=owner_opts)
-current_owner = current.select(current_revesion)
-signing_owner = historical.select(signing_revesion)
+current_revision = Revision.current()
+signing_revision = Revision.closest(doc.iat)
+current = resolve_did_ex(expected_owner, "owner", revision=current_revision, opts=owner_opts)
+historical = resolve_did_ex(expected_owner, "owner", revision=signing_revision, opts=owner_opts)
+current_owner = current.select(current_revision)
+signing_owner = historical.select(signing_revision)
 
 if signing_owner is not None:
     if not verify_jwt_signature(doc, signing_owner.get_public_keys(), opts=opts):
@@ -366,7 +366,7 @@ else:
     report.add_missing("签发时的 owner 文档：需要 closest 发布依据")
 
 if current_owner is not None:
-    if current_owner.mini_iat is not None and doc.iat <= current_owner.mini_iat:
+    if current_owner.valid_iat is not None and doc.iat <= current_owner.valid_iat:
         report.is_revoked = True
     report.remember_owner(expected_owner, current_owner.revision(), role="current")
 elif current.state.is_disabled():
@@ -375,11 +375,11 @@ else:
     report.add_missing("当前 owner 文档：无法判断当前撤销约束")
 if signing_owner is not None:
     report.remember_owner(expected_owner, signing_owner.revision(),
-                          role="signing", revesion=signing_revesion)
+                          role="signing", revision=signing_revision)
 return report.finish(trusted=report.is_signed)
 ```
 
-历史 Owner 决定验签 key，当前 Owner 决定当前撤销线 `mini_iat`（name-lib 现有字段名为 `valid_iat`），阈值比较为 `doc.iat <= mini_iat`。两次查询都可命中缓存，显式使用自己的 revesion，同时继承来源、传输、locker 限制和同一预算/取消信号。按 §1 的推导规则，当 current 回答来自 authority 且 `current.iat < doc.iat` 时，`closest(doc.iat)` 就是 current，第二次查询不需要额外网络请求。缺历史材料不能用当前 Owner 冒充；Owner 正常换 key 也不自动按“当前 Owner 是否保留旧 key”裁决历史签名。
+实现里签发时 owner 的查询边界取 `closest(doc.iat + 1)`：`closest` 严格早于，而同一秒内发布 Owner 并签发设备文档是激活流程的常态，签发时 owner 应是 iat 不晚于签发时刻的最近已发布版本。历史 Owner 决定验签 key，当前 Owner 决定当前撤销线 `valid_iat`，阈值比较为 `doc.iat <= valid_iat`。两次查询都可命中缓存，显式使用自己的 revision，同时继承来源、传输、locker 限制和同一预算/取消信号。按 §1 的推导规则，当 current 回答来自 authority 且 `current.iat < doc.iat` 时，`closest(doc.iat)` 就是 current，第二次查询不需要额外网络请求。缺历史材料不能用当前 Owner 冒充；Owner 正常换 key 也不自动按“当前 Owner 是否保留旧 key”裁决历史签名。
 
 BNS 先使用可信 owner 绑定；无对象子路径的名字缺省取上级名字，一级用户的 profile 由自己的 owner 根验证。路径型 DID Object 的 controller/Zone/Owner 链须先形成可信绑定，不把截掉对象路径当成信任证明。其它 method 使用自己的可信绑定规则，不能从候选自报字段选信任根。
 
@@ -389,9 +389,9 @@ BNS 先使用可信 owner 绑定；无对象子路径的名字缺省取上级名
 
 ## 7. 合并、缓存失效与预装
 
-同键串行锁使用 `(scope, did, doc_type)`，不同 revesion 仍可能更新同一 best，不能分别加锁。锁只覆盖“读缓存、刷新约束、决定查询”和“验证后原子提交”两段，provider/locker I/O 与 Owner 递归不持锁（§4）；提交段重新读取存储中的最新结果再合并，本地 result 只是快照。等待者要重新读取缓存并判断自己的输入、查询和 opts；不持数据库事务等待任何 I/O。Owner 递归使用另一文档键，保留调用链环路检查。
+同键串行锁使用 `(scope, did, doc_type)`，不同 revision 仍可能更新同一 best，不能分别加锁。锁只覆盖“读缓存、刷新约束、决定查询”和“验证后原子提交”两段，provider/locker I/O 与 Owner 递归不持锁（§4）；提交段重新读取存储中的最新结果再合并，本地 result 只是快照。等待者要重新读取缓存并判断自己的输入、查询和 opts；不持数据库事务等待任何 I/O。Owner 递归使用另一文档键，保留调用链环路检查。
 
-提交时按同键原子合并：SQLite 提供跨进程裁决，内存后端提供同样的串行语义；不要求多个不同 DID 或多个公网来源的全局快照。接受规则为：
+提交时按同键原子合并：每键结果文件 + OS 文件锁提供跨进程裁决（TODO D2：redb 单进程独占，不采用），内存后端提供同样的串行语义；不要求多个不同 DID 或多个公网来源的全局快照。接受规则为：
 
 - unknown 保留待验材料；invalid 不推进 best；valid 才与已验证版本比较。更旧但有效的文档仍可报告签名/发布事实，不会成为 best。
 - 同 iat 同 hash 幂等；同 iat 不同 hash 把本次报告改为 invalid(conflict)，保留旧结果。跨进程提交后发现冲突也必须修正报告，不能继续宣称成功。
@@ -421,7 +421,7 @@ remove_doc_result(did, doc_type, opts)
 
 ```python
 def open_rtcp_tunnel(remote_did, requirement, caller_opts=None):
-    opts = normalize_opts(caller_opts, "device")
+    opts = ResolveOpts::normalize(caller_opts, "device")
     opts = (
         opts.with_network_sources("authority_only")
         .with_transport_policy(independent_control_plane)
@@ -431,7 +431,7 @@ def open_rtcp_tunnel(remote_did, requirement, caller_opts=None):
         opts = opts.without_local_lock().with_force_authority_query()
     with resolution_budget(opts):
         result = resolve_did_ex(remote_did, "device", opts=opts)
-        identity = select_rtcp_identity(result, requirement, opts)
+        identity = select_authority_current(result, requirement, opts)
         if identity is None:
             return error("目标身份材料不足或不满足 RTCP 身份要求", result.reason)
         return connect_rtcp_with_identity(remote_did, identity, opts=opts)
@@ -439,7 +439,7 @@ def open_rtcp_tunnel(remote_did, requirement, caller_opts=None):
 
 本示例固定关闭 Zone locker，调用方配置不能重新打开。其它显式允许 Zone locker 的模式，只能使用满足独立控制通道约束并传递剩余预算、取消和 `without_zone_lock` 的服务。
 
-`select_rtcp_identity` 是 RTCP 的证据门禁，不能把普通 `select(current)` 返回的 best 直接当成公网当前身份：
+`select_authority_current` 是 RTCP 的证据门禁，不能把普通 `select(current)` 返回的 best 直接当成公网当前身份：
 
 - `AuthorityCurrent` 关闭两种 locker，从**本轮真实 authority receipt**选择有效文档，核对精确 DID/type/iat/hash。即使本地 best 更新，也不能替换 receipt 指定的 body；模拟发布、旧 receipt、旧 latest 或 Unknown 均不满足要求。
 - `TrustedSnapshot` 按自身准入策略检查允许的本地依据，不能因为限制了联网来源就放宽验证。
@@ -451,7 +451,7 @@ def open_rtcp_tunnel(remote_did, requirement, caller_opts=None):
 def on_rtcp_hello(hello, caller_opts=None):
     if hello.to != self.did:
         return error("我不是你的目标")
-    opts = normalize_opts(caller_opts, "device").not_allow_request().without_zone_lock()
+    opts = ResolveOpts::normalize(caller_opts, "device").not_allow_request().without_zone_lock()
     report = verify_document(hello.from_did, "device", hello.device_doc, opts=opts)
     if not report.success(Revision.current()):
         return error("device doc 验证失败", report.reason)
@@ -495,7 +495,7 @@ AppDoc 使用 DID Document 的 JSON/JWT 两种形式和 iat 版本规则：普�
 
 ## 10. 讨论与后续验收清单
 
-以下是设计验收场景，不表示本次已经新增或执行这些运行测试。网络回流测试须在隔离环境进行。
+以下每行对应 `name-client/tests/resolve_did_scenarios.rs` 中以行号为前缀的测试函数（如 `s11_`、`s31_`）；网络回流、FD 释放类用例须在隔离环境进行（`#[ignore]`）。
 
 | 场景 | 预期 |
 | --- | --- |
@@ -515,7 +515,7 @@ AppDoc 使用 DID Document 的 JSON/JWT 两种形式和 iat 版本规则：普�
 | 同 iat 的坏候选先到、合法候选后到 | 逐个验证，坏候选不占可信槽；两个已验证不同 hash 才判冲突 |
 | 输入与同 iat 发布 hash 不同 | invalid；其它 iat 的发布 hash 不否定该输入 |
 | exact hash 不符、closest 无边界回答或 provider 不支持 | 不满足目标并保留原因，不回退 current/本机最大历史版本 |
-| Owner 历史签名正确，但当前 mini_iat 覆盖子文档 | is_signed=True、is_revoked=True、invalid，所有选择标志 False |
+| Owner 历史签名正确，但当前 valid_iat 覆盖子文档 | is_signed=True、is_revoked=True、invalid，所有选择标志 False |
 | 缺历史 Owner，但当前 Owner 有可用 key | 保留缺材料原因，不用当前根替代 closest 发布依据 |
 | 缓存命中后文档过期、已知撤销或 locker/实际 Owner 依赖变化 | 撤掉选择资格或重验，不能靠缓存命中绕过约束 |
 | local/Zone locker 覆盖、缺列或明确禁用 | 本机优先；未覆盖列继续；强制负回答不当 miss；模拟发布不变公网 receipt |

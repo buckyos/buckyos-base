@@ -761,7 +761,7 @@ pub trait DIDDocumentTrait: Send + Sync {
 
 pub static KNOWN_WEB3_BRIDGE_CONFIG: OnceCell<HashMap<String, String>> = OnceCell::new();
 
-/// JWT 形式 DID Document 的硬规则(doc/verify-did-api-boundary-and-freshness-TODO.md):
+/// JWT 形式 DID Document 的硬规则(doc/resolve-did协议冻结讨论伪代码.md §1 版本模型):
 /// 必须能得出 revision `iat`——`iat` 直接存在,或可由 `exp - DEFAULT_EXPIRE_TIME`
 /// 补充推导(`get_doc_iat` 语义)。两者皆无、无法得出 iat 的文档无效。
 ///

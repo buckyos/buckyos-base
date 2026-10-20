@@ -7,7 +7,7 @@ use http::StatusCode;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use name_client::{
-    CacheBackend, DIDObjectClient, DidDocType, NameClient, NameClientConfig, WebProvider,
+    CacheBackend, DIDObjectClient, DidDocType, LockOptions, NameClient, NameClientConfig, WebProvider,
 };
 use name_lib::{DIDObjectCard, EncodedDocument, OwnerDocument, DID};
 use serde_json::{json, Value};
@@ -325,12 +325,10 @@ async fn example_name_client() -> NameClient {
     let client = NameClient::new(NameClientConfig {
         enable_cache: false,
         cache_backend: CacheBackend::Memory,
-        enable_zone_resolver: false,
+        enable_zone_locker: false,
         ..Default::default()
     });
-    client
-        .add_provider(Box::new(WebProvider::new_with_scheme("http")), Some(0))
-        .await;
+    client.set_method_authority("web", Arc::new(WebProvider::new_with_scheme("http")));
 
     // 这些 fixture 里的 DIDObjectCard 都把 controller 设成 did:web:myhome.com，
     // 但测试环境里并没有真的把 myhome.com 架起来。resolve_did 现在需要能递归解析到
@@ -358,12 +356,14 @@ async fn example_name_client() -> NameClient {
     });
     let owner_document: OwnerDocument = serde_json::from_value(owner_json).unwrap();
     let owner_doc = EncodedDocument::JsonLd(serde_json::to_value(&owner_document).unwrap());
-    client.set_local_authority_override(
+    client.lock_document(
         DID::new("web", "myhome.com"),
         DidDocType::Owner,
         owner_doc,
-        "test-fixture",
-        None,
+        LockOptions {
+            scope: "test-fixture".to_string(),
+            ..Default::default()
+        },
     );
 
     client

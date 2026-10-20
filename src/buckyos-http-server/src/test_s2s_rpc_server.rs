@@ -17,7 +17,8 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
 use name_client::{
-    CacheBackend, IdentityRoots, NameClient, NameClientConfig, NameInfo, NsProvider, RecordType,
+    CacheBackend, Carrier, IdentityRoots, LockOptions, NameClient, NameClientConfig, ResolveOpts,
+    Revision, Source, SourceAnswer, SourceRef, SourceTier,
 };
 use name_lib::{DidDocType, EncodedDocument, NSError, NSResult, DID};
 use serde_json::{json, Value};
@@ -42,10 +43,17 @@ fn public_key(seed: [u8; 32]) -> [u8; 32] {
 }
 
 fn identity_document(did: &DID, seed: [u8; 32]) -> Value {
+    identity_document_at(did, seed, 1_700_000_000)
+}
+
+/// 重构后的 resolver 要求文档能得出 revision iat;轮换时用更高的 iat 表示新版本。
+fn identity_document_at(did: &DID, seed: [u8; 32], iat: u64) -> Value {
     let x = URL_SAFE_NO_PAD.encode(public_key(seed));
     json!({
         "@context": ["https://www.w3.org/ns/did/v1", "https://buckyos.ai/ns/did/v1"],
         "id": did.to_string(),
+        "iat": iat,
+        "exp": iat + 3600 * 24 * 365 * 10,
         "verificationMethod": [{
             "id": "#main_key",
             "type": "JsonWebKey2020",
@@ -99,7 +107,7 @@ fn memory_name_client() -> Arc<NameClient> {
     Arc::new(NameClient::new(NameClientConfig {
         enable_cache: true,
         cache_backend: CacheBackend::Memory,
-        enable_zone_resolver: false,
+        enable_zone_locker: false,
         ..Default::default()
     }))
 }
@@ -126,13 +134,15 @@ impl TestFixture {
                 &server_roots
             };
             write_identity(roots, did, *seed);
-            client.set_local_authority_override(
-                did.clone(),
-                DidDocType::Zone,
-                EncodedDocument::JsonLd(identity_document(did, *seed)),
-                "s2s-test",
-                None,
-            );
+            client.lock_document(
+            did.clone(),
+            DidDocType::Zone,
+            EncodedDocument::JsonLd(identity_document(did, *seed)),
+            LockOptions {
+                scope: "s2s-test".to_string(),
+                ..Default::default()
+            },
+        );
         }
         Self {
             client_roots,
@@ -157,12 +167,14 @@ impl TestFixture {
             &self.server_roots
         };
         write_identity(roots, did, seed);
-        self.client.set_local_authority_override(
+        self.client.lock_document(
             did.clone(),
             DidDocType::Zone,
             EncodedDocument::JsonLd(identity_document(did, seed)),
-            "s2s-test-rotated",
-            None,
+            LockOptions {
+                scope: "s2s-test-rotated".to_string(),
+                ..Default::default()
+            },
         );
     }
 
@@ -469,20 +481,24 @@ async fn standard_two_file_layout_roundtrips_without_keyref() {
 async fn cluster_config_provider_is_prioritized_and_not_queried_per_request() {
     let fixture = TestFixture::standard();
     // NameClient 故意提供错误 key，证明 Provider 命中后不会访问该 fallback。
-    fixture.client.set_local_authority_override(
-        server_did(),
-        DidDocType::Zone,
-        EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
-        "wrong-fallback",
-        None,
-    );
-    fixture.client.set_local_authority_override(
-        client_did(),
-        DidDocType::Zone,
-        EncodedDocument::JsonLd(identity_document(&client_did(), [201u8; 32])),
-        "wrong-fallback",
-        None,
-    );
+    fixture.client.lock_document(
+            server_did(),
+            DidDocType::Zone,
+            EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
+            LockOptions {
+                scope: "wrong-fallback".to_string(),
+                ..Default::default()
+            },
+        );
+    fixture.client.lock_document(
+            client_did(),
+            DidDocType::Zone,
+            EncodedDocument::JsonLd(identity_document(&client_did(), [201u8; 32])),
+            LockOptions {
+                scope: "wrong-fallback".to_string(),
+                ..Default::default()
+            },
+        );
 
     let provider = Arc::new(ClusterConfigPublicKeyProvider::new([
         (client_did(), public_key(CLIENT_SEED)),
@@ -1019,13 +1035,15 @@ async fn tampered_body_and_cross_api_reflection_are_rejected() {
 async fn wrong_target_and_replay_are_rejected() {
     let (fixture, context) = server_context().await;
     let other = DID::new("web", "other-service.example.com");
-    fixture.client.set_local_authority_override(
-        other.clone(),
-        DidDocType::Zone,
-        EncodedDocument::JsonLd(identity_document(&other, [7u8; 32])),
-        "other",
-        None,
-    );
+    fixture.client.lock_document(
+            other.clone(),
+            DidDocType::Zone,
+            EncodedDocument::JsonLd(identity_document(&other, [7u8; 32])),
+            LockOptions {
+                scope: "other".to_string(),
+                ..Default::default()
+            },
+        );
     let wrong_transport = S2sClientTransport::new(
         S2sClientConfig::new(client_did(), other).with_runtime(fixture.client_runtime()),
     )
@@ -1351,34 +1369,28 @@ struct RotatingAuthority {
 }
 
 #[async_trait]
-impl NsProvider for RotatingAuthority {
-    fn get_id(&self) -> String {
+impl Source for RotatingAuthority {
+    fn id(&self) -> String {
         "rotating-s2s-authority".to_string()
     }
 
-    async fn query(
-        &self,
-        _name: &str,
-        _record_type: Option<RecordType>,
-        _from_ip: Option<IpAddr>,
-    ) -> NSResult<NameInfo> {
-        Err(NSError::NotFound("not a DNS provider".to_string()))
-    }
-
-    async fn query_did(
+    async fn get_document(
         &self,
         did: &DID,
-        _doc_type: Option<DidDocType>,
-        _from_ip: Option<IpAddr>,
-    ) -> NSResult<EncodedDocument> {
+        _doc_type: &DidDocType,
+        _revision: &Revision,
+        _opts: &ResolveOpts,
+    ) -> SourceAnswer {
+        let sref = SourceRef::provider(self.id(), SourceTier::Authority);
         if did != &self.did {
-            return Err(NSError::NotFound(did.to_string()));
+            return SourceAnswer::no_answer(sref, did.to_string());
         }
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            Ok(self.stale.clone())
+        let doc = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.stale.clone()
         } else {
-            Ok(self.fresh.clone())
-        }
+            self.fresh.clone()
+        };
+        SourceAnswer::new(sref).with_body(doc, Carrier::Body)
     }
 }
 
@@ -1389,31 +1401,24 @@ struct CountingStableAuthority {
 }
 
 #[async_trait]
-impl NsProvider for CountingStableAuthority {
-    fn get_id(&self) -> String {
+impl Source for CountingStableAuthority {
+    fn id(&self) -> String {
         "counting-stable-s2s-authority".to_string()
     }
 
-    async fn query(
-        &self,
-        _name: &str,
-        _record_type: Option<RecordType>,
-        _from_ip: Option<IpAddr>,
-    ) -> NSResult<NameInfo> {
-        Err(NSError::NotFound("not a DNS provider".to_string()))
-    }
-
-    async fn query_did(
+    async fn get_document(
         &self,
         did: &DID,
-        _doc_type: Option<DidDocType>,
-        _from_ip: Option<IpAddr>,
-    ) -> NSResult<EncodedDocument> {
+        _doc_type: &DidDocType,
+        _revision: &Revision,
+        _opts: &ResolveOpts,
+    ) -> SourceAnswer {
+        let sref = SourceRef::provider(self.id(), SourceTier::Authority);
         if did != &self.did {
-            return Err(NSError::NotFound(did.to_string()));
+            return SourceAnswer::no_answer(sref, did.to_string());
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.document.clone())
+        SourceAnswer::new(sref).with_body(self.document.clone(), Carrier::Body)
     }
 }
 
@@ -1422,19 +1427,15 @@ async fn invalid_ciphertext_name_client_refresh_is_cooldown_bounded() {
     let server_fixture = TestFixture::standard();
     server_fixture
         .client
-        .clear_local_authority_override(&client_did(), DidDocType::Zone);
+        .unlock_document(&client_did(), DidDocType::Zone);
     let authority_calls = Arc::new(AtomicUsize::new(0));
     server_fixture
         .client
-        .set_method_authority(
-            "web",
-            Box::new(CountingStableAuthority {
+        .set_method_authority("web", Arc::new(CountingStableAuthority {
                 did: client_did(),
                 document: EncodedDocument::JsonLd(identity_document(&client_did(), CLIENT_SEED)),
                 calls: authority_calls.clone(),
-            }),
-        )
-        .await;
+            }));
     let context = server_context_with_fixture(&server_fixture, default_policy()).await;
 
     let client_fixture = TestFixture::standard();
@@ -1467,19 +1468,15 @@ async fn stale_remote_cache_gets_one_authority_refresh_with_fresh_nonce() {
     let client_fixture = TestFixture::standard();
     client_fixture
         .client
-        .clear_local_authority_override(&server_did(), DidDocType::Zone);
+        .unlock_document(&server_did(), DidDocType::Zone);
     client_fixture
         .client
-        .set_method_authority(
-            "web",
-            Box::new(RotatingAuthority {
+        .set_method_authority("web", Arc::new(RotatingAuthority {
                 did: server_did(),
                 stale: EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
-                fresh: EncodedDocument::JsonLd(identity_document(&server_did(), SERVER_SEED)),
+                fresh: EncodedDocument::JsonLd(identity_document_at(&server_did(), SERVER_SEED, 1_700_000_001)),
                 calls: AtomicUsize::new(0),
-            }),
-        )
-        .await;
+            }));
 
     let client = kRPC::new_with_transport(
         &format!("http://{addr}/s2s/event-report-v1"),
@@ -1505,19 +1502,15 @@ async fn server_refreshes_stale_sender_key_once_before_failing_closed() {
     let server_fixture = TestFixture::standard();
     server_fixture
         .client
-        .clear_local_authority_override(&client_did(), DidDocType::Zone);
+        .unlock_document(&client_did(), DidDocType::Zone);
     server_fixture
         .client
-        .set_method_authority(
-            "web",
-            Box::new(RotatingAuthority {
+        .set_method_authority("web", Arc::new(RotatingAuthority {
                 did: client_did(),
                 stale: EncodedDocument::JsonLd(identity_document(&client_did(), [201u8; 32])),
-                fresh: EncodedDocument::JsonLd(identity_document(&client_did(), CLIENT_SEED)),
+                fresh: EncodedDocument::JsonLd(identity_document_at(&client_did(), CLIENT_SEED, 1_700_000_001)),
                 calls: AtomicUsize::new(0),
-            }),
-        )
-        .await;
+            }));
     let context = server_context_with_fixture(&server_fixture, default_policy()).await;
 
     let client_fixture = TestFixture::standard();
@@ -1548,13 +1541,15 @@ async fn invalid_remote_document_fails_closed_without_plaintext_fallback() {
     let server_fixture = TestFixture::standard();
     let (addr, handler, task) = spawn_s2s_server(&server_fixture).await;
     let client_fixture = TestFixture::standard();
-    client_fixture.client.set_local_authority_override(
-        server_did(),
-        DidDocType::Zone,
-        EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
-        "wrong-key",
-        None,
-    );
+    client_fixture.client.lock_document(
+            server_did(),
+            DidDocType::Zone,
+            EncodedDocument::JsonLd(identity_document(&server_did(), [200u8; 32])),
+            LockOptions {
+                scope: "wrong-key".to_string(),
+                ..Default::default()
+            },
+        );
     let client = kRPC::new_with_transport(
         &format!("http://{addr}/s2s/event-report-v1"),
         None,

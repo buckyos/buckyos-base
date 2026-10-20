@@ -4,7 +4,6 @@ mod addr_rtt_db;
 mod bns_provider;
 mod did_obj_client;
 mod dns_provider;
-mod doc_cache;
 mod https_provider;
 mod identity_mgr;
 mod local_ns_provider;
@@ -12,17 +11,14 @@ mod name_client;
 mod name_query;
 mod profile_resolver;
 mod provider;
+mod resolver;
 mod utility;
-mod verify;
-mod verify_context;
 mod web_provider;
-mod zone_resolver;
 
 pub use addr_rtt_db::*;
 pub use bns_provider::*;
 pub use did_obj_client::*;
 pub use dns_provider::*;
-pub use doc_cache::*;
 pub use https_provider::*;
 pub use identity_mgr::*;
 use jsonwebtoken::DecodingKey;
@@ -31,11 +27,9 @@ pub use name_client::*;
 pub use name_query::*;
 pub use profile_resolver::*;
 pub use provider::*;
+pub use resolver::*;
 pub use utility::*;
-pub use verify::*;
-pub use verify_context::*;
 pub use web_provider::*;
-pub use zone_resolver::*;
 
 use buckyos_kit::BuckyOSMachineConfig;
 use log::*;
@@ -43,6 +37,7 @@ use name_lib::*;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 #[macro_use]
 extern crate log;
@@ -57,7 +52,7 @@ static NAME_LIB_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 /// - "bns":did:bns 名字的规范 host 映射根
 ///   (`did:bns:alice` ↔ `alice.{bns_root}`)。它与 BNS 权威 resolver 使用
 ///   的 `bns_host` 是两个独立配置。
-/// - "sn":可选,SN 网关 host,配置后注册 sn_resolver 补充源(第 4 节)。
+/// - "sn":可选,SN 网关 host,配置后注册为两个 method 的 normal 来源。
 pub fn get_default_web3_bridge_config() -> HashMap<String, String> {
     BuckyOSMachineConfig::default().web3_bridge
 }
@@ -68,24 +63,18 @@ pub async fn init_name_lib(web3_bridge_config: &HashMap<String, String>) -> NSRe
 }
 
 pub async fn init_name_lib_for_test(web3_bridge_config: &HashMap<String, String>) -> NSResult<()> {
-    let mut config = NameClientConfig::default();
-    config.cache_backend = CacheBackend::Memory;
-    // 测试环境关闭 Zone Resolver cache:开发机上可能真的跑着 127.0.0.1:3180
-    // 服务,默认启用会让测试命中它。
-    config.enable_zone_resolver = false;
-    init_name_lib_ex(web3_bridge_config, config).await
+    // 测试环境:内存缓存并关闭 Zone locker(开发机上可能真的跑着 127.0.0.1:3180)。
+    init_name_lib_ex(web3_bridge_config, NameClientConfig::for_test()).await
 }
 
 pub async fn init_name_lib_ex(
     web3_bridge_config: &HashMap<String, String>,
     config: NameClientConfig,
 ) -> NSResult<()> {
-    //init web3 bridge config
     if IS_NAME_LIB_INITED.get().is_some() {
         return Ok(());
     }
     let _init_guard = NAME_LIB_INIT_LOCK.lock().await;
-    //拿到锁后重新检查：可能已被先拿到锁的调用者（或直接设置 statics 的测试代码）初始化
     if IS_NAME_LIB_INITED.get().is_some() {
         return Ok(());
     }
@@ -95,106 +84,70 @@ pub async fn init_name_lib_ex(
     }
 
     let set_result = KNOWN_WEB3_BRIDGE_CONFIG.set(web3_bridge_config.clone());
-    if set_result.is_err() {
-        if KNOWN_WEB3_BRIDGE_CONFIG.get().is_none() {
-            return Err(NSError::Failed(
-                "Failed to set KNOWN_WEB3_BRIDGE_CONFIG".to_string(),
-            ));
-        }
+    if set_result.is_err() && KNOWN_WEB3_BRIDGE_CONFIG.get().is_none() {
+        return Err(NSError::Failed(
+            "Failed to set KNOWN_WEB3_BRIDGE_CONFIG".to_string(),
+        ));
     }
 
     let client = NameClient::new(config);
-    // 注册模型与顺序见 doc/已有did-resolver介绍.md 第 7 节:每个 method
-    // 第一个总是权威源,补充源按注册顺序即优先级(first-win)。
-
-    // did:bns —— 权威渠道:BNS 智能合约,bns_resolver 是它的委托读取端
-    // (web3 bridge 的 BNS 网关)。补充源:web_resolver(名字的规范 host 映射
-    // alice.{bns_root} 上的 well-known / uppername 双信道)→ dns_resolver
-    // (同一映射 host 上的 TXT 记录,need_proof 候选)。DNS TXT 只用于
-    // current-zone boot:普通 resolve 默认跳过,调用方须通过
-    // ResolvePolicy::with_current_zone 显式给出相同的 zone DID。
-    let bns_provider = BnsProvider::new()?;
-    client
-        .set_method_authority("bns", Box::new(bns_provider))
-        .await;
-    client
-        .add_method_supplement("bns", Box::new(WebProvider::new()))
-        .await;
-    client
-        .add_current_zone_bootstrap_supplement("bns", Box::new(DnsProvider::new(None)))
-        .await;
-
-    // did:web —— 权威发布面就是该域名 HTTPS 站点的固定路径,web_resolver 是
-    // 这个 canonical endpoint 的读取端(先查 W3C well-known 静态 URL,未命中
-    // 再回退 uppername 的 resolver 接口,见 web_provider.rs)。dns_resolver
-    // 降为补充源:DNS 信道本身没有认证能力,它取回的一切都只是 need_proof
-    // 候选("英雄不问出处,但要验证",介绍文档第 3 节),并同样只在
-    // current-zone bootstrap policy 下启用。
-    client
-        .set_method_authority("web", Box::new(WebProvider::new()))
-        .await;
-    client
-        .add_current_zone_bootstrap_supplement("web", Box::new(DnsProvider::new(None)))
-        .await;
-
-    // sn_resolver(介绍文档第 4 节)—— 补充源,走 resolver 接口,支持跨 NAT
-    // 组网阶段取回 DeviceDocument / DeviceInfo。web3 bridge 配置里声明了
-    // "sn" 网关时注册为两个 method 的末位补充源;默认配置不含 sn,即默认不注册。
-    if let Some(sn_host) = web3_bridge_config.get("sn") {
-        client
-            .add_method_supplement("web", Box::new(BaseHttpProvider::new(sn_host)))
-            .await;
-        client
-            .add_method_supplement("bns", Box::new(BaseHttpProvider::new(sn_host)))
-            .await;
-    }
-
-    // zone_resolver(介绍文档第 5 节)不是 provider,不在这里注册:它是
-    // cluster-level cache,`NameClientConfig::enable_zone_resolver` 默认启用,
-    // 默认指向本机 `http://127.0.0.1:3180`(zone_resolver.rs)。
-
-    // 普通名字解析(resolve / resolve_ip)与 DID 管线独立注册。
+    register_default_sources(&client, web3_bridge_config)?;
     client
         .add_dns_provider(Box::new(DnsProvider::new(None)))
         .await;
-    // did:dev / did:key 不注册任何 provider:key 类 DID 不是解析入口(简化文档第 6 节)。
-    let set_result = GLOBAL_NAME_CLIENT.set(client);
-    if set_result.is_err() {
-        if GLOBAL_NAME_CLIENT.get().is_none() {
-            return Err(NSError::Failed(
-                "Failed to set GLOBAL_BOOT_NAME_CLIENT".to_string(),
-            ));
-        }
+
+    if GLOBAL_NAME_CLIENT.set(client).is_err() && GLOBAL_NAME_CLIENT.get().is_none() {
+        return Err(NSError::Failed(
+            "Failed to set GLOBAL_NAME_CLIENT".to_string(),
+        ));
     }
-    //set 失败说明已被其他路径置位，全局状态有效，与 GLOBAL_NAME_CLIENT.set 一样容忍
     let _ = IS_NAME_LIB_INITED.set(true);
     Ok(())
 }
 
-pub async fn resolve_ip(name: &str) -> NSResult<IpAddr> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
+/// 默认来源注册(设计稿 §2.1 三档来源):每个 method 至多一个 authority,
+/// 其后是 trust / normal。
+///
+/// - did:bns —— authority:BNS 智能合约,`BnsProvider` 是它的委托读取端;
+///   normal:`WebProvider`(名字的规范 host 映射 `alice.{bns_root}` 上的静态发布面
+///   与上级 resolver);zone-bootstrap normal:`DnsProvider`(TXT,只在 current-zone
+///   自举时可用)。
+/// - did:web —— authority:`WebProvider`(域名 HTTPS 站点的静态发布面 + 上级 resolver);
+///   zone-bootstrap normal:`DnsProvider`。
+/// - "sn" 网关(web3 bridge 配置)注册为两个 method 的末位 normal 来源。
+/// - did:dev / did:key 不注册任何来源:key 类 DID 不是解析入口。
+pub fn register_default_sources(
+    client: &NameClient,
+    web3_bridge_config: &HashMap<String, String>,
+) -> NSResult<()> {
+    let bns_provider: Arc<dyn Source> = Arc::new(BnsProvider::new()?);
+    client.set_method_authority("bns", bns_provider);
+    client.add_method_normal("bns", Arc::new(WebProvider::new()));
+    client.add_zone_bootstrap_normal("bns", Arc::new(DnsProvider::new(None)));
+
+    client.set_method_authority("web", Arc::new(WebProvider::new()));
+    client.add_zone_bootstrap_normal("web", Arc::new(DnsProvider::new(None)));
+
+    if let Some(sn_host) = web3_bridge_config.get("sn") {
+        let sn: Arc<dyn Source> = Arc::new(BaseHttpProvider::new(sn_host).with_id("sn-resolver"));
+        client.add_method_normal("web", sn.clone());
+        client.add_method_normal("bns", sn);
     }
-    let client = client.unwrap();
+    Ok(())
+}
+
+pub async fn resolve_ip(name: &str) -> NSResult<IpAddr> {
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     client.resolve_ip(name).await
 }
 
 pub async fn resolve_ip_with_options(name: &str, options: ResolveIpOptions) -> NSResult<IpAddr> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     client.resolve_ip_with_options(name, options).await
 }
 
 pub async fn resolve_ips(name: &str) -> NSResult<Vec<IpAddr>> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     client.resolve_ips(name).await
 }
 
@@ -202,25 +155,16 @@ pub async fn resolve_ips_with_options(
     name: &str,
     options: ResolveIpOptions,
 ) -> NSResult<Vec<IpAddr>> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     client.resolve_ips_with_options(name, options).await
 }
 
 pub fn get_name_client() -> Option<&'static NameClient> {
-    let client = GLOBAL_NAME_CLIENT.get();
-    return client;
+    GLOBAL_NAME_CLIENT.get()
 }
 
 pub async fn resolve(name: &str, record_type: Option<RecordType>) -> NSResult<NameInfo> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     client.resolve(name, record_type).await
 }
 
@@ -231,11 +175,7 @@ pub async fn resolve_with_local_ip(
     port: u16,
     policy: Option<&SortPolicy>,
 ) -> NSResult<NameInfo> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     client
         .resolve_with_local_ip(name, record_type, local_ip, port, policy)
         .await
@@ -246,11 +186,7 @@ pub fn rank_socket_addrs(
     addresses: &[SocketAddr],
     policy: Option<&SortPolicy>,
 ) -> NSResult<Vec<RankedAddress>> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     Ok(client.rank_socket_addrs(local_ip, addresses, policy))
 }
 
@@ -259,11 +195,7 @@ pub fn record_connection_outcome(
     remote: SocketAddr,
     outcome: ConnectionOutcome,
 ) -> NSResult<()> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not init yet".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not init yet".to_string()))?;
     client.record_connection_outcome(local_ip, remote, outcome)
 }
 
@@ -272,160 +204,106 @@ pub fn record_connection_outcome(
 /// 注意:它不能用于 DID Document JWT 的 owner binding 验证——不要用
 /// `payload.owner` / `payload.iss` 调本函数来验一份外部 DID Document JWT,
 /// 那只能证明"JWT 能被它自己声明的 owner 验过"。权限主体认证场景必须使用
-/// verify 家族(`resolve_and_verify_did_document_jwt`,doc/verify-did-document-jwt.md)。
+/// `verify_document`。
 pub async fn resolve_auth_key(did: &DID, kid: Option<&str>) -> NSResult<DecodingKey> {
-    let ed25519_auth_key = did.get_ed25519_auth_key();
-    if ed25519_auth_key.is_some() {
-        let auth_key = ed25519_to_decoding_key(&ed25519_auth_key.unwrap())?;
-        return Ok(auth_key);
+    if let Some(ed25519_auth_key) = did.get_ed25519_auth_key() {
+        return ed25519_to_decoding_key(&ed25519_auth_key);
     }
-
-    let client = get_name_client();
-    if client.is_none() {
+    let client = get_name_client().ok_or_else(|| {
         let msg = "Name client not init yet".to_string();
         error!("{}", msg);
-        return Err(NSError::InvalidState(msg));
-    }
-    let did_doc = client.unwrap().resolve_did(did, None).await?;
+        NSError::InvalidState(msg)
+    })?;
+    let did_doc = client.resolve_did(did, None).await?;
     let did_doc = parse_did_doc(did_doc)?;
-    let auth_key = did_doc.get_auth_key(kid);
-    if auth_key.is_some() {
-        let auth_key = auth_key.unwrap();
-        return Ok(auth_key.0);
+    match did_doc.get_auth_key(kid) {
+        Some((key, _)) => Ok(key),
+        None => Err(NSError::NotFound("Invalid kid".to_string())),
     }
-    return Err(NSError::NotFound("Invalid kid".to_string()));
 }
 
+/// 日常解析:普通文档选择 best,owner 选择 latest。
 pub async fn resolve_did(did: &DID, doc_type: Option<DidDocType>) -> NSResult<EncodedDocument> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
     client.resolve_did(did, doc_type).await
 }
 
+/// 精确版本或严格早于指定时间的最近已发布版本。
+pub async fn resolve_did_revision(
+    did: &DID,
+    doc_type: Option<DidDocType>,
+    revision: Revision,
+) -> NSResult<EncodedDocument> {
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client.resolve_did_revision(did, doc_type, revision).await
+}
+
+/// 获取完整结果及原因,控制来源、传输、缓存、locker 和预算。
 pub async fn resolve_did_ex(
     did: &DID,
     doc_type: Option<DidDocType>,
-    policy: ResolvePolicy,
-) -> NSResult<ResolvedDocument> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    let client = client.unwrap();
-    client.resolve_did_ex(did, doc_type, policy).await
+    revision: Revision,
+    opts: ResolveOpts,
+) -> NSResult<DocResult> {
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client.resolve_did_ex(did, doc_type, revision, opts).await
 }
 
-/// 组合便捷 API:resolve(按 `options.policy` 的来源范围)+ 纯 verify 一份
-/// 外部传入的 DID Document JWT(doc/verify-did-document-jwt.md)。**不写 cache**。
-/// 权限主体认证场景必须用 verify 家族,不要用 `payload.owner`/`payload.iss` 调
-/// `resolve_auth_key` 验 DID Document JWT——那只能证明"JWT 能被它自己声明的
-/// owner 验过"。
-pub async fn resolve_and_verify_did_document_jwt(
+/// 始终验证收到的确切文档;允许按 opts 补材料并更新解析缓存。
+/// 入站握手等攻击者可触发的路径必须传 `ResolveOpts::not_allow_request()`。
+pub async fn verify_document(
     did: &DID,
-    doc_type: DidDocType,
-    jwt: &str,
-    options: &ResolveVerifyOptions,
-) -> std::result::Result<VerifiedDidDocument, ResolveVerifyError> {
-    let client = get_name_client().ok_or_else(|| {
-        ResolveVerifyError::Resolve(NSError::NotFound("Name client not found".to_string()))
-    })?;
-    client
-        .resolve_and_verify_did_document_jwt(did, doc_type, jwt, options)
-        .await
-}
-
-/// `resolve_and_verify_did_document_jwt` 的 DeviceDocument typed wrapper
-/// (RTCP 迁移入口)。
-pub async fn resolve_and_verify_device_document_jwt(
-    did: &DID,
-    jwt: &str,
-    options: &ResolveVerifyOptions,
-) -> std::result::Result<(DeviceDocument, VerifiedDidDocument), ResolveVerifyError> {
-    let client = get_name_client().ok_or_else(|| {
-        ResolveVerifyError::Resolve(NSError::NotFound("Name client not found".to_string()))
-    })?;
-    client
-        .resolve_and_verify_device_document_jwt(did, jwt, options)
-        .await
-}
-
-/// 组合便捷 API:resolve + verify + 显式写 verified cache
-/// (`resolve_verify_and_cache_did_document` 的全局包装)。
-pub async fn resolve_verify_and_cache_did_document(
-    did: &DID,
-    doc_type: DidDocType,
-    candidate: &EncodedDocument,
-    options: &ResolveVerifyOptions,
-) -> std::result::Result<(VerifiedDidDocument, CacheWriteOutcome), ResolveVerifyError> {
-    let client = get_name_client().ok_or_else(|| {
-        ResolveVerifyError::Resolve(NSError::NotFound("Name client not found".to_string()))
-    })?;
-    client
-        .resolve_verify_and_cache_did_document(did, doc_type, candidate, options)
-        .await
+    doc_type: Option<DidDocType>,
+    body: &EncodedDocument,
+    revision: Revision,
+    opts: ResolveOpts,
+) -> NSResult<VerifyResult> {
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client.verify_document(did, doc_type, body, revision, opts).await
 }
 
 pub async fn resolve_owner_document(did: &DID) -> NSResult<OwnerDocument> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    client.unwrap().resolve_owner_document(did).await
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client.resolve_owner_document(did).await
 }
 
 pub async fn resolve_user_profile(
     did: &DID,
     opts: ProfileResolveOptions,
 ) -> NSResult<MergedProfile> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    client.unwrap().resolve_user_profile(did, opts).await
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client.resolve_user_profile(did, opts).await
 }
 
 pub async fn owner_is_bound_to_zone(did: &DID, zone_did: &DID) -> NSResult<bool> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    client.unwrap().owner_is_bound_to_zone(did, zone_did).await
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client.owner_is_bound_to_zone(did, zone_did).await
 }
 
-/// add_cache 动词的 Observed 入口(doc/update-did-cache.md):旁路的
-/// **未验证**缓存写入(`CacheEvidence::Unverified`,落 `unverified/` 目录),
-/// 不能提升文档信任等级。它是文件系统旁路协议的进程内薄封装——任何人往
-/// `unverified/` 目录里放约定格式的文件,效果与调用本函数完全等价。
-/// 快速操作:本地解析 + id 一致性检查,**不**触发联网 resolve;深度验证留给
-/// resolve 时的 lazy verify(`verify_and_promote`)。
-///
-/// `source` 描述观察链路(UDP 发现 / gossip / push……),仅诊断用。应用层完成
-/// 验证与最终接受后要保存"已验证文档",用组合 API
-/// `resolve_verify_and_cache_did_document`(或受控进程内的 `add_verified_cache`),
-/// 不要再经过 Observed 旁路。
-pub fn add_observed_cache(
-    did: DID,
+/// 收件箱路径:投递一份候选文档(UDP 发现 / gossip / push……拿到的文档)。
+/// 它只是候选,按 normal 来源进入验证;不等于发布或成功选择。
+pub async fn commit_candidate_doc(
+    did: &DID,
     doc_type: Option<DidDocType>,
-    doc: EncodedDocument,
-    source: Option<UpdateSource>,
-) -> NSResult<CacheWriteOutcome> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    let client = client.unwrap();
-    client.add_observed_cache(did, doc_type, doc, source)
+    doc: &EncodedDocument,
+    source: SourceRef,
+) -> NSResult<()> {
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client
+        .commit_candidate_doc(did, doc_type, doc, source, client.default_resolve_opts())
+        .await
+}
+
+/// 删除普通文档 body;不解锁、不抹掉已知禁用 / 撤销。
+pub async fn remove_doc_result(did: &DID, doc_type: &DidDocType) -> NSResult<()> {
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
+    client
+        .remove_doc_result(did, doc_type, client.default_resolve_opts())
+        .await
 }
 
 pub async fn add_device_info_cache(did: DID, device_info: DeviceInfo) -> NSResult<()> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
     client.add_device_info_cache(did, device_info)
 }
 
@@ -434,111 +312,11 @@ pub async fn add_device_info_cache_with_ttl(
     device_info: DeviceInfo,
     ttl_secs: u64,
 ) -> NSResult<()> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
     client.add_device_info_cache_with_ttl(did, device_info, ttl_secs)
 }
 
 pub async fn add_nameinfo_cache(hostname: &str, info: NameInfo) -> NSResult<()> {
-    let client = get_name_client();
-    if client.is_none() {
-        return Err(NSError::NotFound("Name client not found".to_string()));
-    }
-    let client = client.unwrap();
+    let client = get_name_client().ok_or_else(|| NSError::NotFound("Name client not found".to_string()))?;
     client.add_nameinfo_cache(hostname, info).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use buckyos_kit::buckyos_get_unix_timestamp;
-    use name_lib::NSError;
-    use tempfile::tempdir;
-
-    struct MockProvider {
-        name: String,
-        doc: EncodedDocument,
-    }
-
-    #[async_trait]
-    impl NsProvider for MockProvider {
-        fn get_id(&self) -> String {
-            "mock".to_string()
-        }
-
-        async fn query(
-            &self,
-            name: &str,
-            _record_type: Option<RecordType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<NameInfo> {
-            if name == self.name {
-                Ok(NameInfo::new(name))
-            } else {
-                Err(NSError::NotFound("mock notfound".into()))
-            }
-        }
-
-        async fn query_did(
-            &self,
-            did: &DID,
-            _doc_type: Option<DidDocType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<EncodedDocument> {
-            if did.to_string() == self.name {
-                Ok(self.doc.clone())
-            } else {
-                Err(NSError::NotFound("mock notfound".into()))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_add_observed_cache_is_observed_not_trusted() {
-        // doc/update-did-cache.md 核心原则:系统收到过 != 系统信任它。
-        // add_observed_cache 只产生 Observed 事件;strict 的 resolve_did 不能把
-        // 未通过验证的旁路文档当成解析结果返回。
-        let did = DID::from_str("did:web:example.com").unwrap();
-        let doc = EncodedDocument::JsonLd(serde_json::json!({
-            "exp": buckyos_get_unix_timestamp() + 600,
-            "marker": "mock-doc"
-        }));
-
-        if GLOBAL_NAME_CLIENT.get().is_none() {
-            let tmp = tempdir().unwrap().keep();
-            let client = NameClient::new(NameClientConfig {
-                enable_cache: true,
-                local_cache_dir: Some(tmp.to_string_lossy().to_string()),
-                cache_backend: CacheBackend::Filesystem,
-                enable_zone_resolver: false,
-                ..Default::default()
-            });
-            client
-                .add_provider(
-                    Box::new(MockProvider {
-                        name: did.to_string(),
-                        doc: doc.clone(),
-                    }),
-                    Some(DEFAULT_PROVIDER_TRUST_LEVEL),
-                )
-                .await;
-            let _ = GLOBAL_NAME_CLIENT.set(client);
-            let _ = IS_NAME_LIB_INITED.set(true);
-        }
-
-        add_observed_cache(did.clone(), None, doc.clone(), Some(UpdateSource::Push)).unwrap();
-        // 观察缓存里可见(Unverified)。
-        let client = GLOBAL_NAME_CLIENT.get().unwrap();
-        assert!(client.doc_cache.get(&did, None).is_some());
-
-        // strict resolve:lazy verify 无法把这份无签名 JsonLd 变成可信文档,
-        // 视为 cache miss 继续主循环;没有权威渠道兜底时解析失败,而不是把
-        // 未验证内容返回给调用方。
-        let result = resolve_did(&did, None).await;
-        assert!(result.is_err(), "unverified push must not resolve: {:?}", result);
-    }
 }

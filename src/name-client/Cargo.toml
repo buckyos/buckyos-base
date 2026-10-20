@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 hickory-resolver = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 mini-moka = { workspace = true }
 jsonwebtoken = { workspace = true }
 base64 = { workspace = true }

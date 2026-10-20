@@ -8,7 +8,7 @@
 
 ## 1. 为什么放 name-client（而不是 control_panel）
 
-- **本质是命名解析**：「DID → 它的 profile 文档在哪、怎么取、怎么验签、怎么合并」全是 resolution 关注点，和 `resolve_did` / providers / doc_cache 同层。
+- **本质是命名解析**：「DID → 它的 profile 文档在哪、怎么取、怎么验签、怎么合并」全是 resolution 关注点，和 `resolve_did` / sources / `DocStore` 同层。
 - **多消费者**：control_panel（Self/用户 Profile 页）、msg_center（联系人资料）、Home Station（评论作者身份）、AICC（对端身份）都要这条能力。放在细腰层一次实现，避免 N 份合并逻辑漂移。
 - **符合细腰原则**：这是该长在 waist 上的协议能力；消费者（如 control_panel TODO-6）只调用，不重造。
 
@@ -16,11 +16,11 @@
 
 ## 2. 现状（可复用，勿重造）
 
-**name-client（rev 1f5966d）已有：**
-- `resolve_did(did, doc_type: Option<&str>) -> EncodedDocument`：底层按 doc_type 取 DID 文档（owner/user/device/zone…）。
+**name-client（2026-10-20 resolve-did 重构后）已有：**
+- `resolve_did(did, doc_type: Option<DidDocType>) -> EncodedDocument`：按 doc_type 取 DID 文档（owner/user/device/zone…），普通文档选 best、owner 选 latest；`resolve_did_ex(did, doc_type, Revision, ResolveOpts) -> DocResult` 给出完整结果与原因，`verify_document` 验证确切输入。来源模型、版本选择与验证规则见 [resolve-did 协议冻结讨论](./resolve-did协议冻结讨论伪代码.md)。
 - `resolve(name, record_type) -> NameInfo`、`resolve_auth_key(did, kid)`：DNS/密钥解析。
 - `DIDObjectClient`：解析 DID-Object-Card → `ObjectProfile`（WoT/TD 风格，traits/properties/actions/events）—— 面向 **对象/Agent 能力 profile**。
-- providers：`bns_provider / dns_provider / https_provider / local_ns_provider`；`doc_cache` 缓存。
+- 来源：`bns_provider / dns_provider / https_provider / web_provider / local_ns_provider`（实现 `Source`）；结果缓存 `resolver::DocStore`，本机 / Zone locker。
 
 **name-lib 已有类型：**
 - `OwnerDocument`（user.rs）：用户 owner DID 文档，含 `id / verificationMethod / keyScope / wallets / default_zone_did / version_seq / mini_version_seq / valid_iat`，并带 `validate_jwt_revocation()` 重放/吊销校验。

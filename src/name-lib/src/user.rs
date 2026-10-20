@@ -272,7 +272,7 @@ impl OwnerDocument {
     }
 
     /// owner replay guard(anti-rollback)。revision 只以 iat 为序
-    /// (doc/verify-did-api-boundary-and-freshness-TODO.md):`valid_iat` 一键否决
+    /// (doc/resolve-did协议冻结讨论伪代码.md §6):`valid_iat` 一键否决
     /// 该时间点(含)之前签发的所有文档。`mini_version_seq` 已随 version_seq 整体
     /// 退出流程——读到时只打 deprecation warning,不再执行。
     pub fn validate_jwt_revocation(&self, doc_type: &str, doc: &EncodedDocument) -> NSResult<()> {

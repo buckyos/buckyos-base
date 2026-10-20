@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::resolver::{Carrier, ResolveOpts, Revision, Source, SourceAnswer, SourceRef, SourceTier};
 use crate::{DidDocType, NSResult, NameInfo, NsProvider, RecordType};
 use name_lib::*;
 
@@ -269,9 +270,6 @@ impl NsProvider for LocalConfigDnsProvider {
         "local dns-record-config provider".to_string()
     }
 
-    fn methods(&self) -> Vec<String> {
-        vec!["web".to_string()]
-    }
 
     async fn query(
         &self,
@@ -321,23 +319,36 @@ impl NsProvider for LocalConfigDnsProvider {
         return Ok(name_info);
     }
 
-    async fn query_did(
+}
+
+
+/// 本地配置文件里的 TXT 记录同样可以承载 DID 文档(测试 / 离线环境),作为 normal 来源。
+#[async_trait::async_trait]
+impl Source for LocalConfigDnsProvider {
+    fn id(&self) -> String {
+        "local-config-dns".to_string()
+    }
+
+    async fn get_document(
         &self,
         did: &DID,
-        doc_type: Option<DidDocType>,
-        _from_ip: Option<IpAddr>,
-    ) -> NSResult<EncodedDocument> {
+        doc_type: &DidDocType,
+        _revision: &Revision,
+        _opts: &ResolveOpts,
+    ) -> SourceAnswer {
+        let sref = SourceRef::provider(self.id(), SourceTier::Normal);
         let host_name = did.to_host_name();
-        let name_info = self.get_name_info(&host_name)?;
-        let doc_type = doc_type.unwrap_or_default();
-        let did_documents = name_info.parse_txt_record_to_did_documents()?;
-        if let Some(did_document) = did_documents.get(doc_type.as_str()) {
-            return Ok(did_document.clone());
+        let name_info = match self.get_name_info(&host_name) {
+            Ok(info) => info,
+            Err(err) => return SourceAnswer::no_answer(sref, err.to_string()),
+        };
+        match name_info.parse_txt_record_to_did_documents() {
+            Ok(documents) => match documents.get(doc_type.as_str()) {
+                Some(doc) => SourceAnswer::new(sref).with_body(doc.clone(), Carrier::Body),
+                None => SourceAnswer::no_answer(sref, format!("no {} document in local TXT", doc_type)),
+            },
+            Err(err) => SourceAnswer::unknown(sref, err.to_string(), false),
         }
-        return Err(NSError::NotFound(format!(
-            "DID Document not found: {}",
-            doc_type
-        )));
     }
 }
 
@@ -420,19 +431,28 @@ ptr_records = ["node1.example.com", "node1-alt.example.com"]
         assert_eq!(result.address.len(), 1);
         assert_eq!(result.address[0].to_string(), "192.168.1.1");
 
+        let opts = ResolveOpts::default().normalize(std::time::Duration::from_secs(5));
         let result = provider
-            .query_did(&DID::new("web", "www.example.com"), None, None)
+            .get_document(
+                &DID::new("web", "www.example.com"),
+                &DidDocType::Zone,
+                &Revision::current(),
+                &opts,
+            )
             .await
+            .body
             .unwrap();
 
         let _boot_document = ZoneBootDocument::decode(&result, None).unwrap();
         let result = provider
-            .query_did(
+            .get_document(
                 &DID::new("web", "www.example.com"),
-                Some(DidDocType::Boot),
-                None,
+                &DidDocType::Boot,
+                &Revision::current(),
+                &opts,
             )
             .await
+            .body
             .unwrap();
         let boot_jwt = result.to_string();
         assert_eq!(boot_jwt.as_str(),"eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg");

@@ -43,7 +43,7 @@ impl NameClient {
         force_refresh: bool,
     ) -> NSResult<OwnerDocument> {
         if force_refresh {
-            self.invalidate_did_cache(did.clone(), Some(OWNER_DOC_TYPE));
+            let _ = self.invalidate_did_cache(did, &OWNER_DOC_TYPE).await;
         }
         let owner_doc = self.resolve_did(did, Some(OWNER_DOC_TYPE)).await?;
         decode_owner_document(did, &owner_doc)
@@ -84,7 +84,9 @@ impl NameClient {
         force_refresh: bool,
     ) -> NSResult<Option<UserProfile>> {
         if force_refresh {
-            self.invalidate_did_cache(profile_did.clone(), Some(USER_PROFILE_DOC_TYPE));
+            let _ = self
+                .invalidate_did_cache(profile_did, &USER_PROFILE_DOC_TYPE)
+                .await;
         }
 
         let profile_doc = match self
@@ -356,8 +358,9 @@ fn merge_profile_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NameInfo, NsProvider, RecordType};
+    use crate::resolver::{Carrier, ResolveOpts, Revision, Source, SourceAnswer, SourceRef, SourceTier};
     use async_trait::async_trait;
+    use std::sync::Arc;
     use buckyos_kit::buckyos_get_unix_timestamp;
     use jsonwebtoken::{encode, jwk::Jwk, Algorithm, EncodingKey, Header};
     use name_lib::{EmailContact, MatrixContact, ProfileContact};
@@ -434,42 +437,27 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         docs: HashMap<(String, String), EncodedDocument>,
     }
 
+    /// 测试里 mock 注册为 authority,取回的 body 免 Owner 验签;"user" 文档的真实性
+    /// 由 `decode_user_profile` 用调用方已解析出的 owner key 单独验证。
     #[async_trait]
-    impl NsProvider for ProfileMockProvider {
-        fn get_id(&self) -> String {
+    impl Source for ProfileMockProvider {
+        fn id(&self) -> String {
             "profile-mock".to_string()
         }
 
-        // "user" 文档的真实性由 `decode_user_profile` 用调用方已解析出的 owner key
-        // 单独验证;测试里 mock 注册为权威渠道,取回的 body 按 anchored 对待,
-        // 不进入管线内的 owner 递归验签。
-        async fn query(
-            &self,
-            _name: &str,
-            _record_type: Option<RecordType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<NameInfo> {
-            Err(NSError::NotFound("not implemented".to_string()))
-        }
-
-        async fn query_did(
+        async fn get_document(
             &self,
             did: &DID,
-            doc_type: Option<DidDocType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> NSResult<EncodedDocument> {
-            let key = (
-                did.to_string(),
-                doc_type
-                    .as_ref()
-                    .map(DidDocType::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            );
-            self.docs
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| NSError::NotFound(format!("missing {}", did.to_string())))
+            doc_type: &DidDocType,
+            _revision: &Revision,
+            _opts: &ResolveOpts,
+        ) -> SourceAnswer {
+            let sref = SourceRef::provider(self.id(), SourceTier::Authority);
+            let key = (did.to_string(), doc_type.as_str().to_string());
+            match self.docs.get(&key) {
+                Some(doc) => SourceAnswer::new(sref).with_body(doc.clone(), Carrier::Body),
+                None => SourceAnswer::no_answer(sref, format!("missing {}", did.to_string())),
+            }
         }
     }
 
@@ -535,26 +523,18 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
-            enable_zone_resolver: false,
+            enable_zone_locker: false,
             ..Default::default()
         });
         // 权威渠道 first-win:注册为 authority 的 provider 的回答优先于补充源。
         client
-            .set_method_authority(
-                "bns",
-                Box::new(ProfileMockProvider {
+            .set_method_authority("bns", Arc::new(ProfileMockProvider {
                     docs: high_priority_docs,
-                }),
-            )
-            .await;
+                }));
         client
-            .add_method_supplement(
-                "bns",
-                Box::new(ProfileMockProvider {
+            .add_method_normal("bns", Arc::new(ProfileMockProvider {
                     docs: low_priority_docs,
-                }),
-            )
-            .await;
+                }));
 
         let merged = client
             .resolve_user_profile(&owner_did, ProfileResolveOptions::default())
@@ -673,12 +653,11 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
-            enable_zone_resolver: false,
+            enable_zone_locker: false,
             ..Default::default()
         });
         client
-            .set_method_authority("bns", Box::new(ProfileMockProvider { docs }))
-            .await;
+            .set_method_authority("bns", Arc::new(ProfileMockProvider { docs }));
 
         let merged = client
             .resolve_user_profile(&requested_did, ProfileResolveOptions::default())
@@ -716,12 +695,11 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
-            enable_zone_resolver: false,
+            enable_zone_locker: false,
             ..Default::default()
         });
         client
-            .set_method_authority("bns", Box::new(ProfileMockProvider { docs }))
-            .await;
+            .set_method_authority("bns", Arc::new(ProfileMockProvider { docs }));
 
         let merged = client
             .resolve_user_profile(&owner_did, ProfileResolveOptions::default())
@@ -759,12 +737,11 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let client = NameClient::new(crate::NameClientConfig {
             enable_cache: false,
             cache_backend: crate::CacheBackend::Memory,
-            enable_zone_resolver: false,
+            enable_zone_locker: false,
             ..Default::default()
         });
         client
-            .set_method_authority("bns", Box::new(ProfileMockProvider { docs }))
-            .await;
+            .set_method_authority("bns", Arc::new(ProfileMockProvider { docs }));
 
         assert!(client
             .owner_is_bound_to_zone(&owner_did, &zone_did)

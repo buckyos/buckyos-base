@@ -72,6 +72,7 @@ impl DIDObjectCard {
     ) -> Self {
         let object_url = object_url.into();
         let service_endpoint = object_url.trim_end_matches('/').to_string();
+        let now = buckyos_kit::buckyos_get_unix_timestamp();
 
         Self {
             context: default_did_object_context(),
@@ -88,8 +89,10 @@ impl DIDObjectCard {
                 profile,
                 kind,
             )],
-            exp: None,
-            iat: None,
+            // Card 自身的版本是 iat,有效期是 exp(did-object-protocol.md §6.3);
+            // resolver 按 iat 比较版本,没有 iat/exp 的 Card 无法参与解析。
+            exp: Some(now + crate::DEFAULT_EXPIRE_TIME),
+            iat: Some(now),
             version_seq: None,
             key_scope: HashMap::new(),
             extra: HashMap::new(),
