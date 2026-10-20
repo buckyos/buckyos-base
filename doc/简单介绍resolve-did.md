@@ -1,6 +1,6 @@
 # resolve_did 简介：核心设计意图
 
-本文是教程：用一段伪代码和几条约定，讲清 `resolve_did` 的核心设计意图。它刻意省略了大量工程边界；完整设计（W3C 术语对齐、接口定义、状态机全集、可达性敏感文档的安全发布等）见 [resolve_did重构.md](./resolve_did重构.md)，基础设施愿景见 [resolve-did.md](./resolve-did.md)。
+本文是教程：用一段伪代码和几条约定，讲清 `resolve_did` 的核心设计意图。它刻意省略了大量工程边界；本文描述的是 2026-10 重构前的实现，新设计见 [resolve-did协议冻结讨论伪代码.md](./resolve-did协议冻结讨论伪代码.md)；本文将在重构 M6 删除。
 
 ## 1. resolve_did 在解决什么问题
 

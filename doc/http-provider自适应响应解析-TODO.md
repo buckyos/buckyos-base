@@ -289,7 +289,7 @@ struct HttpDidPayload {
 ## 相关文档与实现
 
 - [`http_did_resolver_api.md`](./http_did_resolver_api.md)
-- [`resolve-did.md`](./resolve-did.md)
+- [`resolve-did协议冻结讨论伪代码.md`](./resolve-did协议冻结讨论伪代码.md)
 - [`src/name-client/src/https_provider.rs`](../src/name-client/src/https_provider.rs)
 - [`src/name-client/src/provider.rs`](../src/name-client/src/provider.rs)
 - [`src/name-client/src/name_query.rs`](../src/name-client/src/name_query.rs)

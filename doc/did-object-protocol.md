@@ -168,11 +168,14 @@ https://myhome.com/devices/cam01
 ```
 did是 did:web:myhome.com:devices:cam01
 
-Runtime 通过 DID Object Resolver 得到 DID Object Card。默认 Web-compatible resolution 是：
+Runtime 通过 DID Object Resolver 得到 DID Object Card。路径型对象的默认 resolution 是直接请求对象 URL：
 
 ```text
-GET https://myhome.com/devices/cam01/did.json
+GET https://myhome.com/devices/cam01
 ```
+
+响应可以是任意业务内容；DID Object Card 放在 body（裸 JSON / JWT）或 `BuckyOS-DID-Document` 响应头中（见 §6.1）。
+只有以 `/` 结尾的目录型 URL 才补 `did.json`。
 
 DID Object Card 是 DID Document：
 
@@ -298,11 +301,8 @@ resolve(input: ObjectURL | DID): Promise<ResolvedObjectCard>
 }
 ```
 
-默认 Web-compatible resolution：
-
-```text
-{object_url}/did.json
-```
+默认 resolution 按 §6.1 的路由规则：路径型对象 URL 直取，目录型 URL 补 `did.json`，非默认文档类型用 `?type=`。
+`{object_url}/did.json` 只作为已配置 provider 的兼容路由保留，不再对新路径对象无条件追加。
 
 BuckyOS Runtime MAY 支持其他 resolver routes，例如 local registry、Zone registry、BNS、DID resolver cache、host manifest 或预配置 DID Object Host。这些 route 的顺序和实现细节不属于核心协议，只要最终返回合法且可验证的 DID Object Card。
 
@@ -320,21 +320,22 @@ DID Object Card v1 固定为 DID Document。
 
 ### 6.1 Default DID Object Card URL
 
-```text
-{object_url}/did.json
-```
+发现路由与 [HTTP DID Resolver API §1.1 / §8](./http_did_resolver_api.md) 一致（2026-10-20 同步）：
 
-示例：
+| 输入 | 默认获取地址 | 说明 |
+| --- | --- | --- |
+| `https://myhome.com/devices/cam01`（路径型，path 不以 `/` 结尾） | 原 URL | Card 在 body 或 `BuckyOS-DID-Document` 响应头；默认逻辑类型 `did-object`，不追加 `?type=` |
+| `https://myhome.com/devices/cam01?type=profile` | 原 URL | 显式选择非默认文档类型；与已有 `type` 冲突时拒绝 |
+| `https://myhome.com/devices/`（目录型，path 以 `/` 结尾） | `https://myhome.com/devices/did.json` | 保留原 query |
+| `did:web:myhome.com:devices:cam01` / `did:bns:myhome:devices:cam01` | 映射到对应 host 的 `/devices/cam01` | Object DID 是规范身份，Object URL 是引用 |
+| `did:web:myhome.com` / `did:bns:myhome`（无对象子路径） | `/.well-known/did.json` | 目录型 |
 
-```text
-https://myhome.com/devices/cam01/did.json
-```
+分类在拼 URL 之前完成，不能先去掉尾斜杠；query 不参与目录判断。`{object_url}/did.json` 与 `{object_url}/{doc_type}.json`
+只对已配置为旧路径型发布模式的 provider 作为兼容路由保留，不对新路径对象无条件追加，也不追加 `/owner.json`
+去取 controller / Owner 的根材料：验证链的根材料必须先建立可信绑定再查询对应 Owner DID。
 
-如果对象使用 `did:web:myhome.com:devices:cam01`，其 DID Document 的标准位置自然对应：
-
-```text
-https://myhome.com/devices/cam01/did.json
-```
+发布方若不想改动原 URL 的业务 body，可在响应头内联完整 Card：`BuckyOS-DID-Document: jwt <compact>` 或
+`BuckyOS-DID-Document: json <base64url>`，单值不超过 16 KiB。body 与头同时给出 Card 时必须是同一份文档。
 
 生产环境 SHOULD 使用 HTTPS。开发环境或 Zone 内网 MAY 使用 HTTP，但 HTTP 返回的 DID Object Card 不能仅依赖传输可信，必须通过 DID Document 签名、controller、Zone 信任链或 Runtime policy 完成验证。
 
@@ -371,6 +372,8 @@ DID Object Card SHOULD 支持缓存和版本判断：
 - HTTP resolver SHOULD 返回 `Last-Modified`。
 - Runtime SHOULD 支持 `If-None-Match` 和 `If-Modified-Since`。
 - 非 HTTP resolver SHOULD 在 resolver metadata 中提供等价的 `card_version`、`fetched_at`、`valid_until`。
+- Card 经响应头承载时，`ETag` / `Last-Modified` 描述的是业务 body；Card 自身的版本是其 `iat` 与内容 hash，
+  有效期是其 `exp`。Card 更新必须让旧响应头可过期或重验，HTTP 缓存期限不能覆盖 Card 的 `exp`。
 
 这些元数据不定义 `read()` 的 session 行为，但为上层 session-aware runtime 提供稳定依据。
 
@@ -1576,7 +1579,8 @@ Resolver 或 Runtime MAY 为 DID Object Card / endpoint response 附加 trust me
 {
   "source": {
     "type": "object_host|zone_registry|local_registry|did_resolver|cache|adapter",
-    "uri": "https://myhome.com/devices/cam01/did.json",
+    "uri": "https://myhome.com/devices/cam01",
+    "carrier": "body|header",
     "trust": "official|verified|zone|local|unverified|cached|stale",
     "fetched_at": "2026-06-07T12:00:00Z",
     "valid_until": "2026-06-07T13:00:00Z"
@@ -1594,11 +1598,15 @@ Resolver 或 Runtime MAY 为 DID Object Card / endpoint response 附加 trust me
 
 ### 16.1 Default route
 
-默认 Web-compatible route：
+默认 route 见 §6.1：
 
 ```text
-GET {object_url}/did.json
+GET {object_url}                  # 路径型对象：Card 在 body 或 BuckyOS-DID-Document 响应头
+GET {object_url}?type={doc_type}  # 显式非默认文档类型
+GET {directory_url}did.json       # 目录型（URL path 以 / 结尾）
 ```
+
+`{object_url}/did.json` 只作为已配置 provider 的兼容路由。
 
 ### 16.2 Additional routes
 
@@ -1736,7 +1744,7 @@ Agent Read Runtime 可以使用本协议材料构造 LLM-facing ReadResult，例
 | 标准 / 技术 | 使用方式 |
 |---|---|
 | W3C DID Core | DID Object Card 使用 DID Document。 |
-| did:web | URL path object 可自然映射到 `/{path}/did.json`。 |
+| did:web | 根域名映射到 `/.well-known/did.json`；URL path object 映射到对象 URL `/{path}` 本身，`/{path}/did.json` 仅作兼容路由。 |
 | W3C WoT Thing Description | DID Object Profile 使用 constrained TD-style document。 |
 | JSON Schema-compatible Data Schema | property/action/event/index schemas。 |
 | HTTP(S) | DID Object Card discovery、property GET、action POST。 |

@@ -1,5 +1,8 @@
 # 伪代码：只描述逻辑，不展开异步、数据库和 wire 格式。
 # 根据 review 的回答整理。helper 的约定写在相邻注释中，不代表已有同名实现。
+# 2026-10-20 按 resolve-did重构-TODO.md 回写：closest 由 current 推导、Invalid 负状态、
+# doc_type=None 归一、串行锁只包读缓存段与提交段（I/O 不持锁，任务合并去重）。
+# wire（versionId/versionTime、BuckyOS-DID-Document 响应头、Zone locker 预算头）见 http_did_resolver_api.md。
 
 # ---------- 数据与约定 ----------
 # doc_result 按 (scope, did, doc_type) 保存，进程内/跨进程共享。
@@ -25,6 +28,10 @@
 # Revision.exact(iat, hash)：指定已发布版本；Revision.closest(iat)：最接近且严格早于 iat 的已发布版本。
 # exact/closest 需要 resolver 的 publish_info 协议回答相应查询；locker 可在本 scope 模拟。
 # 不支持/无回答时保留原因，不能退回当前版本，也不能把本机见过的最大历史版本当 closest。
+# closest 可由 authority 的 current 回答 L 推出：L 是 latest 证明 (L.iat, +∞) 无已发布版本，
+# 故 query_iat > L.iat 时 closest(query_iat) = L；exact(iat, hash) 在 iat == L.iat 且 hash 相同时命中。
+# 推出的回答按完整查询分槽缓存，证据指向该 current receipt；trust/normal 的 body 不能用于推导。
+# query_iat <= L.iat 时必须发真正的历史查询（wire: versionTime）。
 # doc.revision() 是文档身份 (iat, hash)，revesion 是查询条件，二者不要混用。
 # normalize/with/create_get_owner_opts 都返回副本；递归 owner 查询显式传自己的 revesion。
 # 副本继承同一 deadline、取消信号和来源/传输限制，只能收紧，不能通过递归或 fallback 恢复默认值。
@@ -41,6 +48,9 @@
 # exact 查询必须返回该 iat 的实际发布 hash，以便核对；closest 回答还须确认该查询边界内没有更高发布版本。
 # record_for(iat) 只返回覆盖该 iat 的记录；当前 V1 的 hash 不约束 iat 不同的 V2。
 # 已发布记录含 hash；显式“该版本未发布”和 NoAnswer 均不妨碍继续验签。
+# Invalid(reason) 是 authority 对 (did, doc_type) 确定性校验失败的明确回答（如 BNS device/zone 身份不一致）：
+# 不是 Unknown、不退避、可短 TTL 缓存；选择时等同 NotExist；不升级 DID 禁用；不阻止 trust/normal 候选经 owner 链验签。
+# authority 不得把这类失败报成 5xx（cyfs-gateway#207 根因 3）。
 
 # verify_result 的事实字段：is_signed / is_published / is_revoked / is_expired / is_disabled。
 # is_signed 只表示签名核验通过，trust 免签不设置它；未检查的事实保留 unknown/reason。
@@ -49,6 +59,99 @@
 # success(revesion) = validity == valid 且命中目标；current 普通文档取 best，owner 取 latest。
 # exact/closest 还须有对应查询的发布依据；签名有效但目标发布无法确认时，success=False 并保留原因。
 # 签名正确但已撤销的文档可以返回 is_signed=True、is_revoked=True，其它选择标志为 False。
+
+# ---------- 目录/路径入口与 HTTP 文档载体 ----------
+# 本节补充本轮讨论的获取约定；具体 HTTP header 名称/编码不在此伪代码中冻结。
+# 无对象子路径的 did:bns:xxxx 是目录型；did:bns:xxxx:aaa:bbb 是路径型 DID Object。
+# HTTP Object URL 按 URL.path 的尾 "/" 区分目录/路径，query 不参与判断；
+# 不能先 trim 尾 "/" 或把两者作为同一发现入口缓存，丢掉查询语义。
+# DID 表示与 Object URL 分开：冒号路径由 method 映射到 URL 路径，
+# did:web:example.com:user:alice 对应 https://example.com/user/alice。
+# 未带 "/" 的根名字 DID 仍按 method 识别为目录，不能套用裸 HTTP URL 的尾斜杠判断。
+#
+# 目录入口按 method/发布模式的既有规则取得默认 did.json：
+# - 根域名静态发布沿用 /.well-known/did.json；BNS Web 映射使用配置的 bridge host。
+# - 显式 HTTP 目录 https://example.com/user/alice/ -> 同目录 did.json，保留原 query。
+# 路径对象默认直接 GET 映射后的原 URL，不追加 /did.json、/owner.json 或其它类型文件；
+# 只有显式选择非默认文档类型时，才在该 URL 上设置 type 查询参数。
+# 默认路径文档是 DID Object Card（逻辑 doc_type 为 did-object），通常不构造 type 参数。
+# 内部 doc_type 用于匹配/缓存，不等于必须发出的 query selector；
+# 调用入口按已知对象/发布契约确定默认类型，不把全局 zone 默认值套给路径对象，
+# 也不能依据未验证响应把调用方要求的类型悄悄改掉。缓存键仍使用真实 doc_type。
+# 设置 type 使用 URL query API，保留无关参数；已有选择器与调用方要求冲突时拒绝，
+# 不覆盖业务参数或重复拼多个 type；query selector 不改变 Object DID。
+# 入口未指定 doc_type 时可先从输入 URL 的显式 type 归一实际类型，再进入缓存/串行流程；
+# 已指定类型则必须一致。默认查询/目录分支同样校验已有 type，不能因不新增参数而漏检。
+# doc_type=None 的归一在缓存键之前完成，表示接受 method/provider 的默认类型，不是 zone 的别名：
+# - 路径型对象 -> did-object；
+# - 无子路径的 did:bns:<name> -> BNS provider 按 active 类型集合选择：唯一则取之，多个无默认报 ambiguity，
+#   多个且含 zone 取 zone 并在 reasons 记 warn；
+# - did:web 根域名 -> /.well-known/did.json，实际类型由文档内容确定；其它 method 自定规则并返回实际类型。
+# 结果携带 requested_doc_type / actual_doc_type。旧 Zone 分支的 Device→Agent→Owner 探测删除；
+# BNS 对 ood1.<name> 的设备槽位联合校验只挂显式 device 查询。
+#
+# 兼容边界：以上是 DID Object 直接入口的规则，不替换所有 provider 的 wire URL。
+# BNS authority 等现有 /1.0/identifiers/{did}?type=... 仍按原 API 查询；
+# 目录原有的显式类型文件（如 /.well-known/owner.json）继续使用。
+# 旧路径型 did:web /{path}/did.json、/{path}/{doc_type}.json 发布模式保留为兼容路由，
+# 由已知 method/provider 配置选择，不对新路径对象无条件追加这些后缀或无限盲试。
+# HTTP 旧业务 body 不必改成 Card；提供者可在响应 header 内联完整 DID Document。
+# 新客户端统一从 body/header 提取，旧客户端仍可使用原 body 和 Content-Type。
+# 这需要 provider 实现增加能力；不声称所有旧端点已支持新入口、header 或历史查询。
+#
+# body 支持已有裸 JSON/JWT、DID Resolution Result 信封；
+# header 只识别协议明确声明的文档字段，解码出原始 JSON/JWT，不把任意 header 当 Card。
+# header binding 已定（http_did_resolver_api.md §8）：BuckyOS-DID-Document: "jwt <compact>" | "json <base64url>"，
+# 单值 ≤ 16 KiB，重复出现或超限视为损坏而非缺席。
+# Link 指向 Card 可作为后续可选扩展，不能替代本轮对 header 内联文档的支持。
+# 提取后的 SourceAnswer.body 表示确切 DID Document，不一定是原 HTTP entity body。
+# 原业务 body 没有声明为 DID Document 时，不参与 Card 冲突比较。
+# body/header 同时声明文档时须身份、类型、iat/hash 一致；否则拒绝本次来源回答，
+# 不按位置优先级挑一份，也不因此声明整个 DID 禁用。JWT 原文不能重序列化后比较。
+# HTTP 错误、明确禁用/撤销和 publish_info 仍按原契约处理，header 不能覆盖这些事实。
+# header 只是载体，不提升 authority/trust 等级，不自动产生发布依据或 is_signed；
+# Card 的 URL/DID 绑定、controller/Owner、时间与签名仍走同一验证规则。
+# Card 有效也不自动证明旧业务 body 的内容完整性；Card 更新须使旧响应头可过期/重验，
+# 缓存 TTL 不能覆盖 Card 自身 exp，旧业务 body 的 ETag 不能冒充 Card 的 iat/hash。
+
+
+def build_document_request_url(location, doc_type):
+    # location 来自已知 method/provider 路由和调用输入，保留目录标记、原 URL 和对象身份。
+    location.check_input_type_selector(doc_type)
+    if location.is_resolver_api() or location.is_legacy_static_route():
+        return location.existing_document_url(doc_type)  # 保持原 API/静态发布路由。
+    # 默认逻辑类型归一为无 selector；显式非默认类型才需要选择器。
+    selector = location.non_default_type_selector(doc_type)
+    if location.is_directory():
+        # 默认按根目录 well-known 或显式 URL 目录规则补 did.json；
+        # 已有目录显式类型的映射继续沿用该发布契约，不影响路径对象的 query 规则。
+        return location.directory_document_url(selector)
+    url = location.object_url.copy()
+    if selector is not None:
+        url = url.with_document_type_query(selector)  # 安全合并 query；冲突则拒绝，不静默覆盖。
+    return url
+
+
+def document_answer_from_http(response, expected_did, doc_type, opts):
+    opts.budget.check()
+    # response 保留原 Object URL 与实际请求/重定向上下文；对象 URL 绑定不能误用 Card 存放地址。
+    # helper 先处理 HTTP 状态和已有发布状态信封，再识别文档 body；
+    # 支持旧业务 body + header，业务 body 不必是 JSON，且不强制下载无关的大文件。
+    # 格式错误的显式 DID 文档/信封仍报错，不能借 allow_legacy_body 吞掉。
+    answer = decode_http_source_answer(response, allow_legacy_body=True, opts=opts)
+    header_doc = decode_declared_document_header(response.headers, opts=opts)
+    # header 缺席返回 None；显式文档字段存在但损坏/超限则报来源回答错误，不伪装成缺席。
+    if header_doc is not None:
+        if answer.body is not None:
+            require_same_exact_document(answer.body, header_doc, opts=opts)
+        else:
+            answer.body = header_doc  # 保留其原文、响应来源、时间和 header 载体信息。
+        answer.remember_document_carrier("header")
+    # 只检查请求身份/类型/URL 绑定，尚未完成信任验证；保留此前解析的状态与发布事实。
+    # 无文档且无状态回答时保留“不提供 DID 文档”的原因，不把普通业务响应当解析成功。
+    answer.check_requested_document_binding(expected_did, doc_type, opts=opts)
+    return answer
+
 
 # ---------- 请求来源与统一预算 ----------
 # 来源信任等级和网络访问许可是两个维度：trust/authority 不自动意味着传输不依赖待建隧道。
@@ -82,7 +185,10 @@
 # 两种终止均不声明 DID 不存在/禁用/撤销；已经完成的合法原子提交保留，未完成工作取消。
 # budget.run/上下文退出必须取消未共享的子任务、关闭未完成的连接并释放锁/许可，不能留下后台请求。
 # serialize_document 的锁获取也可取消并受该 deadline 限制；调用链 visited 不能识别新入站请求的网络环。
-# 同键串行可能把回流变成等待环，不能当作来源限制的替代；跨进程原子合并也不是网络防环。
+# 同键串行锁不得跨 provider/locker I/O 持有：否则回流入站的受限解析会在同一把锁上等外层的补充源请求，
+# 外层又在等入站的 TLS 握手，每次烧满整份预算才失败（cyfs-gateway#207）。
+# 锁只包两段：读缓存/刷新约束/决定查询；验证后原子提交。I/O 阶段由任务合并（键含访问策略）去重。
+# 跨进程原子合并也不是网络防环。
 #
 # 并发合并覆盖身份解析阶段；共享任务须有有限自身预算，各等待者保留自己的 deadline/取消信号。
 # 合并键包含 scope/DID/doc_type/revesion 及来源/传输/证据要求，受限请求不能加入会访问目标站点的任务。
@@ -108,6 +214,9 @@ def request_source(source, operation, did, doc_type, revesion, opts):
         return Unknown(reason, cacheable=False)
     query = source.get_document if operation == "document" else source.get_publish_info
     # source 的实现接收并执行 request_opts，包含内部解析、每一跳的检查和剩余预算。
+    # HTTP provider 内部用 build_document_request_url 选择文档入口，
+    # 用 document_answer_from_http 统一提取 body/header；所有读取/解码仍在本预算内。
+    # publish_info 的查询仍走其已有协议，不能从“header 中有 Card”推导发布状态。
     try:
         raw = opts.budget.run(
             lambda: query(did, doc_type, revesion, opts=request_opts),
@@ -127,11 +236,12 @@ def request_source(source, operation, did, doc_type, revesion, opts):
 def resolve_did_ex(did, doc_type, revesion=None, opts=None):
     revesion = normalize_revesion(revesion)  # None -> current；exact 必须同时有 iat/hash。
     opts = normalize_opts(opts, doc_type)
-    # 串行键仍为 (scope, did, doc_type)，不同 revesion 也会更新同一 best，不能分别加锁。
+    # 串行键为 (scope, did, doc_type)，不同 revesion 也会更新同一 best，不能分别加锁。
+    # 锁只在 _get_document 的读缓存段和 update_doc_result 的提交段内持有；
+    # provider/locker I/O 和候选验证（含 owner 递归）不持锁，跨请求去重由任务合并负责。
     # 等待者重新读缓存并判断自己的输入/revesion/opts，不能复用另一份文档的验证成功。
-    # 不持数据库事务等待 locker/provider；跨进程由提交时的原子合并裁决最终结果。
-    # 递归 owner 使用另一文档键；保留调用链的环路检查，不在持有本键时再次进入本键。
-    with resolution_budget(opts), serialize_document(did, doc_type, opts):
+    # 不持数据库事务等待任何 I/O；跨进程由提交时的原子合并裁决最终结果。
+    with resolution_budget(opts):
         result, publish_info = _get_document(did, doc_type, revesion, opts)
         if result.locked:
             return result
@@ -179,8 +289,9 @@ def _get_document(did, doc_type, revesion, opts):
     if locked is not None:
         return locked, None
 
-    result = get_doc_result(did, doc_type, opts)
-    refresh_known_constraints(result, opts)
+    with serialize_document(did, doc_type, opts):  # 段 1：只包读缓存与刷新约束，不包任何 I/O。
+        result = get_doc_result(did, doc_type, opts)
+        refresh_known_constraints(result, opts)
     publish_info = get_publish_info(did, doc_type, revesion, opts)
     result.apply_publish_info(publish_info)  # None 不抹掉已知状态，负状态覆盖其声明的 DID/类型/版本范围。
     if result.state.is_disabled():
@@ -191,6 +302,8 @@ def _get_document(did, doc_type, revesion, opts):
     # helper 可用已允许的本地材料构造源；内部递归查询仍继承 opts。
     for provider in _get_did_providers(did, doc_type, opts):
         opts.budget.check()
+        # 不持串行锁；get_document_by_provider 内部经 merge_or_run 按 (scope, provider, did, doc_type,
+        # revesion, 访问策略) 合并并发的相同查询，受限请求不会加入会访问目标站点的任务。
         answer = get_document_by_provider(provider, did, doc_type, revesion, opts)
         # 一次回答可同时带 body 和 publish_info；拆开缓存，避免重复网络请求。
         result.commit(answer, provider, revesion, opts)
@@ -236,7 +349,12 @@ def get_document_by_provider(provider, did, doc_type, revesion, opts):
         return cached.answer  # 不刷新原查询时间。
     if not revesion.is_current() and not provider.supports_publish_info():
         return Unknown("此来源不支持指定版本/closest 查询", cacheable=False)
-    answer = request_source(provider, "document", did, doc_type, revesion, opts)
+    # 共享任务有自己的有限预算；每个等待者保留自己的 deadline/取消，最后一个离开才取消任务。
+    answer = merge_or_run(
+        key=(opts.scope, provider.id, did, doc_type, revesion.cache_key(), opts.access_policy_key()),
+        run=lambda: request_source(provider, "document", did, doc_type, revesion, opts),
+        opts=opts,
+    )
     opts.record_query_answer(provider, did, doc_type, revesion, answer)
     # OK / NotExist / 来源回答的 Unknown 分开保存；Unknown 只短期退避，不能变成 NotExist/禁用。
     # 策略拒绝、调用预算/取消不得污染共享查询缓存；不能仅因构造了 Unknown 就缓存。
@@ -286,35 +404,36 @@ def verify_document(did, doc_type, doc_body, revesion=None, opts=None):
         if not doc.matches(did, doc_type) or doc.iat is None:
             return Invalid("文档身份、类型或 iat 不合法")
 
-        with serialize_document(did, doc_type, opts):
+        with serialize_document(did, doc_type, opts):  # 段 1：读缓存与刷新约束，不包 I/O。
             result = get_doc_result(did, doc_type, opts)
             refresh_known_constraints(result, opts)
-            # locker 仍优先；这里比较的是收到的文档，不能用锁定的另一份文档替代它。
-            locked = get_locked_document(did, doc_type, revesion, opts)
-            if locked is not None:
-                result = locked
-            cached = result.find_verified(doc.revision())
-            # reusable_for 检查来源范围、owner/locker 依赖，以及目标查询的发布依据是否仍可复用。
-            # 默认 best 的签名结论可复用，不为每次缓存命中强制刷新公网发布状态。
-            # force_authority_query 时，缺本轮匹配 receipt 的旧验证结果不能让本次权威查询短路。
-            if cached is not None and cached.reusable_for(revesion, opts):
-                report = cached.report.copy_for(doc)
-                apply_known_constraints(report, doc, result, revesion, opts)
-                report.set_selection_flags(doc, result, revesion)
-                if report.success(revesion):
-                    return report
-
-            # 即便缓存命中失败，也可复用该确切文档原先取得的 authority/trust 来源材料。
-            # 验签所用 owner/locker 依据失效时不能改作免签来源；单纯解绑不抹掉已有 trust 来源。
-            source = reusable_source(cached, opts) if cached is not None else Source.normal()
-            info = get_publish_info(did, doc_type, revesion, opts)
-            report = _verify_document_ex(did, doc_type, doc, result, info, source, revesion, opts)
-            if not result.locked:
-                # 保存发布/撤销事实；只有 valid 的输入才可推进 best；不依赖业务准入结果。
-                result.apply_verification(doc, source, report, revesion)
-                result = update_doc_result(did, doc_type, result, opts)
+        # locker 仍优先；这里比较的是收到的文档，不能用锁定的另一份文档替代它。
+        locked = get_locked_document(did, doc_type, revesion, opts)
+        if locked is not None:
+            result = locked
+        cached = result.find_verified(doc.revision())
+        # reusable_for 检查来源范围、owner/locker 依赖，以及目标查询的发布依据是否仍可复用。
+        # 默认 best 的签名结论可复用，不为每次缓存命中强制刷新公网发布状态。
+        # force_authority_query 时，缺本轮匹配 receipt 的旧验证结果不能让本次权威查询短路。
+        if cached is not None and cached.reusable_for(revesion, opts):
+            report = cached.report.copy_for(doc)
+            apply_known_constraints(report, doc, result, revesion, opts)
             report.set_selection_flags(doc, result, revesion)
-            return report
+            if report.success(revesion):
+                return report
+
+        # 即便缓存命中失败，也可复用该确切文档原先取得的 authority/trust 来源材料。
+        # 验签所用 owner/locker 依据失效时不能改作免签来源；单纯解绑不抹掉已有 trust 来源。
+        source = reusable_source(cached, opts) if cached is not None else Source.normal()
+        info = get_publish_info(did, doc_type, revesion, opts)  # I/O 与 owner 递归都不持锁。
+        report = _verify_document_ex(did, doc_type, doc, result, info, source, revesion, opts)
+        if not result.locked:
+            # 保存发布/撤销事实；只有 valid 的输入才可推进 best；不依赖业务准入结果。
+            # update_doc_result 在段 2 的锁内重读存储并原子合并；合并后发现同 iat 不同 hash 则改报 invalid(conflict)。
+            result.apply_verification(doc, source, report, revesion)
+            result = update_doc_result(did, doc_type, result, opts)
+        report.set_selection_flags(doc, result, revesion)
+        return report
 
 
 def _verify_document_ex(did, doc_type, doc, result, publish_info, source, revesion, opts):
@@ -364,6 +483,8 @@ def _verify_document_ex(did, doc_type, doc, result, publish_info, source, revesi
     signing_revesion = Revision.closest(doc.iat)  # 与调用方要查询哪个子文档版本无关。
     current = resolve_did_ex(expected_owner, "owner", revesion=current_revesion, opts=owner_opts)
     current_owner = current.select(current_revesion)
+    # 第二次查询通常命中推导：current 来自 authority 且 current_owner.iat < doc.iat 时，
+    # closest(doc.iat) 的槽位已由 current receipt 填好，不再发网络请求；否则走真实历史查询。
     historical = resolve_did_ex(expected_owner, "owner", revesion=signing_revesion, opts=owner_opts)
     signing_owner = historical.select(signing_revesion)
 
@@ -457,7 +578,9 @@ def get_expected_owner(did, publish_info, result):
     binding = trusted_owner_binding(publish_info, result)
     if binding is not None:
         return binding
-    if did.method == "bns":
+    # 路径对象的 controller/Zone/Owner 链须先形成可信绑定；不能自报 controller 建根，
+    # 也不能把“取得签发者的 owner 文档”实现为向对象 URL 追加 /owner.json。
+    if did.method == "bns" and not did.has_object_path():
         return did.get_upper() or did  # 子名字的上级；一级用户的 profile 由自己的 owner 根验证。
     return None  # 其它 method 使用其可信绑定规则，不能取候选自报的 owner。
 
@@ -481,9 +604,11 @@ def get_doc_result(did, doc_type, opts):
 
 
 def update_doc_result(did, doc_type, result, opts):
-    # 按同键原子合并，保留未被更高版本替换的 best、公共负状态和分时间的历史记录。
-    # sqlite 负责跨进程，内存后端提供同样的串行语义；不要求多个不同 DID 的全局快照。
-    return local_cache(opts).merge_doc_result(opts.scope, did, doc_type, result)
+    # 段 2：在 serialize_document 内重读存储中的最新结果，再把本地快照按同键原子合并，
+    # 保留未被更高版本替换的 best、公共负状态和分时间的历史记录。
+    # 嵌入式存储负责跨进程裁决，内存后端提供同样的串行语义；不要求多个不同 DID 的全局快照。
+    with serialize_document(did, doc_type, opts):
+        return local_cache(opts).merge_doc_result(opts.scope, did, doc_type, result)
 
 
 def commit_candidate_doc(did, doc_type, doc_body, source, opts=None):
@@ -555,6 +680,17 @@ def on_rtcp_hello(hello, caller_opts=None):
 # - 串行锁等待、owner 递归、多 provider 重试共用 deadline；超时/取消不残留请求或锁，
 #   不写禁用状态、不污染普通调用缓存；并发合并不跨访问策略复用网络任务。
 # - AuthorityCurrent 不接受模拟发布/旧 receipt/仅 trust best；有效身份、吊销与隧道复用仍按原准入要求检查。
+# - 目录/路径：无 path 的 BNS 根按 method 目录规则取 did.json；:aaa:bbb 直取对象 URL，
+#   默认 did-object 不附 type，非默认类型才安全合并 query；显式 URL 尾 "/" 不被提前抹掉。
+# - 旧 resolver API、根目录显式类型文件、已配置的旧路径静态发布路由仍可使用；
+#   新路径入口不无条件追加 /did.json 或 /owner.json，路径对象缺可信绑定时不自建 Owner 根。
+# - 旧 HTML/JSON/媒体 body + 合法文档 header 可提取 Card；body/header 两种载体同等验证，
+#   相同文档幂等、不同文档拒绝该响应；损坏/超限 header 不覆盖负状态或绕过验证。
+# - authority 只支持 current 且文档 iat 晚于当前 owner 发布时间：closest 由推导得到，不发历史查询；
+#   文档 iat 早于当前 owner 时 501 保留缺材料原因，不用当前 owner 冒充。
+# - authority 回答 Invalid：不退避、类型级负状态；normal JWT 仍可经 owner 链成为 best；AuthorityCurrent 拒绝。
+# - 回流：外层默认策略解析在补充源 I/O 中，入站受限策略解析同一 (scope, did, doc_type) 不被串行锁阻塞，
+#   各自在预算内结束；BNS 对健康 Zone 返回 503/不响应时 Relay 对自身连接数不增长。
 
 
 def get_device_info(device_name):
