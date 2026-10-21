@@ -4,6 +4,7 @@
 //! 获取规则:
 //! - 目录型(无对象子路径):`https://{host}/.well-known/did.json`(默认类型)或
 //!   `/.well-known/{doc_type}.json`(显式类型,BuckyOS 扩展);
+//!   显式类型文件无回答时,也接受 `did.json` 中身份和实际类型均匹配的文档;
 //! - 路径型对象(`did:web:example.com:user:alice`):直取 `https://example.com/user/alice`,
 //!   默认逻辑类型 `did-object`,文档可在 body 或 `BuckyOS-DID-Document` 响应头中;
 //!   显式非默认类型用 `?type=` 选择;已配置时再尝试兼容路由 `/{path}/did.json`;
@@ -266,10 +267,47 @@ impl Source for WebProvider {
         };
         let allow_legacy_body = !primary.is_directory();
         let mut answer = self
-            .fetch_url(url, did, doc_type, revision, opts, allow_legacy_body, false)
+            .fetch_url(url.clone(), did, doc_type, revision, opts, allow_legacy_body, false)
             .await;
         if Self::answer_is_conclusive(&answer) {
             return answer;
+        }
+        // 根 did.json 的实际类型可以是 Device / Owner 等,不一定是 Zone。
+        // 保留显式类型文件的优先级和明确负状态,再兼容既有默认发布入口。
+        // 每轮重新获取,不能把类型发现缓存当作新的 authority-current 回答。
+        if primary.is_directory() {
+            if let Ok(default_url) = build_document_request_url(&primary, None) {
+                if default_url != url && opts.budget().check().is_ok() {
+                    let mut default_answer = self
+                        .fetch_url(default_url.clone(), did, doc_type, revision, opts, false, false)
+                        .await;
+                    if let Some(body) = default_answer.body.as_ref() {
+                        let matches = ParsedDocument::parse(body)
+                            .ok()
+                            .map_or(false, |parsed| {
+                                parsed.id.as_ref() == Some(did)
+                                    && parsed.doc_type.as_ref() == Some(doc_type)
+                            });
+                        if !matches {
+                            default_answer = SourceAnswer::unknown(
+                                sref.clone(),
+                                format!(
+                                    "default document does not declare requested identity {}#{}",
+                                    did.to_string(), doc_type
+                                ),
+                                false,
+                            )
+                            .with_context(default_url.to_string());
+                        }
+                    }
+                    if Self::answer_is_conclusive(&default_answer) {
+                        return default_answer;
+                    }
+                    if (answer.cacheable && !default_answer.cacheable) || answer.reason.is_none() {
+                        answer = default_answer;
+                    }
+                }
+            }
         }
         if let Some(legacy) = legacy {
             if let Ok(url) = build_document_request_url(&legacy, Some(doc_type)) {
@@ -337,6 +375,10 @@ impl Source for WebProvider {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "web_provider_tests.rs"]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {

@@ -59,6 +59,9 @@ resolver，还是未来某个新 method 的 resolver。理由：
 - 静态发布面只返回文档本体，不要把 §3 的状态信封塞进去。需要 `missing` / `revoked` / `invalid` 等状态语义时走 resolver API。
 - `/.well-known/did.json` 是 W3C 兼容基线，保持 JSON/JSON-LD；BuckyOS 扩展的 `{doc_type}[.json|.jwt]` 允许 JWT。
   `doc_type` 只能使用 `[A-Za-z0-9_-]`，不含 `.` 或 `/`。客户端按 body 自动识别 JSON/JSON-LD 与 JWT，不能只依赖 `Content-Type`。
+- WebProvider 的根 `did.json` 可以发布 Device、Owner 等默认身份文档。查询 current 的显式类型文件未得到有效文档或明确发布状态时，
+  在查询上级 resolver 之前尝试根 `did.json`，且仅接受 DID 和实际文档类型都与请求一致的 body；不能用此兼容入口绕过明确负状态。
+  所有尝试共享原请求预算，exact / closest 查询仍只走 resolver API。
 
 ## 2. 请求
 
