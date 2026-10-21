@@ -380,23 +380,30 @@ impl PublishInfo {
             (Some(base), None) => Some(base),
             (None, Some(other)) => Some(other),
             (Some(mut base), Some(other)) => {
+                // 已知禁用 / 撤销只被新的明确 current 回答翻篇(设计稿:None / Unknown
+                // 不能覆盖已知禁用);历史版本回答和推导回答不描述当前状态,不能覆盖。
+                let can_clear_disabled = other.query.is_current() && !other.derived;
                 if other.did_state.is_some() {
-                    // 已知禁用不被 Normal 覆盖。
-                    let keep_base = base
-                        .did_state
-                        .as_ref()
-                        .map_or(false, DidState::is_disabled)
-                        && !other.did_state.as_ref().map_or(false, DidState::is_disabled);
+                    let keep_base = !can_clear_disabled
+                        && base.did_state.as_ref().map_or(false, DidState::is_disabled)
+                        && !other
+                            .did_state
+                            .as_ref()
+                            .map_or(false, DidState::is_disabled);
                     if !keep_base {
                         base.did_state = other.did_state.clone();
                     }
                 }
                 if other.type_state.is_some() {
-                    let keep_base = base
-                        .type_state
-                        .as_ref()
-                        .map_or(false, TypeState::is_disabled)
-                        && !other.type_state.as_ref().map_or(false, TypeState::is_disabled);
+                    let keep_base = !can_clear_disabled
+                        && base
+                            .type_state
+                            .as_ref()
+                            .map_or(false, TypeState::is_disabled)
+                        && !other
+                            .type_state
+                            .as_ref()
+                            .map_or(false, TypeState::is_disabled);
                     if !keep_base {
                         base.type_state = other.type_state.clone();
                     }
@@ -486,12 +493,27 @@ mod tests {
     fn merge_keeps_known_negative_state() {
         let revoked = PublishInfo::new(did(), DidDocType::Zone, Revision::current())
             .with_status(&DocumentStatus::Revoked, None, None);
+        // 没有回答、历史版本回答都不能覆盖已知撤销。
+        let merged = PublishInfo::merge(Some(revoked.clone()), None).unwrap();
+        assert!(merged.is_disabled());
+        let historical_active = PublishInfo::new(
+            did(),
+            DidDocType::Zone,
+            Revision::exact(10, "aa"),
+        )
+        .with_status(&DocumentStatus::Active, None, None);
+        let merged = PublishInfo::merge(Some(revoked.clone()), Some(historical_active)).unwrap();
+        assert!(merged.is_disabled());
+        let mut derived_active = PublishInfo::new(did(), DidDocType::Zone, Revision::current())
+            .with_status(&DocumentStatus::Active, None, None);
+        derived_active.derived = true;
+        let merged = PublishInfo::merge(Some(revoked.clone()), Some(derived_active)).unwrap();
+        assert!(merged.is_disabled());
+        // 新的明确 current 回答(如重新签发后 authority 回答 active)可以翻篇。
         let active = PublishInfo::new(did(), DidDocType::Zone, Revision::current())
             .with_status(&DocumentStatus::Active, None, None);
-        let merged = PublishInfo::merge(Some(revoked.clone()), Some(active)).unwrap();
-        assert!(merged.is_disabled());
-        let merged = PublishInfo::merge(Some(revoked), None).unwrap();
-        assert!(merged.is_disabled());
+        let merged = PublishInfo::merge(Some(revoked), Some(active)).unwrap();
+        assert!(!merged.is_disabled());
         let invalid = PublishInfo::new(did(), DidDocType::Device, Revision::current())
             .with_status(&DocumentStatus::Invalid, Some("mismatch".into()), None);
         assert!(!invalid.is_disabled());

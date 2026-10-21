@@ -208,6 +208,13 @@ pub struct DocResult { state, latest, best, history, candidates, slots: HashMap<
 - 删除旧 API、deprecated 标记、`verify_context.rs`、`doc_cache.rs` 旧实现。
 - 清理源码里对旧文档的引用（`grep -rn "doc/verify-did-api-boundary\|doc/update-did-cache\|简化文档\|verify-did-document-jwt\|已有did-resolver介绍\|简单介绍resolve-did\|resolve_did重构\|resolve-did.md" src`，2026-10-20 共 14 个文件 67 处，`provider.rs` 22 处、`doc_cache.rs` 13 处最多）。
 - 执行 §4 文档清理。
+- **合入后的上游测试遗留（2026-10-20 修复，未提交）**：cyfs-gateway main 上 bns-server、cyfs-sn 测试编译不过，`test_control_server`、`test_dns_over_tcp` 失败。处理结果：
+  - name-client 修正两处：① `get_document` 在本轮发布信息让结果 disabled 后提前返回时，没有执行 `refresh_known_constraints`，revoked 之后旧 best 仍会被 `select` 返回（违反设计稿“已知禁用 / 撤销撤掉选择资格”），现在返回前先刷新；② `PublishInfo::merge` 原来任何非禁用回答都覆盖不了已知禁用，撤销过的设备重新签发后也永远恢复不了。**[已定，2026-10-20 用户裁决]** 新的、非推导的 current 明确回答可以翻篇；None、历史版本回答、推导回答仍不能覆盖（单测 `merge_keeps_known_negative_state` 已改写）。
+  - **[已定，2026-10-20 用户裁决]** authority 回答的类型级 `expired`（文档自身、owner 或 zone 过期）不撤掉选择资格：本机已验证、自身 exp 未到的 best 仍可选。这和重构前“过期即报错”不同；bns-server 的 `did_resolver_owner_policy_revokes_device_and_expiry_keeps_verified_best` 按此断言。
+  - bns-server：显式 `type=device` 也走设备槽位投影，回答的 `docType` 就是 `device`（D4；此前只有缺省 / `type=zone` 会投影，新客户端按 D4 传 `device` 时拿到 missing，buckyos `active_server` 的设备门禁因此不可用）。缺省 / `type=zone` 的旧投影保留给旧客户端，待旧客户端退场后按 D4 / N3 删除。测试里设备 DID 改为显式传 `DidDocType::Device`，夹具文档补 iat。
+  - cyfs-sn：SN 对未在 BNS 发布 zone 文档的用户返回 `auth_db_projection`（`SNUserInfo` 投影，无 iat、无签名），Zone locker 按 Unknown 处理。**[已定，2026-10-20 用户裁决]** 接受这一行为；locker 互通改为在 `test_sn_bns_proxy_rpc_paths` 末尾，用已发布签名 zone JWT 的用户断言。
+  - `test_control_server`：provider id 前缀随重构由 `https-resolver:` 改为 `http-provider:`，只改期望值（id 只在回包里回显）。`test_dns_over_tcp`：与 resolve-did 无关，测试没设控制服务端口，本机运行 gateway 时 13451 冲突，改为随机端口。
+  - 合入顺序：bns-server 的 owner_policy 测试依赖上面两处 name-client 修正，须先推 buckyos-base main，cyfs-gateway 再提交；其余测试对 base main 原样即可通过。
 - **未做**：真实 Zone 验收（bns-server 升级 versionId / versionTime / `invalid` 后，devnet 跑 §10 的 exact / closest 行与 RTCP 两个场景）；zone-resolver-server 读 `BuckyOS-Resolve-*` 头；N1–N7 上游 issue（§7）；三个上游仓库与本仓库的改动都未提交，上线顺序：先推 buckyos-base main，再在 buckyos / cyfs-gateway / cyfs-ndn `cargo update -p name-client -p name-lib -p kRPC -p buckyos-http-server` 并提交迁移。
 
 ## 3. 验收

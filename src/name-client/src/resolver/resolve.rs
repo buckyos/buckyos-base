@@ -349,6 +349,9 @@ impl NameClient {
         result.apply_publish_info(publish_info.as_ref());
         result.fill_slot_from_known(revision, publish_info.as_ref());
         if result.is_disabled() {
+            // 本轮发布信息带来的禁用 / 撤销同样撤掉已有选择资格,否则旧 best 会被 select 返回。
+            let owner = self.owner_constraint_for(did, &result, opts);
+            result.refresh_known_constraints(self.locker_version(), owner.as_ref());
             let (merged, _) = self.update_doc_result(did, doc_type, result, opts).await?;
             return Ok((merged, publish_info));
         }
