@@ -1,0 +1,28 @@
+[package]
+name = "buckyos-js-runtime"
+version.workspace = true
+edition = "2024"
+authors = ["BuckyOS DAO", "@wugren"]
+description = "Boa based runtime for directory JS packages (pkg.yaml + main(args))"
+
+[dependencies]
+boa_engine = { workspace = true }
+boa_runtime = { workspace = true }
+boa_gc = { workspace = true }
+boa_macros = { workspace = true }
+boa_ast = { workspace = true }
+boa_parser = { workspace = true }
+boa_interner = { workspace = true }
+rustc-hash = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+shlex = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+buckyos-kit = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

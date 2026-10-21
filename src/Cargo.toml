@@ -11,6 +11,7 @@ members = [
     "./buckyos-http-server",
     "./rbac",
     "./buckyos-io",
+    "./buckyos-js-runtime",
 ]
 
 [workspace.package]
@@ -97,6 +98,17 @@ hickory-resolver = { version = "0.25", features = ["tls-ring", "webpki-roots"] }
 governor = "0.10"
 nonzero_ext = "0.3"
 
+# JS engine (keep in step with cyfs-gateway's cyfs-process-chain)
+boa_engine = { version = "0.21", features = ["embedded_lz4", "trace", "annex-b", "temporal", "jsvalue-enum", "intl_bundled", "either", "deser", "float16"] }
+boa_runtime = { version = "0.21", features = ["all"] }
+boa_gc = "0.21"
+boa_macros = "0.21"
+boa_ast = "0.21"
+boa_parser = "0.21"
+boa_interner = "0.21"
+rustc-hash = "2"
+shlex = "1"
+
 # Random
 rand = "0.9"
 rand_core = "0.6"
@@ -119,6 +131,7 @@ buckyos-http-server = { path = "./buckyos-http-server" }
 rbac = { path = "./rbac" }
 debug-lib = { path = "./debug-lib" }
 buckyos-io = { path = "./buckyos-io" }
+buckyos-js-runtime = { path = "./buckyos-js-runtime" }
 
 # Dev dependencies
 tempfile = "3.23.0"
