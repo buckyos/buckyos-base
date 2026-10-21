@@ -1,5 +1,6 @@
 mod channel;
 mod config;
+mod error_trace;
 mod event;
 mod json;
 mod log_util;
@@ -18,6 +19,7 @@ extern crate log;
 
 pub use channel::*;
 pub use config::*;
+pub use error_trace::*;
 pub use event::*;
 pub use json::*;
 pub use log_util::*;
