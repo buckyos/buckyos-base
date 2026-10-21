@@ -47,12 +47,112 @@ pub enum ServerErrorCode {
     InvalidDnsRecordType,
     Rejected,
     AlreadyExists,
+    /// Upstream sent no response head within the response budget.
+    ResponseHeadTimeout,
+    /// Request body produced no data within the idle budget.
+    BodyIdleTimeout,
 }
 
-pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
-pub type ServerError = sfo_result::Error<ServerErrorCode>;
-pub use sfo_result::err as server_err;
-pub use sfo_result::into_err as into_server_err;
+#[derive(thiserror::Error)]
+#[error("{}", self.display_line())]
+pub struct ServerError {
+    code: ServerErrorCode,
+    msg: String,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    trace: buckyos_kit::ErrorTrace,
+}
+
+pub type ServerResult<T> = std::result::Result<T, ServerError>;
+
+impl ServerError {
+    #[track_caller]
+    pub fn new(code: ServerErrorCode, msg: impl Into<String>) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: None,
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    #[track_caller]
+    pub fn with_source(
+        code: ServerErrorCode,
+        msg: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            code,
+            msg: msg.into(),
+            source: Some(source.into()),
+            trace: buckyos_kit::ErrorTrace::capture(),
+        }
+    }
+
+    pub fn code(&self) -> ServerErrorCode {
+        self.code
+    }
+
+    pub fn msg(&self) -> &str {
+        &self.msg
+    }
+
+    pub fn trace(&self) -> &buckyos_kit::ErrorTrace {
+        &self.trace
+    }
+
+    fn source_ref(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+
+    fn display_line(&self) -> buckyos_kit::ErrorLine<'_> {
+        buckyos_kit::ErrorLine::new(&self.code, &self.msg, self.source_ref())
+    }
+}
+
+impl std::fmt::Debug for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.trace
+            .fmt_debug(f, &self.code, &self.msg, self.source_ref())
+    }
+}
+
+/// `server_err!(code)` / `server_err!(code, fmt, args..)`
+#[macro_export]
+macro_rules! server_err {
+    ( $fmt:literal ) => {
+        $crate::ServerError::new(::std::default::Default::default(), format!($fmt))
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        $crate::ServerError::new(::std::default::Default::default(), format!($fmt, $($arg)*))
+    };
+    ( $code:path ) => {
+        $crate::ServerError::new($code, ::std::string::String::new())
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        $crate::ServerError::new($code, format!($($arg)*))
+    };
+}
+
+/// Closure for `map_err` that keeps the error as `source`. Same forms as `server_err!`.
+#[macro_export]
+macro_rules! into_server_err {
+    ( $fmt:literal ) => {
+        |e| $crate::ServerError::with_source(::std::default::Default::default(), format!($fmt), e)
+    };
+    ( $fmt:literal, $($arg:tt)* ) => {
+        |e| $crate::ServerError::with_source(::std::default::Default::default(), format!($fmt, $($arg)*), e)
+    };
+    ( $code:path ) => {
+        |e| $crate::ServerError::with_source($code, ::std::string::String::new(), e)
+    };
+    ( $code:path, $($arg:tt)* ) => {
+        |e| $crate::ServerError::with_source($code, format!($($arg)*), e)
+    };
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct StreamInfo {

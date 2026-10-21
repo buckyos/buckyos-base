@@ -119,7 +119,6 @@ casbin = { version = "2.20", features = ["logging","explain"] }
 regex = "1"
 nvml-wrapper = "0.11"
 bip39 = "2.0"
-sfo-result = "0.2"
 
 # Internal workspace dependencies
 buckyos-kit = { path = "./buckyos-kit" }
