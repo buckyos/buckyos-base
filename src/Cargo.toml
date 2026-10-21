@@ -10,6 +10,7 @@ members = [
     "./kRPC",
     "./buckyos-http-server",
     "./rbac",
+    "./buckyos-io",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ async-trait = "0.1"
 async-recursion = "1.1"
 futures = "0.3"
 futures-util = "0.3"
+pin-project = "1.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -91,6 +93,10 @@ tokio-util = { version = "0.7", features = ["full"] }
 # DNS
 hickory-resolver = { version = "0.25", features = ["tls-ring", "webpki-roots"] }
 
+# Rate limiting
+governor = "0.10"
+nonzero_ext = "0.3"
+
 # Random
 rand = "0.9"
 rand_core = "0.6"
@@ -112,6 +118,7 @@ kRPC = { path = "./kRPC" }
 buckyos-http-server = { path = "./buckyos-http-server" }
 rbac = { path = "./rbac" }
 debug-lib = { path = "./debug-lib" }
+buckyos-io = { path = "./buckyos-io" }
 
 # Dev dependencies
 tempfile = "3.23.0"

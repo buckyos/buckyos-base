@@ -1,0 +1,20 @@
+[package]
+name = "buckyos-io"
+version.workspace = true
+edition = "2024"
+authors = ["BuckyOS DAO", "@wugren"]
+description = "Speed limiting, traffic statistics and stream/datagram wrappers for tokio IO"
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
+async-recursion = { workspace = true }
+governor = { workspace = true }
+nonzero_ext = { workspace = true }
+pin-project = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
