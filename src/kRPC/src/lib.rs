@@ -52,6 +52,19 @@ pub enum RPCErrors {
     /// S2S transport 临时失败(网络超时、临时不可用):可按业务策略有界重试。
     #[error("S2S transient failure: {0}")]
     S2sTransientError(String),
+    /// A failure with a wire error code (`RPCErrorDetail`); the client side of
+    /// a call gets the same variant back, not a reason text.
+    #[error("{0}")]
+    Detailed(RPCErrorDetail),
+}
+
+impl RPCErrors {
+    pub fn detail(&self) -> Option<&RPCErrorDetail> {
+        match self {
+            Self::Detailed(detail) => Some(detail),
+            _ => None,
+        }
+    }
 }
 pub type Result<T> = std::result::Result<T, RPCErrors>;
 const DEFAULT_KRPC_TIMEOUT_SECS: u64 = 15;
@@ -312,12 +325,12 @@ impl kRPC {
             .map_err(|err| RPCErrors::ReasonError(format!("{}", err)))?;
 
         if response.status().is_success() {
-            let rpc_response: RPCResponse = response
+            let value: Value = response
                 .json()
                 .await
                 .map_err(|err| RPCErrors::ParserResponseError(format!("{}", err)))?;
 
-            Self::check_rpc_response(rpc_response, current_seq)
+            Self::check_rpc_response_value(value, current_seq)
         } else {
             Err(RPCErrors::ReasonError(format!(
                 "rpc call error: {}",
@@ -436,9 +449,9 @@ impl kRPC {
                 .await
             {
                 Ok(plaintext) => {
-                    let rpc_response: RPCResponse = serde_json::from_slice(&plaintext)
+                    let value: Value = serde_json::from_slice(&plaintext)
                         .map_err(|err| RPCErrors::ParserResponseError(format!("{}", err)))?;
-                    return Self::check_rpc_response(rpc_response, current_seq);
+                    return Self::check_rpc_response_value(value, current_seq);
                 }
                 Err(S2sError::DecryptFailed) => {
                     // 可能目标 key 轮换:refresh 后新 nonce 重试一次
@@ -456,7 +469,18 @@ impl kRPC {
         }))
     }
 
-    fn check_rpc_response(rpc_response: RPCResponse, current_seq: u64) -> Result<Value> {
+    fn check_rpc_response_value(value: Value, current_seq: u64) -> Result<Value> {
+        let detail = RPCErrorDetail::from_response_value(&value);
+        let rpc_response: RPCResponse = serde_json::from_value(value)
+            .map_err(|err| RPCErrors::ParserResponseError(format!("{}", err)))?;
+        Self::check_rpc_response(rpc_response, current_seq, detail)
+    }
+
+    fn check_rpc_response(
+        rpc_response: RPCResponse,
+        current_seq: u64,
+        detail: Option<RPCErrorDetail>,
+    ) -> Result<Value> {
         if rpc_response.seq != current_seq {
             return Err(RPCErrors::ParserResponseError(format!(
                 "seq not match: {}!={}",
@@ -466,9 +490,10 @@ impl kRPC {
 
         match rpc_response.result {
             RPCResult::Success(value) => Ok(value),
-            RPCResult::Failed(err) => {
-                Err(RPCErrors::ReasonError(format!("rpc call error: {}", err)))
-            }
+            RPCResult::Failed(err) => match detail {
+                Some(detail) => Err(RPCErrors::Detailed(detail)),
+                None => Err(RPCErrors::ReasonError(format!("rpc call error: {}", err))),
+            },
         }
     }
 }

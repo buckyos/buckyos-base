@@ -12,7 +12,10 @@ mod test_s2s_rpc_server;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use ::kRPC::{RPCHandler, RPCRequest, RPCResponse, RPCResult, RPCServerContext, RPCServerHandler};
+use ::kRPC::{
+    RPCErrorDetail, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult, RPCServerContext,
+    RPCServerHandler,
+};
 use buckyos_kit::AsyncStream;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -279,9 +282,9 @@ pub async fn serve_http_by_rpc_handler_with_limit<T: RPCHandler + Send + Sync + 
     log::debug!("|==>recv kRPC req: method={}", rpc_request.method);
 
     let server_ctx = RPCServerContext::plaintext(client_ip);
-    let resp = dispatch_rpc_request(rpc_handler, rpc_request, &server_ctx).await;
+    let (resp, detail) = dispatch_rpc_request(rpc_handler, rpc_request, &server_ctx).await;
 
-    let body_json = serde_json::to_string(&resp).map_err(|e| {
+    let body_json = rpc_response_json(&resp, detail.as_ref()).map_err(|e| {
         server_err!(
             ServerErrorCode::EncodeError,
             "Failed to convert response to string: {}",
@@ -302,28 +305,44 @@ pub async fn serve_http_by_rpc_handler_with_limit<T: RPCHandler + Send + Sync + 
 
 /// 共享 RPC dispatch(doc/krpc-s2s-payload-encryption-TODO.md §9.2):
 /// plaintext 与 S2S 加密入口都经由它把 `RPCRequest` 变成 `RPCResponse`,
-/// handler 错误统一映射为 `RPCResult::Failed`,不复制 error mapping。
+/// handler 错误统一映射为 `RPCResult::Failed`,不复制 error mapping;
+/// `RPCErrors::Detailed` 的错误码随响应一起返回(见 `rpc_response_json`)。
 pub(crate) async fn dispatch_rpc_request<T: RPCServerHandler + Send + Sync + 'static>(
     rpc_handler: &T,
     rpc_request: RPCRequest,
     server_ctx: &RPCServerContext,
-) -> RPCResponse {
+) -> (RPCResponse, Option<RPCErrorDetail>) {
     let rpc_seq = rpc_request.seq;
     let rpc_trace_id = rpc_request.trace_id.clone();
     match rpc_handler
         .handle_rpc_call_with_context(rpc_request, server_ctx)
         .await
     {
-        Ok(resp) => resp,
+        Ok(resp) => (resp, None),
         Err(e) => {
             log::warn!("Failed to handle rpc call: {}", e);
-            RPCResponse {
-                result: RPCResult::Failed(e.to_string()),
-                seq: rpc_seq,
-                trace_id: rpc_trace_id,
-            }
+            let detail = match &e {
+                RPCErrors::Detailed(detail) => Some(detail.clone()),
+                _ => None,
+            };
+            (
+                RPCResponse {
+                    result: RPCResult::Failed(e.to_string()),
+                    seq: rpc_seq,
+                    trace_id: rpc_trace_id,
+                },
+                detail,
+            )
         }
     }
+}
+
+/// Response body of a dispatched call, with the error code of a detailed failure.
+pub(crate) fn rpc_response_json(
+    resp: &RPCResponse,
+    detail: Option<&RPCErrorDetail>,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&resp.to_wire_value(detail)?)
 }
 
 pub async fn hyper_serve_http(
@@ -642,6 +661,50 @@ mod tests {
                 trace_id: Some("trace-1".to_string()),
             }
         );
+    }
+
+    struct DetailedErrorRpcHandler;
+
+    #[async_trait]
+    impl RPCHandler for DetailedErrorRpcHandler {
+        async fn handle_rpc_call(
+            &self,
+            _req: RPCRequest,
+            _ip_from: IpAddr,
+        ) -> Result<RPCResponse, RPCErrors> {
+            Err(RPCErrors::Detailed(RPCErrorDetail::new(
+                "access_denied",
+                "denied",
+                Some(json!({ "reason": "resource_grant_missing" })),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn detailed_errors_carry_their_code_on_the_wire() {
+        let mut rpc_request = RPCRequest::new("test", json!({}));
+        rpc_request.seq = 9;
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/krpc")
+            .body(full_body(serde_json::to_string(&rpc_request).unwrap()))
+            .unwrap();
+        let response = serve_http_by_rpc_handler(
+            request,
+            StreamInfo::new("127.0.0.1:12345".to_string()),
+            &DetailedErrorRpcHandler,
+        )
+        .await
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["code"], "access_denied");
+        assert_eq!(body["data"]["reason"], "resource_grant_missing");
+        let detail = RPCErrorDetail::from_response_value(&body).unwrap();
+        assert_eq!(detail.code, "access_denied");
+        let rpc_response: RPCResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(rpc_response.seq, 9);
+        assert!(matches!(rpc_response.result, RPCResult::Failed(_)));
     }
 
     fn rpc_request_body() -> String {

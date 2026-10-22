@@ -134,6 +134,66 @@ pub enum RPCResult {
     Failed(String),
 }
 
+pub const RPC_ERROR_CODE_FIELD: &str = "code";
+pub const RPC_ERROR_DATA_FIELD: &str = "data";
+
+/// A failure a client branches on: `code` names the error class on the wire and
+/// `data` carries its typed payload. It travels beside the human-readable
+/// `error` text of a failed response, so callers never parse that text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RPCErrorDetail {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl RPCErrorDetail {
+    pub fn new(code: impl Into<String>, message: impl Into<String>, data: Option<Value>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            data,
+        }
+    }
+
+    /// The detail of a failed response JSON (`error` + `code` [+ `data`]).
+    pub fn from_response_value(value: &Value) -> Option<Self> {
+        let message = value.get("error")?.as_str()?;
+        let code = value.get(RPC_ERROR_CODE_FIELD)?.as_str()?;
+        Some(Self {
+            code: code.to_string(),
+            message: message.to_string(),
+            data: value.get(RPC_ERROR_DATA_FIELD).cloned(),
+        })
+    }
+}
+
+impl std::fmt::Display for RPCErrorDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+impl RPCResponse {
+    /// Wire JSON of this response; a failed one also carries `detail`.
+    pub fn to_wire_value(&self, detail: Option<&RPCErrorDetail>) -> serde_json::Result<Value> {
+        let mut value = serde_json::to_value(self)?;
+        if let (RPCResult::Failed(_), Some(detail), Some(object)) =
+            (&self.result, detail, value.as_object_mut())
+        {
+            object.insert(
+                RPC_ERROR_CODE_FIELD.to_string(),
+                Value::String(detail.code.clone()),
+            );
+            if let Some(data) = detail.data.as_ref() {
+                object.insert(RPC_ERROR_DATA_FIELD.to_string(), data.clone());
+            }
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct RPCResponse {
     pub result: RPCResult,
@@ -497,5 +557,27 @@ mod tests {
         assert_eq!(resp.seq, 12);
         assert_eq!(resp.trace_id, None);
         assert_eq!(resp.result, RPCResult::Failed("boom".to_string()));
+    }
+
+    #[test]
+    fn failed_response_carries_error_detail_beside_the_text() {
+        let detail = RPCErrorDetail::new("access_denied", "denied", Some(json!({"reason": "x"})));
+        let resp = RPCResponse::new(RPCResult::Failed("denied (access_denied)".to_string()), 7);
+        let wire = resp.to_wire_value(Some(&detail)).unwrap();
+        assert_eq!(wire["code"], "access_denied");
+        assert_eq!(wire["data"]["reason"], "x");
+
+        let parsed: RPCResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(parsed.result, RPCResult::Failed("denied (access_denied)".to_string()));
+        let parsed_detail = RPCErrorDetail::from_response_value(&wire).unwrap();
+        assert_eq!(parsed_detail.code, "access_denied");
+        assert_eq!(parsed_detail.data, Some(json!({"reason": "x"})));
+
+        let plain = resp.to_wire_value(None).unwrap();
+        assert!(plain.get("code").is_none());
+        assert!(RPCErrorDetail::from_response_value(&plain).is_none());
+
+        let success = RPCResponse::new(RPCResult::Success(json!(1)), 8);
+        assert!(success.to_wire_value(Some(&detail)).unwrap().get("code").is_none());
     }
 }

@@ -14,7 +14,8 @@
 //! - 解密失败、replay、admission 失败都不会进入 `RPCHandler`。
 
 use crate::{
-    dispatch_rpc_request, full_body, read_body_with_limit, server_err, text_response,
+    dispatch_rpc_request, full_body, read_body_with_limit, rpc_response_json, server_err,
+    text_response,
     ServerError, ServerErrorCode, ServerResult, StreamInfo,
 };
 use ::kRPC::s2s::{
@@ -201,8 +202,8 @@ async fn serve_plaintext<T: RPCServerHandler + Send + Sync + 'static>(
     };
 
     // 5. dispatch,生成现有 plaintext RPCResponse JSON
-    let resp = dispatch_rpc_request(rpc_handler, rpc_request, &server_ctx).await;
-    let body_json = serde_json::to_string(&resp).map_err(|e| {
+    let (resp, detail) = dispatch_rpc_request(rpc_handler, rpc_request, &server_ctx).await;
+    let body_json = rpc_response_json(&resp, detail.as_ref()).map_err(|e| {
         server_err!(ServerErrorCode::EncodeError, "encode response: {}", e)
     })?;
     Response::builder()
@@ -282,16 +283,16 @@ async fn serve_encrypted<T: RPCServerHandler + Send + Sync + 'static>(
     };
 
     // 15. dispatch(协议保留 API `__probe` 由入口处理,不进业务 handler)
-    let resp: RPCResponse = if canonical_api == S2S_PROBE_API {
-        handle_probe(&rpc_request, &decrypted, s2s_context)
+    let (resp, detail): (RPCResponse, _) = if canonical_api == S2S_PROBE_API {
+        (handle_probe(&rpc_request, &decrypted, s2s_context), None)
     } else {
         dispatch_rpc_request(rpc_handler, rpc_request, &server_ctx).await
     };
 
     // 16. 生成与 request nonce 绑定的加密 response
-    let response_json = serde_json::to_vec(&resp).map_err(|e| {
-        server_err!(ServerErrorCode::EncodeError, "encode response: {}", e)
-    })?;
+    let response_json = rpc_response_json(&resp, detail.as_ref())
+        .map(String::into_bytes)
+        .map_err(|e| server_err!(ServerErrorCode::EncodeError, "encode response: {}", e))?;
     let now = buckyos_kit::buckyos_get_unix_timestamp();
     let (response_headers, sealed) = match s2s_context
         .seal_response(&decrypted, &response_json, now)
