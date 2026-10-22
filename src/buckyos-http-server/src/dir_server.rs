@@ -319,12 +319,11 @@ impl DirServer {
         false
     }
 
-    fn build_etag(file_meta: &std::fs::Metadata) -> Option<String> {
-        let modified = file_meta.modified().ok()?;
-        let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+    fn build_etag(file_size: u64, last_modified: Option<SystemTime>) -> Option<String> {
+        let dur = last_modified?.duration_since(UNIX_EPOCH).ok()?;
         Some(format!(
             "\"{:x}-{:x}-{:x}\"",
-            file_meta.len(),
+            file_size,
             dur.as_secs(),
             dur.subsec_nanos()
         ))
@@ -375,9 +374,11 @@ impl DirServer {
 
         let file_size = file_meta.len();
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
-        let last_modified = file_meta.modified().ok();
+        // Reproducible archives can use an epoch mtime for every package version.
+        // Such timestamps cannot validate content changes, even for equal-size files.
+        let last_modified = file_meta.modified().ok().filter(|mtime| *mtime > UNIX_EPOCH);
         let etag = if self.etag {
-            Self::build_etag(&file_meta)
+            Self::build_etag(file_size, last_modified)
         } else {
             None
         };
@@ -1012,6 +1013,63 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn test_archive_mtime_does_not_validate_stale_content() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("index.html");
+        let old_body = b"<script src='/assets/old.js'></script>";
+        let new_body = b"<script src='/assets/new.js'></script>";
+        assert_eq!(old_body.len(), new_body.len());
+
+        for mode in ["exact", "before"] {
+            for modified in [UNIX_EPOCH, UNIX_EPOCH - Duration::from_secs(1)] {
+                tokio::fs::write(&file_path, old_body).await.unwrap();
+                std::fs::File::open(&file_path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+
+                let server = Arc::new(
+                    DirServer::builder()
+                        .id("test")
+                        .root_path(temp_dir.path().to_path_buf())
+                        .if_modified_since(mode)
+                        .build()
+                        .await
+                        .unwrap(),
+                );
+
+                let initial = request_dir_server(server.clone(), "http://localhost/", &[]).await;
+                assert_eq!(initial.status(), StatusCode::OK);
+                assert!(!initial.headers().contains_key(ETAG));
+                assert!(!initial.headers().contains_key(LAST_MODIFIED));
+                assert_eq!(initial.collect().await.unwrap().to_bytes().as_ref(), old_body);
+
+                // A package update changes the asset URL but preserves its size and mtime.
+                tokio::fs::write(&file_path, new_body).await.unwrap();
+                std::fs::File::open(&file_path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+
+                let old_etag = format!("\"{:x}-0-0\"", old_body.len());
+                let old_date = httpdate::fmt_http_date(UNIX_EPOCH);
+                for headers in [
+                    vec![("if-none-match", old_etag.clone())],
+                    vec![("if-modified-since", old_date.clone())],
+                    vec![("if-none-match", old_etag), ("if-modified-since", old_date)],
+                ] {
+                    let response =
+                        request_dir_server(server.clone(), "http://localhost/", &headers).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert!(!response.headers().contains_key(ETAG));
+                    assert!(!response.headers().contains_key(LAST_MODIFIED));
+                    assert_eq!(response.collect().await.unwrap().to_bytes().as_ref(), new_body);
+                }
+            }
+        }
     }
 
     #[tokio::test]
