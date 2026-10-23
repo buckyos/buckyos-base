@@ -357,7 +357,7 @@ table: metadata
   value: u32
 ```
 
-`flush()` 调用时执行批量写入。启动 `open()` 时一次性加载到内存（也可改为 lazy load，看实测内存占用）。
+`flush()` 调用时执行批量写入。启动 `open()` 时一次性加载到内存（也可改为 lazy load，看实测内存占用）。`schema_version` 缺失或不等于当前版本时，`open()` 按缓存失效处理：清空 `address_stats` 后写入当前版本，不读取旧条目。
 
 **故障容忍**：持久化失败不影响内存中数据使用，只是 log warn，确保进程不会因为磁盘问题挂掉。
 

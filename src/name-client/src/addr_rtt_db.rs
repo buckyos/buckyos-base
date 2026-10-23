@@ -207,12 +207,6 @@ pub enum UnknownStrategy {
     Median,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct LegacyPersistedEntry {
-    stats: AddressStats,
-    consecutive_failure_score: f64,
-}
-
 #[derive(Clone, Debug)]
 struct EntryState {
     stats: AddressStats,
@@ -233,14 +227,6 @@ impl EntryState {
         Self {
             consecutive_failure_score: failure_score_from_stats(&stats),
             stats,
-            last_touched_tick,
-        }
-    }
-
-    fn from_legacy(persisted: LegacyPersistedEntry, last_touched_tick: u64) -> Self {
-        Self {
-            stats: persisted.stats,
-            consecutive_failure_score: persisted.consecutive_failure_score,
             last_touched_tick,
         }
     }
@@ -897,9 +883,9 @@ impl RttDatabase {
         for row in table.iter()? {
             let (key_guard, value_guard) = row?;
             let key: EntryKey = bincode::deserialize(key_guard.value())?;
-            let tick = self.next_tick();
-            let state = deserialize_entry_state(value_guard.value(), tick)?;
-            self.entries.insert(key, state);
+            let stats: AddressStats = bincode::deserialize(value_guard.value())?;
+            self.entries
+                .insert(key, EntryState::from_stats(stats, self.next_tick()));
         }
 
         tracing::debug!(
@@ -917,12 +903,18 @@ impl RttDatabase {
 
     #[cfg(feature = "persistence")]
     fn ensure_storage_schema(&self, db: &Database) -> Result<()> {
+        let schema_bytes = SCHEMA_VERSION.to_le_bytes();
         let write_txn = db.begin_write()?;
         {
-            let _ = write_txn.open_table(ADDRESS_STATS_TABLE)?;
             let mut metadata = write_txn.open_table(METADATA_TABLE)?;
-            let schema_bytes = SCHEMA_VERSION.to_le_bytes();
-            metadata.insert(SCHEMA_VERSION_KEY, schema_bytes.as_slice())?;
+            let is_current = metadata
+                .get(SCHEMA_VERSION_KEY)?
+                .is_some_and(|stored| stored.value() == schema_bytes.as_slice());
+            if !is_current {
+                write_txn.delete_table(ADDRESS_STATS_TABLE)?;
+                metadata.insert(SCHEMA_VERSION_KEY, schema_bytes.as_slice())?;
+            }
+            let _ = write_txn.open_table(ADDRESS_STATS_TABLE)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -1010,17 +1002,6 @@ fn outcome_kind_label(outcome: OutcomeKind) -> &'static str {
         OutcomeKind::Refused => "refused",
         OutcomeKind::Unreachable => "unreachable",
         OutcomeKind::LocalError => "local_error",
-    }
-}
-
-#[cfg(feature = "persistence")]
-fn deserialize_entry_state(bytes: &[u8], tick: u64) -> Result<EntryState> {
-    match bincode::deserialize::<AddressStats>(bytes) {
-        Ok(stats) => Ok(EntryState::from_stats(stats, tick)),
-        Err(stats_error) => match bincode::deserialize::<LegacyPersistedEntry>(bytes) {
-            Ok(legacy) => Ok(EntryState::from_legacy(legacy, tick)),
-            Err(_) => Err(stats_error.into()),
-        },
     }
 }
 
@@ -1445,6 +1426,60 @@ mod tests {
         let value = table.get(key.as_slice()).unwrap().unwrap();
         let stats: AddressStats = bincode::deserialize(value.value()).unwrap();
         assert_eq!(stats.rtt_ewma, Some(Duration::from_millis(25)));
+    }
+
+    #[cfg(feature = "persistence")]
+    #[test]
+    fn open_discards_entries_without_current_schema_version() {
+        let local: IpAddr = "10.0.0.1".parse().unwrap();
+        let remote = test_addr("192.0.2.10", 443);
+        let stats = AddressStats {
+            samples: 1,
+            success_count: 1,
+            rtt_ewma: Some(Duration::from_millis(25)),
+            ..AddressStats::default()
+        };
+        for stored_version in [Some(1u32), None] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("addr-rtt.redb");
+            {
+                let storage = Database::create(&path).unwrap();
+                let write_txn = storage.begin_write().unwrap();
+                {
+                    let mut table = write_txn.open_table(ADDRESS_STATS_TABLE).unwrap();
+                    let key = bincode::serialize(&EntryKey { local, remote }).unwrap();
+                    let value = bincode::serialize(&(stats.clone(), 3.0f64)).unwrap();
+                    table.insert(key.as_slice(), value.as_slice()).unwrap();
+                    let mut metadata = write_txn.open_table(METADATA_TABLE).unwrap();
+                    if let Some(version) = stored_version {
+                        let version_bytes = version.to_le_bytes();
+                        metadata
+                            .insert(SCHEMA_VERSION_KEY, version_bytes.as_slice())
+                            .unwrap();
+                    }
+                }
+                write_txn.commit().unwrap();
+            }
+
+            let db = RttDatabase::open(&path, Config::default()).unwrap();
+            assert!(db.get_stats(local, remote).is_none());
+            drop(db);
+
+            let storage = Database::open(&path).unwrap();
+            let read_txn = storage.begin_read().unwrap();
+            assert_eq!(
+                read_txn
+                    .open_table(ADDRESS_STATS_TABLE)
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .count(),
+                0
+            );
+            let metadata = read_txn.open_table(METADATA_TABLE).unwrap();
+            let version = metadata.get(SCHEMA_VERSION_KEY).unwrap().unwrap();
+            assert_eq!(version.value(), SCHEMA_VERSION.to_le_bytes().as_slice());
+        }
     }
 
     #[cfg(feature = "persistence")]
