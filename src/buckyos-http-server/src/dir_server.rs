@@ -5,7 +5,7 @@ use http::{StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
-use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
+use hyper::header::{CACHE_CONTROL, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
 use log::{debug, info, warn};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use std::path::{Component, Path, PathBuf};
@@ -374,9 +374,13 @@ impl DirServer {
 
         let file_size = file_meta.len();
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
+        let is_html = mime_type.essence_str() == "text/html";
         // Reproducible archives can use an epoch mtime for every package version.
         // Such timestamps cannot validate content changes, even for equal-size files.
-        let last_modified = file_meta.modified().ok().filter(|mtime| *mtime > UNIX_EPOCH);
+        let last_modified = file_meta
+            .modified()
+            .ok()
+            .filter(|mtime| *mtime > UNIX_EPOCH);
         let etag = if self.etag {
             Self::build_etag(file_size, last_modified)
         } else {
@@ -385,6 +389,9 @@ impl DirServer {
 
         if self.request_not_modified(&req, etag.as_deref(), last_modified) {
             let mut response_builder = http::Response::builder().status(StatusCode::NOT_MODIFIED);
+            if is_html {
+                response_builder = response_builder.header(CACHE_CONTROL, "no-cache");
+            }
             if let Some(etag) = etag.as_ref() {
                 response_builder = response_builder.header(ETAG, etag.as_str());
             }
@@ -432,6 +439,9 @@ impl DirServer {
                         )
                         .header("Accept-Ranges", "bytes");
 
+                    if is_html {
+                        response_builder = response_builder.header(CACHE_CONTROL, "no-cache");
+                    }
                     if let Some(etag) = etag.as_ref() {
                         response_builder = response_builder.header(ETAG, etag.as_str());
                     }
@@ -467,6 +477,9 @@ impl DirServer {
             .header("Content-Length", file_size)
             .header("Accept-Ranges", "bytes");
 
+        if is_html {
+            response_builder = response_builder.header(CACHE_CONTROL, "no-cache");
+        }
         if let Some(etag) = etag.as_ref() {
             response_builder = response_builder.header(ETAG, etag.as_str());
         }
@@ -987,6 +1000,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_html_revalidates_for_index_and_fallback_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let body = b"<script src='/assets/app.js'></script>";
+        tokio::fs::write(temp_dir.path().join("index.html"), body)
+            .await
+            .unwrap();
+        tokio::fs::create_dir(temp_dir.path().join("assets"))
+            .await
+            .unwrap();
+        tokio::fs::write(temp_dir.path().join("assets/app.js"), b"export {}")
+            .await
+            .unwrap();
+
+        let server = Arc::new(
+            DirServer::builder()
+                .id("test")
+                .root_path(temp_dir.path().to_path_buf())
+                .fallback_file("index.html")
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        for path in ["/", "/index.html", "/documents/notes?src=notes.md"] {
+            let uri = format!("http://localhost{path}");
+            let response = request_dir_server(server.clone(), &uri, &[]).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
+            let etag = response.headers()[ETAG].to_str().unwrap().to_string();
+            let modified = response.headers()[LAST_MODIFIED]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(response.collect().await.unwrap().to_bytes().as_ref(), body);
+
+            for validator in [("if-none-match", etag), ("if-modified-since", modified)] {
+                let response = request_dir_server(server.clone(), &uri, &[validator]).await;
+                assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+                assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
+            }
+
+            let response =
+                request_dir_server(server.clone(), &uri, &[("range", "bytes=0-6".to_string())])
+                    .await;
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
+            assert_eq!(
+                response.collect().await.unwrap().to_bytes().as_ref(),
+                &body[..7]
+            );
+        }
+
+        let uri = "http://localhost/assets/app.js";
+        let response = request_dir_server(server.clone(), uri, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(CACHE_CONTROL));
+        let etag = response.headers()[ETAG].to_str().unwrap().to_string();
+        assert_eq!(
+            response.collect().await.unwrap().to_bytes().as_ref(),
+            b"export {}"
+        );
+        let response = request_dir_server(server.clone(), uri, &[("if-none-match", etag)]).await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(!response.headers().contains_key(CACHE_CONTROL));
+        let response = request_dir_server(server, uri, &[("range", "bytes=0-5".to_string())]).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(!response.headers().contains_key(CACHE_CONTROL));
+        assert_eq!(
+            response.collect().await.unwrap().to_bytes().as_ref(),
+            b"export"
+        );
+    }
+
+    #[tokio::test]
     async fn test_if_modified_since_exact_returns_not_modified() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("ims.txt");
@@ -1043,9 +1130,13 @@ mod tests {
 
                 let initial = request_dir_server(server.clone(), "http://localhost/", &[]).await;
                 assert_eq!(initial.status(), StatusCode::OK);
+                assert_eq!(initial.headers()[CACHE_CONTROL], "no-cache");
                 assert!(!initial.headers().contains_key(ETAG));
                 assert!(!initial.headers().contains_key(LAST_MODIFIED));
-                assert_eq!(initial.collect().await.unwrap().to_bytes().as_ref(), old_body);
+                assert_eq!(
+                    initial.collect().await.unwrap().to_bytes().as_ref(),
+                    old_body
+                );
 
                 // A package update changes the asset URL but preserves its size and mtime.
                 tokio::fs::write(&file_path, new_body).await.unwrap();
@@ -1064,9 +1155,13 @@ mod tests {
                     let response =
                         request_dir_server(server.clone(), "http://localhost/", &headers).await;
                     assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
                     assert!(!response.headers().contains_key(ETAG));
                     assert!(!response.headers().contains_key(LAST_MODIFIED));
-                    assert_eq!(response.collect().await.unwrap().to_bytes().as_ref(), new_body);
+                    assert_eq!(
+                        response.collect().await.unwrap().to_bytes().as_ref(),
+                        new_body
+                    );
                 }
             }
         }
