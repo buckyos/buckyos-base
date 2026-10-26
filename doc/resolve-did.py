@@ -314,6 +314,17 @@ def get_document(did, doc_type, revision, opts):
         if (doc_type == "owner" or not revision.is_current()) and result.satisfies_published_target(revision):
             break
         # 默认 latest + best 收集本轮允许的来源，已有 latest 也继续寻找可能更高的 best。
+        # authority 本轮回答的文档已验证并成为 best 时，其余来源并发查询，只等宽限期
+        # （config.supplement_grace，默认 1 秒）：到期未回答记为该来源 Unknown，不退避、
+        # 不终止调用；总预算耗尽/取消照常外抛。authority 未给出有效 best 时仍逐个等待（buckyos#684）。
+        if provider.is_authority() and revision.is_current() and result.best_is(answer.body):
+            rest = remaining_providers()
+            grace_opts = opts.with_budget(opts.budget.child(config.supplement_grace))
+            answers = gather(get_document_by_provider(p, did, doc_type, revision, grace_opts) for p in rest)
+            opts.budget.check()
+            for p, answer in zip(rest, answers):
+                result.commit(answer_or_unknown(answer, p), p, revision, opts)
+            break
 
     refresh_known_constraints(result, opts)
     result = update_doc_result(did, doc_type, result, opts)

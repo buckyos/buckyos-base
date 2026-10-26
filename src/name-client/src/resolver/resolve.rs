@@ -369,7 +369,8 @@ impl NameClient {
             result.add_reason(format!("no source registered for DID method {}", did.method));
         }
         let owner = self.owner_constraint_for(did, &result, opts);
-        for provider in providers {
+        let mut providers = providers.into_iter();
+        while let Some(provider) = providers.next() {
             opts.budget().check()?;
             let answer = self
                 .get_document_by_provider(&provider, did, doc_type, revision, opts)
@@ -385,6 +386,13 @@ impl NameClient {
             if (*doc_type == DidDocType::Owner || !revision.is_current())
                 && result.satisfies_published_target(revision)
             {
+                break;
+            }
+            if provider.is_authority() && revision.is_current() && authority_body_is_best(&result, &answer) {
+                let rest: Vec<RegisteredSource> = providers.by_ref().collect();
+                for answer in self.collect_supplements(&rest, did, doc_type, revision, opts).await? {
+                    result.commit(&answer, revision, self.locker_version(), owner.as_ref());
+                }
                 break;
             }
         }
@@ -633,6 +641,43 @@ impl NameClient {
         Ok(answer.publish_info)
     }
 
+    /// authority 本轮已给出有效 best:其余来源并发查询,只在宽限期内收集,按注册顺序
+    /// 返回。宽限期到期或单个来源出错按该来源 Unknown 处理(不退避);总预算耗尽 /
+    /// 取消照常向外抛。
+    async fn collect_supplements(
+        &self,
+        providers: &[RegisteredSource],
+        did: &DID,
+        doc_type: &DidDocType,
+        revision: &Revision,
+        opts: &ResolveOpts,
+    ) -> NSResult<Vec<SourceAnswer>> {
+        let grace_opts = opts
+            .clone()
+            .with_budget(opts.budget().child(self.config.supplement_grace));
+        let answers = futures::future::join_all(
+            providers
+                .iter()
+                .map(|provider| self.get_document_by_provider(provider, did, doc_type, revision, &grace_opts)),
+        )
+        .await;
+        opts.budget().check()?;
+        Ok(providers
+            .iter()
+            .zip(answers)
+            .map(|(provider, answer)| {
+                answer.unwrap_or_else(|err| {
+                    let reason = format!(
+                        "{}: not answered within the supplement grace after the authority answer: {}",
+                        provider.sref.id, err
+                    );
+                    opts.record_unanswered(&provider.sref, Operation::Document, reason.clone());
+                    SourceAnswer::unknown(provider.sref.clone(), reason, false)
+                })
+            })
+            .collect())
+    }
+
     // ---------- provider 查询 ----------
 
     /// 伪代码 `get_document_by_provider`:本轮回答复用 → 查询缓存 → 任务合并。
@@ -826,6 +871,17 @@ async fn query_source(
             SourceAnswer::unknown(sref.clone(), err.to_string(), false)
         }
     }
+}
+
+/// 本轮 authority 回答的文档已验证并成为 best。
+fn authority_body_is_best(result: &DocResult, answer: &SourceAnswer) -> bool {
+    let Some(revision) = answer.body.as_ref().and_then(DocRevision::of) else {
+        return false;
+    };
+    result
+        .best
+        .as_ref()
+        .map_or(false, |best| best.is_valid() && best.revision == revision)
 }
 
 fn locked_publish_info(locked: &DocResult) -> Option<PublishInfo> {

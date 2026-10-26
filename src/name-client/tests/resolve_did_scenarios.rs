@@ -417,6 +417,66 @@ async fn s11_authority_v1_and_signed_normal_v2_give_latest_v1_best_v2() {
     assert_eq!(marker(&fx.client.resolve_did(&zone_did(), Some(DidDocType::Zone)).await.unwrap()), "v2");
 }
 
+fn grace_fixture(grace: Duration) -> Fixture {
+    let fx = fixture();
+    let client = NameClient::new(NameClientConfig {
+        resolve_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(2),
+        supplement_grace: grace,
+        ..NameClientConfig::for_test()
+    });
+    client.set_method_authority("bns", fx.authority.clone());
+    client.add_method_trust("bns", fx.trust.clone());
+    client.add_method_normal("bns", fx.normal.clone());
+    Fixture { client, ..fx }
+}
+
+/// authority 已给出有效 best 时,慢补充来源只等宽限期:按时返回 authority 的文档,
+/// 未回答的来源记为 Unknown 且不退避(issue #684)。
+#[tokio::test]
+async fn s11_slow_supplement_after_valid_authority_is_bounded_by_grace() {
+    let fx = grace_fixture(Duration::from_millis(200));
+    let t = now();
+    fx.authority.publish(&owner_did(), &DidDocType::Owner, owner_doc(t - 1000, None));
+    let v1 = zone_doc(t - 500, "v1");
+    fx.authority.publish(&zone_did(), &DidDocType::Zone, v1.clone());
+    fx.normal.add(&zone_did(), &DidDocType::Zone, zone_doc(t - 100, "v2"));
+    *fx.normal.mode.lock().unwrap() = Mode::Hang(Duration::from_secs(3));
+
+    for round in 1..=2 {
+        let started = std::time::Instant::now();
+        let result = fx
+            .client
+            .resolve_did_ex(&zone_did(), Some(DidDocType::Zone), Revision::current(), opts(&fx))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "round {} waited {:?}", round, started.elapsed());
+        assert_eq!(result.best.as_ref().unwrap().revision, rev(&v1));
+        assert_eq!(result.latest.as_ref().unwrap().revision, rev(&v1));
+        assert!(result.reason().contains("normal-site"), "{}", result.reason());
+        assert_eq!(fx.normal.calls(), round, "grace expiry does not back the source off");
+    }
+}
+
+/// authority Unknown 时补充来源不受宽限期限制,仍在单源上限内等待回答。
+#[tokio::test]
+async fn s12_authority_unknown_waits_for_slow_supplement_beyond_grace() {
+    let fx = grace_fixture(Duration::from_millis(100));
+    let t = now();
+    fx.authority.publish(&owner_did(), &DidDocType::Owner, owner_doc(t - 1000, None));
+    fx.authority.set_mode(&zone_did(), Mode::Down);
+    let v2 = zone_doc(t - 100, "v2");
+    fx.normal.add(&zone_did(), &DidDocType::Zone, v2.clone());
+    *fx.normal.mode.lock().unwrap() = Mode::Hang(Duration::from_millis(400));
+
+    let result = fx
+        .client
+        .resolve_did_ex(&zone_did(), Some(DidDocType::Zone), Revision::current(), opts(&fx))
+        .await
+        .unwrap();
+    assert_eq!(result.best.as_ref().unwrap().revision, rev(&v2));
+}
+
 /// authority Unknown,补充来源仍可用:继续查询允许来源并按验签规则处理,不把 Unknown 当禁用。
 #[tokio::test]
 async fn s12_authority_unknown_does_not_stop_supplements() {

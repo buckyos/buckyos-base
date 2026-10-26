@@ -36,7 +36,7 @@ if report.success(Revision.current()):
 | `exact(iat, hash)` | 指定的已发布版本 | 精确匹配 iat/hash，且有该查询的发布依据 |
 | `closest(iat)` | 已发布版本中最大的 `document.iat < query.iat` | 发布回答确认所选版本及查询边界内没有更高版本 |
 
-Owner 是信任根，只从 authority/locker 取得当前或指定的已发布版本，始终不设置 best。普通 current 解析即使已经取得 latest，也继续收集本轮允许的 trust/normal 来源，以寻找更高的有效 best；authority 未回答不构成停止补充来源的规则。
+Owner 是信任根，只从 authority/locker 取得当前或指定的已发布版本，始终不设置 best。普通 current 解析即使已经取得 latest，也继续收集本轮允许的 trust/normal 来源，以寻找更高的有效 best；authority 未回答不构成停止补充来源的规则。authority 本轮回答的文档已验证并成为 best 时，其余来源并发查询，只在宽限期（`config.supplement_grace`，默认 1 秒）内收集：到期未回答按该来源 Unknown 记录，不退避、不终止调用，按时返回已有选择；宽限期为 0 时不再查询补充来源。authority 未给出有效 best 时，补充来源照旧在单源上限内等待（buckyos#684）。
 
 `exact/closest` 依赖 resolver 的 `publish_info` 查询能力（wire 为 `versionId` / `versionTime`）；locker 可以在自己的 scope 内模拟。不支持或没有回答时保留原因，不能退回 current，也不能把本机曾见过的最大历史版本当成 closest。查询旧版普通文档仍检查它今天是否过期、撤销；这里不提供只证明“发布当时合法”的 `AtPublication` 模式。
 
@@ -509,6 +509,7 @@ AppDoc 使用 DID Document 的 JSON/JWT 两种形式和 iat 版本规则：普�
 | 文档 header 缺席、损坏、超限，或与负状态同在 | 缺席不等于损坏；错误明确保留，header 不覆盖禁用/撤销或绕过预算 |
 | 路径对象自报 controller，却没有可信绑定 | 不能自建信任根，也不能用对象自身 `/owner.json` 冒充签发者根材料 |
 | authority 发布 V1，trust/合法 normal 提供更高 V2 | latest 保留 V1，best 可到 V2；普通 current 不因已有 latest 停止收集 |
+| authority 给出有效 V1，补充来源超过宽限期仍未回答 | 按时返回 best=V1；该来源记 Unknown，不退避，下次调用照常再查 |
 | authority Unknown，补充来源仍可用 | 继续查询允许来源并按其信任/验签规则处理，不把 Unknown 当禁用 |
 | trust 提供无签名 JSON，随后解绑站点 | 可成为 best，不自动标 signed/published；解绑只改变以后来源列表 |
 | 验证 V1 时已有更高有效 best V2 | 报告针对 V1；不回滚 best，不借 V2 成功让 V1 命中 current |

@@ -283,6 +283,8 @@ cd cyfs-gateway && cargo check --workspace
 
 **R4. 默认调用方的回流仍可能发生，但深度为 1 且有界。** Relay 上 SN resolver、msg_center 等默认策略调用在 authority Unknown 后仍会查 WebProvider，请求可能绕回 Relay 一次；入站 RTCP 用 authority_only，不再向外发补充源请求，所以不会继续套娃，并在各自预算内结束。这是“先能力后安全”的取舍：默认调用方保留从补充源拿 best 的能力。若要在 Relay 进程上整体禁止，应由该进程的 `NameClientConfig` 把默认 opts 收紧为 authority_only，而不是改 resolver 语义。
 
+**R5. authority 已给出有效 best 后，补充源只等宽限期（buckyos#684，2026-10-25 用户裁决）。** 原规则“已有 latest 也继续收集”按顺序等每个补充源，WebProvider 内部最多串 4 次请求、每次上限 10 秒；msg_center 解析代签设备时外层 3 秒超时，BNS 已返回有效设备文档仍被慢 Web 源拖到超时。调整：`get_document` 中 authority 本轮回答的文档已验证并成为 best 时，其余来源用 `budget.child(config.supplement_grace)`（默认 1 秒）并发查询，按注册顺序提交；宽限期到期或单源出错记为该来源 Unknown，不退避（这是调用方自限，不是来源故障），总预算耗尽/取消照常外抛。authority 未给出有效 best（Unknown、负状态、坏文档）时补充源仍逐个在单源上限内等待，s11/s12 语义不变；`supplement_grace = 0` 等于 authority 有效即停。回归：`s11_slow_supplement_after_valid_authority_is_bounded_by_grace`、`s12_authority_unknown_waits_for_slow_supplement_beyond_grace`。
+
 ### 5.3 #207 验收清单对应
 
 | #207 验收项 | 本 TODO 落点 |

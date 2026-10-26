@@ -263,6 +263,8 @@ pub const DEFAULT_DEVICE_INFO_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2)
 pub const DEFAULT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// authority 本轮给出有效 best 后,其余 trust / normal 来源的并发收集宽限期。
+pub const DEFAULT_SUPPLEMENT_GRACE: Duration = Duration::from_secs(1);
 const MAX_CACHED_LOCAL_IPS: usize = 8;
 
 #[derive(Clone)]
@@ -282,6 +284,9 @@ pub struct NameClientConfig {
     pub resolve_timeout: Duration,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// authority 本轮给出有效 best 后,其余来源只在此宽限期内收集;到期未回答的
+    /// 来源按单源 Unknown 处理,不终止调用。为 0 时不再查询补充来源。
+    pub supplement_grace: Duration,
     /// 并发、合并、退避与日志限流参数。
     pub concurrency: ConcurrencyConfig,
     /// 默认 scope(Zone 内进程可设为 `Scope::Zone(zone_did)`,启用 current-zone 自举来源)。
@@ -301,6 +306,7 @@ impl Default for NameClientConfig {
             resolve_timeout: DEFAULT_RESOLVE_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            supplement_grace: DEFAULT_SUPPLEMENT_GRACE,
             concurrency: ConcurrencyConfig::default(),
             default_scope: None,
         }
