@@ -5,7 +5,7 @@
 //! 覆盖已知禁用或撤销;负状态只覆盖它明确声明的 DID、类型或版本范围。
 
 use super::revision::{normalize_hash, DocRevision, Revision};
-use buckyos_kit::buckyos_get_unix_timestamp;
+use super::clock::unix_now;
 use name_lib::{DidDocType, DID};
 use serde::{Deserialize, Serialize};
 
@@ -214,7 +214,7 @@ impl PublishInfo {
             latest_iat: None,
             boundary: None,
             query,
-            checked_at: Some(buckyos_get_unix_timestamp()),
+            checked_at: Some(unix_now()),
             valid_until: None,
             source: None,
             simulated: false,
@@ -276,8 +276,8 @@ impl PublishInfo {
         self.latest_record().and_then(PublishRecord::revision)
     }
 
-    pub fn cache_ttl_secs(&self) -> u64 {
-        let base = match (&self.did_state, &self.type_state) {
+    fn base_ttl_secs(&self) -> u64 {
+        match (&self.did_state, &self.type_state) {
             (Some(DidState::Tombstoned), _) | (_, Some(TypeState::Revoked)) => {
                 TERMINAL_STATE_TTL_SECS
             }
@@ -285,10 +285,26 @@ impl PublishInfo {
             (_, Some(TypeState::Missing)) => MISSING_STATE_TTL_SECS,
             _ if !self.query.is_current() => HISTORICAL_QUERY_TTL_SECS,
             _ => PUBLISH_QUERY_TTL_SECS,
-        };
+        }
+    }
+
+    /// 回答所依据的检查时刻(不晚于本机当前时刻)。缓存读取再次应用同一回答时它不变。
+    pub fn evidence_time(&self, now: u64) -> u64 {
+        self.checked_at.map_or(now, |checked_at| checked_at.min(now))
+    }
+
+    /// 该回答作为发布 / 状态依据的到期时刻:检查时刻 + 按状态的 TTL,且不超过来源声明的
+    /// `validUntil`。按检查时刻而不是读取时刻计算,读缓存不会给证据续命。
+    pub fn expires_at(&self, now: u64) -> u64 {
+        let expires = self.evidence_time(now) + self.base_ttl_secs();
+        self.valid_until.map_or(expires, |valid_until| valid_until.min(expires))
+    }
+
+    pub fn cache_ttl_secs(&self) -> u64 {
+        let base = self.base_ttl_secs();
         match self.valid_until {
             Some(valid_until) => {
-                let now = buckyos_get_unix_timestamp();
+                let now = unix_now();
                 base.min(valid_until.saturating_sub(now).max(1))
             }
             None => base,
@@ -312,7 +328,12 @@ impl PublishInfo {
                 if boundary.query_iat != *before_iat || !boundary.confirmed {
                     return None;
                 }
-                boundary.selected.clone()
+                // closest 严格早于查询边界;来源回答越界(含等号)不能作为依据。locker 的模拟
+                // 发布可在 scope 内模拟完整历史(`LockOptions::simulate_history`,Root Trust)。
+                boundary
+                    .selected
+                    .clone()
+                    .filter(|selected| self.simulated || selected.iat < *before_iat)
             }
         }
     }
@@ -383,6 +404,16 @@ impl PublishInfo {
                 // 已知禁用 / 撤销只被新的明确 current 回答翻篇(设计稿:None / Unknown
                 // 不能覆盖已知禁用);历史版本回答和推导回答不描述当前状态,不能覆盖。
                 let can_clear_disabled = other.query.is_current() && !other.derived;
+                // 新的明确 current 已发布回答说明该 DID 仍在使用:解除已知的 DID 级禁用。
+                let reaffirms_did = can_clear_disabled
+                    && !other.simulated
+                    && other.did_state.is_none()
+                    && other.type_state == Some(TypeState::Active)
+                    && other.latest_record().is_some()
+                    && base.did_state.as_ref().map_or(false, DidState::is_disabled);
+                if reaffirms_did {
+                    base.did_state = Some(DidState::Normal);
+                }
                 if other.did_state.is_some() {
                     let keep_base = !can_clear_disabled
                         && base.did_state.as_ref().map_or(false, DidState::is_disabled)
@@ -428,9 +459,8 @@ impl PublishInfo {
                 if other.boundary.is_some() && other.query == base.query {
                     base.boundary = other.boundary;
                 }
-                if other.checked_at.is_some() {
-                    base.checked_at = other.checked_at;
-                }
+                // 保留最新的检查时刻:旧回答再次合并不能让依据看起来更旧或更新。
+                base.checked_at = base.checked_at.max(other.checked_at);
                 base.valid_until = match (base.valid_until, other.valid_until) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
@@ -519,5 +549,28 @@ mod tests {
         assert!(!invalid.is_disabled());
         assert!(invalid.type_state.as_ref().unwrap().is_not_exist());
         assert_eq!(invalid.cache_ttl_secs(), INVALID_STATE_TTL_SECS);
+    }
+
+    /// T03:closest 边界回答必须严格早于查询边界、已确认且属于同一查询。
+    #[test]
+    fn closest_boundary_must_strictly_precede_the_query() {
+        let closest = |selected: u64, query_iat: u64, confirmed: bool| {
+            let mut info = PublishInfo::new(did(), DidDocType::Owner, Revision::closest(200))
+                .with_record(PublishRecord::published(selected, "aa", false));
+            info.boundary = Some(Boundary {
+                query_iat,
+                selected: Some(DocRevision::new(selected, "aa")),
+                confirmed,
+            });
+            info
+        };
+        assert_eq!(closest(199, 200, true).satisfies(&Revision::closest(200)), Some(DocRevision::new(199, "aa")));
+        assert_eq!(closest(200, 200, true).satisfies(&Revision::closest(200)), None, "selected.iat == query_iat");
+        assert_eq!(closest(201, 200, true).satisfies(&Revision::closest(200)), None);
+        assert_eq!(closest(150, 200, false).satisfies(&Revision::closest(200)), None, "unconfirmed boundary");
+        assert_eq!(closest(150, 199, true).satisfies(&Revision::closest(200)), None, "boundary of another query");
+        let mut simulated = closest(250, 200, true);
+        simulated.simulated = true;
+        assert!(simulated.satisfies(&Revision::closest(200)).is_some(), "locker may simulate the whole history");
     }
 }

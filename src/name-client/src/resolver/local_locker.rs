@@ -7,7 +7,7 @@
 use super::publish_info::{Boundary, DocumentStatus, PublishInfo, PublishRecord, TypeState};
 use super::revision::{DocRevision, ParsedDocument, Revision};
 use super::source::{Carrier, SourceAnswer, SourceRef};
-use buckyos_kit::buckyos_get_unix_timestamp;
+use super::clock::unix_now;
 use log::warn;
 use name_lib::{DidDocType, EncodedDocument, NSError, NSResult, DID};
 use serde::{Deserialize, Serialize};
@@ -191,7 +191,7 @@ impl LocalLocker {
         let entries = self.entries.read().unwrap();
         let entry = entries.get(&(did.clone(), doc_type.to_string()))?;
         if let Some(expires_at) = entry.options.expires_at {
-            if expires_at <= buckyos_get_unix_timestamp() {
+            if expires_at <= unix_now() {
                 return None;
             }
         }

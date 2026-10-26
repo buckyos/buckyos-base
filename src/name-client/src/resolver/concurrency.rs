@@ -16,7 +16,8 @@ use name_lib::{NSError, NSResult};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio::sync::{watch, Mutex, OwnedMutexGuard, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -79,19 +80,76 @@ struct SharedTask {
     deadline: Instant,
 }
 
+impl SharedTask {
+    fn usable(&self) -> bool {
+        self.deadline > Instant::now() && !self.cancel.is_cancelled()
+    }
+
+    /// 尝试加入:任务仍可用且还有等待者时等待者数加一。等待者已归零的任务正被最后一个
+    /// 离开者取消,不能再加入。
+    fn try_join(&self, max_waiters: usize, key: &str) -> NSResult<bool> {
+        if !self.usable() {
+            return Ok(false);
+        }
+        match self
+            .waiters
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |w| (w > 0).then_some(w + 1))
+        {
+            Err(_) => Ok(false),
+            Ok(previous) if previous + 1 > max_waiters => {
+                self.waiters.fetch_sub(1, Ordering::AcqRel);
+                Err(NSError::Failed(format!(
+                    "resolve queue full for {} ({} waiters)",
+                    key,
+                    previous + 1
+                )))
+            }
+            Ok(_) => Ok(true),
+        }
+    }
+}
+
+/// 等待者的成员资格:离开(包括等待 Future 被 drop / abort)时递减;最后一个离开且任务
+/// 尚无回答时取消任务并清理登记。
+struct Membership<'a> {
+    tasks: &'a DashMap<String, Arc<SharedTask>>,
+    key: &'a str,
+    task: Arc<SharedTask>,
+}
+
+impl Drop for Membership<'_> {
+    fn drop(&mut self) {
+        if self.task.waiters.fetch_sub(1, Ordering::AcqRel) == 1 && self.task.result.borrow().is_none() {
+            debug!("last waiter left; cancelling shared resolve task {}", self.key);
+            self.task.cancel.cancel();
+            self.tasks.remove_if(self.key, |_, t| Arc::ptr_eq(t, &self.task));
+        }
+    }
+}
+
+enum Claim {
+    Joined(Arc<SharedTask>),
+    Created,
+}
+
 /// 任务合并。
 pub struct TaskMerger {
-    tasks: DashMap<String, Arc<SharedTask>>,
+    tasks: Arc<DashMap<String, Arc<SharedTask>>>,
     permits: Arc<Semaphore>,
     config: ConcurrencyConfig,
+    /// 测试调度钩子:查找未命中之后、取得创建权之前调用。
+    #[cfg(test)]
+    pub(crate) on_lookup_miss: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl TaskMerger {
     pub fn new(config: ConcurrencyConfig) -> Self {
         Self {
-            tasks: DashMap::new(),
+            tasks: Arc::new(DashMap::new()),
             permits: Arc::new(Semaphore::new(config.max_concurrent_queries.max(1))),
             config,
+            #[cfg(test)]
+            on_lookup_miss: std::sync::Mutex::new(None),
         }
     }
 
@@ -99,7 +157,23 @@ impl TaskMerger {
         self.tasks.len()
     }
 
+    /// 某个合并键当前登记的等待者数(诊断用);没有登记的任务时为 0。
+    pub fn waiters(&self, key: &str) -> usize {
+        self.tasks
+            .get(key)
+            .map_or(0, |task| task.waiters.load(Ordering::Acquire))
+    }
+
+    /// 当前可用的并发许可数(诊断用)。
+    pub fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+
     /// 合并键相同的并发查询共享一个任务。`run` 只在新建任务时执行一次。
+    ///
+    /// 共享任务有自己的有限预算(共享上限与发起者剩余预算取小)和自己的取消信号:发起者
+    /// 取消或离开不影响其它等待者;每个等待者按自己的预算等待;登记由任务完成或最后一个
+    /// 等待者离开时清理。
     pub async fn merge_or_run<F, Fut>(
         &self,
         key: String,
@@ -113,26 +187,24 @@ impl TaskMerger {
         let budget = opts.budget().clone();
         budget.check()?;
 
-        // 加入已有任务。
-        if let Some(existing) = self.tasks.get(&key).map(|t| t.clone()) {
-            if existing.deadline > Instant::now() && !existing.cancel.is_cancelled() {
-                let waiters = existing.waiters.fetch_add(1, Ordering::AcqRel) + 1;
-                if waiters > self.config.max_waiters_per_task {
-                    existing.waiters.fetch_sub(1, Ordering::AcqRel);
-                    return Err(NSError::Failed(format!(
-                        "resolve queue full for {} ({} waiters)",
-                        key, waiters
-                    )));
-                }
-                let outcome = Self::wait_for(&existing, &budget).await;
-                Self::leave(&existing);
-                return outcome;
+        // 快路径:加入已有任务。
+        let existing = self.tasks.get(&key).map(|t| t.clone());
+        if let Some(existing) = existing {
+            if existing.try_join(self.config.max_waiters_per_task, &key)? {
+                return self.wait_as_member(&key, existing, &budget).await;
             }
-            self.tasks.remove(&key);
+        }
+        #[cfg(test)]
+        {
+            // 先取出钩子再调用:`if let` 的临时守卫会活到块尾。
+            let hook = self.on_lookup_miss.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
 
-        // 新建共享任务:自己的有限预算(与发起者剩余预算取小),等待者各自保留 deadline。
-        let task_budget = budget.child(self.config.shared_task_timeout);
+        // 原子地取得创建权:同键已有可加入的任务就加入,否则登记新任务。
+        let task_budget = Budget::new(self.config.shared_task_timeout.min(budget.remaining()));
         let (tx, rx) = watch::channel(None);
         let task = Arc::new(SharedTask {
             result: rx,
@@ -140,42 +212,76 @@ impl TaskMerger {
             cancel: task_budget.cancel_token(),
             deadline: task_budget.deadline(),
         });
-        self.tasks.insert(key.clone(), task.clone());
+        let claim = match self.tasks.entry(key.clone()) {
+            dashmap::Entry::Occupied(mut occupied) => {
+                if occupied.get().try_join(self.config.max_waiters_per_task, &key)? {
+                    Claim::Joined(occupied.get().clone())
+                } else {
+                    occupied.insert(task.clone());
+                    Claim::Created
+                }
+            }
+            dashmap::Entry::Vacant(vacant) => {
+                vacant.insert(task.clone());
+                Claim::Created
+            }
+        };
+        if let Claim::Joined(existing) = claim {
+            return self.wait_as_member(&key, existing, &budget).await;
+        }
 
         let permits = self.permits.clone();
         let fut = run(task_budget.clone());
         let task_key = key.clone();
         let cancel = task_budget.cancel_token();
+        let deadline = task_budget.deadline();
+        let tasks = self.tasks.clone();
+        let registered = task.clone();
         tokio::spawn(async move {
+            let unknown = |reason: String| {
+                SourceAnswer::unknown(super::source::SourceRef::normal("merger"), reason, false)
+            };
             let permit = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,
+                _ = tokio::time::sleep_until(deadline) => None,
                 permit = permits.acquire_owned() => permit.ok(),
             };
-            if permit.is_none() {
-                let _ = tx.send(Some(SourceAnswer::unknown(
-                    super::source::SourceRef::normal("merger"),
-                    format!("shared task {} cancelled before start", task_key),
-                    false,
-                )));
-                return;
-            }
-            let answer = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => SourceAnswer::unknown(
-                    super::source::SourceRef::normal("merger"),
-                    format!("shared task {} cancelled", task_key),
-                    false,
-                ),
-                answer = fut => answer,
+            let answer = match permit {
+                None => unknown(format!("shared task {} was cancelled or ran out of budget before start", task_key)),
+                Some(permit) => {
+                    let answer = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => unknown(format!("shared task {} cancelled", task_key)),
+                        _ = tokio::time::sleep_until(deadline) => {
+                            unknown(format!("shared task {} exceeded its budget", task_key))
+                        }
+                        answer = fut => answer,
+                    };
+                    drop(permit);
+                    answer
+                }
             };
             let _ = tx.send(Some(answer));
-            drop(permit);
+            tasks.remove_if(&task_key, |_, t| Arc::ptr_eq(t, &registered));
         });
 
-        let outcome = Self::wait_for(&task, &budget).await;
-        Self::leave(&task);
-        self.tasks.remove_if(&key, |_, t| Arc::ptr_eq(t, &task));
+        self.wait_as_member(&key, task, &budget).await
+    }
+
+    async fn wait_as_member(
+        &self,
+        key: &str,
+        task: Arc<SharedTask>,
+        budget: &Budget,
+    ) -> NSResult<SourceAnswer> {
+        let member = Membership {
+            tasks: &self.tasks,
+            key,
+            task,
+        };
+        let outcome = Self::wait_for(&member.task, budget).await;
+        drop(member);
         outcome
     }
 
@@ -198,16 +304,6 @@ impl TaskMerger {
                 }
             }))
             .await
-    }
-
-    /// 单个等待者离开不取消其它有效等待者的任务;最后一个离开才取消无用任务。
-    fn leave(task: &Arc<SharedTask>) {
-        if task.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if task.result.borrow().is_none() {
-                debug!("last waiter left; cancelling shared resolve task");
-                task.cancel.cancel();
-            }
-        }
     }
 }
 

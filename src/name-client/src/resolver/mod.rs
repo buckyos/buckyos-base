@@ -9,6 +9,7 @@
 //! - `concurrency`:串行锁、任务合并、退避与日志限流(M5)。
 
 pub mod budget;
+pub mod clock;
 pub mod concurrency;
 pub mod doc_result;
 pub mod http_doc;
@@ -39,3 +40,7 @@ pub use store::*;
 pub use verify::*;
 pub use verify_result::*;
 pub use zone_locker::*;
+
+/// doc/resolve-did单元测试设计.md 的内核组合测试(T01–T17 与 §4 属性测试)。
+#[cfg(test)]
+mod design_tests;

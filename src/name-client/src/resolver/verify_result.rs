@@ -4,7 +4,7 @@
 use super::publish_info::{Boundary, PublishRecord};
 use super::revision::{DocRevision, Revision};
 use super::source::SourceTier;
-use buckyos_kit::buckyos_get_unix_timestamp;
+use super::clock::unix_now;
 use name_lib::{DidDocType, DID};
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,9 @@ pub struct Dependency {
     pub revision: DocRevision,
     pub role: DependencyRole,
     pub query: Revision,
+    /// 依赖由 locker 模拟发布满足:locker 配置变化时需要重验。
+    #[serde(default)]
+    pub simulated: bool,
 }
 
 /// 发布依据:来源、是否 locker 模拟、命中的记录与查询边界。
@@ -41,6 +44,9 @@ pub struct PublishEvidence {
     pub query: Revision,
     pub boundary: Option<Boundary>,
     pub checked_at: u64,
+    /// 来源声明的回答有效期(`validUntil`);查询槽不能比它活得更久。
+    #[serde(default)]
+    pub valid_until: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +116,7 @@ impl VerifyResult {
             source_tier: None,
             source_id: None,
             conflict: None,
-            verified_at: buckyos_get_unix_timestamp(),
+            verified_at: unix_now(),
             authority_receipt: None,
             owner_binding: None,
         }
@@ -144,6 +150,7 @@ impl VerifyResult {
         revision: DocRevision,
         role: DependencyRole,
         query: Revision,
+        simulated: bool,
     ) {
         self.dependencies.push(Dependency {
             did: did.clone(),
@@ -151,6 +158,7 @@ impl VerifyResult {
             revision,
             role,
             query,
+            simulated,
         });
     }
 

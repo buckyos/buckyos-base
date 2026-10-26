@@ -47,4 +47,6 @@ buckyos-kit = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Tokio 虚拟时钟:预算 / 宽限期 / 来源超时的边界测试。
+tokio = { workspace = true, features = ["test-util"] }
 rcgen = "0.14"

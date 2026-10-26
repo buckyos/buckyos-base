@@ -6,7 +6,7 @@
 //!   `BuckyOS-DID-Document` 响应头统一提取 [`SourceAnswer`];
 //! - 所有读取 / 解码都在同一预算内,取得 header Card 不要求完整下载大业务 body。
 
-use super::budget::Budget;
+use super::budget::{erase, BoxFut, Budget};
 use super::publish_info::{Boundary, DocumentStatus, PublishInfo, PublishRecord};
 use super::revision::{normalize_hash, validate_compact_jwt, DocRevision, ParsedDocument, Revision};
 use super::source::{Carrier, SourceAnswer, SourceRef};
@@ -137,8 +137,15 @@ impl DocumentLocation {
             .map(|(_, v)| v.to_string())
     }
 
-    /// 所有分支先校验原 URL 已有的 `type`:与调用方要求冲突时明确拒绝。
+    /// 所有分支先校验原 URL 已有的 `type`:与调用方要求冲突时明确拒绝;重复出现的
+    /// 选择器(无论值是否相同)一律拒绝,不发出重复选择器。
     pub fn check_input_type_selector(&self, doc_type: Option<&DidDocType>) -> NSResult<()> {
+        if self.url.query_pairs().filter(|(k, _)| k == "type").count() > 1 {
+            return Err(NSError::InvalidParam(format!(
+                "object url {} repeats the type selector",
+                self.url
+            )));
+        }
         let Some(existing) = self.existing_type_selector() else {
             return Ok(());
         };
@@ -298,17 +305,54 @@ impl HttpResponseParts {
     }
 }
 
+/// 响应 body 的分块来源:`reqwest::Response` 与测试用的假流共用同一读取规则。
+pub trait ResponseBody: Send {
+    /// 响应声明的 Content-Length(分块传输时为 None)。
+    fn content_length(&self) -> Option<u64>;
+    /// 下一块;读完返回 None。
+    fn next_chunk(&mut self) -> BoxFut<'_, NSResult<Option<Vec<u8>>>>;
+}
+
+impl ResponseBody for reqwest::Response {
+    fn content_length(&self) -> Option<u64> {
+        reqwest::Response::content_length(self)
+    }
+
+    fn next_chunk(&mut self) -> BoxFut<'_, NSResult<Option<Vec<u8>>>> {
+        erase(async move {
+            self.chunk()
+                .await
+                .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+                .map_err(|err| NSError::Failed(format!("read response failed: {}", err)))
+        })
+    }
+}
+
 /// 在预算内读取响应;取得 header Card 不要求完整下载无关的大业务 body。
 pub async fn read_response(resp: reqwest::Response, budget: &Budget) -> NSResult<HttpResponseParts> {
     let status = resp.status();
     let headers = resp.headers().clone();
     let final_url = Some(resp.url().clone());
-    let has_header_doc = headers.get(DID_DOCUMENT_HEADER).is_some();
+    read_response_body(status, headers, final_url, resp, budget).await
+}
+
+/// [`read_response`] 的读取规则,body 来自任意 [`ResponseBody`]。
+pub async fn read_response_body<B: ResponseBody>(
+    status: StatusCode,
+    headers: HeaderMap,
+    final_url: Option<Url>,
+    resp: B,
+    budget: &Budget,
+) -> NSResult<HttpResponseParts> {
+    // 只有未声明为 DID 文档的业务 body 才能在已有 header Card 时跳过;声明为文档的超限
+    // body 必须拒绝,不能只信 header 而跳过冲突 / 状态检查。
+    let declared = declares_did_document(headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()));
+    let may_skip_body = headers.get(DID_DOCUMENT_HEADER).is_some() && !declared;
     let too_large = resp
         .content_length()
         .is_some_and(|len| len > MAX_HTTP_DID_BODY_BYTES as u64);
     if too_large {
-        if has_header_doc {
+        if may_skip_body {
             return Ok(HttpResponseParts {
                 status,
                 headers,
@@ -325,14 +369,10 @@ pub async fn read_response(resp: reqwest::Response, budget: &Budget) -> NSResult
     let mut resp = resp;
     let mut body = Vec::new();
     let mut skipped = false;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|err| NSError::Failed(format!("read response failed: {}", err)))?
-    {
+    while let Some(chunk) = resp.next_chunk().await? {
         budget.check()?;
         if body.len().saturating_add(chunk.len()) > MAX_HTTP_DID_BODY_BYTES {
-            if has_header_doc {
+            if may_skip_body {
                 skipped = true;
                 body.clear();
                 break;
@@ -532,21 +572,48 @@ enum DetectedBody {
     Empty,
     Envelope(Box<DidResolutionEnvelope>),
     Document(EncodedDocument),
-    /// 普通业务内容(HTML / 媒体 / 非文档 JSON)。
+    /// 普通业务内容(HTML / 媒体 / 未声明为文档的 JSON)。
     Legacy,
+    /// 声明为 DID 文档 / 信封,但内容损坏:拒绝来源回答,不能当业务内容吞掉。
+    Malformed(String),
 }
 
-fn detect_body(body: &[u8], content_type: Option<&str>) -> DetectedBody {
+/// Content-Type 声明正文是 DID 文档或 DID Resolution 信封(`application/did+json`、
+/// `application/did+ld+json`、`application/did-resolution` 等)。
+pub fn declares_did_document(content_type: Option<&str>) -> bool {
+    content_type.map_or(false, |ct| {
+        let ct = ct.to_ascii_lowercase();
+        let mime = ct.split(';').next().unwrap_or_default().trim();
+        mime.starts_with("application/did") || ct.contains("did-resolution")
+    })
+}
+
+/// 业务 JSON 与 DID 文档的区分:声明了 DID 形式的 `id`。
+fn looks_like_did_document(map: &serde_json::Map<String, Value>) -> bool {
+    map.get("id")
+        .and_then(|id| id.as_str())
+        .map_or(false, |id| id.starts_with("did:"))
+}
+
+/// 识别 body。`allow_legacy_body` 的入口(路径对象 URL)可能返回任意业务内容:那里只有
+/// 声明为 DID 文档(Content-Type、信封结构或 DID `id`)的 JSON 才当文档;目录 / resolver
+/// API 入口的 JSON 一律按文档处理。声明为文档的内容损坏时报错。
+fn detect_body(body: &[u8], content_type: Option<&str>, allow_legacy_body: bool) -> DetectedBody {
+    let declared = declares_did_document(content_type);
+    let undeclared_or = |reason: &str| {
+        if declared {
+            DetectedBody::Malformed(reason.to_string())
+        } else {
+            DetectedBody::Legacy
+        }
+    };
     let Ok(text) = std::str::from_utf8(body) else {
-        return DetectedBody::Legacy;
+        return undeclared_or("declared DID document is not UTF-8");
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return DetectedBody::Empty;
     }
-    let looks_json = content_type
-        .map(|ct| ct.to_ascii_lowercase())
-        .map_or(false, |ct| ct.contains("json") || ct.contains("did"));
     if trimmed.starts_with('{') {
         match serde_json::from_str::<Value>(trimmed) {
             Ok(Value::Object(map)) => {
@@ -556,26 +623,28 @@ fn detect_body(body: &[u8], content_type: Option<&str>) -> DetectedBody {
                 if is_envelope {
                     match serde_json::from_value::<DidResolutionEnvelope>(Value::Object(map)) {
                         Ok(envelope) => DetectedBody::Envelope(Box::new(envelope)),
-                        Err(_) => DetectedBody::Legacy,
+                        Err(err) => DetectedBody::Malformed(format!("malformed DID resolution envelope: {}", err)),
                     }
-                } else {
+                } else if declared || !allow_legacy_body || looks_like_did_document(&map) {
                     DetectedBody::Document(EncodedDocument::JsonLd(Value::Object(map)))
+                } else {
+                    DetectedBody::Legacy
                 }
             }
-            _ => DetectedBody::Legacy,
+            Ok(_) => undeclared_or("declared DID document is not a JSON object"),
+            Err(_) => undeclared_or("declared DID document is not valid JSON"),
         }
     } else if trimmed.starts_with('"') {
         match serde_json::from_str::<Value>(trimmed) {
             Ok(Value::String(jwt)) if validate_compact_jwt(&jwt).is_ok() => {
                 DetectedBody::Document(EncodedDocument::Jwt(jwt))
             }
-            _ => DetectedBody::Legacy,
+            _ => undeclared_or("declared DID document is not a compact JWT"),
         }
     } else if validate_compact_jwt(trimmed).is_ok() && !trimmed.contains(char::is_whitespace) {
         DetectedBody::Document(EncodedDocument::Jwt(trimmed.to_string()))
     } else {
-        let _ = looks_json;
-        DetectedBody::Legacy
+        undeclared_or("declared DID document is neither JSON nor JWT")
     }
 }
 
@@ -830,7 +899,7 @@ pub fn document_answer_from_http(
             return answer.with_context(context);
         }
         StatusCode::BAD_REQUEST => {
-            let code = match detect_body(&parts.body, parts.content_type()) {
+            let code = match detect_body(&parts.body, parts.content_type(), allow_legacy_body) {
                 DetectedBody::Envelope(envelope) => envelope.error_code(),
                 _ => None,
             };
@@ -868,10 +937,13 @@ pub fn document_answer_from_http(
     let detected = if parts.body_skipped {
         DetectedBody::Legacy
     } else {
-        detect_body(&parts.body, parts.content_type())
+        detect_body(&parts.body, parts.content_type(), allow_legacy_body)
     };
     let mut body_doc: Option<(EncodedDocument, Carrier)> = None;
     match detected {
+        DetectedBody::Malformed(reason) => {
+            return SourceAnswer::unknown(sref.clone(), reason, false).with_context(context);
+        }
         DetectedBody::Envelope(envelope) => {
             let doc = match envelope.document() {
                 Ok(doc) => doc,
@@ -1247,5 +1319,271 @@ mod tests {
         assert_eq!(url.as_str(), "https://resolver.example.com/1.0/identifiers/did:bns:alice?type=owner&versionTime=42");
         let url = resolver_api_url("http://127.0.0.1:3180/", &DID::new("bns", "alice"), Some(&DidDocType::Owner), &Revision::exact(7, "x")).unwrap();
         assert_eq!(url.as_str(), "http://127.0.0.1:3180/1.0/identifiers/did:bns:alice?type=owner&versionId=7");
+    }
+
+    // ---------- T12:合法 header 不能洗白坏正文 ----------
+
+    fn card() -> EncodedDocument {
+        EncodedDocument::JsonLd(doc_json())
+    }
+
+    fn card_headers(content_type: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
+        headers.insert(DID_DOCUMENT_HEADER, HeaderValue::from_str(&encode_declared_document_header(&card())).unwrap());
+        headers
+    }
+
+    fn object_answer(parts: &HttpResponseParts) -> SourceAnswer {
+        document_answer_from_http(parts, &sref(), &did(), &DidDocType::Zone, &Revision::current(), true)
+    }
+
+    /// T12:未声明为 DID 文档的业务 JSON / HTML 不参与冲突比较,可提取 header Card。
+    #[test]
+    fn t12_business_body_does_not_conflict_with_the_card() {
+        for (content_type, body) in [
+            ("application/json", r#"{"title":"hello"}"#),
+            ("text/html", "<html>hi</html>"),
+            ("text/html", r#"{"id":"did:web:example.com","iat":10"#),
+        ] {
+            let parts = HttpResponseParts::for_test(StatusCode::OK, card_headers(content_type), body);
+            let answer = object_answer(&parts);
+            assert_eq!(answer.body, Some(card()), "{} {}: {:?}", content_type, body, answer.reason);
+            assert_eq!(answer.carrier, Carrier::Header);
+            assert!(answer.publish_info.is_none(), "a header carrier never creates publish facts");
+        }
+    }
+
+    /// T12:Content-Type / 信封表明正文是 DID 文档,但 JSON 截断或信封结构错误 → 拒绝来源
+    /// 回答,不能当业务内容吞掉后只信 header。
+    #[test]
+    fn t12_malformed_declared_document_is_rejected_even_with_a_card() {
+        for (content_type, body) in [
+            ("application/did+json", r#"{"id":"did:web:example.com","iat":10"#),
+            ("application/did+ld+json", "{\"id\":"),
+            ("application/did-resolution", r#"{"didDocumentMetadata":"oops"}"#),
+            ("application/json", r#"{"didDocument":{"id":"did:web:example.com"},"didDocumentMetadata":["bad"]}"#),
+        ] {
+            let parts = HttpResponseParts::for_test(StatusCode::OK, card_headers(content_type), body);
+            let answer = object_answer(&parts);
+            assert!(answer.is_unknown(), "{} {}: declared body was swallowed", content_type, body);
+            assert!(!answer.cacheable);
+        }
+    }
+
+    /// T12:合法正文 + 损坏 / 重复 / 超限的 header → 拒绝("损坏"不等于"没提供");合法正文
+    /// 无 header → 按 body。
+    #[test]
+    fn t12_valid_body_with_corrupt_header_is_rejected() {
+        let body = card().to_string();
+        let plain = HttpResponseParts::for_test(StatusCode::OK, HeaderMap::new(), &body);
+        assert_eq!(object_answer(&plain).body, Some(card()));
+
+        let mut corrupt = Vec::new();
+        let mut h = HeaderMap::new();
+        h.insert(DID_DOCUMENT_HEADER, HeaderValue::from_static("json !!!not-base64!!!"));
+        corrupt.push(h);
+        let mut h = HeaderMap::new();
+        let value = HeaderValue::from_str(&encode_declared_document_header(&card())).unwrap();
+        h.append(DID_DOCUMENT_HEADER, value.clone());
+        h.append(DID_DOCUMENT_HEADER, value);
+        corrupt.push(h);
+        let mut h = HeaderMap::new();
+        h.insert(DID_DOCUMENT_HEADER, HeaderValue::from_str(&header_of_len(MAX_HEADER_DOCUMENT_BYTES + 1).1).unwrap());
+        corrupt.push(h);
+        for headers in corrupt {
+            let parts = HttpResponseParts::for_test(StatusCode::OK, headers, &body);
+            let answer = object_answer(&parts);
+            assert!(answer.is_unknown() && !answer.cacheable, "{:?}", answer.reason);
+            assert!(answer.reason.unwrap().contains("corrupt"));
+        }
+    }
+
+    /// 构造一个合法编码、长度恰为 `len` 字节的 `json` 头值。
+    fn header_of_len(len: usize) -> (EncodedDocument, String) {
+        let b64 = len - "json ".len();
+        let bytes = match b64 % 4 {
+            0 => b64 / 4 * 3,
+            2 => (b64 - 2) / 4 * 3 + 1,
+            3 => (b64 - 3) / 4 * 3 + 2,
+            _ => panic!("base64url without padding cannot be {} chars", b64),
+        };
+        let base = json!({"id": "did:web:example.com", "iat": 1000, "exp": 2_000_000_000u64, "pad": ""});
+        let pad = "x".repeat(bytes - base.to_string().len());
+        let doc = json!({"id": "did:web:example.com", "iat": 1000, "exp": 2_000_000_000u64, "pad": pad});
+        let value = encode_declared_document_header(&EncodedDocument::JsonLd(doc.clone()));
+        assert_eq!(value.len(), len);
+        (EncodedDocument::JsonLd(doc), value)
+    }
+
+    /// T12:header 编码后单值长度 16 KiB-1 / 16 KiB 仍合法并受控解析,16 KiB+1 拒绝。
+    #[test]
+    fn t12_header_length_boundary() {
+        for (len, accepted) in [
+            (MAX_HEADER_DOCUMENT_BYTES - 1, true),
+            (MAX_HEADER_DOCUMENT_BYTES, true),
+            (MAX_HEADER_DOCUMENT_BYTES + 1, false),
+        ] {
+            let (doc, value) = header_of_len(len);
+            let mut headers = HeaderMap::new();
+            headers.insert(DID_DOCUMENT_HEADER, HeaderValue::from_str(&value).unwrap());
+            let decoded = decode_declared_document_header(&headers);
+            if accepted {
+                assert_eq!(decoded.unwrap(), Some(doc.clone()), "len={}", len);
+                let parts = HttpResponseParts::for_test(StatusCode::OK, headers, "<html></html>");
+                assert_eq!(object_answer(&parts).body, Some(doc), "len={}", len);
+            } else {
+                assert!(decoded.is_err(), "len={}", len);
+            }
+        }
+    }
+
+    /// T12:同身份、类型、iat 但 hash 不同的两份文档 → 拒绝本次回答,不宣布 DID 禁用;
+    /// 明确 revoked 的信封或 5xx 不能被 header 覆盖。
+    #[test]
+    fn t12_conflicts_and_negative_states_beat_the_card() {
+        let mut other = doc_json();
+        other["marker"] = json!("other");
+        let parts = HttpResponseParts::for_test(StatusCode::OK, card_headers("application/did+json"), &other.to_string());
+        let answer = object_answer(&parts);
+        assert!(answer.is_unknown() && answer.publish_info.is_none());
+
+        let revoked = json!({"didDocumentMetadata": {"deactivated": true, "buckyos": {"documentStatus": "revoked"}}});
+        let parts = HttpResponseParts::for_test(StatusCode::GONE, card_headers("application/did-resolution"), &revoked.to_string());
+        let answer = object_answer(&parts);
+        assert!(answer.body.is_none());
+        assert!(answer.publish_info.unwrap().is_disabled());
+
+        let parts = HttpResponseParts::for_test(StatusCode::BAD_GATEWAY, card_headers("text/html"), "<html>down</html>");
+        let answer = object_answer(&parts);
+        assert!(answer.failure && answer.body.is_none());
+    }
+
+    /// T12:重定向后仍按原 Object URL 的 DID 绑定检查 Card;header 载体不提升来源等级。
+    #[test]
+    fn t12_redirect_keeps_the_object_binding() {
+        let mut parts = HttpResponseParts::for_test(StatusCode::OK, card_headers("text/html"), "<html></html>");
+        parts.final_url = Some(Url::parse("https://cdn.example.net/cards/alice").unwrap());
+        let answer = document_answer_from_http(&parts, &SourceRef::provider("site", SourceTier::Normal), &did(), &DidDocType::Zone, &Revision::current(), true);
+        assert_eq!(answer.body, Some(card()));
+        assert_eq!(answer.source.tier, SourceTier::Normal);
+        assert!(answer.publish_info.is_none());
+
+        let foreign = EncodedDocument::JsonLd(json!({"id": "did:web:cdn.example.net", "iat": 1000, "exp": 2_000_000_000u64}));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        headers.insert(DID_DOCUMENT_HEADER, HeaderValue::from_str(&encode_declared_document_header(&foreign)).unwrap());
+        let mut parts = HttpResponseParts::for_test(StatusCode::OK, headers, "<html></html>");
+        parts.final_url = Some(Url::parse("https://cdn.example.net/").unwrap());
+        assert!(object_answer(&parts).is_unknown(), "the Card host is not the object identity");
+    }
+
+    struct FakeBody {
+        length: Option<u64>,
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        pulled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ResponseBody for FakeBody {
+        fn content_length(&self) -> Option<u64> {
+            self.length
+        }
+
+        fn next_chunk(&mut self) -> BoxFut<'_, NSResult<Option<Vec<u8>>>> {
+            self.pulled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let chunk = self.chunks.pop_front();
+            erase(async move { Ok(chunk) })
+        }
+    }
+
+    impl Drop for FakeBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    const CHUNK: usize = 512 * 1024;
+
+    async fn read_fake(content_type: &str, with_card: bool, declared_length: bool) -> (NSResult<HttpResponseParts>, usize, bool) {
+        let total_chunks = MAX_HTTP_DID_BODY_BYTES / CHUNK + 4;
+        let pulled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = FakeBody {
+            length: declared_length.then_some((total_chunks * CHUNK) as u64),
+            chunks: (0..total_chunks).map(|_| vec![b' '; CHUNK]).collect(),
+            pulled: pulled.clone(),
+            dropped: dropped.clone(),
+        };
+        let mut headers = if with_card { card_headers(content_type) } else { HeaderMap::new() };
+        if !with_card {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type).unwrap());
+        }
+        let budget = Budget::new(Duration::from_secs(5));
+        let result = read_response_body(StatusCode::OK, headers, None, body, &budget).await;
+        (result, pulled.load(std::sync::atomic::Ordering::SeqCst), dropped.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// T12 读取变体:合法 header + 超大媒体 body 可跳过无关内容(已知长度时一块都不读,分块时
+    /// 读到上限即停并释放);明确声明为 DID 文档但超限的 body 必须拒绝。
+    #[tokio::test]
+    async fn t12_large_bodies_are_skipped_only_when_undeclared() {
+        let (parts, pulled, dropped) = read_fake("video/mp4", true, true).await;
+        let parts = parts.unwrap();
+        assert!(parts.body_skipped && parts.body.is_empty());
+        assert_eq!(pulled, 0, "known Content-Length: nothing is downloaded");
+        assert!(dropped);
+
+        let (parts, pulled, dropped) = read_fake("video/mp4", true, false).await;
+        assert!(parts.unwrap().body_skipped);
+        assert!(pulled <= MAX_HTTP_DID_BODY_BYTES / CHUNK + 2, "stopped at the limit, pulled {}", pulled);
+        assert!(dropped);
+
+        for declared_length in [true, false] {
+            let (parts, _, dropped) = read_fake("application/did+json", true, declared_length).await;
+            assert!(parts.is_err(), "declared DID body over the limit must be rejected (length known: {})", declared_length);
+            assert!(dropped);
+            let (parts, _, _) = read_fake("video/mp4", false, declared_length).await;
+            assert!(parts.is_err(), "no card: oversize body is an error");
+        }
+    }
+
+    // ---------- T11:归一化发生在缓存键之前 ----------
+
+    /// T11:路径对象 / 目录 / 业务 query / 已有 type 选择器的路由与类型归一。
+    #[test]
+    fn t11_location_table() {
+        let object = DocumentLocation::from_object_url("https://example.com/a?lang=zh", did()).unwrap();
+        assert!(!object.is_directory());
+        assert_eq!(object.normalized_doc_type(None), DidDocType::DidObject);
+        assert_eq!(build_document_request_url(&object, None).unwrap().as_str(), "https://example.com/a?lang=zh");
+
+        let dir = DocumentLocation::from_object_url("https://example.com/a/?lang=zh", did()).unwrap();
+        assert!(dir.is_directory());
+        assert_eq!(build_document_request_url(&dir, None).unwrap().as_str(), "https://example.com/a/did.json?lang=zh");
+
+        let slash_in_query = DocumentLocation::from_object_url("https://example.com/a?next=%2F", did()).unwrap();
+        assert!(!slash_in_query.is_directory(), "a slash inside the query does not make a directory");
+        assert_eq!(build_document_request_url(&slash_in_query, None).unwrap().as_str(), "https://example.com/a?next=%2F");
+
+        let typed = DocumentLocation::from_object_url("https://example.com/a?type=profile", did()).unwrap();
+        assert_eq!(typed.normalized_doc_type(None), DidDocType::custom("profile"));
+        assert_eq!(build_document_request_url(&typed, None).unwrap().as_str(), "https://example.com/a?type=profile");
+        assert!(build_document_request_url(&typed, Some(&DidDocType::DidObject)).is_err(), "default branch also checks the selector");
+        assert!(build_document_request_url(&typed, Some(&DidDocType::custom("other"))).is_err());
+        let typed_dir = DocumentLocation::from_object_url("https://example.com/a/?type=profile", did()).unwrap();
+        assert!(build_document_request_url(&typed_dir, Some(&DidDocType::Zone)).is_err());
+
+        for url in ["https://example.com/a?type=profile&type=other", "https://example.com/a?type=profile&type=profile"] {
+            let dup = DocumentLocation::from_object_url(url, did()).unwrap();
+            for requested in [None, Some(DidDocType::custom("profile"))] {
+                assert!(
+                    build_document_request_url(&dup, requested.as_ref()).is_err(),
+                    "{} with {:?}: repeated type selectors are rejected consistently",
+                    url,
+                    requested
+                );
+            }
+        }
     }
 }

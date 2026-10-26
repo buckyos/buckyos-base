@@ -118,6 +118,15 @@ impl NameClient {
             report = result.accept_verified(body.clone(), source, report, &revision);
             let (merged, conflict) = self.update_doc_result(did, &doc_type, result, &opts).await?;
             result = merged;
+            // 提交后按存储中的最终状态重新裁决:另一方先提交的撤销 / 禁用同样约束本次报告。
+            if report.is_valid() {
+                let owner = self.owner_constraint_for(did, &result, &opts);
+                apply_known_constraints(&mut report, &parsed, &result, &revision, owner.as_ref());
+                if !report.is_valid() {
+                    let trusted = report.is_signed;
+                    report = report.finish(trusted);
+                }
+            }
             if let Some(conflict) = conflict {
                 if conflict == doc_revision || result.find_verified(&doc_revision).is_none() {
                     report = report.invalid(format!(
@@ -149,7 +158,6 @@ impl NameClient {
         if opts.force_authority_query {
             // 缺本轮匹配 receipt 的旧验证结果不能让本次权威查询短路。
             let has_receipt = opts
-                .receipts()
                 .authority_receipts(did, &result.doc_type)
                 .iter()
                 .any(|r| r.answer.publish_info.as_ref().and_then(|i| i.latest_revision()) == Some(cached.revision.clone()));
@@ -361,6 +369,7 @@ impl NameClient {
                     signing_owner.revision.clone(),
                     DependencyRole::SigningOwner,
                     signing_revision.clone(),
+                    is_simulated(signing_owner),
                 );
             }
             None => {
@@ -388,6 +397,7 @@ impl NameClient {
                     current_owner.revision.clone(),
                     DependencyRole::CurrentOwner,
                     current_revision,
+                    is_simulated(current_owner),
                 );
             }
             None if current.is_disabled() => {
@@ -499,6 +509,15 @@ impl NameClient {
     fn use_disk_for(&self, opts: &ResolveOpts) -> bool {
         opts.allow_local_cache() && self.config.enable_cache && self.store.is_persistent()
     }
+}
+
+/// 该选择是否由 locker 模拟发布提供。
+fn is_simulated(choice: &super::doc_result::Choice) -> bool {
+    choice
+        .report
+        .publish_evidence
+        .as_ref()
+        .map_or(false, |evidence| evidence.simulated)
 }
 
 /// 用签发时 owner 文档的全部 key(默认 + 历史)核验 JWT 签名。

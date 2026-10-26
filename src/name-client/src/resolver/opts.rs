@@ -8,8 +8,10 @@ use super::budget::Budget;
 use super::source::{Operation, SourceAnswer, SourceRef};
 use name_lib::{DidDocType, NSError, NSResult, DID};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::time::Instant as MonoInstant;
 use tokio_util::sync::CancellationToken;
 
 /// 信任域标识:普通缓存和本机 locker 属于 Host;Zone locker 的回答携带
@@ -91,15 +93,17 @@ impl std::fmt::Debug for TransportPolicy {
 }
 
 /// 本轮请求上下文中的一条真实回答。按来源 / DID / doc_type / 查询区分,
-/// 递归共享;最外层新调用建立新的集合,复用 Opts 配置不能继承上轮 receipt。
+/// 递归共享;最外层新调用开始新的一轮,复用 Opts 配置不能继承上轮 receipt。
 #[derive(Debug, Clone)]
 pub struct Receipt {
+    /// 所属调用轮次(见 [`ReceiptSet::begin_round`])。
+    pub round: u64,
     pub source: SourceRef,
     pub did: DID,
     pub doc_type: DidDocType,
     pub revision_key: String,
     pub answer: SourceAnswer,
-    pub recorded_at: Instant,
+    pub recorded_at: MonoInstant,
 }
 
 /// 本轮诊断:策略拒绝、超时等未回答记录。
@@ -110,10 +114,13 @@ pub struct Unanswered {
     pub reason: String,
 }
 
+/// receipt 集合。调用方可以保存已归一化的 opts 并在调用后读取本轮回答;每个最外层调用
+/// 在同一集合里开始新的一轮,只复用 / 采信本轮的回答,旧轮次只留作诊断。
 #[derive(Debug, Default)]
 pub struct ReceiptSet {
     receipts: Mutex<Vec<Receipt>>,
     unanswered: Mutex<Vec<Unanswered>>,
+    current_round: AtomicU64,
 }
 
 impl ReceiptSet {
@@ -121,8 +128,19 @@ impl ReceiptSet {
         Arc::new(Self::default())
     }
 
+    /// 开始新的一轮,返回轮次号。
+    pub fn begin_round(&self) -> u64 {
+        self.current_round.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// 最近开始的一轮。
+    pub fn current_round(&self) -> u64 {
+        self.current_round.load(Ordering::Acquire)
+    }
+
     pub fn record(
         &self,
+        round: u64,
         source: &SourceRef,
         did: &DID,
         doc_type: &DidDocType,
@@ -134,18 +152,20 @@ impl ReceiptSet {
         }
         let mut receipts = self.receipts.lock().unwrap();
         receipts.retain(|r| {
-            !(r.source.id == source.id
+            !(r.round == round
+                && r.source.id == source.id
                 && r.did == *did
                 && r.doc_type == *doc_type
                 && r.revision_key == revision_key)
         });
         receipts.push(Receipt {
+            round,
             source: source.clone(),
             did: did.clone(),
             doc_type: doc_type.clone(),
             revision_key: revision_key.to_string(),
             answer: answer.clone(),
-            recorded_at: Instant::now(),
+            recorded_at: MonoInstant::now(),
         });
     }
 
@@ -153,6 +173,7 @@ impl ReceiptSet {
     /// 返回 None,不隐含联网。
     pub fn reusable(
         &self,
+        round: u64,
         source_id: &str,
         did: &DID,
         doc_type: &DidDocType,
@@ -163,7 +184,8 @@ impl ReceiptSet {
         receipts
             .iter()
             .find(|r| {
-                r.source.id == source_id
+                r.round == round
+                    && r.source.id == source_id
                     && r.did == *did
                     && r.doc_type == *doc_type
                     && r.revision_key == revision_key
@@ -172,13 +194,19 @@ impl ReceiptSet {
             .map(|r| r.answer.clone())
     }
 
-    /// 本轮真实 authority 回答(供 `select_rtcp_identity` 等证据门禁使用)。
+    /// 最近一轮的真实 authority 回答(供 `select_authority_current` 等证据门禁使用)。
     pub fn authority_receipts(&self, did: &DID, doc_type: &DidDocType) -> Vec<Receipt> {
+        self.authority_receipts_in(self.current_round(), did, doc_type)
+    }
+
+    /// 指定轮次的真实 authority 回答。
+    pub fn authority_receipts_in(&self, round: u64, did: &DID, doc_type: &DidDocType) -> Vec<Receipt> {
         let receipts = self.receipts.lock().unwrap();
         receipts
             .iter()
             .filter(|r| {
-                r.did == *did
+                r.round == round
+                    && r.did == *did
                     && r.doc_type == *doc_type
                     && r.source.is_authority()
                     && !r.source.is_locker()
@@ -225,6 +253,8 @@ pub struct ResolveOpts {
     pub max_depth: usize,
     budget: Option<Budget>,
     receipts: Option<Arc<ReceiptSet>>,
+    /// 本调用所属的 receipt 轮次;递归继承,最外层调用重新开始。
+    receipt_round: u64,
     visited: Vec<(DID, DidDocType)>,
 }
 
@@ -264,6 +294,7 @@ impl Default for ResolveOpts {
             max_depth: 8,
             budget: None,
             receipts: None,
+            receipt_round: 0,
             visited: Vec::new(),
         }
     }
@@ -387,13 +418,13 @@ impl ResolveOpts {
         let mut opts = self.clone();
         if opts.budget.is_none() {
             let timeout = opts.resolve_timeout.unwrap_or(default_timeout);
-            let mut deadline = Instant::now() + timeout;
+            let mut deadline = MonoInstant::now() + timeout;
             if let Some(caller) = opts.deadline {
-                deadline = deadline.min(caller);
+                deadline = deadline.min(MonoInstant::from_std(caller));
             }
             let budget = match opts.cancel.clone() {
                 Some(cancel) => Budget::with_cancel(
-                    deadline.saturating_duration_since(Instant::now()),
+                    deadline.saturating_duration_since(MonoInstant::now()),
                     cancel,
                 ),
                 None => Budget::with_deadline(deadline),
@@ -401,9 +432,27 @@ impl ResolveOpts {
             opts.budget = Some(budget);
         }
         if opts.receipts.is_none() {
-            opts.receipts = Some(ReceiptSet::new());
+            let receipts = ReceiptSet::new();
+            opts.receipt_round = receipts.begin_round();
+            opts.receipts = Some(receipts);
         }
         opts
+    }
+
+    /// 最外层调用开始新的 receipt 轮次:复用已归一化的 opts 时不继承上一次调用的
+    /// "本轮回答";同一集合仍可被调用方读取。
+    pub(crate) fn begin_receipt_round(&mut self) {
+        if let Some(receipts) = self.receipts.as_ref() {
+            self.receipt_round = receipts.begin_round();
+        }
+    }
+
+    /// 本调用轮次内的真实 authority 回答。
+    pub fn authority_receipts(&self, did: &DID, doc_type: &DidDocType) -> Vec<Receipt> {
+        self.receipts
+            .as_ref()
+            .map(|r| r.authority_receipts_in(self.receipt_round, did, doc_type))
+            .unwrap_or_default()
     }
 
     /// 用已有预算 / receipt 构造副本(共享任务、locker 转发等内部用途)。
@@ -449,7 +498,7 @@ impl ResolveOpts {
     ) -> Option<SourceAnswer> {
         self.receipts
             .as_ref()?
-            .reusable(&source.id, did, doc_type, revision_key, operation)
+            .reusable(self.receipt_round, &source.id, did, doc_type, revision_key, operation)
     }
 
     pub fn record_query_answer(
@@ -461,7 +510,7 @@ impl ResolveOpts {
         answer: &SourceAnswer,
     ) {
         if let Some(receipts) = self.receipts.as_ref() {
-            receipts.record(source, did, doc_type, revision_key, answer);
+            receipts.record(self.receipt_round, source, did, doc_type, revision_key, answer);
         }
     }
 

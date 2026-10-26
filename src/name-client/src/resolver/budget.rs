@@ -1,6 +1,7 @@
 //! 整次调用共用的有限预算(设计稿 §4)。
 //!
-//! `Budget` 在最外层以 `monotonic_now() + resolve_timeout` 建立绝对 deadline,
+//! `Budget` 在最外层以 `monotonic_now() + resolve_timeout` 建立绝对 deadline
+//! (`tokio::time::Instant`,测试可用 Tokio 虚拟时钟统一推进),
 //! 覆盖锁与并发许可等待、缓存 I/O、locker/provider 查询、解析、验签和提交。
 //! 副本共享同一 deadline 和取消信号;Owner 递归、fallback 和重试不能续期。
 //!
@@ -11,7 +12,8 @@ use name_lib::{NSError, NSResult};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// 类型擦除的 boxed future。解析主路径嵌套很深,下游 crate 的 `Send` / 类型深度

@@ -7,7 +7,7 @@ use super::publish_info::{DidState, PublishInfo, TypeState};
 use super::revision::{DocRevision, ParsedDocument, Revision};
 use super::source::{Carrier, SourceAnswer, SourceRef, SourceTier};
 use super::verify_result::{DependencyRole, PublishEvidence, Validity, VerifyResult};
-use buckyos_kit::buckyos_get_unix_timestamp;
+use super::clock::unix_now;
 use name_lib::{DidDocType, EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +106,14 @@ pub struct DocResult {
     pub state_source: Option<String>,
     #[serde(default)]
     pub state_valid_until: Option<u64>,
+    /// 当前状态(did_state / type_state)所依据回答的检查时刻;跨进程合并时较新的一方胜出,
+    /// 基于旧快照的本地结果不能覆盖存储中更新的状态。
+    #[serde(default)]
+    pub state_checked_at: Option<u64>,
+    /// DID 级状态所依据回答的检查时刻:DID 级状态覆盖该 DID 的全部类型,各类型结果与 DID 级
+    /// 记录之间按它同步。
+    #[serde(default)]
+    pub did_state_checked_at: Option<u64>,
     #[serde(default)]
     pub owner_binding: Option<DID>,
     #[serde(default)]
@@ -153,6 +161,8 @@ impl DocResult {
             type_state: None,
             state_source: None,
             state_valid_until: None,
+            state_checked_at: None,
+            did_state_checked_at: None,
             owner_binding: None,
             latest: None,
             best: None,
@@ -165,9 +175,17 @@ impl DocResult {
             locked: false,
             locker_version: 0,
             reasons: Vec::new(),
-            updated_at: buckyos_get_unix_timestamp(),
+            updated_at: unix_now(),
             generation: 0,
             base_generation: 0,
+        }
+    }
+
+    /// 采用 DID 级记录中更新的 DID 级状态(DID 级状态覆盖该 DID 的全部类型)。
+    pub fn adopt_did_state(&mut self, did_level: &DocResult) {
+        if did_level.did_state_checked_at > self.did_state_checked_at {
+            self.did_state = did_level.did_state.clone();
+            self.did_state_checked_at = did_level.did_state_checked_at;
         }
     }
 
@@ -243,11 +261,17 @@ impl DocResult {
         let Some(info) = info else {
             return;
         };
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
+        // 依据的检查时刻:缓存读取再次应用同一回答时不变,有效期不因此续期。
+        let evidence_at = info.evidence_time(now);
+        let previous_did_state = self.did_state.clone();
         let merged = PublishInfo::merge(self.publish_info.take(), Some(info.clone()));
         if let Some(merged) = merged.as_ref() {
             if merged.did_state.is_some() {
                 self.did_state = merged.did_state.clone();
+            }
+            if info.did_state.is_some() || self.did_state != previous_did_state {
+                self.did_state_checked_at = Some(self.did_state_checked_at.map_or(evidence_at, |at| at.max(evidence_at)));
             }
             if let Some(type_state) = merged.type_state.as_ref() {
                 // Unknown 不能覆盖已知禁用;新的明确回答可以翻篇(authority 新回答)。
@@ -257,9 +281,17 @@ impl DocResult {
                 self.owner_binding = merged.owner_binding.clone();
             }
             self.state_source = merged.source.clone();
-            self.state_valid_until = Some(now + merged.cache_ttl_secs());
+            if info.did_state.is_some() || info.type_state.is_some() {
+                if self.state_checked_at.map_or(true, |at| evidence_at >= at) {
+                    self.state_checked_at = Some(evidence_at);
+                    self.state_valid_until = Some(info.expires_at(now));
+                }
+            } else if self.state_valid_until.is_none() {
+                self.state_valid_until = Some(info.expires_at(now));
+            }
             if info.query.is_current() {
-                self.publish_info_valid_until = Some(now + merged.cache_ttl_secs());
+                let expires = info.expires_at(now);
+                self.publish_info_valid_until = Some(self.publish_info_valid_until.map_or(expires, |v| v.max(expires)));
             }
         }
         self.publish_info = merged;
@@ -405,7 +437,7 @@ impl DocResult {
             doc,
             revision,
             sources: vec![source],
-            added_at: buckyos_get_unix_timestamp(),
+            added_at: unix_now(),
             last_reason: None,
         });
     }
@@ -429,7 +461,7 @@ impl DocResult {
             self.rejected.push(Rejected {
                 revision,
                 reason,
-                at: buckyos_get_unix_timestamp(),
+                at: unix_now(),
             });
         }
         if self.rejected.len() > 64 {
@@ -505,7 +537,7 @@ impl DocResult {
             return report;
         }
 
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let choice = Choice {
             exp: ParsedDocument::parse(&doc).ok().and_then(|p| p.exp),
             doc,
@@ -559,7 +591,7 @@ impl DocResult {
                         query: revision.clone(),
                         revision: Some(doc_revision.clone()),
                         evidence: evidence.clone(),
-                        valid_until: now + super::publish_info::HISTORICAL_QUERY_TTL_SECS,
+                        valid_until: slot_valid_until(evidence, now),
                     });
                     if !self.history.iter().any(|c| c.revision == doc_revision)
                         && self.latest.as_ref().map(|l| &l.revision) != Some(&doc_revision)
@@ -578,12 +610,12 @@ impl DocResult {
 
     /// closest 回答确认边界之前没有任何版本:记录空槽,查询目标"已回答"。
     pub fn set_empty_slot(&mut self, revision: &Revision, evidence: PublishEvidence) {
+        let valid_until = slot_valid_until(&evidence, unix_now());
         self.set_slot(Slot {
             query: revision.clone(),
             revision: None,
             evidence,
-            valid_until: buckyos_get_unix_timestamp()
-                + super::publish_info::HISTORICAL_QUERY_TTL_SECS,
+            valid_until,
         });
     }
 
@@ -629,7 +661,7 @@ impl DocResult {
     }
 
     pub fn slot_for(&self, revision: &Revision) -> Option<&Slot> {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         self.slots
             .iter()
             .find(|slot| slot.query == *revision && slot.valid_until > now)
@@ -678,7 +710,7 @@ impl DocResult {
         let Some(info) = publish_info.filter(|info| info.query == *revision) else {
             return;
         };
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         match info.satisfies(revision) {
             Some(target) => {
                 let Some(choice) = self.find_verified(&target).filter(|c| c.is_valid()).cloned() else {
@@ -687,11 +719,12 @@ impl DocResult {
                 let Some(evidence) = publish_evidence_for(info, &target) else {
                     return;
                 };
+                let valid_until = slot_valid_until(&evidence, now);
                 self.set_slot(Slot {
                     query: revision.clone(),
                     revision: Some(target.clone()),
                     evidence,
-                    valid_until: now + super::publish_info::HISTORICAL_QUERY_TTL_SECS,
+                    valid_until,
                 });
                 if self.latest.as_ref().map(|l| &l.revision) != Some(&target) {
                     self.push_history(choice);
@@ -708,12 +741,48 @@ impl DocResult {
                             query: revision.clone(),
                             boundary: info.boundary.clone(),
                             checked_at: info.checked_at.unwrap_or(now),
+                            valid_until: info.valid_until,
                         };
                         self.set_empty_slot(revision, evidence);
                     }
                 }
             }
         }
+    }
+
+    /// authority 的 current 发布回答指明的 latest 若已是本地验证过的文档(例如 trust 取得的
+    /// body),按这份新的发布依据把它记为 latest,不必重复下载;不伪造 `is_signed`,body
+    /// 保留原来源,发布依据保留 authority 来源。
+    pub fn fill_latest_from_known(&mut self, publish_info: Option<&PublishInfo>) {
+        let Some(info) = publish_info
+            .filter(|info| info.query.is_current() && !info.derived && !info.simulated && !info.is_disabled())
+        else {
+            return;
+        };
+        let Some(target) = info.latest_revision() else {
+            return;
+        };
+        if self.latest.as_ref().map_or(false, |latest| latest.revision == target && latest.is_valid()) {
+            return;
+        }
+        let Some(mut choice) = self.find_verified(&target).filter(|c| c.is_valid()).cloned() else {
+            return;
+        };
+        let Some(evidence) = publish_evidence_for(info, &target) else {
+            return;
+        };
+        choice.report.is_published = true;
+        choice.report.publish_evidence = Some(evidence);
+        if let Some(best) = self.best.as_mut().filter(|best| best.revision == target) {
+            best.report.is_published = true;
+            best.report.publish_evidence = choice.report.publish_evidence.clone();
+        }
+        if let Some(old) = self.latest.take() {
+            if old.revision != target && old.report.is_published {
+                self.push_history(old);
+            }
+        }
+        self.latest = Some(choice);
     }
 
     // ---------- 选择 ----------
@@ -743,7 +812,15 @@ impl DocResult {
     /// 指定查询的发布目标是否已有依据(含"确认不存在"的空槽)。
     pub fn satisfies_published_target(&self, revision: &Revision) -> bool {
         match revision {
-            Revision::Current => self.latest.as_ref().map_or(false, Choice::is_valid),
+            // 已合并的发布依据指明了另一份 latest 时,缓存的旧 latest 不满足目标。
+            Revision::Current => self.latest.as_ref().map_or(false, |latest| {
+                latest.is_valid()
+                    && self
+                        .publish_info
+                        .as_ref()
+                        .and_then(PublishInfo::latest_revision)
+                        .map_or(true, |published| published == latest.revision)
+            }),
             _ => match self.slot_for(revision) {
                 Some(slot) => match slot.revision.as_ref() {
                     Some(target) => self.find_verified(target).map_or(false, Choice::is_valid),
@@ -776,7 +853,7 @@ impl DocResult {
         locker_version: u64,
         owner: Option<&OwnerConstraint>,
     ) {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         // 过期的发布查询回答:TTL 过期不等于清除已知禁用 / 撤销。
         if let Some(valid_until) = self.state_valid_until {
             if valid_until <= now {
@@ -887,12 +964,14 @@ impl DocResult {
             choice.report = choice.report.finish(true);
             return Err(choice);
         }
+        // locker 配置变化:由 locker 模拟发布满足的依据(包括 owner 等验证依赖)都要重验。
         if locker_changed
-            && choice
+            && (choice
                 .report
                 .publish_evidence
                 .as_ref()
                 .map_or(false, |e| e.simulated)
+                || choice.report.dependencies.iter().any(|d| d.simulated))
         {
             return Err(choice);
         }
@@ -916,12 +995,17 @@ impl DocResult {
             let mut local = local;
             local.generation = base.generation + 1;
             local.locked = false;
-            local.updated_at = buckyos_get_unix_timestamp();
+            local.updated_at = unix_now();
             return (local, None);
         }
         let mut conflict: Option<DocRevision> = None;
-        // 本地已确定拒绝(撤销 / 过期 / 禁用)的版本不能从存储中复活。
+        // 本地已确定拒绝(撤销 / 过期 / 禁用)的版本不能从存储中复活;存储中已拒绝的版本
+        // 也不能借本地旧快照复活。
         let locally_rejected: Vec<DocRevision> = local.rejected.iter().map(|r| r.revision.clone()).collect();
+        let stored_rejected: Vec<DocRevision> = base.rejected.iter().map(|r| r.revision.clone()).collect();
+        let not_rejected = |choice: &Option<Choice>| {
+            choice.clone().filter(|c| !stored_rejected.contains(&c.revision))
+        };
         if base.best.as_ref().map_or(false, |c| locally_rejected.contains(&c.revision)) {
             base.best = None;
         }
@@ -930,26 +1014,16 @@ impl DocResult {
         }
         base.history.retain(|c| !locally_rejected.contains(&c.revision));
         base.requested_doc_type = local.requested_doc_type.clone();
-        if local.did_state.is_some() {
-            let keep = base.did_state.as_ref().map_or(false, DidState::is_disabled)
-                && !local.did_state.as_ref().map_or(false, DidState::is_disabled)
-                && local.state_valid_until.map_or(true, |v| {
-                    base.state_valid_until.map_or(false, |b| b > v)
-                });
-            if !keep {
-                base.did_state = local.did_state.clone();
-            }
-        }
-        if local.type_state.is_some() {
+        // 状态按所依据回答的检查时刻裁决:本地快照只有带来了更新的依据时才覆盖存储。
+        if local.state_checked_at > base.state_checked_at {
             base.type_state = local.type_state.clone();
-        } else if local.state_valid_until.is_none() && base.state_valid_until.map_or(false, |v| v <= buckyos_get_unix_timestamp()) {
-            if let Some(TypeState::Missing) | Some(TypeState::Invalid { .. }) = base.type_state.as_ref() {
-                base.type_state = None;
-            }
-        }
-        if local.state_source.is_some() {
             base.state_source = local.state_source.clone();
             base.state_valid_until = local.state_valid_until;
+            base.state_checked_at = local.state_checked_at;
+        }
+        if local.did_state_checked_at > base.did_state_checked_at {
+            base.did_state = local.did_state.clone();
+            base.did_state_checked_at = local.did_state_checked_at;
         }
         if local.owner_binding.is_some() {
             base.owner_binding = local.owner_binding.clone();
@@ -960,14 +1034,17 @@ impl DocResult {
         }
 
         // best / latest:取更高的有效版本;同 iat 不同 hash 记冲突。
-        let local_best = local.best.clone();
-        let local_latest = local.latest.clone();
+        let local_best = not_rejected(&local.best);
+        let local_latest = not_rejected(&local.latest);
         base.best = Self::merge_choice(base.best.take(), local_best, &mut conflict, false);
         base.latest = Self::merge_choice(base.latest.take(), local_latest, &mut conflict, true);
         if base.is_owner() {
             base.best = None;
         }
         for choice in local.history {
+            if stored_rejected.contains(&choice.revision) {
+                continue;
+            }
             if base
                 .verified_choices()
                 .iter()
@@ -1026,7 +1103,9 @@ impl DocResult {
         base.reasons = local.reasons;
         base.locked = false;
         base.locker_version = local.locker_version;
-        base.updated_at = buckyos_get_unix_timestamp();
+        // 合并后的状态(可能来自存储中更新的撤销 / 禁用)同样约束本地带来的选择。
+        base.refresh_known_constraints(base.locker_version, None);
+        base.updated_at = unix_now();
         base.generation += 1;
         (base, conflict)
     }
@@ -1106,9 +1185,16 @@ impl DocResult {
             Revision::Closest { before_iat } => doc_revision.iat < *before_iat || simulated_target,
         };
         if !matches_target {
-            return None;
+            // 锁定文档不是目标,但 locker 对该目标给出了明确回答(如 latest 之后的 exact
+            // 未发布、closest 确认为空):这是强制回答,不能当 miss 继续查,也不写入普通缓存。
+            let answers_target = answer.publish_info.as_ref().map_or(false, |info| match revision {
+                Revision::Exact { iat, .. } => info.record_for(*iat).map_or(false, |r| !r.published),
+                Revision::Closest { before_iat } => info.closest_confirmed_empty(*before_iat),
+                Revision::Current => false,
+            });
+            return answers_target.then_some(result);
         }
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let mut report = VerifyResult::new(locker_version);
         report.revision = Some(doc_revision.clone());
         report.doc_type = Some(doc_type.clone());
@@ -1133,6 +1219,7 @@ impl DocResult {
                 _ => None,
             },
             checked_at: now,
+            valid_until: None,
         };
         report.is_published = true;
         report.publish_evidence = Some(evidence);
@@ -1172,8 +1259,15 @@ pub fn publish_evidence_for(info: &PublishInfo, revision: &DocRevision) -> Optio
         record: record.clone(),
         query: info.query.clone(),
         boundary: info.boundary.clone(),
-        checked_at: info.checked_at.unwrap_or_else(buckyos_get_unix_timestamp),
+        checked_at: info.checked_at.unwrap_or_else(unix_now),
+        valid_until: info.valid_until,
     })
+}
+
+/// 查询槽的有效期:依据检查时刻起的历史查询上限,且不超过来源声明的 validUntil。
+fn slot_valid_until(evidence: &PublishEvidence, now: u64) -> u64 {
+    let cap = evidence.checked_at.min(now) + super::publish_info::HISTORICAL_QUERY_TTL_SECS;
+    evidence.valid_until.map_or(cap, |valid_until| valid_until.min(cap))
 }
 
 /// 仅读取当前已有的状态和 owner 材料,不隐含网络请求;不把"未发现撤销"说成全网确认。
@@ -1184,7 +1278,7 @@ pub fn apply_known_constraints(
     revision: &Revision,
     owner: Option<&OwnerConstraint>,
 ) {
-    let now = buckyos_get_unix_timestamp();
+    let now = unix_now();
     let check_time = match (&result.doc_type, revision) {
         (DidDocType::Owner, Revision::Exact { iat, .. }) => *iat,
         (DidDocType::Owner, Revision::Closest { before_iat }) => *before_iat,
@@ -1265,7 +1359,7 @@ mod tests {
 
     #[test]
     fn authority_sets_latest_and_best_trust_only_best() {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let mut result = DocResult::empty(Scope::Host, did(), DidDocType::Zone);
         result.commit(&authority_answer(now - 100, "v1"), &Revision::current(), 0, None);
         assert!(result.latest.is_some() && result.best.is_some());
@@ -1281,7 +1375,7 @@ mod tests {
 
     #[test]
     fn same_iat_different_hash_conflicts_after_verification() {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let mut result = DocResult::empty(Scope::Host, did(), DidDocType::Zone);
         result.commit(&authority_answer(now - 100, "v1"), &Revision::current(), 0, None);
         let other = doc(now - 100, "v1-evil");
@@ -1303,7 +1397,7 @@ mod tests {
 
     #[test]
     fn merge_keeps_stored_on_conflict_and_unions_candidates() {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let mut stored = DocResult::empty(Scope::Host, did(), DidDocType::Zone);
         stored.commit(&authority_answer(now - 100, "v1"), &Revision::current(), 0, None);
         // 模拟另一进程在本地快照读取之后提交过(存储代际前进),走合并路径。
@@ -1332,7 +1426,7 @@ mod tests {
 
     #[test]
     fn locked_result_matches_target_revision_only() {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let body = doc(now - 100, "locked");
         let rev = DocRevision::of(&body).unwrap();
         let answer = SourceAnswer::new(SourceRef::local_locker()).with_body(body, Carrier::Locker);
@@ -1346,7 +1440,7 @@ mod tests {
 
     #[test]
     fn refresh_revokes_by_owner_valid_iat() {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let mut result = DocResult::empty(Scope::Host, did(), DidDocType::Zone);
         result.commit(&authority_answer(now - 100, "v1"), &Revision::current(), 0, None);
         let owner = OwnerConstraint {
@@ -1357,5 +1451,55 @@ mod tests {
         result.refresh_known_constraints(0, Some(&owner));
         assert!(result.best.is_none() && result.latest.is_none());
         assert!(result.candidates.is_empty(), "revoked bodies are not re-verified");
+    }
+
+    fn trust_answer(doc: EncodedDocument) -> SourceAnswer {
+        SourceAnswer::new(SourceRef::provider("trust", SourceTier::Trust)).with_body(doc, Carrier::Body)
+    }
+
+    /// T07:exp 等号即不可选;刷新约束只读本机时间,确定过期的 body 不回到候选。
+    #[test]
+    fn refresh_expires_at_the_exact_second() {
+        use super::super::clock::test_clock;
+        let _clock = test_clock::Frozen::at(10_000);
+        let body = EncodedDocument::JsonLd(json!({"id": "did:bns:zone1.alice", "iat": 100, "exp": 10_010}));
+        let mut result = DocResult::empty(Scope::Host, did(), DidDocType::Zone);
+        test_clock::set(10_009);
+        result.commit(&trust_answer(body.clone()), &Revision::current(), 0, None);
+        result.refresh_known_constraints(0, None);
+        assert!(result.select(&Revision::current()).is_some());
+        test_clock::set(10_010);
+        result.refresh_known_constraints(0, None);
+        assert!(result.select(&Revision::current()).is_none());
+        assert!(result.candidates.is_empty());
+        assert!(result.is_rejected(&DocRevision::of(&body).unwrap()));
+    }
+
+    /// T16:提交时存储已前进(另一方写入了撤销并拒绝了旧版本);基于旧快照的本地结果不能把
+    /// 状态恢复为 Active,也不能让被拒绝的版本复活。
+    #[test]
+    fn merge_does_not_resurrect_state_from_a_stale_snapshot() {
+        let now = unix_now();
+        let mut snapshot = DocResult::empty(Scope::Host, did(), DidDocType::Zone);
+        snapshot.commit(&authority_answer(now - 100, "v0"), &Revision::current(), 0, None);
+        snapshot.generation = 1;
+        snapshot.mark_base_generation();
+
+        let mut stored = snapshot.clone();
+        let revoked = PublishInfo::new(did(), DidDocType::Zone, Revision::current())
+            .with_status(&DocumentStatus::Revoked, None, None)
+            .with_source("authority");
+        stored.apply_publish_info(Some(&revoked));
+        stored.refresh_known_constraints(0, None);
+        stored.generation = 2;
+        assert!(stored.is_disabled() && stored.best.is_none());
+
+        let mut local = snapshot;
+        local.commit(&trust_answer(doc(now - 50, "newer")), &Revision::current(), 0, None);
+        assert!(local.best.as_ref().unwrap().is_valid());
+        let (merged, _) = DocResult::merge_into(Some(stored), local);
+        assert!(merged.is_disabled(), "stale Active snapshot overwrote the stored revocation");
+        assert!(merged.select(&Revision::current()).is_none());
+        assert!(merged.latest.is_none(), "rejected v0 came back as latest");
     }
 }

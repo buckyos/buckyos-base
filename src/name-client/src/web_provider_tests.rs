@@ -497,3 +497,35 @@ async fn cancellation_during_root_fallback_does_not_start_parent_request() {
     assert_eq!(site.targets(), [DEVICE_PATH, ROOT_PATH]);
     site.assert_no_parent();
 }
+
+/// T11:兼容的旧静态文件路由只按已知配置使用(每个配置一条),不对路径对象无限追加后缀试探;
+/// 显式非默认类型走 `?type=` 选择器与对应的旧路由。
+#[tokio::test]
+async fn legacy_static_routes_follow_configuration_only() {
+    let object = DID::new("web", &format!("{}:user:alice", CHILD_HOST));
+    for (legacy, doc_type, expected) in [
+        (true, DidDocType::DidObject, vec!["/user/alice", "/user/alice/did.json"]),
+        (false, DidDocType::DidObject, vec!["/user/alice"]),
+        (true, DidDocType::custom("info"), vec!["/user/alice?type=info", "/user/alice/info.json"]),
+        (false, DidDocType::custom("info"), vec!["/user/alice?type=info"]),
+    ] {
+        let site = HttpSite::start(|_| Response::new(404, "")).await;
+        let mut provider = WebProvider::new_with_scheme("http").with_legacy_path_routes(legacy);
+        provider.client = Client::builder()
+            .no_proxy()
+            .resolve(CHILD_HOST, site.address)
+            .resolve(PARENT_HOST, site.address)
+            .build()
+            .unwrap();
+        let answer = provider
+            .get_document(&object, &doc_type, &Revision::current(), &opts())
+            .await;
+        assert!(answer.body.is_none());
+        let static_targets: Vec<String> = site
+            .targets()
+            .into_iter()
+            .filter(|target| !target.starts_with("/1.0/identifiers/"))
+            .collect();
+        assert_eq!(static_targets, expected, "legacy={} type={}", legacy, doc_type);
+    }
+}

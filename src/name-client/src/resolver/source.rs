@@ -8,7 +8,7 @@ use super::opts::ResolveOpts;
 use super::publish_info::{PublishInfo, PublishRecord, PUBLISH_QUERY_TTL_SECS};
 use super::revision::{DocRevision, ParsedDocument, Revision};
 use async_trait::async_trait;
-use buckyos_kit::buckyos_get_unix_timestamp;
+use super::clock::unix_now;
 use name_lib::{DidDocType, EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -199,7 +199,7 @@ impl SourceAnswer {
             unsupported_history: false,
             carrier: Carrier::None,
             source,
-            answered_at: buckyos_get_unix_timestamp(),
+            answered_at: unix_now(),
             ttl_secs: None,
             context: None,
         }
@@ -383,7 +383,7 @@ pub fn normalize_source_answer(
 ) -> SourceAnswer {
     answer.source = sref.clone();
     if answer.answered_at == 0 {
-        answer.answered_at = buckyos_get_unix_timestamp();
+        answer.answered_at = unix_now();
     }
     if sref.is_authority()
         && revision.is_current()

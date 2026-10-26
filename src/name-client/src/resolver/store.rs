@@ -18,7 +18,8 @@
 use super::doc_result::DocResult;
 use super::opts::Scope;
 use super::source::SourceAnswer;
-use buckyos_kit::{buckyos_get_unix_timestamp, get_buckyos_service_local_data_dir};
+use super::clock::unix_now;
+use buckyos_kit::get_buckyos_service_local_data_dir;
 use log::{debug, warn};
 use name_lib::{DidDocType, EncodedDocument, NSError, NSResult, DID};
 use std::collections::HashMap;
@@ -204,7 +205,7 @@ impl DocStore {
             result.publish_info = None;
             result.publish_info_valid_until = None;
             result.generation += 1;
-            result.updated_at = buckyos_get_unix_timestamp();
+            result.updated_at = unix_now();
         };
         if let Some(result) = self.memory_only.lock().unwrap().get_mut(&key) {
             strip(result);
@@ -231,7 +232,7 @@ impl DocStore {
     // ---------- 查询回答缓存(进程内) ----------
 
     pub fn get_query_answer(&self, key: &str) -> Option<SourceAnswer> {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let cache = self.query_cache.lock().unwrap();
         cache
             .get(key)
@@ -240,7 +241,7 @@ impl DocStore {
     }
 
     pub fn set_query_answer(&self, key: String, answer: SourceAnswer, ttl_secs: u64) {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let mut cache = self.query_cache.lock().unwrap();
         if cache.len() > 4096 {
             cache.retain(|_, entry| entry.valid_until > now);
@@ -312,7 +313,7 @@ impl DocStore {
         write_atomic(&dir.join(&name), &document.to_string())?;
         let meta = serde_json::json!({
             "source": source,
-            "observed_at": buckyos_get_unix_timestamp(),
+            "observed_at": unix_now(),
         });
         write_atomic(&dir.join(name.replace(".doc.json", ".meta.json")), &meta.to_string())
     }

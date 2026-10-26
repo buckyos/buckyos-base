@@ -19,7 +19,7 @@ use super::store::DocStore;
 use super::verify_result::VerifyResult;
 use super::zone_locker::ZoneLocker;
 use crate::name_client::NameClient;
-use buckyos_kit::buckyos_get_unix_timestamp;
+use super::clock::unix_now;
 use log::warn;
 use name_lib::{DIDDocumentTrait, DidDocType, EncodedDocument, NSError, NSResult, OwnerDocument, DID};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub struct InfoCache {
 
 impl InfoCache {
     pub fn get(&self, did: &DID, doc_type: &DidDocType) -> Option<(EncodedDocument, u64)> {
-        let now = buckyos_get_unix_timestamp();
+        let now = unix_now();
         let entries = self.entries.lock().unwrap();
         entries
             .get(&(did.clone(), doc_type.to_string()))
@@ -44,7 +44,7 @@ impl InfoCache {
     pub fn insert(&self, did: &DID, doc_type: &DidDocType, doc: EncodedDocument, exp: u64) {
         let mut entries = self.entries.lock().unwrap();
         if entries.len() > 4096 {
-            let now = buckyos_get_unix_timestamp();
+            let now = unix_now();
             entries.retain(|_, (_, e)| *e > now);
         }
         entries.insert((did.clone(), doc_type.to_string()), (doc, exp));
@@ -82,6 +82,10 @@ impl NameClient {
             .with_connect_timeout(self.config.connect_timeout)
             .with_request_timeout(self.config.request_timeout);
         let mut opts = opts.normalize(self.config.resolve_timeout);
+        if opts.depth() == 0 {
+            // 最外层调用(递归经 `descend` 时 depth > 0):本轮回答从新的一轮开始。
+            opts.begin_receipt_round();
+        }
         if !self.config.enable_cache {
             opts.allow_local_cache = false;
         }
@@ -346,7 +350,12 @@ impl NameClient {
         };
 
         let mut publish_info = self.get_publish_info(did, doc_type, revision, opts, &result).await?;
+        if publish_info.as_ref().map_or(false, |info| info.simulated) {
+            // locker 的模拟发布事实只用于本次选择,不写入普通来源缓存。
+            result.locked = true;
+        }
         result.apply_publish_info(publish_info.as_ref());
+        result.fill_latest_from_known(publish_info.as_ref());
         result.fill_slot_from_known(revision, publish_info.as_ref());
         if result.is_disabled() {
             // 本轮发布信息带来的禁用 / 撤销同样撤掉已有选择资格,否则旧 best 会被 select 返回。
@@ -378,6 +387,7 @@ impl NameClient {
             result.commit(&answer, revision, self.locker_version(), owner.as_ref());
             if provider.is_authority() {
                 publish_info = PublishInfo::merge(publish_info, answer.publish_info.clone());
+                result.fill_latest_from_known(answer.publish_info.as_ref());
                 result.fill_slot_from_known(revision, publish_info.as_ref());
             }
             if result.is_disabled() {
@@ -412,6 +422,12 @@ impl NameClient {
             .unwrap_or_else(|| DocResult::empty(opts.scope.clone(), did.clone(), doc_type.clone()));
         result.mark_base_generation();
         result.reasons.clear();
+        if let Some(did_level) = self
+            .store
+            .get_doc_result(&opts.scope, did, &did_state_doc_type(), use_disk)
+        {
+            result.adopt_did_state(&did_level);
+        }
         if use_disk {
             for inbox in self.store.collect_inbox(did, doc_type) {
                 if let Some(revision) = DocRevision::of(&inbox.document) {
@@ -444,12 +460,16 @@ impl NameClient {
         if use_disk {
             opts.budget()
                 .wait(tokio::task::spawn_blocking(move || {
-                    store.merge_doc_result(&scope, &did, &doc_type, result, true)
+                    let merged = store.merge_doc_result(&scope, &did, &doc_type, result, true)?;
+                    sync_did_state(&store, &scope, &did, &merged.0, true)?;
+                    Ok(merged)
                 }))
                 .await?
                 .map_err(|err| NSError::Failed(format!("merge task failed: {}", err)))?
         } else {
-            store.merge_doc_result(&scope, &did, &doc_type, result, false)
+            let merged = store.merge_doc_result(&scope, &did, &doc_type, result, false)?;
+            sync_did_state(&store, &scope, &did, &merged.0, false)?;
+            Ok(merged)
         }
     }
 
@@ -619,7 +639,7 @@ impl NameClient {
                 }
             }
             if !opts.force_authority_query {
-                if let Some(current) = result.publish_info_fresh(buckyos_get_unix_timestamp()) {
+                if let Some(current) = result.publish_info_fresh(unix_now()) {
                     if !current.simulated || opts.allow_local_lock() || opts.allow_zone_lock() {
                         if let Some(derived) = current.derive_for(revision) {
                             return Ok(Some(derived));
@@ -882,6 +902,36 @@ fn authority_body_is_best(result: &DocResult, answer: &SourceAnswer) -> bool {
         .best
         .as_ref()
         .map_or(false, |best| best.is_valid() && best.revision == revision)
+}
+
+/// DID 级状态记录的伪类型:与各 doc_type 结果同 scope 存放。
+pub(crate) fn did_state_doc_type() -> DidDocType {
+    DidDocType::custom("did-state")
+}
+
+/// 把结果里更新的 DID 级状态写入 DID 级记录(按检查时刻裁决,见 `DocResult::merge_into`)。
+fn sync_did_state(
+    store: &DocStore,
+    scope: &super::opts::Scope,
+    did: &DID,
+    merged: &DocResult,
+    use_disk: bool,
+) -> NSResult<()> {
+    if merged.did_state_checked_at.is_none() || merged.doc_type == did_state_doc_type() {
+        return Ok(());
+    }
+    let known = store
+        .get_doc_result(scope, did, &did_state_doc_type(), use_disk)
+        .and_then(|record| record.did_state_checked_at);
+    if known >= merged.did_state_checked_at {
+        return Ok(());
+    }
+    let mut record = DocResult::empty(scope.clone(), did.clone(), did_state_doc_type());
+    record.did_state = merged.did_state.clone();
+    record.did_state_checked_at = merged.did_state_checked_at;
+    store
+        .merge_doc_result(scope, did, &did_state_doc_type(), record, use_disk)
+        .map(|_| ())
 }
 
 fn locked_publish_info(locked: &DocResult) -> Option<PublishInfo> {
