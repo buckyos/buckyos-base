@@ -2,6 +2,7 @@
 #![allow(unused)]
 
 mod agent;
+pub mod bearer_token;
 mod device;
 mod disk_space;
 mod did;
