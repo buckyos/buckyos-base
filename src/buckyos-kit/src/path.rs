@@ -68,9 +68,8 @@ pub fn get_buckyos_root_dir() -> PathBuf {
         if current_dir.join("applist.json").exists() {
             current_dir.parent().unwrap().to_path_buf()
         } else if cfg!(target_os = "windows") {
-            let user_data_dir = env::var("APPDATA")
-                .unwrap_or_else(|_| env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
-            Path::new(&user_data_dir).join("buckyos")
+            // 使用较短的默认路径，避免 Windows 路径长度限制。
+            Path::new(r"C:\buckyos").to_path_buf()
         } else {
             Path::new("/opt/buckyos").to_path_buf()
         }

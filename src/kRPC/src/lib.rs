@@ -68,6 +68,7 @@ impl RPCErrors {
 }
 pub type Result<T> = std::result::Result<T, RPCErrors>;
 const DEFAULT_KRPC_TIMEOUT_SECS: u64 = 15;
+const MAX_HTTP_ERROR_BODY_BYTES: usize = 4096;
 
 /// 客户端 transport 安全模式(显式配置,不由 URL scheme 猜测;
 /// doc/krpc-s2s-payload-encryption-TODO.md §11.1)。
@@ -332,10 +333,7 @@ impl kRPC {
 
             Self::check_rpc_response_value(value, current_seq)
         } else {
-            Err(RPCErrors::ReasonError(format!(
-                "rpc call error: {}",
-                response.status()
-            )))
+            Err(http_response_error(response).await)
         }
     }
 
@@ -498,6 +496,61 @@ impl kRPC {
     }
 }
 
+async fn http_response_error(mut response: reqwest::Response) -> RPCErrors {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let mut message = format!("rpc call error: {status}");
+    if content_type.is_empty()
+        || content_type == "text/plain"
+        || content_type == "application/json"
+        || content_type.ends_with("+json")
+    {
+        let mut body = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), async {
+            while body.len() <= MAX_HTTP_ERROR_BODY_BYTES {
+                let Some(chunk) = response.chunk().await? else {
+                    break;
+                };
+                let remaining = MAX_HTTP_ERROR_BODY_BYTES + 1 - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Ok::<_, reqwest::Error>(())
+        })
+        .await;
+        let truncated = body.len() > MAX_HTTP_ERROR_BODY_BYTES;
+        body.truncate(MAX_HTTP_ERROR_BODY_BYTES);
+        let body = String::from_utf8_lossy(&body);
+        let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let lower = body.to_ascii_lowercase();
+        if !body.is_empty() && !lower.starts_with("<!doctype html") && !lower.starts_with("<html") {
+            message.push_str(": ");
+            message.push_str(&body);
+            if truncated {
+                message.push_str(" [truncated]");
+            }
+        }
+        match read {
+            Err(_) => message.push_str(" [error body read timed out]"),
+            Ok(Err(_)) => message.push_str(" [error body incomplete]"),
+            Ok(Ok(())) => {}
+        }
+    }
+    RPCErrors::Detailed(RPCErrorDetail::new(
+        "http_error",
+        message,
+        Some(serde_json::json!({ "status": status.as_u16() })),
+    ))
+}
+
 fn map_s2s_error(err: S2sError) -> RPCErrors {
     if err.is_permanent() {
         RPCErrors::S2sPermanentError(err.to_string())
@@ -510,6 +563,69 @@ fn map_s2s_error(err: S2sError) -> RPCErrors {
 mod test {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn http_error_body_is_bounded_and_filters_html() {
+        let response = http::Response::builder()
+            .status(504)
+            .header("content-type", "text/plain")
+            .body("x".repeat(MAX_HTTP_ERROR_BODY_BYTES * 4))
+            .unwrap();
+        let error = http_response_error(response.into()).await;
+        let detail = error.detail().unwrap();
+        assert_eq!(detail.code, "http_error");
+        assert_eq!(detail.data, Some(json!({ "status": 504 })));
+        assert_eq!(
+            detail.message,
+            format!(
+                "rpc call error: 504 Gateway Timeout: {} [truncated]",
+                "x".repeat(MAX_HTTP_ERROR_BODY_BYTES)
+            )
+        );
+
+        for content_type in ["text/html", "application/xhtml+xml", "text/plain", ""] {
+            let response = http::Response::builder()
+                .status(502)
+                .header("content-type", content_type)
+                .body("<!DOCTYPE html><html><body>proxy page</body></html>")
+                .unwrap();
+            let error = http_response_error(response.into()).await;
+            let detail = error.detail().unwrap();
+            assert_eq!(detail.data, Some(json!({ "status": 502 })));
+            assert_eq!(detail.message, "rpc call error: 502 Bad Gateway");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_error_body_read_does_not_wait_for_the_rpc_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/plain\r\nContent-Length: 1000\r\n\r\nupstream timed out")
+                .await
+                .unwrap();
+            let _ = released.await;
+            drop(stream);
+        });
+        let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), http_response_error(response))
+            .await
+            .unwrap();
+        let detail = error.detail().unwrap();
+        assert_eq!(detail.data, Some(json!({ "status": 504 })));
+        assert!(detail.message.contains("upstream timed out"));
+        assert!(detail.message.ends_with("[error body read timed out]"));
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
+
     #[test]
     fn test_encode_decode() {
         let req = RPCRequest {

@@ -466,8 +466,14 @@ async fn handle_request(
         }
         Err(e) => {
             log::error!("http error {}", e);
+            let status = match e.code() {
+                ServerErrorCode::ResponseHeadTimeout => StatusCode::GATEWAY_TIMEOUT,
+                ServerErrorCode::BodyIdleTimeout => StatusCode::REQUEST_TIMEOUT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .status(status)
+                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
                 .body(
                     Full::new(Bytes::from(e.msg().to_string()))
                         .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e))
@@ -614,6 +620,73 @@ mod tests {
     use async_trait::async_trait;
     use http_body_util::BodyExt;
     use serde_json::json;
+
+    struct TimeoutHttpServer(ServerErrorCode);
+
+    #[async_trait]
+    impl HttpServer for TimeoutHttpServer {
+        async fn serve_request(
+            &self,
+            req: Request<BoxBody<Bytes, ServerError>>,
+            _info: StreamInfo,
+        ) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+            req.into_body().collect().await?;
+            Err(ServerError::new(
+                self.0,
+                "upstream response timed out after 60000ms",
+            ))
+        }
+
+        fn id(&self) -> String {
+            "timeout-test".to_string()
+        }
+
+        fn http_version(&self) -> http::Version {
+            http::Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn http_timeout_status_and_diagnostic_reach_krpc_client() {
+        for (code, status) in [
+            (ServerErrorCode::ResponseHeadTimeout, 504),
+            (ServerErrorCode::BodyIdleTimeout, 408),
+            (ServerErrorCode::IOError, 500),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.unwrap();
+                hyper_serve_http1(
+                    Box::new(stream),
+                    Arc::new(TimeoutHttpServer(code)),
+                    StreamInfo::new(peer.to_string()),
+                )
+                .await
+                .unwrap();
+            });
+            let client = ::kRPC::kRPC::new(&format!("http://{addr}/kapi/test"), None);
+            let error = client.call("test", json!({})).await.unwrap_err();
+            let detail = error.detail().unwrap();
+            assert_eq!(detail.code, "http_error");
+            assert_eq!(detail.data, Some(json!({ "status": status })));
+            assert!(detail
+                .message
+                .contains(&format!("rpc call error: {status}")));
+            assert!(detail
+                .message
+                .contains("upstream response timed out after 60000ms"));
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     struct ErrorRpcHandler;
 

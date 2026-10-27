@@ -57,15 +57,16 @@ fn holds_own_storage(file_system: &str) -> bool {
 
 /// The storage a mount draws from: an APFS container (`/dev/disk3s5` → `/dev/disk3`), a ZFS
 /// pool (`rpool/ROOT/ubuntu` → `rpool`), otherwise the device itself.
-fn storage_root(device: &str) -> String {
-    if let Some(rest) = device.strip_prefix("/dev/disk") {
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if !digits.is_empty() && rest[digits.len()..].starts_with('s') {
-            return format!("/dev/disk{digits}");
+fn storage_root(device: &str, file_system: &str) -> String {
+    if file_system.eq_ignore_ascii_case("apfs") {
+        if let Some(rest) = device.strip_prefix("/dev/disk") {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty() && rest[digits.len()..].starts_with('s') {
+                return format!("/dev/disk{digits}");
+            }
         }
-        return device.to_string();
     }
-    if !device.starts_with('/') {
+    if file_system.eq_ignore_ascii_case("zfs") && !device.starts_with('/') {
         if let Some((pool, _)) = device.split_once('/') {
             return pool.to_string();
         }
@@ -86,10 +87,16 @@ pub fn distinct_disk_samples(
         if sample.total == 0 || !holds_own_storage(&sample.file_system) {
             continue;
         }
+        let file_system = sample.file_system.to_ascii_lowercase();
+        let space_key = if file_system == "zfs" {
+            sample.available
+        } else {
+            sample.total
+        };
         let key = (
-            storage_root(&sample.device),
-            sample.file_system.to_ascii_lowercase(),
-            sample.available,
+            storage_root(&sample.device, &file_system),
+            file_system,
+            space_key,
         );
         match index.get(&key) {
             Some(&slot) => groups[slot].push(sample),
@@ -104,15 +111,19 @@ pub fn distinct_disk_samples(
         .into_iter()
         .map(|mut group| {
             let first = group.remove(0);
+            let available = group.iter().fold(first.available, |available, other| {
+                available.min(other.available)
+            });
             if group.iter().all(|other| other.total == first.total) {
-                return first;
+                return DiskSpaceSample { available, ..first };
             }
             let used = group
                 .iter()
                 .fold(first.used(), |sum, other| sum.saturating_add(other.used()));
             DiskSpaceSample {
-                device: storage_root(&first.device),
-                total: used.saturating_add(first.available),
+                device: storage_root(&first.device, &first.file_system),
+                total: used.saturating_add(available),
+                available,
                 ..first
             }
         })
@@ -216,6 +227,97 @@ mod tests {
     }
 
     #[test]
+    fn macos_volume_names_count_once_when_free_space_changes_between_mounts() {
+        let total = 994_662_584_320;
+        let available = 393_558_260_265;
+        let mut samples = vec![
+            sample("Macintosh HD", "apfs", "/", total, available),
+            sample(
+                "Macintosh HD",
+                "apfs",
+                "/System/Volumes/Data",
+                total,
+                available - 4096,
+            ),
+        ];
+        for _ in 0..2 {
+            let distinct = distinct_disk_samples(samples.clone());
+            assert_eq!(distinct.len(), 1);
+            assert_eq!(distinct[0].available, available - 4096);
+            assert_eq!(
+                distinct_disk_space(distinct),
+                (total, total - available + 4096)
+            );
+            samples.reverse();
+        }
+    }
+
+    #[test]
+    fn bind_mounts_count_once_when_free_space_changes_between_mounts() {
+        let samples = vec![
+            sample("/dev/nvme0n1p2", "btrfs", "/", 500 * GIB, 300 * GIB),
+            sample(
+                "/dev/nvme0n1p2",
+                "btrfs",
+                "/home",
+                500 * GIB,
+                300 * GIB - 4096,
+            ),
+            sample(
+                "/dev/nvme0n1p2",
+                "btrfs",
+                "/etc/hosts",
+                500 * GIB,
+                300 * GIB + 4096,
+            ),
+        ];
+        assert_eq!(distinct_disk_space(samples), (500 * GIB, 200 * GIB + 4096));
+    }
+
+    #[test]
+    fn separate_disks_with_identical_capacity_and_free_space_still_add_up() {
+        let samples = vec![
+            sample("/dev/sdb1", "ext4", "/mnt/a", 4000 * GIB, 3000 * GIB),
+            sample("/dev/sdc1", "ext4", "/mnt/b", 4000 * GIB, 3000 * GIB),
+        ];
+        let distinct = distinct_disk_samples(samples);
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct_disk_space(distinct), (8000 * GIB, 2000 * GIB));
+    }
+
+    #[test]
+    fn non_apfs_partitions_of_one_macos_disk_remain_separate() {
+        for file_system in ["hfs", "exfat"] {
+            for available in [200 * GIB, 300 * GIB] {
+                let samples = vec![
+                    sample(
+                        "/dev/disk4s1",
+                        file_system,
+                        "/Volumes/A",
+                        500 * GIB,
+                        300 * GIB,
+                    ),
+                    sample(
+                        "/dev/disk4s2",
+                        file_system,
+                        "/Volumes/B",
+                        500 * GIB,
+                        available,
+                    ),
+                ];
+                let distinct = distinct_disk_samples(samples);
+                assert_eq!(distinct.len(), 2);
+                assert_eq!(distinct[0].device, "/dev/disk4s1");
+                assert_eq!(distinct[1].device, "/dev/disk4s2");
+                assert_eq!(
+                    distinct_disk_space(distinct),
+                    (1000 * GIB, 700 * GIB - available)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn zfs_datasets_add_their_usage_and_share_the_pool_free_space() {
         let samples = vec![
             sample("rpool/ROOT/ubuntu", "zfs", "/", 110 * GIB, 100 * GIB),
@@ -232,6 +334,23 @@ mod tests {
         assert_eq!(distinct.len(), 1);
         assert_eq!(distinct[0].device, "rpool");
         assert_eq!(distinct_disk_space(distinct), (155 * GIB, 55 * GIB));
+    }
+
+    #[test]
+    fn zfs_datasets_with_different_free_space_remain_separate() {
+        let samples = vec![
+            sample("rpool/ROOT/ubuntu", "zfs", "/", 110 * GIB, 100 * GIB),
+            sample(
+                "rpool/USERDATA/alice",
+                "zfs",
+                "/home/alice",
+                110 * GIB,
+                90 * GIB,
+            ),
+        ];
+        let distinct = distinct_disk_samples(samples);
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct_disk_space(distinct), (220 * GIB, 30 * GIB));
     }
 
     #[test]
