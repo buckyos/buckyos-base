@@ -25,6 +25,8 @@ use tokio::sync::RwLock;
 pub enum RPCErrors {
     #[error("Failed due to reason: {0}")]
     ReasonError(String),
+    #[error("HTTP transport error: {0}")]
+    HttpTransportError(#[source] reqwest::Error),
     #[error("Unknown method: {0}")]
     UnknownMethod(String),
     #[error("Invalid token: {0}")]
@@ -59,6 +61,20 @@ pub enum RPCErrors {
 }
 
 impl RPCErrors {
+    pub fn is_retryable_transport(&self) -> bool {
+        match self {
+            Self::HttpTransportError(error) => {
+                error.is_timeout()
+                    || (!error.is_builder()
+                        && !error.is_redirect()
+                        && !error.is_decode()
+                        && !error.is_status()
+                        && (error.is_connect() || error.is_request() || error.is_body()))
+            }
+            _ => false,
+        }
+    }
+
     pub fn detail(&self) -> Option<&RPCErrorDetail> {
         match self {
             Self::Detailed(detail) => Some(detail),
@@ -323,12 +339,14 @@ impl kRPC {
             .json(request_body)
             .send()
             .await
-            .map_err(|err| RPCErrors::ReasonError(format!("{}", err)))?;
+            .map_err(RPCErrors::HttpTransportError)?;
 
         if response.status().is_success() {
-            let value: Value = response
-                .json()
+            let body = response
+                .bytes()
                 .await
+                .map_err(RPCErrors::HttpTransportError)?;
+            let value: Value = serde_json::from_slice(&body)
                 .map_err(|err| RPCErrors::ParserResponseError(format!("{}", err)))?;
 
             Self::check_rpc_response_value(value, current_seq)
@@ -563,6 +581,119 @@ fn map_s2s_error(err: S2sError) -> RPCErrors {
 mod test {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_plain_response(
+        status: u16,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/kapi/test", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn plain_rpc_preserves_connection_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/kapi/test", listener.local_addr().unwrap());
+        drop(listener);
+        let error = kRPC::new(&url, None)
+            .call("test", json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.is_retryable_transport(), "{error:?}");
+        assert!(matches!(error, RPCErrors::HttpTransportError(error) if error.is_connect()));
+    }
+
+    #[tokio::test]
+    async fn plain_rpc_preserves_request_and_response_body_timeouts() {
+        for send_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/kapi/test", listener.local_addr().unwrap());
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                stream.read(&mut request).await.unwrap();
+                if send_headers {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+                }
+                let _ = released.await;
+                drop(stream);
+            });
+            let error = kRPC::new_with_timeout(&url, None, Duration::from_millis(100))
+                .call("test", json!({}))
+                .await
+                .unwrap_err();
+            assert!(error.is_retryable_transport(), "{error:?}");
+            assert!(matches!(error, RPCErrors::HttpTransportError(error) if error.is_timeout()));
+            release.send(()).unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_rpc_authentication_and_http_errors_are_not_transport_failures() {
+        for message in [
+            "Invalid token: signature",
+            "No permission: denied",
+            "Token expired",
+        ] {
+            let body =
+                serde_json::to_string(&RPCResponse::new(RPCResult::Failed(message.into()), 7))
+                    .unwrap();
+            let (url, server) = serve_plain_response(200, body).await;
+            let error = kRPC::new(&url, None)
+                .post_plain_json(&json!({}), 7)
+                .await
+                .unwrap_err();
+            assert!(!error.is_retryable_transport(), "{error:?}");
+            assert!(matches!(error, RPCErrors::ReasonError(_)));
+            server.await.unwrap();
+        }
+        for status in [401, 403, 503] {
+            let (url, server) = serve_plain_response(status, "denied".into()).await;
+            let error = kRPC::new(&url, None)
+                .call("test", json!({}))
+                .await
+                .unwrap_err();
+            assert!(!error.is_retryable_transport(), "{error:?}");
+            assert_eq!(
+                error.detail().unwrap().data,
+                Some(json!({"status": status}))
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_rpc_invalid_url_and_invalid_json_are_not_retryable() {
+        let error = kRPC::new("not a URL", None)
+            .call("test", json!({}))
+            .await
+            .unwrap_err();
+        assert!(!error.is_retryable_transport(), "{error:?}");
+        assert!(matches!(error, RPCErrors::HttpTransportError(error) if error.is_builder()));
+
+        let (url, server) = serve_plain_response(200, "not JSON".into()).await;
+        let error = kRPC::new(&url, None)
+            .call("test", json!({}))
+            .await
+            .unwrap_err();
+        assert!(!error.is_retryable_transport(), "{error:?}");
+        assert!(matches!(error, RPCErrors::ParserResponseError(_)));
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn http_error_body_is_bounded_and_filters_html() {
