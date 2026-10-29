@@ -1,6 +1,7 @@
+use crate::resolver::decode_declared_document_header;
 use name_lib::{
-    resolve_href, ActionError, ActionInvocation, ActionObserved, ActionResponse, DIDObjectCard,
-    NSError, NSResult, ObjectProfile,
+    resolve_href, ActionError, ActionInvocation, ActionObserved, ActionResponse,
+    DIDDocumentTrait, DIDObjectCard, EncodedDocument, NSError, NSResult, ObjectProfile,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
@@ -34,8 +35,38 @@ impl DIDObjectClient {
 
     pub async fn resolve_card(&self, did_object_url: &str) -> NSResult<DIDObjectCard> {
         let card_url = DIDObjectCard::default_card_url(did_object_url);
-        let value = self.get_json(&card_url, "DID Object Card").await?;
-        let card = DIDObjectCard::from_value(value)?;
+        let response = self
+            .http_client
+            .get(&card_url)
+            .send()
+            .await
+            .map_err(|err| NSError::Failed(format!("request {card_url} failed: {err}")))?;
+        let status = response.status();
+        let header_doc = decode_declared_document_header(response.headers())?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| NSError::Failed(format!("read {card_url} response failed: {err}")))?;
+        if !status.is_success() {
+            return Err(http_status_error(status, "DID Object Card", body));
+        }
+        let body_doc = parse_card_body(&body);
+        let doc = match (header_doc, body_doc) {
+            (Some(header), Some(body)) => {
+                if header.clone().to_json_value()? != body.clone().to_json_value()? {
+                    return Err(NSError::InvalidData);
+                }
+                header
+            }
+            (Some(header), None) => header,
+            (None, Some(body)) => body,
+            (None, None) => {
+                return Err(NSError::NotFound(format!(
+                    "DID Object Card not provided by {card_url}"
+                )))
+            }
+        };
+        let card = DIDObjectCard::decode(&doc, None)?;
         card.validate()?;
         Ok(card)
     }
@@ -55,7 +86,7 @@ impl DIDObjectClient {
     }
 
     pub async fn resolve(&self, did_object_url: &str) -> NSResult<ResolvedDIDObject> {
-        let object_url = normalize_object_url(did_object_url);
+        let object_url = did_object_url.trim().to_string();
         let object_card = self.resolve_card(did_object_url).await?;
         let object_profile = self.resolve_profile_from_card(&object_card).await?;
         Ok(ResolvedDIDObject {
@@ -275,6 +306,28 @@ fn normalize_object_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
+fn parse_card_body(body: &str) -> Option<EncodedDocument> {
+    let body = body.trim();
+    if body.starts_with('{') {
+        let value: Value = serde_json::from_str(body).ok()?;
+        let is_did_document = value.get("id").and_then(Value::as_str).is_some_and(|id| id.starts_with("did:"))
+            && value.get("service").is_some();
+        return is_did_document.then_some(EncodedDocument::JsonLd(value));
+    }
+    let parts: Vec<&str> = body.split('.').collect();
+    if parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        })
+    {
+        return Some(EncodedDocument::Jwt(body.to_string()));
+    }
+    None
+}
+
 async fn parse_json_response(
     response: reqwest::Response,
     url: &str,
@@ -436,7 +489,7 @@ mod tests {
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let first_line = request.lines().next().unwrap_or_default();
 
-                let (status, body) = if first_line.starts_with("GET /devices/cam01/did.json ") {
+                let (status, body) = if first_line.starts_with("GET /devices/cam01 ") {
                     ("200 OK", serde_json::to_string(&card).unwrap())
                 } else if first_line.starts_with("GET /devices/cam01/profile.json ") {
                     ("200 OK", serde_json::to_string(&profile).unwrap())
@@ -491,5 +544,60 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    async fn serve_once(listener: TcpListener, responses: Vec<(&'static str, String, Option<String>)>) {
+        for (expected_line, body, header) in responses {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let first_line = request.lines().next().unwrap_or_default().to_string();
+            let (status, body) = if first_line.starts_with(expected_line) {
+                ("200 OK", body)
+            } else {
+                ("404 Not Found", json!({"error": first_line}).to_string())
+            };
+            let header = header
+                .map(|value| format!("BuckyOS-DID-Document: {value}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: text/html\r\n{header}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn path_object_card_comes_from_header_and_directory_appends_did_json() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let object_url = format!("http://{addr}/devices/cam01");
+        let dir_url = format!("http://{addr}/devices/");
+        let card = test_card(&object_url);
+        let header = crate::resolver::encode_declared_document_header(&EncodedDocument::JsonLd(
+            serde_json::to_value(&card).unwrap(),
+        ));
+        let server = tokio::spawn(serve_once(
+            listener,
+            vec![
+                ("GET /devices/cam01 ", "<html>camera</html>".to_string(), Some(header)),
+                ("GET /devices/did.json ", serde_json::to_string(&card).unwrap(), None),
+                ("GET /devices/cam02 ", "<html>no card</html>".to_string(), None),
+            ],
+        ));
+
+        let client = DIDObjectClient::new();
+        let from_header = client.resolve_card(&object_url).await.unwrap();
+        assert_eq!(from_header.id, card.id);
+        let from_dir = client.resolve_card(&dir_url).await.unwrap();
+        assert_eq!(from_dir.id, card.id);
+        let missing = client
+            .resolve_card(&format!("http://{addr}/devices/cam02"))
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, NSError::NotFound(_)));
+        server.await.unwrap();
     }
 }

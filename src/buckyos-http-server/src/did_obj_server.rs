@@ -34,6 +34,10 @@ pub struct DIDObjectRequestContext {
     pub object_params: HashMap<String, String>,
     /// The DID Object endpoint suffix, such as did.json, profile.json, props/name, or methods/name.
     pub endpoint_path: String,
+    /// Request headers (credentials such as `Authorization` or the SSO cookie stay with the provider).
+    pub headers: http::HeaderMap,
+    /// The request query, without the leading `?`.
+    pub query: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,6 +308,10 @@ impl<T: DIDObjectServer> DIDObjectHttpServer<T> {
         &self.object_url_patterns
     }
 
+    pub fn inner(&self) -> &Arc<T> {
+        &self.inner
+    }
+
     fn match_object_url(
         &self,
         req: &http::Request<BoxBody<Bytes, ServerError>>,
@@ -335,6 +343,7 @@ impl<T: DIDObjectServer> DIDObjectHttpServer<T> {
 
     fn request_context(
         &self,
+        req: &RequestParts,
         path: &str,
         endpoint: &DIDObjectEndpoint,
         object_match: DIDObjectUrlMatch,
@@ -347,6 +356,8 @@ impl<T: DIDObjectServer> DIDObjectHttpServer<T> {
             object_path: object_match.object_path,
             object_params: object_match.params,
             endpoint_path: endpoint.endpoint_path.clone(),
+            headers: req.headers.clone(),
+            query: req.query.clone(),
         }
     }
 }
@@ -360,6 +371,10 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let method = req.method().clone();
         let path = normalize_path(req.uri().path());
+        let parts = RequestParts {
+            headers: req.headers().clone(),
+            query: req.uri().query().map(str::to_string),
+        };
         let endpoint = match DIDObjectEndpoint::parse(&path) {
             Some(endpoint) => endpoint,
             None => {
@@ -379,8 +394,25 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
             }
         };
 
+        let type_selector = request_type_selector(&req);
+        if method == Method::GET
+            && endpoint.kind == DIDObjectEndpointKind::Card
+            && type_selector.as_deref() == Some("profile")
+        {
+            let ctx = self.request_context(&parts, &path, &endpoint, object_match, info);
+            return match self.inner.object_profile_for(ctx).await {
+                Ok(profile) => json_response(StatusCode::OK, &profile),
+                Err(err) => did_object_error_response(err),
+            };
+        }
+
         if method == Method::GET && endpoint.kind == DIDObjectEndpointKind::Card {
-            let ctx = self.request_context(&path, &endpoint, object_match, info);
+            if let Some(selector) = type_selector.filter(|selector| selector != "did-object") {
+                return did_object_error_response(DIDObjectError::not_found(format!(
+                    "DID Object document type '{selector}' is not served"
+                )));
+            }
+            let ctx = self.request_context(&parts, &path, &endpoint, object_match, info);
             return match self.inner.object_card_for(ctx).await {
                 Ok(card) => json_response(StatusCode::OK, &card),
                 Err(err) => did_object_error_response(err),
@@ -388,7 +420,7 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
         }
 
         if method == Method::GET && endpoint.kind == DIDObjectEndpointKind::Profile {
-            let ctx = self.request_context(&path, &endpoint, object_match, info);
+            let ctx = self.request_context(&parts, &path, &endpoint, object_match, info);
             return match self.inner.object_profile_for(ctx).await {
                 Ok(profile) => json_response(StatusCode::OK, &profile),
                 Err(err) => did_object_error_response(err),
@@ -397,7 +429,7 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
 
         if method == Method::GET && endpoint.kind == DIDObjectEndpointKind::Property {
             let property = endpoint.item.as_deref().unwrap_or_default();
-            let ctx = self.request_context(&path, &endpoint, object_match, info);
+            let ctx = self.request_context(&parts, &path, &endpoint, object_match, info);
             return match self.inner.read_property(property, ctx).await {
                 Ok(value) => json_response(StatusCode::OK, &value),
                 Err(err) => did_object_error_response(err),
@@ -426,7 +458,7 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
                 )));
             }
 
-            let ctx = self.request_context(&path, &endpoint, object_match, info);
+            let ctx = self.request_context(&parts, &path, &endpoint, object_match, info);
             return match self.inner.invoke_action(request, ctx).await {
                 Ok(success) => {
                     json_response(StatusCode::OK, &DIDObjectActionResponse::from(success))
@@ -439,7 +471,7 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
         }
 
         if endpoint.kind == DIDObjectEndpointKind::Event {
-            let ctx = self.request_context(&path, &endpoint, object_match, info);
+            let ctx = self.request_context(&parts, &path, &endpoint, object_match, info);
             return match self
                 .inner
                 .handle_event_request(endpoint.item.as_deref(), ctx)
@@ -464,6 +496,11 @@ impl<T: DIDObjectServer> HttpServer for DIDObjectHttpServer<T> {
     fn http3_port(&self) -> Option<u16> {
         self.http3_port
     }
+}
+
+struct RequestParts {
+    headers: http::HeaderMap,
+    query: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -514,6 +551,14 @@ impl DIDObjectEndpoint {
                 DID_OBJECT_EVENT_PREFIX,
                 DIDObjectEndpointKind::Event,
             )
+        })
+        .or_else(|| {
+            Some(Self::from_parts(
+                DIDObjectEndpointKind::Card,
+                &segments,
+                &[],
+                None,
+            ))
         })
     }
 
@@ -582,6 +627,18 @@ enum DIDObjectEndpointKind {
     Property,
     Action,
     Event,
+}
+
+fn request_type_selector(req: &http::Request<BoxBody<Bytes, ServerError>>) -> Option<String> {
+    req.uri().query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (key == "type").then(|| {
+            percent_decode_str(value)
+                .decode_utf8()
+                .map(|value| value.into_owned())
+                .unwrap_or_default()
+        })
+    })
 }
 
 fn normalize_path(path: &str) -> String {

@@ -275,6 +275,13 @@ did:web:myhome.com:services:repo
 
 Path DID 的可信性通常需要回溯到 controller、Zone 或 Owner，而不是只相信当前 HTTP host。
 
+BuckyOS 约定（2026-10-29 裁决 D7 / D8 / D11，见 buckyos `doc/key url.md` §6）：
+
+- 已有 DID 的对象（User、Device、Agent、Group、Zone 服务）复用自己的 DID 作为 Object DID，不另造。
+- 服务或实体的子对象使用 path DID，从稳定的服务 / 实体身份派生：`did:web:<entity-host>:sessions:<sid>`、`did:bns:<zone>:homestation:home:alice:feed`。path 段对应对象 URL 的路径段，不因 HTTP endpoint 调整而改身份。
+- NamedObject 不自动获得 Object DID；内容对象用 `cyfs://<objid>/` 引用。
+- 每个对象有一个默认 Object URL（Card `id` 对应者）；跨 Zone 的默认 Object URL 是 `https://<zone-host>/<path>`。同一对象的其他 URL 在 `alsoKnownAs` 声明，附件、导出、版本快照不进 `alsoKnownAs`。
+
 ### 5.3 Resolver assumption
 
 本协议假设 Runtime 有一个 DID Object Resolver：
@@ -311,6 +318,8 @@ BuckyOS Runtime MAY 支持其他 resolver routes，例如 local registry、Zone 
 v1 核心协议不要求 `obj://`。上层 Agent Runtime MAY 使用 `obj://` 作为 canonical semantic object URI，但进入本协议 data/control plane 时 SHOULD 能解析为 Object URL 或 Object DID。
 
 如果实现支持 `obj://`，它应被视为 resolver input，而不是 property/action/event 的 wire endpoint。
+
+BuckyOS 的 `obj://` host 段只允许两类值（buckyos `doc/key url.md` §4）：current zone 的系统服务名（`obj://config/...`、`obj://msg-center/...`，不展开、不带 Zone），或带 Zone 的实体 DID canonical hostname（`obj://xiaobai.test.buckyos.io/sessions/<sid>`）。不做类型简写，NamedObject id 不进 host。跨 Zone 引用服务对象直接用 https Object URL，resolver 不为 `obj://<service>/` 补 Zone。
 
 ---
 

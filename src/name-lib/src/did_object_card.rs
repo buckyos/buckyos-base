@@ -173,7 +173,21 @@ impl DIDObjectCard {
     }
 
     pub fn default_card_url(object_url: &str) -> String {
-        format!("{}/did.json", object_url.trim_end_matches('/'))
+        let object_url = object_url.trim();
+        let path_end = object_url.find(['?', '#']).unwrap_or(object_url.len());
+        let (base, suffix) = object_url.split_at(path_end);
+        let has_path = base
+            .find("://")
+            .map(|pos| base[pos + 3..].contains('/'))
+            .unwrap_or(true);
+        if !has_path {
+            return format!("{base}/did.json{suffix}");
+        }
+        if base.ends_with('/') {
+            format!("{base}did.json{suffix}")
+        } else {
+            object_url.to_string()
+        }
     }
 
     pub fn get_default_key(&self) -> Option<Jwk> {
@@ -447,6 +461,22 @@ mod tests {
         assert_eq!(
             DIDObjectCard::default_card_url("https://myhome.com/devices/cam01/"),
             "https://myhome.com/devices/cam01/did.json"
+        );
+        assert_eq!(
+            DIDObjectCard::default_card_url("https://myhome.com/devices/cam01"),
+            "https://myhome.com/devices/cam01"
+        );
+        assert_eq!(
+            DIDObjectCard::default_card_url("https://myhome.com/devices/?view=a"),
+            "https://myhome.com/devices/did.json?view=a"
+        );
+        assert_eq!(
+            DIDObjectCard::default_card_url("https://myhome.com/devices/cam01?type=profile"),
+            "https://myhome.com/devices/cam01?type=profile"
+        );
+        assert_eq!(
+            DIDObjectCard::default_card_url("https://myhome.com"),
+            "https://myhome.com/did.json"
         );
     }
 

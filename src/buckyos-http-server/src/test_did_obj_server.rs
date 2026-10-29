@@ -328,7 +328,10 @@ async fn example_name_client() -> NameClient {
         enable_zone_locker: false,
         ..Default::default()
     });
-    client.set_method_authority("web", Arc::new(WebProvider::new_with_scheme("http")));
+    client.set_method_authority(
+        "web",
+        Arc::new(WebProvider::new_with_scheme("http").with_legacy_path_routes(false)),
+    );
 
     // 这些 fixture 里的 DIDObjectCard 都把 controller 设成 did:web:myhome.com，
     // 但测试环境里并没有真的把 myhome.com 架起来。resolve_did 现在需要能递归解析到
@@ -647,10 +650,18 @@ async fn runner_routes_multiple_did_object_servers() {
     let runner_task = tokio::spawn(async move { runner.run().await });
     wait_for_tcp(addr).await;
 
-    let cam01_response = http_get(addr, "/devices/cam01/did.json").await;
+    let cam01_response = http_get(addr, "/devices/cam01").await;
     assert!(cam01_response.contains("200 OK"), "{cam01_response}");
     let cam01_card: DIDObjectCard = http_json_body(&cam01_response);
     assert_eq!(cam01_card.service_endpoint().unwrap(), cam01_url);
+
+    let cam01_profile_response = http_get(addr, "/devices/cam01?type=profile").await;
+    assert!(cam01_profile_response.contains("200 OK"), "{cam01_profile_response}");
+    let cam01_profile: Value = http_json_body(&cam01_profile_response);
+    assert_eq!(cam01_profile["title"], "Example Camera");
+
+    let cam01_unknown_type = http_get(addr, "/devices/cam01?type=owner").await;
+    assert!(cam01_unknown_type.contains("404 Not Found"), "{cam01_unknown_type}");
 
     let cam02_response = http_get(addr, "/devices/cam02/did.json").await;
     assert!(cam02_response.contains("200 OK"), "{cam02_response}");
