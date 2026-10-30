@@ -166,18 +166,16 @@ pub struct StreamInfo {
     pub source_mac: Option<String>,
     pub source_hostname: Option<String>,
     pub source_online_secs: Option<String>,
+    pub source_device_did: Option<String>,
+    pub source_identity_trust: Option<String>,
 }
 
 impl StreamInfo {
     pub fn new(src_addr: String) -> Self {
         Self {
             src_addr: Some(src_addr.clone()),
-            dst_addr: None,
             conn_src_addr: Some(src_addr),
-            real_src_addr: None,
-            source_mac: None,
-            source_hostname: None,
-            source_online_secs: None,
+            ..Default::default()
         }
     }
 
@@ -185,13 +183,20 @@ impl StreamInfo {
         let src_addr = real_src_addr.clone().or_else(|| conn_src_addr.clone());
         Self {
             src_addr,
-            dst_addr: None,
             conn_src_addr,
             real_src_addr,
-            source_mac: None,
-            source_hostname: None,
-            source_online_secs: None,
+            ..Default::default()
         }
+    }
+
+    pub fn with_source_device(
+        mut self,
+        source_device_did: Option<String>,
+        source_identity_trust: Option<String>,
+    ) -> Self {
+        self.source_device_did = source_device_did;
+        self.source_identity_trust = source_identity_trust;
+        self
     }
 
     pub fn with_device_info(
