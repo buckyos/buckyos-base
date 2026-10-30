@@ -558,7 +558,7 @@ impl NameClient {
                 }
             }
         }
-        if opts.allow_zone_lock() {
+        if opts.allow_zone_lock() && !self.is_zone_locker_bypassed(did) {
             if let Some(zone) = self.zone_locker_snapshot() {
                 let sref = zone.source_ref();
                 let answer = self
@@ -610,7 +610,7 @@ impl NameClient {
                 return Ok(Some(info));
             }
         }
-        if opts.allow_zone_lock() {
+        if opts.allow_zone_lock() && !self.is_zone_locker_bypassed(did) {
             if let Some(zone) = self.zone_locker_snapshot() {
                 let sref = zone.source_ref();
                 let answer = self

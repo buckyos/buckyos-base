@@ -332,6 +332,7 @@ pub struct NameClient {
     pub(crate) registry: SourceRegistry,
     pub(crate) local_locker: Arc<LocalLocker>,
     pub(crate) zone_locker: StdRwLock<Option<Arc<ZoneLocker>>>,
+    pub(crate) zone_locker_bypass: StdRwLock<HashSet<DID>>,
     pub(crate) locks: DocLocks,
     pub(crate) merger: TaskMerger,
     pub(crate) backoff: Backoff,
@@ -372,6 +373,7 @@ impl NameClient {
             registry: SourceRegistry::new(),
             local_locker: Arc::new(LocalLocker::new()),
             zone_locker: StdRwLock::new(zone_locker),
+            zone_locker_bypass: StdRwLock::new(HashSet::new()),
             locks: DocLocks::new(),
             merger: TaskMerger::new(config.concurrency.clone()),
             backoff: Backoff::new(config.concurrency.clone()),
@@ -408,6 +410,22 @@ impl NameClient {
         if let Ok(mut zone) = self.zone_locker.write() {
             *zone = Some(Arc::new(ZoneLocker::new(config)));
         }
+    }
+
+    /// Zone locker 例外：解析这些 DID 时不问 Zone locker（文档与发布信息都跳过），
+    /// 本机 locker、缓存与来源照常。用于本进程访问自己的 Zone locker 要经过的节点 /
+    /// 中继：例如普通节点的 Zone locker（本机 3180）经 RTCP 转发到 OOD，解析这个 OOD
+    /// 的身份时再问 Zone locker 就会形成回环。整体替换旧名单。
+    pub fn set_zone_locker_bypass(&self, dids: impl IntoIterator<Item = DID>) {
+        if let Ok(mut bypass) = self.zone_locker_bypass.write() {
+            *bypass = dids.into_iter().collect();
+        }
+    }
+
+    pub fn is_zone_locker_bypassed(&self, did: &DID) -> bool {
+        self.zone_locker_bypass
+            .read()
+            .map_or(false, |bypass| bypass.contains(did))
     }
 
     // ---- 本机 locker ----

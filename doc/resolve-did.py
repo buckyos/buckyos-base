@@ -646,21 +646,30 @@ def open_rtcp_tunnel(remote_did, requirement, caller_opts=None):
     opts = (
         opts.with_network_sources("authority_only")
         .with_transport_policy(independent_control_plane)
-        .without_zone_lock()
     )
     if requirement == "AuthorityCurrent":
-        opts = opts.without_local_lock().with_force_authority_query()
-    # 本示例固定关闭 Zone locker，caller_opts 的 allow_zone_lock 不会覆盖它。
-    # 其它显式允许 Zone locker 的模式只能选满足独立控制通道约束的 locker，并传递剩余预算/取消
-    # 和 without_zone_lock；仅使用 localhost 或关闭再次选 locker 都不充分。
-    # AuthorityCurrent 显式禁用两种 locker，以取得真实权威回答，不接受 scope 内模拟发布。
+        opts = opts.with_force_authority_query()
+    # 本机 / Zone locker 按 hosts 模型优先且强制返回，两种要求下都先于 method authority。
+    # Zone locker 是 Zone 级 hosts，让整个集群对同一 DID 得到一致结果，地位与本机 locker 相同，
+    # 不按出站来源对待（buckyos#710：SN 中继的目标身份由 SN 自己的 zone resolver 回答，
+    # 不再请求经本 SN 中继才能到达的该域名 HTTPS）。Zone locker 仍须传递剩余预算/取消和
+    # without_zone_lock。访问 Zone locker 本身要经过的节点/中继（例如普通节点的 3180 经
+    # RTCP 转发到 OOD）列入客户端的 Zone locker 例外（set_zone_locker_bypass），解析它们时
+    # 跳过 Zone locker，否则访问 Zone locker 要先解析它们，形成回环。locker 的回答（含 missing/invalid/revoked）不再交给 authority；
+    # locker Unknown / 未覆盖时，AuthorityCurrent 只接受本轮真实 authority 回答。
+    # 把 snapshot 准入升级为 MethodAuthorityCurrent、或从权威否定中恢复的后台确认，
+    # 要的是 method authority 本身的回答：那里关闭两种 locker。
     with resolution_budget(opts):
         result = resolve_did_ex(remote_did, "device", opts=opts)
-        identity = select_authority_current(result, requirement, opts)
+        if result.locked:
+            identity = result.select(Revision.current())  # trust：host / zone snapshot
+        else:
+            identity = select_authority_current(result, requirement, opts)
         if identity is None:
             return error("目标身份材料不足或不满足 RTCP 身份要求", result.reason)
-        # select_authority_current 是 RTCP 的证据门禁，不直接把普通 select(current) 的 best 当公网当前：
-        # AuthorityCurrent 从本轮真实 authority receipt 选择有效文档，检查精确 DID/type/iat/hash 绑定。
+        # 没有 locker 回答时，select_authority_current 是 RTCP 的证据门禁，不直接把普通
+        # select(current) 的 best 当公网当前：AuthorityCurrent 从本轮真实 authority receipt
+        # 选择有效文档，检查精确 DID/type/iat/hash 绑定。
         # 即使缓存 best 更新，也不能用它替换 receipt 指定的 body；旧 latest/Unknown 不满足本次确认。
         # TrustedSnapshot 按自身准入策略检查允许的本地依据，不能因来源限制而放宽验证。
         # 复用/建连携带这一确切身份快照；地址材料获取也继承来源/传输限制和剩余预算，
@@ -690,7 +699,8 @@ def on_rtcp_hello(hello, caller_opts=None):
 # - authority 自身的 DNS/代理/内部 fallback 需要目标 RTCP 时，受限请求直接拒绝，不因 authority 等级放行。
 # - 串行锁等待、owner 递归、多 provider 重试共用 deadline；超时/取消不残留请求或锁，
 #   不写禁用状态、不污染普通调用缓存；并发合并不跨访问策略复用网络任务。
-# - AuthorityCurrent 不接受模拟发布/旧 receipt/仅 trust best；有效身份、吊销与隧道复用仍按原准入要求检查。
+# - AuthorityCurrent：本机 / Zone locker 的强制回答优先（trust 记为 host/zone snapshot，含负状态）；
+#   没有 locker 回答时不接受模拟发布/旧 receipt/仅 trust best；有效身份、吊销与隧道复用仍按原准入要求检查。
 # - 目录/路径：无 path 的 BNS 根按 method 目录规则取 did.json；:aaa:bbb 直取对象 URL，
 #   默认 did-object 不附 type，非默认类型才安全合并 query；显式 URL 尾 "/" 不被提前抹掉。
 # - 旧 resolver API、根目录显式类型文件、已配置的旧路径静态发布路由仍可使用；
